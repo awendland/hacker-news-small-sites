@@ -81,7 +81,7 @@ export async function* generateRssFeeds({
       rss.item({
         title: sss.title,
         description: `
-<strong>Score:</strong> ${sss.score} <em>(as of ${pubDate.toISOString()})
+<strong>Score:</strong> ${sss.score} <em>(as of ${pubDate.toISOString()})</em>
 <br /><strong>URL:</strong> ${sss.url}
 `,
         url: sss.url,
