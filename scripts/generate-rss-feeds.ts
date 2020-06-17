@@ -8,7 +8,7 @@ import RSS from "rss"
 import {
   LocalDate,
   ZoneId,
-  ZonedDateTime,
+  LocalDateTime,
   LocalTime,
   convert,
 } from "@js-joda/core"
@@ -52,10 +52,9 @@ export async function* generateRssFeeds({
   topSitesTable: string
 }) {
   const since = convert(
-    ZonedDateTime.of(
-      LocalDate.now().minusDays(maxStoryAge),
-      LocalTime.MIDNIGHT,
-      ZoneId.of("America/Los_Angeles")
+    LocalDateTime.of(
+      LocalDate.now(ZoneId.of("America/Los_Angeles")).minusDays(maxStoryAge),
+      LocalTime.MIDNIGHT
     )
   ).toDate()
   console.log(`Retrieving stories since ${since.toISOString()}`)
