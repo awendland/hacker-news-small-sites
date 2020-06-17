@@ -41,23 +41,28 @@ export type FeedConfiguration = t.TypeOf<typeof FeedConfiguration>
 export async function* generateRssFeeds({
   queryRunner,
   feedConfigs,
+  maxStoryAge,
   hackerNewsTable,
   topSitesTable,
 }: {
   queryRunner: (q: string) => Promise<any[]>
   feedConfigs: Iterable<FeedConfiguration>
+  maxStoryAge: number
   hackerNewsTable: string
   topSitesTable: string
 }) {
+  const since = convert(
+    ZonedDateTime.of(
+      LocalDate.now().minusDays(maxStoryAge),
+      LocalTime.MIDNIGHT,
+      ZoneId.of("America/Los_Angeles")
+    )
+  ).toDate()
+  console.log(`Retrieving stories since ${since.toISOString()}`)
+
   const rows = await queryRunner(
     queries.selectSmallSiteStoriesSince({
-      since: convert(
-        ZonedDateTime.of(
-          LocalDate.now().minusDays(2),
-          LocalTime.MIDNIGHT,
-          ZoneId.of("America/Los_Angeles")
-        )
-      ).toDate(),
+      since,
       minScore: 1,
       hackerNewsTable,
       topSitesTable,
@@ -122,6 +127,12 @@ export async function run() {
       description:
         "name of the bigquery top-sites table to use (must have a 'domain' column)",
       default: `hacker-news-small-sites.top_sites.majestic_million`,
+    })
+    .option("maxStoryAge", {
+      type: "number",
+      description:
+        "how many days back should stories be retrieved from (eg. '3' would mean fetch stories from the last 3 days)",
+      default: 3,
     }).argv
 
   const readFeedConfigs = async (stream: Readable) =>

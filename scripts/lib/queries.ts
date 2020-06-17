@@ -87,4 +87,4 @@ export const selectSmallSiteStoriesSince = ({
   WHERE
     ts.domain IS NULL
   ORDER BY
-    3 DESC`
+    \`timestamp\` DESC`
