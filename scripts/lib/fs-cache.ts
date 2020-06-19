@@ -2,6 +2,7 @@ import * as TE from "fp-ts/lib/TaskEither"
 import { join } from "path"
 import { flow, pipe } from "fp-ts/lib/function"
 import { readFile, writeFileP } from "./func"
+import * as crypto from "crypto"
 
 /**
  * Create a cache that stores key, value pairs in files named by the
@@ -21,7 +22,13 @@ export const createFsCache = (cacheDir: string) => <ME>(
   function fromFsCache(
     key: string
   ): TE.TaskEither<ME | NodeJS.ErrnoException, Buffer> {
-    const bkey = Buffer.from(key).toString("base64")
+    // Using the sha1 could result in returning the wrong entry for a given
+    // key, and since there is no likely no metadata being stored with the
+    // cache entry to make sure it's the right one, it is possible that
+    // incorrect data could be returned and used for a given key. Since this
+    // is unlikely to occur (the chance of a sha1 collision is very low) we're
+    // ignoring the issue for the time being.
+    const bkey = crypto.createHash("sha1").update(key).digest("hex")
     const cachePath = join(cacheDir, bkey)
     return pipe(
       readFile(cachePath),
