@@ -47,6 +47,8 @@ export const genSelectFor = <P extends t.Props>(
 
 export const SmallSiteStory = t.type({
   id: t.number,
+  by: t.string,
+  descendants: t.union([t.number, t.null]),
   score: t.number,
   title: t.string,
   timestamp: DateFromBigQueryTimestamp,
@@ -76,6 +78,7 @@ export const selectSmallSiteStoriesSince = ({
       AND post.type = 'story'
       AND post.score >= ${minScore}
       AND post.timestamp >= '${since.toISOString()}'
+      AND dead IS NOT true
     )
   SELECT ${genSelectFor(SmallSiteStory, "sss")}
   FROM

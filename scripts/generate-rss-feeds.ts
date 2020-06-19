@@ -60,6 +60,7 @@ export async function* generateRssFeeds({
   console.log(`Retrieving stories since ${since.toISOString()}`)
 
   const rows = await queryRunner(
+    // TODO log query when verbose logging is on (eg. during CI)
     queries.selectSmallSiteStoriesSince({
       since,
       minScore: 1,
@@ -85,8 +86,9 @@ export async function* generateRssFeeds({
       rss.item({
         title: sss.title,
         description: `
-<strong>Score:</strong> ${sss.score} <em>(as of ${pubDate.toISOString()})</em>
-<br /><strong>URL:</strong> ${sss.url}
+<em>Score / Comments / User</em><br />
+${sss.score} / ${sss.descendants} (<a href="https://news.ycombinator.com/item?id=${sss.id}">thread link</a>) / ${sss.by}<br />
+${sss.url}
 `,
         url: sss.url,
         guid: `hacker-news-small-sites-${sss.id}`,
