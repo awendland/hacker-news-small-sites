@@ -17,7 +17,13 @@ const blackholeConsole = new VirtualConsole()
 export const readablify = (url: string, data: Buffer) =>
   pipe(
     Option.tryCatch(() => {
-      return new JSDOM(data, { url, virtualConsole: blackholeConsole })
+      const page = new JSDOM(data, { url, virtualConsole: blackholeConsole })
+      // Run a simple heuristic to see if the document is a valid webpage or
+      // not. This should filter out any resources such as PDFs from trying
+      // to be treated as Readability compatible articles.
+      if (page.window.document.querySelectorAll("p").length < 1)
+        throw new Error(`Unable to find any <p> tags in ${url}`)
+      return page
     }),
     Option.chain(
       flow(
