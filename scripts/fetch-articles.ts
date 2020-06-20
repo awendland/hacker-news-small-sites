@@ -196,6 +196,7 @@ export async function run() {
     await batchTraverse(TE.taskEither)(A.chunksOf(1)(feedPaths), updateFeed)()
   )
   console.groupEnd()
+  // TODO a silent exit occurs sometimes at very high levels of parallelism
 }
 
 if (require.main === module) {
