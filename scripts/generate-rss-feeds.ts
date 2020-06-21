@@ -86,9 +86,20 @@ export async function* generateRssFeeds({
       rss.item({
         title: sss.title,
         description: `
-<em>Score / Comments / User</em><br />
-${sss.score} / ${sss.descendants} (<a href="https://news.ycombinator.com/item?id=${sss.id}">thread link</a>) / ${sss.by}<br />
-${sss.url}
+Score ${sss.score} | Comments ${
+          sss.descendants
+        } (<a href="https://news.ycombinator.com/item?id=${
+          sss.id
+        }">thread link</a>) | @${sss.by}
+<br/>
+${sss.timestamp.toLocaleDateString("en-US", {
+  timeZone: "America/Los_Angeles",
+  month: "long",
+  year: "numeric",
+  day: "numeric",
+})} | ${sss.url} | <a href="https://web.archive.org/web/*/${
+          sss.url
+        }">archive.org</a>
 `,
         url: sss.url,
         guid: `hacker-news-small-sites-${sss.id}`,
