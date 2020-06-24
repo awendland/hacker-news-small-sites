@@ -3,6 +3,7 @@ import { join } from "path"
 import { flow, pipe } from "fp-ts/lib/function"
 import { readFile, writeFileP } from "./func"
 import * as crypto from "crypto"
+import * as Log from "./simple-logger"
 
 /**
  * Create a cache that stores key, value pairs in files named by the
@@ -31,14 +32,21 @@ export const createFsCache = (cacheDir: string) => <ME>(
     const bkey = crypto.createHash("sha1").update(key).digest("hex")
     const cachePath = join(cacheDir, bkey)
     return pipe(
-      readFile(cachePath),
+      TE.rightIO(() => Log.trace(`Looking for ${key} at ${cachePath}`)),
+      TE.chain(() => readFile(cachePath)),
       TE.orElse(
         flow(
+          () => Log.trace(`Cache miss for ${key}`),
           () => onMiss(key),
           TE.chainW((freshValue: Buffer) =>
             pipe(
               writeFileP(cachePath, freshValue),
-              TE.map(() => freshValue)
+              TE.map(() => {
+                Log.trace(
+                  `Cached ${freshValue.length} bytes for ${key} at ${cachePath}`
+                )
+                return freshValue
+              })
             )
           )
         )

@@ -7,12 +7,17 @@ import * as A from "fp-ts/lib/Array"
 import * as t from "io-ts"
 import { Lens } from "monocle-ts"
 import { xml2json, json2xml } from "./lib/xml"
-import * as Option from "fp-ts/lib/Option"
 import { createFsCache, fromNoOpCache } from "./lib/fs-cache"
 import { batchTraverse } from "fp-ts-contrib/lib/batchTraverse"
-import * as boolean from "fp-ts/lib/boolean"
-import { readablify } from "./lib/readablify"
+import * as E from "fp-ts/lib/Either"
+import * as Log from "./lib/simple-logger"
+import {
+  readablify,
+  NotAnArticleError,
+  NotReadableError,
+} from "./lib/readablify"
 import { fetchBuffer } from "./lib/fetch"
+import { RequestError } from "got/dist/source"
 
 export const CDATA = t.type({
   __cdata: t.string,
@@ -90,12 +95,28 @@ export async function run() {
       type: "number",
       description: "number of parallel fetch requests to run at once",
       default: 20,
+    })
+    .option("logLevel", {
+      description: "verbosity of logging output",
+      choices: Object.keys(Log.LogLevel),
+      default: "INFO",
     }).argv
+
+  Log.setLevelByString(args.logLevel)
 
   const readFeed = flow(
     readFile,
-    TE.map(flow((b) => b.toString("utf8"), xml2json)),
-    TE.chainEitherKW(RssDocument.decode)
+    TE.chainEitherKW(
+      flow(
+        (b) => b.toString("utf8"),
+        (xmlStr) =>
+          E.tryCatch(
+            () => xml2json(xmlStr),
+            (e) => e as Error
+          ),
+        E.chainW(RssDocument.decode)
+      )
+    )
   )
 
   const fetchReadable = (url: string) =>
@@ -104,15 +125,19 @@ export async function run() {
         maxResponseSize: args.fetchMaxSize,
         timeout: args.fetchTimeout,
       }),
-      TE.map((r) => {
+      TE.chainEitherK((r) => {
         return pipe(
           readablify(url, r.rawBody),
-          Option.map((p) => p.content)
+          E.map((p) => p.content)
         )
       }),
       TE.orElse((e) => {
-        console.error(e)
-        return TE.right(Option.none as Option.Option<string>)
+        if (e instanceof NotAnArticleError || e instanceof NotReadableError)
+          Log.info(String(e))
+        else Log.info(e)
+        if (e instanceof RequestError)
+          return TE.right("Unable to retrieve article")
+        return TE.right("Unable to extract article")
       })
     )
 
@@ -120,45 +145,44 @@ export async function run() {
     (url: string) =>
       pipe(
         url,
-        tee(() => console.log(`Cache miss for ${url}`)),
+        tee(() => Log.info(`Fetching ${url}`)),
         fetchReadable,
-        TE.map(tee(() => console.log(`Fetched ${url}`))),
-        TE.map(
-          Option.fold(
-            () => Buffer.from("Unable to extract article", "utf8"),
-            (s) => Buffer.from(s, "utf8")
-          )
-        )
+        TE.map(tee(() => Log.trace(`Parsed ${url}`))),
+        TE.map((s) => Buffer.from(s, "utf8"))
       ),
     args.cacheDir ? createFsCache(args.cacheDir) : fromNoOpCache
   )
 
-  const addContentToItems = (item: RssItem) =>
-    pipe(
-      lens_description.get(item).includes(TAG),
-      boolean.fold(
-        () =>
-          pipe(
-            lens_link.get(item),
-            fetchReadableCached,
-            TE.map((html) =>
-              pipe(
-                item,
-                lens_description.modify(
-                  (curDesc) =>
-                    `${curDesc}<br/><!-- ${TAG} --><hr/>${html.toString(
-                      "utf8"
-                    )}`
-                )
-              )
-            )
-          ),
-        () => TE.right(item)
+  const addContentToItems = (item: RssItem) => {
+    if (lens_description.get(item).includes(TAG)) {
+      Log.trace(`No updated needed for ${item.link}`)
+      return TE.right(item)
+    }
+    return pipe(
+      lens_link.get(item),
+      fetchReadableCached,
+      TE.map((html) =>
+        pipe(
+          item,
+          lens_description.modify(
+            (curDesc) =>
+              `${curDesc}<br/><!-- ${TAG} --><hr/>${html.toString("utf8")}`
+          )
+        )
       )
     )
+  }
 
   const writeFeed = (path: string, data: RssDocument) =>
-    pipe(json2xml(data), (xml) => writeFileP(path, xml))
+    pipe(
+      TE.fromEither(
+        E.tryCatch(
+          () => json2xml(data),
+          (e) => e
+        )
+      ),
+      TE.chainW((xml) => writeFileP(path, xml))
+    )
 
   const updateFeed = (path: string) =>
     pipe(
@@ -167,35 +191,41 @@ export async function run() {
         pipe(
           lens_items.get(feed),
           tee((items) =>
-            console.group(`Updating ${items.length} items in ${path}...`)
+            Log.group(
+              Log.LogLevel.INFO,
+              `Updating ${items.length} items in ${path}...`
+            )
           ),
           (items) =>
             batchTraverse(TE.taskEither)(
               A.chunksOf(args.parallelism)(items),
               addContentToItems
             ),
-          TE.map(tee(() => console.groupEnd())),
+          TE.bimap(
+            tee(() => Log.groupEnd(Log.LogLevel.INFO)),
+            tee(() => Log.groupEnd(Log.LogLevel.INFO))
+          ),
           TE.map((updatedItems) => lens_items.set(updatedItems)(feed))
         )
       ),
       TE.chainW((updatedFeed) =>
         pipe(
-          args.write,
-          boolean.fold(
-            () => TE.right(undefined),
-            () => writeFeed(path, updatedFeed)
-          ),
-          TE.map(() => updatedFeed)
+          args.write ? writeFeed(path, updatedFeed) : TE.right(undefined),
+          TE.map(() => ({ path, updatedFeed }))
         )
       )
     )
 
   const feedPaths = fg.sync([args.feeds]).sort()
-  console.group(`Processing ${feedPaths.length} feeds [write=${args.write}]...`)
-  getOrThrow(
-    await batchTraverse(TE.taskEither)(A.chunksOf(1)(feedPaths), updateFeed)()
+  Log.group(
+    Log.LogLevel.INFO,
+    `Processing ${feedPaths.length} feeds [write=${args.write}]...`
   )
-  console.groupEnd()
+  for (const feedPath of feedPaths) {
+    getOrThrow(await updateFeed(feedPath)())
+  }
+  Log.groupEnd(Log.LogLevel.INFO)
+  Log.info(`Done`)
   // TODO a silent exit occurs sometimes at very high levels of parallelism
 }
 
