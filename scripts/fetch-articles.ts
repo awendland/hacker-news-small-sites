@@ -1,3 +1,9 @@
+var SegfaultHandler = require("segfault-handler")
+SegfaultHandler.registerHandler("crash.log")
+process.on("uncaughtException", function (exception) {
+  console.log(exception)
+})
+
 import * as yargs from "yargs"
 import fg from "fast-glob"
 import { flow, pipe } from "fp-ts/lib/function"
