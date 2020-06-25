@@ -18,6 +18,7 @@ import {
 } from "./lib/readablify"
 import { fetchBuffer } from "./lib/fetch"
 import { RequestError } from "got/dist/source"
+import clip from "text-clipper"
 
 export const CDATA = t.type({
   __cdata: t.string,
@@ -90,6 +91,11 @@ export async function run() {
         "max size (in bytes) that a fetched page can be, otherwise that entry will be failed",
       defaults: 5 * 1024 * 1024,
     })
+    .option("maxArticleLength", {
+      type: "number",
+      description: "maximum length of the article, in characters",
+      default: 10_000,
+    })
     .option("parallelism", {
       alias: "j",
       type: "number",
@@ -128,7 +134,28 @@ export async function run() {
       TE.chainEitherK((r) => {
         return pipe(
           readablify(url, r.rawBody),
-          E.map((p) => p.content)
+          E.map((p) => p.content),
+          E.chain((h) =>
+            pipe(
+              E.tryCatch(
+                (): string | undefined =>
+                  clip(h, args.maxArticleLength, { html: true }),
+                (e) => e as Error
+              ),
+              E.filterOrElse(
+                (u): u is string => typeof u === "string",
+                () => new Error("Unable to clip article (returned undefined)")
+              ),
+              E.map((clipped) => {
+                if (clipped == h) return clipped
+                Log.trace(
+                  `Clipped ${h.length} char article to ${args.maxArticleLength} for ${url}`
+                )
+                return `${clipped}
+<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="${url}">${url}</a></em></p>`
+              })
+            )
+          )
         )
       }),
       TE.orElse((e) => {
