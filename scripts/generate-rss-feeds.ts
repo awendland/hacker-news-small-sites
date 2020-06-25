@@ -38,15 +38,19 @@ export const FeedConfiguration = t.type({
 })
 export type FeedConfiguration = t.TypeOf<typeof FeedConfiguration>
 
+const urlHasPath = (url: string) => new URL(url).pathname.length > 1
+
 export async function* generateRssFeeds({
   queryRunner,
   feedConfigs,
   maxStoryAge,
+  allowBareDomains,
   hackerNewsTable,
   topSitesTable,
 }: {
   queryRunner: (q: string) => Promise<any[]>
   feedConfigs: Iterable<FeedConfiguration>
+  allowBareDomains: boolean
   maxStoryAge: number
   hackerNewsTable: string
   topSitesTable: string
@@ -81,6 +85,7 @@ export async function* generateRssFeeds({
         )
       )
       .filter((s) => s.score > config.minScore)
+      .filter((s) => allowBareDomains || urlHasPath(s.url))
     console.log(`${config.rssMeta.title} has ${items.length} items`)
     items.forEach((sss) =>
       rss.item({
@@ -145,6 +150,12 @@ export async function run() {
       description:
         "how many days back should stories be retrieved from (eg. '3' would mean fetch stories from the last 3 days)",
       default: 3,
+    })
+    .option("allowBareDomains", {
+      type: "boolean",
+      description:
+        "bare domain articles (ie. URLs without a path) are removed as a heuristic to avoid non-blog posts",
+      default: false,
     }).argv
 
   const readFeedConfigs = async (stream: Readable) =>
