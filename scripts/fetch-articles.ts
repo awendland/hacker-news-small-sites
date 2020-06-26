@@ -19,6 +19,7 @@ import {
 import { fetchBuffer } from "./lib/fetch"
 import { RequestError } from "got/dist/source"
 import clip from "text-clipper"
+import * as PathReporter from "io-ts/lib/PathReporter"
 
 export const CDATA = t.type({
   __cdata: t.string,
@@ -110,20 +111,31 @@ export async function run() {
 
   Log.setLevelByString(args.logLevel)
 
-  const readFeed = flow(
-    readFile,
-    TE.chainEitherKW(
-      flow(
-        (b) => b.toString("utf8"),
-        (xmlStr) =>
-          E.tryCatch(
-            () => xml2json(xmlStr),
-            (e) => e as Error
-          ),
-        E.chainW(RssDocument.decode)
+  const readFeed = (feedPath: string) =>
+    pipe(
+      readFile(feedPath),
+      TE.chainEitherKW(
+        flow(
+          (b) => b.toString("utf8"),
+          (xmlStr) =>
+            E.tryCatch(
+              () => xml2json(xmlStr),
+              (e) => e as Error
+            ),
+          E.chainW(
+            flow(
+              RssDocument.decode,
+              E.mapLeft(
+                (e) =>
+                  new Error(
+                    `${feedPath}: ${PathReporter.failure(e).join("\n")}`
+                  )
+              )
+            )
+          )
+        )
       )
     )
-  )
 
   const fetchReadable = (url: string) =>
     pipe(
