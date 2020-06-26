@@ -32,7 +32,7 @@ export const RssItem = t.type({
 export type RssItem = t.TypeOf<typeof RssItem>
 
 export const RssChannel = t.type({
-  item: t.array(RssItem),
+  item: t.union([t.array(RssItem), t.undefined]),
 })
 
 export const RssFeed = t.type({
@@ -229,6 +229,7 @@ export async function run() {
       TE.chain((feed) =>
         pipe(
           lens_items.get(feed),
+          (maybeItems) => maybeItems ?? [],
           tee((items) =>
             Log.group(
               Log.LogLevel.INFO,
