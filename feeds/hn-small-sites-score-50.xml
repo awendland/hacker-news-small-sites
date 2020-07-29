@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Wed, 29 Jul 2020 08:18:41 GMT</lastBuildDate>
+        <lastBuildDate>Wed, 29 Jul 2020 12:22:21 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-50.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Wed, 29 Jul 2020 08:18:41 GMT</pubDate>
+        <pubDate>Wed, 29 Jul 2020 12:22:21 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,1362 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[WasmBoxC: Simple, Fast, and VM-Less Sandboxing]]>
+            </title>
+            <description>
+<![CDATA[
+Score 86 | Comments 26 (<a href="https://news.ycombinator.com/item?id=23972929">thread link</a>) | @syrusakbary
+<br/>
+July 27, 2020 | https://kripken.github.io/blog/wasm/2020/07/27/wasmboxc.html | <a href="https://web.archive.org/web/*/https://kripken.github.io/blog/wasm/2020/07/27/wasmboxc.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+      <div>
+        <article itemscope="" itemtype="http://schema.org/BlogPosting">
+
+  
+
+  <div itemprop="articleBody">
+    <p>The software ecosystem has a lot of useful but unsafe code, and the easier it is to sandbox that code, the more
+often that’ll happen. If it were as simple as passing the compiler a <code>--sandbox</code> flag
+that makes an unsafe library unable to see or affect anything
+outside of it, that would be incredible! We can’t get it quite that easy,
+but this post describes <strong>WasmBoxC</strong>, a sandboxing approach that is
+very simple to use. All you need to do is:</p>
+
+<ul>
+  <li><strong>Compile the unsafe library using a <a href="https://webassembly.org/">WebAssembly</a> (wasm) compiler instead of the normal system compiler</strong>.
+That uses wasm internally, but you don’t need to care about that —
+all you see is it emits a C file with sandboxed code.</li>
+  <li><strong>Write some C to interface with the compiled C of the unsafe library</strong>. (This is
+necessary because the sandboxed code can’t access outside memory, and also it
+uses the portable wasm ABI.)</li>
+</ul>
+
+<p>Compile and link that C code, and now that unsafe library is sandboxed from the rest of your application!
+In a later section we’ll see concrete examples of how easy both those steps are.</p>
+
+<p>Here is the approach in more detail:</p>
+
+<p><img src="https://kripken.github.io/blog/assets/wasmboxc.png" alt="unsafe code => safe wasm => safe c => safe native"></p>
+
+<p>By <strong>compiling to wasm</strong> we sandbox the code, preventing it from accessing
+anything on the outside.
+That includes both <em>memory</em> - the sandboxed code can’t read or write to anywhere outside it -
+and <em>capabilities</em> - the sandboxed code can’t do anything but pure computation,
+unless you give it a function to call to do things like read from a file, tell
+the time, etc.
+We also get the rest of the wasm guarantees on
+<a href="https://webassembly.org/docs/security/">safety</a> and
+<a href="https://webassembly.org/docs/portability/">portability</a>. Wasm
+sandboxing is even safe to run in the same process as other code (at least modulo
+<a href="https://en.wikipedia.org/wiki/Spectre_(security_vulnerability)">Spectre-type</a>
+vulnerabilities), much like
+<a href="http://www.cse.psu.edu/~gxt29/papers/sfi-final.pdf">Software Fault Isolation (SFI)</a>.</p>
+
+<p>After we’ve compiled an unsafe library to wasm, how can we run it as part of our
+application?
+We could integrate a wasm VM and run the wasm there. But instead,
+with WasmBoxC we take a <strong>VM-less</strong> approach and compile the wasm into native
+code, while preserving the wasm semantics, including the sandboxing.
+That native code can be linked normally into an application, which
+is much simpler than integrating a wasm VM.</p>
+
+<p>The specific approach WasmBoxC takes to compile wasm into native code is to
+<strong>compile it to C</strong> using
+<a href="https://github.com/WebAssembly/wabt">wabt</a>’s
+<a href="https://github.com/WebAssembly/wabt/tree/master/wasm2c">wasm2c</a> tool,
+and then run a standard C compiler on it. In fact,
+WasmBoxC’s approach compiles into a <strong>simple subset of C</strong>.
+This is a big part of what makes this approach so simple, and
+brings several advantages:</p>
+
+<ul>
+  <li>It’s easy to read and verify the generated C for security.</li>
+  <li>It lets us use a C compiler like clang or gcc to make the sandboxed
+code very fast.</li>
+  <li>It’s very easy to use the code in existing build systems.</li>
+  <li>It’s easy to write code to interact with the sandbox.</li>
+  <li>A single build of C code can be compiled and run on practically any platform,
+and code to interact with the sandbox also only needs to be written once.</li>
+</ul>
+
+<p>Despite the simplicity of using C, WasmBoxC sandboxing has low
+overhead: just <strong>14%</strong> with some non-portable C code (the
+“signal handler trick”, see later), or <strong>42%</strong> in 100% portable C
+(with no OS- or CPU-specific operations at all). We’ll also see that there are options
+in between those 14% and 42% numbers.</p>
+
+<p>The basic idea in WasmBoxC is simple and
+<a href="https://twitter.com/FlohOfWoe/status/1011523018428780544">not original</a>.
+What is
+new in this post is showing that the approach works, doing
+benchmarking on real-world code to show it is fast, presenting complete examples of how
+easy it is to sandbox real-world libraries, and writing up the approach in
+detail to describe the benefits (see in particular the section on memory-safe
+languages).
+This post also invents a name for the technique.</p>
+
+<h2 id="speed">Speed</h2>
+
+<p>To get an idea of WasmBoxC’s speed, let’s take a look at
+<a href="https://github.com/emscripten-core/emscripten/blob/master/tests/test_benchmark.py">20 benchmarks</a>,
+comparing clang 9.0.1, clang 11 (dev version as of May 23 2020), gcc 9.2.1, and
+WasmBoxC. All numbers are normalized to clang 9 (which is therefore equal to 1; lower numbers are better).</p>
+
+<p><img src="https://kripken.github.io/blog/assets/wasmboxc-perf.png" alt="performance results"></p>
+
+<table>
+  <thead>
+    <tr>
+      <th>compiler</th>
+      <th>relative speed</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>clang 9.0.1</td>
+      <td>1.00</td>
+    </tr>
+    <tr>
+      <td>clang 11 (dev)</td>
+      <td>0.97</td>
+    </tr>
+    <tr>
+      <td>gcc 9.2.1</td>
+      <td>0.93</td>
+    </tr>
+    <tr>
+      <td>WasmBoxC (explicit)</td>
+      <td>1.42</td>
+    </tr>
+    <tr>
+      <td>WasmBoxC (OS-based)</td>
+      <td>1.14</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>These benchmarks include a wide variety of code, and the ones prefixed with <code>zzz_</code> are real-world
+codebases or benchmarks:
+the 
+<a href="https://box2d.org/">Box2D</a> and
+<a href="https://en.wikipedia.org/wiki/Bullet_(software)">Bullet</a>
+physics engines, the
+<a href="https://en.wikipedia.org/wiki/Coremark">CoreMark</a> and
+<a href="https://en.wikipedia.org/wiki/LINPACK_benchmarks">LINPACK</a>
+benchmarks, the
+<a href="https://www.lua.org/">Lua</a> VM (one GC and one computational benchmark),
+the
+<a href="https://en.wikipedia.org/wiki/Lempel%E2%80%93Ziv%E2%80%93Markov_chain_algorithm">LZMA</a>
+and
+<a href="https://zlib.net/">zlib</a>
+compression libraries,
+and the
+<a href="https://www.sqlite.org/index.html">SQLite</a> database.
+Incidentally, this shows WasmBoxC can run all of
+these today!</p>
+
+<p>Two results are shown for WasmBoxC, representing two implementations of memory sandboxing. The first is <strong>explicit</strong> sandboxing, in which each memory load and store is explicitly verified to be within the sandboxed memory using an explicit check (that is, an <code>if</code> statement is done before each memory access). This has <strong>42%</strong> overhead.</p>
+
+<p>The <strong>OS-based</strong> implementation uses the
+“<a href="https://github.com/WebAssembly/wabt/pull/1442/files#diff-e962256d2c336a13791ce03c1dae5d2fR106">signal handler trick</a>” that
+<a href="https://hg.mozilla.org/mozilla-central/file/3334d8dff757051c7a359818e0ceb5ad7852fdbc/js/src/wasm/WasmSignalHandlers.cpp">wasm</a>
+<a href="https://docs.google.com/document/d/17y4kxuHFrVxAiuCP_FFtFA2HP5sNPsCD10KEx17Hz6M/edit#heading=h.tbi7hpbheoai">VMs</a>
+use.
+This technique reserves lots of memory around the valid range and relies on
+CPU hardware to give us a signal if an access is out of bounds
+(for more background see section 3.1.4 in
+<a href="http://www.cse.psu.edu/~gxt29/papers/sfi-final.pdf">Tan, 2017</a>).
+That is fully safe and has the benefit of avoiding explicit bounds checks. It has
+just <strong>14%</strong> overhead! However, it cannot be used everywhere (it needs
+signals and CPU memory protection, and only works on 64-bit systems).</p>
+
+<p>There are more options in between those 14% and 42% figures.
+Explicit and OS-based sandboxing preserve wasm semantics perfectly, that is, a trap
+will happen exactly when a wasm VM would have trapped. If we are willing to relax
+that
+(but we may not want to <a href="https://github.com/WebAssembly/wabt/pull/1432">call it wasm</a> if we do)
+then we can use masking sandboxing instead
+(see section 3.1.3 in
+<a href="http://www.cse.psu.edu/~gxt29/papers/sfi-final.pdf">Tan, 2017</a>),
+which is 100% portable like explicit sandboxing and also prevents any accesses
+outside of the sandbox, and is somewhat faster at <strong>29%</strong> overhead. Other sandboxing
+improvements are possible too - almost no effort has gone into this yet.</p>
+
+<p>An interesting thing happens in the <code>lua_binarytrees</code> and <code>havlak</code> benchmarks,
+where WasmBoxC is actually faster than both gcc and clang in all sandboxing modes,
+up to 32%! How can we beat normal native builds, and by so much?
+<a href="https://twitter.com/kripken/status/1262092956070109185">Looking into this</a>,
+both of these benchmarks use a lot of <code>malloc</code>s and data structures with pointers.
+Like the <a href="https://en.wikipedia.org/wiki/X32_ABI">x32 ABI</a>, wasm is 32-bit,
+so pointers take half the space. Measuring the maximum process memory used
+in <code>lua_binarytrees</code>, WasmBoxC uses 33% less which helps a lot with CPU cache usage.
+While this makes a big difference on these two benchmarks, we are likely
+getting some speedup on the others as well due to this factor, as on average x32
+is faster than normal x64
+<a href="https://en.wikipedia.org/wiki/X32_ABI#Details">by around 5-8%</a>.
+Wasm is a nice way to get something
+like x32’s benefits!</p>
+
+<p>The benchmarking here measures performance <em>within</em> the sandbox. It
+does not measure the speed of calls from the outside in or inside out. Such
+calls can be very fast because the sandboxed code is just C, which means that
+we can even inline across the sandbox boundary — safely! — if we do
+LTO. I verified that happens in the sandboxing example in the next section,
+see later. (Note, however, then using the signal handler trick may make things
+more complicated here.)</p>
+
+<p>Some final notes on performance:</p>
+
+<ul>
+  <li>
+    <p>We can compile WasmBoxC’s C code with any native compiler. In the
+above we did so always with clang 9 for simplicity. The results vary a little
+when changing the compiler, for example the “explicit” sandboxing results go from
+14% up to 16% with gcc 9.2 or down to 11% with clang 11. There’s nothing magical about
+that 14% figure — we are at the point where native compiler differences matter.</p>
+  </li>
+  <li>
+    <p>Results should improve over time as wasm adds more performance features
+like <a href="https://github.com/WebAssembly/simd">simd</a> (note that the native compilers we
+compared to may have gained an advantage from autovectorization).</p>
+  </li>
+  <li>
+    <p>That WasmBoxC can reach 14% overhead shows that the
+cost of compiling through wasm (which cannot represent irreducible control
+flow, for example) is fairly low, and also that current compilers to wasm are
+not introducing significant unnecessary overhead.</p>
+  </li>
+</ul>
+
+<p>I’ve done my best to measure everything here carefully and accurately, but
+it’s possible I’ve made a mistake somewhere. Please check my work and see if you
+get similar results!</p>
+
+<h2 id="ease-of-use">Ease of use</h2>
+
+<p>This section has a full example of WasmBoxC usage. Here are the source files:</p>
+
+<div><div><pre><code><span>// my-code.c</span>
+
+<span>#include &lt;stdint.h&gt;
+#include &lt;stdio.h&gt;
+</span>
+<span>// We could also include the .wasm.h file for these,</span>
+<span>// but let's declare externs manually for the example.</span>
+
+<span>extern</span> <span>void</span> <span>wasmbox_init</span><span>(</span><span>void</span><span>);</span>
+
+<span>extern</span> <span>uint32_t</span> <span>(</span><span>*</span><span>Z_twiceZ_ii</span><span>)(</span><span>uint32_t</span><span>);</span>
+
+<span>extern</span> <span>uint32_t</span> <span>(</span><span>*</span><span>Z_do_bad_thingZ_ii</span><span>)(</span><span>uint32_t</span><span>);</span>
+
+<span>int</span> <span>main</span><span>()</span> <span>{</span>
+  <span>puts</span><span>(</span><span>"Initializing sandboxed unsafe library"</span><span>);</span>
+  <span>wasmbox_init</span><span>();</span>
+  <span>printf</span><span>(</span><span>"Calling twice on 21 returns %d</span><span>\n</span><span>"</span><span>,</span> <span>Z_twiceZ_ii</span><span>(</span><span>21</span><span>));</span>
+  <span>puts</span><span>(</span><span>"Calling something bad now..."</span><span>);</span>
+  <span>Z_do_bad_thingZ_ii</span><span>(</span><span>1</span><span>);</span>
+  <span>puts</span><span>(</span><span>"(this will never be printed, as the bad thing will trap)"</span><span>);</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p><code>main()</code> is pretty simple: Initialize, call something in the sandbox that does a
+computation for us, and call something that will trap inside the sandbox.
+(What’s with the <code>Z_</code> stuff? See later in “API”.)</p>
+
+<div><div><pre><code><span>// unsafe-lib.c</span>
+
+<span>#include &lt;stdlib.h&gt;
+</span>
+<span>__attribute__</span><span>((</span><span>used</span><span>))</span>
+<span>int</span> <span>twice</span><span>(</span><span>int</span> <span>x</span><span>)</span> <span>{</span>
+  <span>return</span> <span>x</span> <span>+</span> <span>x</span><span>;</span>
+<span>}</span>
+
+<span>__attribute__</span><span>((</span><span>used</span><span>))</span>
+<span>int</span> <span>do_bad_thing</span><span>(</span><span>int</span> <span>size</span><span>)</span> <span>{</span>
+  <span>// Allocate an unknown size here (so the LLVM optimizer doesn't know if the</span>
+  <span>// store later down is valid or not).</span>
+  <span>char</span><span>*</span> <span>x</span> <span>=</span> <span>malloc</span><span>(</span><span>size</span><span>);</span>
+  <span>// Write to an address that is definitely not in the sandbox (the default</span>
+  <span>// memory size is much smaller), which in wasm will trap.</span>
+  <span>x</span><span>[</span><span>1024</span> <span>*</span> <span>1024</span> <span>*</span> <span>1024</span><span>]</span> <span>=</span> <span>42</span><span>;</span>
+  <span>// Avoid the optimizer knowing the store can never be observed.</span>
+  <span>return</span> <span>(</span><span>int</span><span>)</span><span>x</span><span>;</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p><code>twice()</code> does what you’d expect, and <code>do_bad_thing</code> does a store that will
+definitely trap. (Ignore the details there; for this example we need the LLVM optimizer not to
+remove the bad code as undefined behavior!)</p>
+
+<p>And here’s how easy it is to use WasmBoxC to get a fully sandboxed library linked with our normal code:</p>
+
+<div><div><pre><code><span># build our main code to an object normally</span>
+<span>$ </span>clang my-code.c         <span>-c</span> <span>-O3</span> <span>-o</span> my-code.o
+<span># build the unsafe library to C with emcc</span>
+<span>$ </span>emcc unsafe-lib.c          <span>-O3</span> <span>-o</span> unsafe-lib.wasm <span>-s</span> WASM2C <span>--no-entry</span>
+<span># build the unsafe …</span></code></pre></div></div></div></article></div></div></div>
+<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://kripken.github.io/blog/wasm/2020/07/27/wasmboxc.html">https://kripken.github.io/blog/wasm/2020/07/27/wasmboxc.html</a></em></p>]]>
+            </description>
+            <link>https://kripken.github.io/blog/wasm/2020/07/27/wasmboxc.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-23972929</guid>
+            <pubDate>Tue, 28 Jul 2020 06:34:47 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Fewer premature babies born since Covid-19 lockdown]]>
+            </title>
+            <description>
+<![CDATA[
+Score 173 | Comments 134 (<a href="https://news.ycombinator.com/item?id=23972152">thread link</a>) | @breitling
+<br/>
+July 27, 2020 | https://www.cbc.ca/news/canada/calgary/fewer-premature-preterm-babies-born-during-pandemic-calgary-around-the-world-1.5665089 | <a href="https://web.archive.org/web/*/https://www.cbc.ca/news/canada/calgary/fewer-premature-preterm-babies-born-during-pandemic-calgary-around-the-world-1.5665089">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><p>Doctors in countries&nbsp;including Denmark, Ireland, Australia, the U.S. and Canada&nbsp;have been reporting that fewer preterm babies are being born.</p><div><p><span><span><span></span><span>Dr. Belal Alshaikh says COVID-19 has brought a curious development to some maternity wards, and he is trying to help researchers from around the world find out why.<!-- --> <!-- -->4:35</span></span></span></p><p><span><p>Count this one as a positive side-effect of the COVID-19 pandemic.</p>  <p>Doctors in countries&nbsp;including Denmark, Ireland, Australia, the U.S. and Canada&nbsp;have been reporting that fewer preterm babies are being born.</p>  <p>While&nbsp;peer-reviewed studies investigating the drop&nbsp;are pending, and the downward&nbsp;trend across countries is currently anecdotal,&nbsp;Neonatologist Dr. Belal Alshaikh has been studying the possible&nbsp;phenomenon&nbsp;in Calgary.</p>  <p>"It's actually not that common to see this drop down in the numbers in many countries," said Alshaikh, who is&nbsp;also the medical director of the neonatal intensive care unit at the South Health Campus,&nbsp;and&nbsp;has seen the trend right here in Calgary.</p>  <p>Alshaikh told<em> <a href="https://www.cbc.ca/listen/live-radio/1-97-the-homestretch">The Homestretch</a></em> there are two ways to measure preterm birth — gestational age and actual birth weight. And by both measures, the numbers are dramatically lower.</p>  <p>Births considered very premature —&nbsp;born at fewer than 29 to 32 weeks&nbsp;— have&nbsp;dropped by&nbsp;34&nbsp;to 40 per cent, he said.</p>  <p>"If we use their gestational age and if we are talking about the very earliest preemies,"&nbsp;Alshaikh&nbsp;said.</p>  <p>"That's kind of dramatic, actually, and surprising for us."</p>  <p>The numbers are even more dramatic for babies under one kilogram.</p>  <p>"If we used birth weight, those babies born less than one kilo, the number was actually very low and half of what we used to see in the last few years, during the same period of time of the year."</p>    <p>Alshaikh said the trend is very unusual.</p>  <p>"Soon after the lockdown in mid-March, we started to see fewer babies coming to our unit and to intensive care units, and these numbers of preemies were also low in April and mid-May," Alshaikh said.&nbsp;</p>  <p>"So by that time, by late May, we felt like we needed to look at the numbers, and see where we are. And also at that time we started hearing that other hospitals, in Ireland and Denmark, have also noticed the drop down in the number of preemies."</p>  <p>When Calgary doctors took a good look at the numbers and compared them to the same time last year, it was an eyeopener.</p>  <p>"We were surprised," Alshaikh said. "We saw that our number is way lower than what we used to see during this period of time."</p>  <p>There are three main causes that doctors are looking at.</p>  <p>One is social distancing, which may have cut down on the amount of general infection from contact with others.</p>  <p>Another is less air pollution, from fewer cars being on the roads.</p>  <p>"This might actually help because studies in the past showed that air pollution actually increases the risk for preterm birth," Alshaikh said.</p>  <p>And simply not going out to work — resting — may be a final key.</p>  <p>"By staying home, a pregnant woman may have less stress from commuting and from work,&nbsp; and that might have helped them," Alshaikh said, adding it's too soon to know for sure which of these lockdown-related factors have contributed the most.</p>  <p><span><figure><div><p><img alt="" srcset="https://i.cbc.ca/1.3068968.1431344120!/fileImage/httpImage/image.jpg_gen/derivatives/original_300/premature-babies.jpg 300w,https://i.cbc.ca/1.3068968.1431344120!/fileImage/httpImage/image.jpg_gen/derivatives/original_460/premature-babies.jpg 460w,https://i.cbc.ca/1.3068968.1431344120!/fileImage/httpImage/image.jpg_gen/derivatives/original_620/premature-babies.jpg 620w,https://i.cbc.ca/1.3068968.1431344120!/fileImage/httpImage/image.jpg_gen/derivatives/original_780/premature-babies.jpg 780w,https://i.cbc.ca/1.3068968.1431344120!/fileImage/httpImage/image.jpg_gen/derivatives/original_1180/premature-babies.jpg 1180w" sizes="(max-width: 300px) 300px,(max-width: 460px) 460px,(max-width: 620px) 620px,(max-width: 780px) 780px,(max-width: 1180px) 1180px" src="https://i.cbc.ca/1.3068968.1431344120!/fileImage/httpImage/image.jpg_gen/derivatives/original_780/premature-babies.jpg"></p></div><figcaption>Calgary doctors who noticed a reduced number of premature births during the pandemic lockdown, are seeing those numbers rise again as restrictions have eased.<!-- --> <!-- -->(Jim Lynch, Flickr cc)</figcaption></figure></span></p>  <p>&nbsp;"We see sometimes variation during the year, but it's not to the degree that we see fewer babies," Alshaikh said. "And the fact that we see the same trend in Ireland, in Denmark in Australia, it's kind of surprising for everyone working in this field."</p>  <p>Preterm birth comes with a host of challenges for the babies and their parents.</p>  <p>"The risk is high on children and their families, and also medical care resources," Alshaikh said. "For children, the risk increases for vision and hearing problems, and also for learning disability. It's higher even as the gestational age goes down. For example,&nbsp; 24 weeks is at very high risk compared to babies born at 28 weeks gestation or at 32 weeks gestation."</p>  <h2>Doctors teaming up to study</h2>  <p>The Calgary doctors will continue to study the phenomenon, which could hold clues to reducing preterm births in general.</p>  <p>For now, Alshaikh said it's too early to provide any specific advice to pregnant woman — other than to avoid stress, try to rest at home, get a lot of sleep&nbsp;and focus on good nutrition.&nbsp;</p>  <p>"We've teamed up, actually, with the teams across the world, in Ireland and also in Denmark, and there is also a group in Manitoba working on this project, and we are hoping to understand more the ways to prevent the preterm birth, and also like to see if we can understand more on risk factors that are affecting preterm birth," Alshaikh said.&nbsp;</p>  <p>But the Calgary doctor said there is one alarming development already —&nbsp;as the lockdown restriction ease, those preterm birth numbers are already on the rise again.</p>  <p>"We are actually noticing, even in Calgary, that when the restrictions started to be eased, the number of preterm babies coming to our unit and intensive care is going up again, which is quite actually interesting for us," Alshaikh said. "And we are trying to tease out what factors are affecting this trend."</p>  <p><strong>With files from <em><a href="https://www.cbc.ca/listen/live-radio/1-97-the-homestretch">The Homestretch</a></em>.</strong></p></span></p></div></div>]]>
+            </description>
+            <link>https://www.cbc.ca/news/canada/calgary/fewer-premature-preterm-babies-born-during-pandemic-calgary-around-the-world-1.5665089</link>
+            <guid isPermaLink="false">hacker-news-small-sites-23972152</guid>
+            <pubDate>Tue, 28 Jul 2020 04:00:11 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[The Double-Entry Counting Method (2016)]]>
+            </title>
+            <description>
+<![CDATA[
+Score 61 | Comments 7 (<a href="https://news.ycombinator.com/item?id=23971567">thread link</a>) | @dragonsh
+<br/>
+July 27, 2020 | https://beancount.github.io/docs/the_double_entry_counting_method.html | <a href="https://web.archive.org/web/*/https://beancount.github.io/docs/the_double_entry_counting_method.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div role="main">
+<div>
+
+<p>Martin Blais, December 2016</p>
+<p><a href="http://furius.ca/beancount/doc/double-entry"><span>http://furius.ca/beancount/doc/double-entry</span></a></p>
+<p><a href="#introduction"><span>Introduction</span></a></p>
+<p><a href="#basics-of-double-entry-bookkeeping"><span>Basics of Double-Entry Bookkeeping</span></a></p>
+<blockquote>
+<p><a href="#statements"><span>Statements</span></a></p>
+<p><a href="#single-entry-bookkeeping"><span>Single-Entry Bookkeeping</span></a></p>
+<p><a href="#double-entry-bookkeeping"><span>Double-Entry Bookkeeping</span></a></p>
+<p><a href="#many-accounts"><span>Many Accounts</span></a></p>
+<p><a href="#multiple-postings"><span>Multiple Postings</span></a></p>
+</blockquote>
+<p><a href="#types-of-accounts"><span>Types of Accounts</span></a></p>
+<p><a href="#trial-balance"><span>Trial Balance</span></a></p>
+<p><a href="#income-statement"><span>Income Statement</span></a></p>
+<p><a href="#clearing-income"><span>Clearing Income</span></a></p>
+<p><a href="#equity"><span>Equity</span></a></p>
+<p><a href="#balance-sheet"><span>Balance Sheet</span></a></p>
+<p><a href="#summarizing"><span>Summarizing</span></a></p>
+<p><a href="#period-reporting"><span>Period Reporting</span></a></p>
+<p><a href="#chart-of-accounts"><span>Chart of Accounts</span></a></p>
+<blockquote>
+<p><a href="#country-institution-convention"><span>Country-Institution Convention</span></a></p>
+</blockquote>
+<p><a href="#credits-debits"><span>Credits &amp; Debits</span></a></p>
+<p><a href="#accounting-equations"><span>Accounting Equations</span></a></p>
+<p><a href="#plain-text-accounting"><span>Plain-Text Accounting</span></a></p>
+<p><a href="#the-table-perspective"><span>The Table Perspective</span></a></p>
+<h2 id="introduction">Introduction<a id="introduction"></a><a href="#introduction" title="Permanent link"></a></h2>
+<p>This document is a gentle introduction to the double-entry counting method, as written from the perspective of a computer scientist. It is an attempt to explain basic bookkeeping using as simple an approach as possible, doing away with some of the idiosyncrasies normally involved in accounting. It is also representative of how <a href="http://furius.ca/beancount/"><span>Beancount</span></a> works, and it should be useful to all users of <a href="http://plaintextaccounting.org/"><span>plain-text accounting</span></a>.</p>
+<p>Note that I am not an accountant, and in the process of writing this document I may have used terminology that is slightly different or unusual to that which is taught in perhaps more traditional training in accounting. I granted myself license to create something new and perhaps even unusual in order to explain those ideas as simply and clearly as possible to someone unfamiliar with them.</p>
+<p>I believe that the method of double-entry counting should be taught to everyone at the high school level everywhere as it is a tremendously useful organizational skill, and I hope that this text can help spread its knowledge beyond professional circles.</p>
+<h2 id="basics-of-double-entry-bookkeeping">Basics of Double-Entry Bookkeeping<a id="basics-of-double-entry-bookkeeping"></a><a href="#basics-of-double-entry-bookkeeping" title="Permanent link"></a></h2>
+<p>The double-entry system is just a simple <em>method of counting</em>, with some simple rules.</p>
+<p>Let’s begin by defining the notion of an <strong>account</strong>. An account is something that can contain things, like a bag. It is used to count things, to accumulate things. Let’s draw a horizontal arrow to visually represent the evolving contents of an account over time:</p>
+<p><img src="https://beancount.github.io/docs/the_double_entry_counting_method/media/5b1da6643866c557b2a5ce687e70ee1db16b14de.png"></p>
+<p>On the left, we have the past, and to the right, increasing time: the present, the future, etc.</p>
+<p>For now, let’s assume that accounts can contain only one kind of thing, for example, <em>dollars</em>. All accounts begin with an empty content of zero dollars. We will call the number of units in the account the <strong>balance</strong> of an account. Note that it represents its contents at a particular point in time. I will draw the balance using a number above the account’s timeline:</p>
+<p><img src="https://beancount.github.io/docs/the_double_entry_counting_method/media/842dcb36da9e0e70c35d1023d65d8a571062baf0.png"></p>
+<p>The contents of accounts can change over time. In order to change the content of an account, we have to add something to it. We will call this addition a <strong>posting</strong> to an account, and I will draw this change as a circled number on the account’s timeline, for example, adding $100 to the account:</p>
+<p><img src="https://beancount.github.io/docs/the_double_entry_counting_method/media/5e5e7897a346355eccd4d21ec9485c3464a2d996.png"></p>
+<p>Now, we can draw the updated balance of the account after the posting with another little number right after it:</p>
+<p><img src="https://beancount.github.io/docs/the_double_entry_counting_method/media/0c8a78dac61ae7fddde25761f036e7f379cad247.png"></p>
+<p>The account’s balance, after adding $100, is now $100.</p>
+<p>We can also remove from the contents of an account. For example, we could remove $25, and the resulting account balance is now $75:</p>
+<p><img src="https://beancount.github.io/docs/the_double_entry_counting_method/media/98e314125325ecc72262a73a21b74db3200414fd.png"></p>
+<p>Account balances can also become <em>negative</em>, if we remove more dollars than there are in the account. For example, if we remove $200 from this account, the balance now becomes $-125:</p>
+<p><img src="https://beancount.github.io/docs/the_double_entry_counting_method/media/bdc8a23347040de123e3359a7c8f0cc253c6d7d2.png"></p>
+<p>It’s perfectly fine for accounts to contain a negative balance number. Remember that all we’re doing is counting things. As we will see shortly, some accounts will remain with a negative balance for most of their timeline.</p>
+<h3 id="statements">Statements<a id="statements"></a><a href="#statements" title="Permanent link"></a></h3>
+<p>Something worthy of notice is how the timeline notation I’ve written in the previous section is analogous to paper account statements institutions maintain for each client and which you typically receive through the mail:</p>
+<table><thead><tr><th><em><strong>Date</strong></em></th><th><em><strong>Description</strong></em></th><th><em><strong>Amount</strong></em></th><th><em><strong>Balance</strong></em></th></tr></thead><tbody><tr><td>2016-10-02</td><td>...</td><td>100.00</td><td>1100.00</td></tr><tr><td>2016-10-05</td><td>...</td><td>-25.00</td><td>1075.00</td></tr><tr><td>2016-10-06</td><td>...</td><td>-200.00</td><td>875.00</td></tr><tr><td><em><strong>Final Balance</strong></em></td><td>875.00</td><td></td><td></td></tr></tbody></table>
+<p>Sometimes the amount column is split into two, one showing the positive amounts and the other the negative ones:</p>
+<table><thead><tr><th><em><strong>Date</strong></em></th><th><em><strong>Description</strong></em></th><th><em><strong>Debit</strong></em></th><th><em><strong>Credit</strong></em></th><th><em><strong>Balance</strong></em></th></tr></thead><tbody><tr><td>2016-10-02</td><td>...</td><td></td><td>100.00</td><td>1100.00</td></tr><tr><td>2016-10-05</td><td>...</td><td>25.00</td><td></td><td>1075.00</td></tr><tr><td>2016-10-06</td><td>...</td><td>200.00</td><td></td><td>875.00</td></tr><tr><td><em><strong>Final Balance</strong></em></td><td>875.00</td><td></td><td></td><td></td></tr></tbody></table>
+<p>Here, “debit” means “removed from your account” and “credit” means “deposited in your account.” Sometimes the words “withdrawals” and “deposits” will be used. It all depends on context: for checking and savings accounts it is usual to have both types of postings, but for a credit card account typically it shows only positive numbers and then the occasional monthly payment so the single column format is used.</p>
+<p>In any case, the “balance” column always shows the resulting balance <em>after</em> the amount has been posted to the account. And sometimes the statements are rendered in decreasing order of time.</p>
+<h3 id="single-entry-bookkeeping">Single-Entry Bookkeeping<a id="single-entry-bookkeeping"></a><a href="#single-entry-bookkeeping" title="Permanent link"></a></h3>
+<p>In this story, this account belongs to someone. We’ll call this person the <strong>owner</strong> of the account. The account can be used to represent a real world account, for example, imagine that we use it to represent the content of the owner’s checking account at a bank. So we’re going to label the account by giving it a name, in this case “Checking”:</p>
+<p><img src="https://beancount.github.io/docs/the_double_entry_counting_method/media/380ec8fea9ee9069411a61ccabcc838de44042ef.png"></p>
+<p>Imagine that at some point, this account has a balance of $1000, like I’ve drawn on the picture. Now, if the owner spends $79 of this account, we would represent it like this:</p>
+<p><img src="https://beancount.github.io/docs/the_double_entry_counting_method/media/b24d8c1e40edf6fd7e9d768ba8f0df279cd41f0e.png"></p>
+<p>Furthermore, if the expense was for a meal at a restaurant, we could flag the posting with a <strong>category</strong> to indicate what the change was used for. Let’s say, “Restaurant”, like this:</p>
+<p><img src="https://beancount.github.io/docs/the_double_entry_counting_method/media/7ee843cd9b997a9447bb022d7d35121a820e296d.png"></p>
+<p>Now, if we have a lot of these, we could write a computer program to accumulate all the changes for each category and calculate the sums for each of them. That would tell us how much we spent in restaurants in total, for example. This is called the <strong>single-entry method</strong> of accounting.</p>
+<p>But we’re not going to do it this way; we have a better way. Bear with me for a few more sections.</p>
+<h3 id="double-entry-bookkeeping">Double-Entry Bookkeeping<a id="double-entry-bookkeeping"></a><a href="#double-entry-bookkeeping" title="Permanent link"></a></h3>
+<p>An owner may have multiple accounts. I will represent this by drawing many similar account timelines on the same graphic. As before, these are labeled with unique names. Let’s assume that the owner has the same “Checking” account as previously, but now also a <strong>“</strong>Restaurant<strong>”</strong> account as well, which can be used to accumulate all food expenses at restaurants. It looks like this:</p>
+<p><img src="https://beancount.github.io/docs/the_double_entry_counting_method/media/3c380375442a643877c59660832bd7df6192e9cb.png"></p>
+<p>Now, instead of <em>categorizing</em> the posting to a “restaurant category” as we did previously, we could create a matching posting on the “Restaurant” account to record how much we spent for food, with the amount spent ($79):</p>
+<p><img src="https://beancount.github.io/docs/the_double_entry_counting_method/media/b86a7242b92effc613f88bc0cc70381d72e774f0.png"></p>
+<p>The “Restaurant” account, like all other accounts, also has an accumulated balance, so we can find out how much we spent in “Restaurant” in total. This is entirely symmetrical to counting changes in a checking account.</p>
+<p>Now, we can associate the two postings together, by creating a kind of “parent” box that refers to both of them. We will call this object a <strong>transaction</strong>:</p>
+<p><img src="https://beancount.github.io/docs/the_double_entry_counting_method/media/b77efafcf2d6a6f1afbfb13da70be2f892b339b4.png"></p>
+<p>Notice here that we’ve also associated a description to this transaction: “Dinner at Uncle Boons”. A transaction also has a <strong>date</strong>, and all of its postings are recorded to occur on that date. We call this the transaction date.</p>
+<p>We can now introduce the fundamental rule of double-entry bookkeeping system:</p>
+<pre><code>The sum of all the postings of a transaction must equal zero.
+</code></pre>
+<p>Remember this, as this is the foundation of the double-entry method, and its most important characteristic. It has important consequences which I will discuss later in this document.</p>
+<p>In our example, we remove $79 from the “Checking” account and “give it” to the “Restaurant” account. ($79) + ($-79) = $0. To emphasize this, I could draw a little summation line under the postings of the transaction, like this:</p>
+<p><img src="https://beancount.github.io/docs/the_double_entry_counting_method/media/b4182b9f64113868123cbcec20d468ab18b2786f.png"></p>
+<h3 id="many-accounts">Many Accounts<a id="many-accounts"></a><a href="#many-accounts" title="Permanent link"></a></h3>
+<p>There may be many such transactions, over many different accounts. For example, if the owner of the accounts had a lunch the next day which she paid using a credit card, it could be represented by creating a “Credit Card” account dedicated to tracking the real world credit card balance, and with a corresponding transaction:</p>
+<p><img src="https://beancount.github.io/docs/the_double_entry_counting_method/media/f85a66510ce2e3bb614edca76463a9c4752a7d26.png"></p>
+<p>In this example, the owner spent $35 at a restaurant called “Eataly.” The previous balance of the owner’s credit card was $-450; after the expense, the new balance is $-485.</p>
+<p>For each real world account, the owner can create a bookkeeping account like we did. Also, for each category of expenditure, the owner also creates a bookkeeping account. In this system, there are no limits to how many accounts can be created.</p>
+<p>Note that the balance in the example is a negative number; this is not an error. Balances for credit card accounts are normally negative: they represent an amount <em>you owe</em>, that the bank is lending you <em>on credit</em>. When your credit card company keeps track of your expenses, they write out your statement from their perspective, as positive numbers. For you, those are amounts you need to eventually pay. But here, in our accounting system, we’re representing numbers from the owner’s point-of-view, and from her perspective, this is money she owes, not something she has. What we have is a meal sitting in our stomach (a positive number of $ of “Restaurant”).</p>
+<h3 id="multiple-postings">Multiple Postings<a id="multiple-postings"></a><a href="#multiple-postings" title="Permanent link"></a></h3>
+<p>Finally, transactions may have more than two postings; in fact, they may have any number of postings. The only thing that matters is that the sum of their amounts is zero (from the rule of double-entry bookkeeping above).</p>
+<p>For example, let’s look at what would happen if the owner gets her salary paid for December:</p>
+<p><img src="https://beancount.github.io/docs/the_double_entry_counting_method/media/18980f41275676c5c7cf3b39dd256512bb45b78b.png"></p>
+<p>Her gross salary received in this example is recorded as $-2,905 (I’ll explain the sign in a moment). $905 is set aside for taxes. Her “net” salary of $2,000, the remainder, is deposited in her “Checking” account and the resulting balance of that account is $2,921 (the previous balance of $921 + $2,000 = $2,921). This transaction has three postings: (+2,000) + (-2,905) + (+905) = 0. The double-entry rule is respected.</p>
+<p>Now, you may ask: Why is her salary recorded as a negative number? The reasoning here is similar to that of the credit card above, though perhaps a bit more subtle. These accounts exist to track all the amounts from the owner’s point-of-view. The owner gives out work, and receives money and taxes in exchange for it …</p></div></div></div>
+<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://beancount.github.io/docs/the_double_entry_counting_method.html">https://beancount.github.io/docs/the_double_entry_counting_method.html</a></em></p>]]>
+            </description>
+            <link>https://beancount.github.io/docs/the_double_entry_counting_method.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-23971567</guid>
+            <pubDate>Tue, 28 Jul 2020 01:59:44 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[How Did the Casio F91W Become a Terrorist Icon?]]>
+            </title>
+            <description>
+<![CDATA[
+Score 150 | Comments 74 (<a href="https://news.ycombinator.com/item?id=23971045">thread link</a>) | @joeschmoe83
+<br/>
+July 27, 2020 | https://reaperfeed.com/how-did-the-casio-f91w-become-a-terrorist-icon/ | <a href="https://web.archive.org/web/*/https://reaperfeed.com/how-did-the-casio-f91w-become-a-terrorist-icon/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+        
+<p>The humble Casio F91W has been an iconic watch since it was first made in Japan back in 1989. Upon its release, it was sold for around $20 making it one of the world’s first affordable digital watches. Today, Casio still produces over 3 million of the F91W every year. The prevalence of this iconic timepiece through the years means it’s likely you’ve worn one at some point. If you have, then it’s probably the only thing you have in common with Osama bin Laden, Chechen militants, and Napoleon Dynamite. Congratulations!</p>
+
+
+
+<p>As a kid in school, I personally remember being told off for talking in the back of the class. I had been caught excitedly telling my friends that I had just figured out what kind of watch the most wanted man on earth, Osama bin Laden, wears. As punishment, I was called up to answer the maths question on the board, at which I failed miserably. <em>”You need to focus on what matters! You can’t solve maths problems but you can tell everyone about the watches worn by terrorists?”</em> screamed my teacher. <a href="https://reaperfeed.com/about-reaper-feed/">Looking back</a>, I feel I prioritized the right kind of knowledge.</p>
+
+
+
+<figure><img src="https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/Casio-G-Shock-Designer-Moriai-aBlogtoWatch-67.jpg?w=696&amp;ssl=1" alt="Inventor of the Casio FW91" srcset="https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/Casio-G-Shock-Designer-Moriai-aBlogtoWatch-67.jpg?w=860&amp;ssl=1 860w, https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/Casio-G-Shock-Designer-Moriai-aBlogtoWatch-67.jpg?resize=300%2C228&amp;ssl=1 300w, https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/Casio-G-Shock-Designer-Moriai-aBlogtoWatch-67.jpg?resize=768%2C584&amp;ssl=1 768w, https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/Casio-G-Shock-Designer-Moriai-aBlogtoWatch-67.jpg?resize=696%2C529&amp;ssl=1 696w, https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/Casio-G-Shock-Designer-Moriai-aBlogtoWatch-67.jpg?resize=552%2C420&amp;ssl=1 552w, https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/Casio-G-Shock-Designer-Moriai-aBlogtoWatch-67.jpg?resize=80%2C60&amp;ssl=1 80w" sizes="(max-width: 696px) 100vw, 696px" data-recalc-dims="1"><figcaption>Inventor of the Casio F91W, Ryusuke Moriai, polishes a Samurai sword in Tokyo. Photo from <a href="https://www.ablogtowatch.com/tokyo-man-designs-casio-g-shock-watches-ryusuke-moriai/">A Blog to Watch.</a></figcaption></figure>
+
+
+
+<p>The Casio F91W was designed by Ryusuke Moriai which he described as “small, flat and simple”. The watch features a seven-segment numerical display on a grey LCD screen. Water-resistant, extremely durable and accurate to within 30 seconds a month, it’s a tried and tested piece of kit.</p>
+
+
+
+<hr>
+
+
+
+<figure><a href="https://www.amazon.com/Military-Grade-Travel-Guide-Dangerous-ebook/dp/B086JBW97K"><img src="https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/06/Corporate-Work-Blog-Banner-2.png?resize=696%2C392&amp;ssl=1" alt="" srcset="https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/06/Corporate-Work-Blog-Banner-2.png?resize=1024%2C576&amp;ssl=1 1024w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/06/Corporate-Work-Blog-Banner-2.png?resize=300%2C169&amp;ssl=1 300w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/06/Corporate-Work-Blog-Banner-2.png?resize=768%2C432&amp;ssl=1 768w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/06/Corporate-Work-Blog-Banner-2.png?resize=1536%2C864&amp;ssl=1 1536w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/06/Corporate-Work-Blog-Banner-2.png?resize=2048%2C1152&amp;ssl=1 2048w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/06/Corporate-Work-Blog-Banner-2.png?resize=696%2C392&amp;ssl=1 696w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/06/Corporate-Work-Blog-Banner-2.png?resize=1068%2C601&amp;ssl=1 1068w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/06/Corporate-Work-Blog-Banner-2.png?resize=1920%2C1080&amp;ssl=1 1920w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/06/Corporate-Work-Blog-Banner-2.png?resize=747%2C420&amp;ssl=1 747w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/06/Corporate-Work-Blog-Banner-2.png?w=1392&amp;ssl=1 1392w" sizes="(max-width: 696px) 100vw, 696px" data-recalc-dims="1"></a></figure>
+
+
+
+<hr>
+
+
+
+<p>If there’s one thing that’s to be said for international terrorists, they know a thing or two about choosing reliable products for waging war. The F-91W joined the ranks of other terrorist accessories like the Kalashnikov and the Toyota technical because it’s cheap, solid, and reliable. Oh, and it also doubles as a bombmaking accessory which we’ll look into later.</p>
+
+
+
+<h3><strong><em>A Terrorist Fashion Icon</em></strong></h3>
+
+
+
+<p>Whilst Casio has advanced further into combat watches through its iconic Casio G-Shock range, the F91W has remained the true battlefield accessory throughout modern warfare. Aside from iconic weapons, the Casio F-91W is the only branded accessory that Osama bin Laden was ever seen wearing in the open. Al-Qaeda was reported to <a href="https://wikileaks.org/gitmo/prisoner/720.html">hand the watches out to recruits</a> at their terror training camps across Afghanistan and Pakistan throughout the 1990s and early 2000s. Thus, it was al-Qaeda and bin Laden who arguably started the terrorist trend surrounding the watch.</p>
+
+
+
+<div><figure><img src="https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/07/obl_AP070817055372-1.jpg?w=696&amp;ssl=1" alt="Osama Bin Laden wearing Casio FW91" srcset="https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/07/obl_AP070817055372-1.jpg?w=371&amp;ssl=1 371w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/07/obl_AP070817055372-1.jpg?resize=239%2C300&amp;ssl=1 239w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/07/obl_AP070817055372-1.jpg?resize=335%2C420&amp;ssl=1 335w" sizes="(max-width: 371px) 100vw, 371px" data-recalc-dims="1"><figcaption>Osama bin Laden wearing the iconic F-91W.</figcaption></figure></div>
+
+
+
+<p>During the height of the War on Terror, it didn’t take long for the US government to spot the prevalence of the Casio F91W amongst terrorists. In 2011, Wikileaks released a document labeled the “Matrix of Threat Indicators for Enemy Combatants” which was intended to assist staff at Guantanamo decide which detainees are more likely to carry out suicide attacks. According to the document, owning an F-91W was the biggest giveaway of a serious terror suspect alongside ownership of a satellite phone, a radio transceiver, or large quantities of cash.</p>
+
+
+
+<p>However, this wasn’t just paranoia. Statistics in other similar documents released by Wikileaks revealed that around a third of inmates being held at Guantanamo that were captured whilst wearing an F-91W had a known correlation with explosives. The F-91W watch came up almost 150 times in the piles of leaked <a href="https://wikileaks.org/gitmo/pdf/ym/us9ym-000840dp.pdf">Guantanamo prisoner assessments</a>. Ironically, four of the chaplains who worked at Guantanimo Bay also wore the watch.</p>
+
+
+
+<figure><img src="https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/07/5cc7041ab14bf43772045166.jpg?fit=696%2C348&amp;ssl=1" alt="Casio FW91 Guantanamo Bay" srcset="https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/07/5cc7041ab14bf43772045166.jpg?w=1100&amp;ssl=1 1100w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/07/5cc7041ab14bf43772045166.jpg?resize=300%2C150&amp;ssl=1 300w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/07/5cc7041ab14bf43772045166.jpg?resize=1024%2C512&amp;ssl=1 1024w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/07/5cc7041ab14bf43772045166.jpg?resize=768%2C384&amp;ssl=1 768w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/07/5cc7041ab14bf43772045166.jpg?resize=696%2C348&amp;ssl=1 696w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/07/5cc7041ab14bf43772045166.jpg?resize=1068%2C534&amp;ssl=1 1068w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/07/5cc7041ab14bf43772045166.jpg?resize=840%2C420&amp;ssl=1 840w" sizes="(max-width: 696px) 100vw, 696px"></figure>
+
+
+
+<p>One of the detainees at Guantanamo was grilled over the prevalence of the watch amongst suspected terrorists. He claimed that the water-resistant feature of the F91W watch was handy due to the Islamic requirement for followers to wash up to their elbows before prayers. Innocent enough explanation, right? Well not really. Interrogators smelled a rat when another prisoner claimed the prevalence of the watch amongst Jihadi inmates was simply due to the built-in compass that helped them pray towards Mecca. However, there is no compass in the F91W.</p>
+
+
+
+<p>Despite the fairly frosty relationship between the two, ISIS didn’t let it get in between their choice of a good wristwatch. The F-91W was a feature of various ISIS militants including Tunisian born Tariq al-Harzi who was a high ranking Emir of the Islamic State. It was also worn by Kevin Chassin who was a French-born Jihadist who went to Syria to join ISIS. He was subsequently utilized for his high propaganda value in ISIS videos. </p>
+
+
+
+<figure><img src="https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/07/Untitled-design-3.jpg?resize=696%2C364&amp;ssl=1" alt="Casio F91W." srcset="https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/07/Untitled-design-3.jpg?resize=1024%2C536&amp;ssl=1 1024w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/07/Untitled-design-3.jpg?resize=300%2C157&amp;ssl=1 300w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/07/Untitled-design-3.jpg?resize=768%2C402&amp;ssl=1 768w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/07/Untitled-design-3.jpg?resize=696%2C364&amp;ssl=1 696w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/07/Untitled-design-3.jpg?resize=1068%2C559&amp;ssl=1 1068w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/07/Untitled-design-3.jpg?resize=803%2C420&amp;ssl=1 803w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/07/Untitled-design-3.jpg?w=1200&amp;ssl=1 1200w" sizes="(max-width: 696px) 100vw, 696px" data-recalc-dims="1"></figure>
+
+
+
+<p>However, the leader of ISIS Abu Bakr al-Baghdadi wasn’t so fond of the cheap Casio F91W. Instead, al-Baghdadi opted for a flashy watch that sparked debate over the exact model. The watch was spotted during his infamous speech in Mosul that declared the formation of the so-called Caliphate. It was believed to be either a Rolex or an Omega Seamaster, both of which run north of $3,000 and contradict the contents of his speech as well as his ideals.</p>
+
+
+
+<p>It’s not just Jihadist terrorist groups that wear the watch. Introducing Subcomandante Marcos who, until recently, led the Zapatista National Liberation Army (EZLN) in Mexico. The photogenic insurgent leader was pictured in an iconic photo on horseback while smoking a pipe and wearing, you guessed it! </p>
+
+
+
+<figure><img src="https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/Untitled-design-6.jpg?fit=696%2C364&amp;ssl=1" alt="subcomandante Marcos Casio FW91" srcset="https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/Untitled-design-6.jpg?w=1200&amp;ssl=1 1200w, https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/Untitled-design-6.jpg?resize=300%2C157&amp;ssl=1 300w, https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/Untitled-design-6.jpg?resize=1024%2C536&amp;ssl=1 1024w, https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/Untitled-design-6.jpg?resize=768%2C402&amp;ssl=1 768w, https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/Untitled-design-6.jpg?resize=696%2C364&amp;ssl=1 696w, https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/Untitled-design-6.jpg?resize=1068%2C559&amp;ssl=1 1068w, https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/Untitled-design-6.jpg?resize=803%2C420&amp;ssl=1 803w" sizes="(max-width: 696px) 100vw, 696px"><figcaption>Subcomandante Marcos wearing the Casio F91W</figcaption></figure>
+
+
+
+<p>Of course, the watch is not only appreciated by the terrorists of the world but likewise by the people who combat them. Various fighting forces across the Middle East have been seen using the watch. Such as the Syrian Democratic Forces which is a coalition waging an anti-ISIS campaign across war-torn Syria.</p>
+
+
+
+<h3><em><strong> How the Casio F91W Became a Bomb Makers Accessory</strong></em></h3>
+
+
+
+<p>The Casio F91W is not only the terrorist’s timepiece of choice due to its ruggedness and reliability. Due to its long-lead timer, it also doubles as a bomb-making accessory for various terror groups around the world from Afghanistan to Chechnya. Deadly usage of the watch has been well documented through various case studies.</p>
+
+
+
+<figure><img src="https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/photo-casio-f91w-is-a-favourite-of-cia-s-terrorist-arm-al-qaeeda-supposedly.jpg?resize=696%2C500&amp;ssl=1" alt="Casio FW91" width="696" height="500" srcset="https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/photo-casio-f91w-is-a-favourite-of-cia-s-terrorist-arm-al-qaeeda-supposedly.jpg?w=600&amp;ssl=1 600w, https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/photo-casio-f91w-is-a-favourite-of-cia-s-terrorist-arm-al-qaeeda-supposedly.jpg?resize=300%2C216&amp;ssl=1 300w, https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/photo-casio-f91w-is-a-favourite-of-cia-s-terrorist-arm-al-qaeeda-supposedly.jpg?resize=585%2C420&amp;ssl=1 585w" sizes="(max-width: 696px) 100vw, 696px" data-recalc-dims="1"></figure>
+
+
+
+<p>According to US intelligence officials, the watch doubles as a bomb timer as its alarm can be set beyond a 24-hour period. During the War on Terror, Pakistani ISI officials found more than 600 of the watches in a terrorist safe house in Karachi which led to a period of anybody being found wearing an F91W watch to be liable for arrest and questioning. However, with the watch being available for $4 dollars on Pakistani markets, simply possessing a Casio watch doesn’t prove anything and this tactic of arrest was soon dropped.</p>
+
+
+
+<p>In September 1999, a series of bombs were detonated inside four Russian apartment buildings in the cities of Moscow, Volgodonsk, and Buinaksk. The blasts killed 367 people and injured over 1,000 others. Russian investigators concluded that the attackers had been trained in terror camps being run by Ibn al-Khattab inside Chechnya which had recently gained unstable independence following the First Chechen War.</p>
+
+
+
+<figure><img src="https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/07/ap_99090902501_custom-0dbb7e58420fd5260bf942910bfb61bd5c7c782f-s800-c85.jpg?w=696&amp;ssl=1" alt="Casio F91W" srcset="https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/07/ap_99090902501_custom-0dbb7e58420fd5260bf942910bfb61bd5c7c782f-s800-c85.jpg?w=800&amp;ssl=1 800w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/07/ap_99090902501_custom-0dbb7e58420fd5260bf942910bfb61bd5c7c782f-s800-c85.jpg?resize=300%2C195&amp;ssl=1 300w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/07/ap_99090902501_custom-0dbb7e58420fd5260bf942910bfb61bd5c7c782f-s800-c85.jpg?resize=768%2C498&amp;ssl=1 768w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/07/ap_99090902501_custom-0dbb7e58420fd5260bf942910bfb61bd5c7c782f-s800-c85.jpg?resize=696%2C452&amp;ssl=1 696w, https://i1.wp.com/reaperfeed.com/wp-content/uploads/2020/07/ap_99090902501_custom-0dbb7e58420fd5260bf942910bfb61bd5c7c782f-s800-c85.jpg?resize=647%2C420&amp;ssl=1 647w" sizes="(max-width: 696px) 100vw, 696px" data-recalc-dims="1"><figcaption>Fire and smoke rise from a destroyed apartment building as Russian firefighters try to save people in Moscow on Sept. 9, 1999.&nbsp;</figcaption></figure>
+
+
+
+<p>Investigations carried out inside Chechnya discovered that the bombs used in the attacks were comprised of ammonium nitrate and aluminum powder, with plastic serving as an intermediate explosive. The detonator? A combination of a Krona battery and a Casio F-91W. </p>
+
+
+
+<blockquote><p>“about a third of inmates at JTF-GTMO [the unit in charge of Guantanamo] who were captured wearing one of these watches had a known correlation with explosives”.</p><cite>– Prisoner evaluation sheet from Guantanamo.</cite></blockquote>
+
+
+
+<p>In 1994, an al-Qaeda militant named Ramzi Yousef used the Casio F-91W as a 4-hour timer on the bomb he constructed in an airplane toilet of Philippine Airlines Flight 434. He proceeded to leave his deadly work under the seat before leaving the plane. It detonated on the next flight, killing a Japanese businessman named Haruki Ikegami who sat in Yousef’s seat. Thankfully, the bomb’s orientation caused the energy to be mostly absorbed by Ikegami. Thus other passengers and the plane were not catastrophically damaged.</p>
+
+
+
+<p>So, to round off this article I feel it’s fitting to make a comparison between Ryusuke Moriai and Mikhail Kalashnikov. Just like when Kalashnikov designed the AK47 intended solely for the defense of his motherland, the innovative inventor Ryusuke Moriai could never have predicted that his creation would go on an unstoppable path of its own and be used for far more sinister purposes than ever intended. Mr. Moriai had unwittingly created a watch ideal for modern warfare.</p>
+
+
+
+<figure><img src="https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/e5d2ebf24cf0e901f0be47c23482b2e8_0.jpg?fit=696%2C923&amp;ssl=1" alt="Casio F91W" srcset="https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/e5d2ebf24cf0e901f0be47c23482b2e8_0.jpg?w=1200&amp;ssl=1 1200w, https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/e5d2ebf24cf0e901f0be47c23482b2e8_0.jpg?resize=226%2C300&amp;ssl=1 226w, https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/e5d2ebf24cf0e901f0be47c23482b2e8_0.jpg?resize=772%2C1024&amp;ssl=1 772w, https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/e5d2ebf24cf0e901f0be47c23482b2e8_0.jpg?resize=768%2C1018&amp;ssl=1 768w, https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/e5d2ebf24cf0e901f0be47c23482b2e8_0.jpg?resize=1159%2C1536&amp;ssl=1 1159w, https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/e5d2ebf24cf0e901f0be47c23482b2e8_0.jpg?resize=696%2C923&amp;ssl=1 696w, https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/e5d2ebf24cf0e901f0be47c23482b2e8_0.jpg?resize=1068%2C1416&amp;ssl=1 1068w, https://i2.wp.com/reaperfeed.com/wp-content/uploads/2020/07/e5d2ebf24cf0e901f0be47c23482b2e8_0.jpg?resize=317%2C420&amp;ssl=1 317w" sizes="(max-width: 696px) 100vw, 696px"></figure>
+
+
+
+<p>I was hoping to find a profound statement from Casio on the watch being used for deadly means by some pretty evil people. I was looking for something similar to what Kalashnikov said about the violent impact of his life’s work. <a href="https://www.theguardian.com/artanddesign/2011/apr/28/casio-f-91w-watch-design-hipsters-al-qaida">The Guardian</a> approached the PR department for Casio hoping for a similar statement on the widespread use of the F-91W amongst global terrorists. But they just received a blunt email stating: “Casio is not making any further comment on the F-91W watch at this point in time.” Damn.</p>
+
+
+
+<p>For more stories like this as well as photography from the more bizarre sides of human conflict, you can stay up to speed with us on <a href="https://www.instagram.com/reaperfeed1/">Instagram</a> and <a href="https://twitter.com/Reaperfeed1">Twitter</a>.</p>
+    </div></div>]]>
+            </description>
+            <link>https://reaperfeed.com/how-did-the-casio-f91w-become-a-terrorist-icon/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-23971045</guid>
+            <pubDate>Tue, 28 Jul 2020 00:40:10 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[How GPT3 Works – Visualizations and Animations]]>
+            </title>
+            <description>
+<![CDATA[
+Score 331 | Comments 85 (<a href="https://news.ycombinator.com/item?id=23967887">thread link</a>) | @dsr12
+<br/>
+July 27, 2020 | https://jalammar.github.io/how-gpt3-works-visualizations-animations/ | <a href="https://web.archive.org/web/*/https://jalammar.github.io/how-gpt3-works-visualizations-animations/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+    <p>(Live thread, will be updated with new visuals and polish over the next few days. Join <a href="http://eepurl.com/gl0BHL">the mailing list</a> to get updated when completed)</p>
+
+<p>A trained language model generates text.</p>
+
+<p>We can optionally pass it some text as input, which influences its output.</p>
+
+<p>The output is generated from what the model “learned” during its training period where it scanned vast amounts of text.</p>
+
+<p><img src="https://jalammar.github.io/images/gpt3/01-gpt3-language-model-overview.gif">
+  <br>
+
+</p>
+
+<!--more-->
+
+<p>Training is the process of exposing the model to lots of text. That process has been completed. All the experiments you see now are from that one trained model. It was estimated to cost 355 GPU years and cost $4.6m.</p>
+
+<p><img src="https://jalammar.github.io/images/gpt3/02-gpt3-training-language-model.gif">
+  <br>
+
+</p>
+
+<p>The dataset of 300 billion tokens of text is used to generate training examples for the model. For example, these are three training examples generated from the one sentence at the top.</p>
+
+<p>You can see how you can slide a window across all the text and make lots of examples.</p>
+
+<p><img src="https://jalammar.github.io/images/gpt3/gpt3-training-examples-sliding-window.png">
+  <br>
+
+</p>
+
+<p>The model is presented with an example. We only show it the features and ask it to predict the next word.</p>
+
+<p>The model’s prediction will be wrong. We calculate the error in its prediction and update the model so next time it makes a better prediction.</p>
+
+<p>Repeat millions of times</p>
+
+<p><img src="https://jalammar.github.io/images/gpt3/03-gpt3-training-step-back-prop.gif">
+  <br>
+
+</p>
+
+<p>Now let’s look at these same steps with a bit more detail.</p>
+
+<p>GPT3 actually generates output one token at a time (let’s assume a token is a word for now).</p>
+
+<p><img src="https://jalammar.github.io/images/gpt3/04-gpt3-generate-tokens-output.gif">
+  <br>
+
+</p>
+
+<p>Please note: This is a description of how GPT-3 works and not a discussion of what is novel about it (which is mainly the ridiculously large scale). The architecture is a transformer decoder model based on this paper https://arxiv.org/pdf/1801.10198.pdf</p>
+
+<p>GPT3 is MASSIVE. It encodes what it learns from training in 175 billion numbers (called parameters). These numbers are used to calculate which token to generate at each run.</p>
+
+<p>The untrained model starts with random parameters. Training finds values that lead to better predictions.</p>
+
+<p><img src="https://jalammar.github.io/images/gpt3/gpt3-parameters-weights.png">
+  <br>
+
+</p>
+
+<p>These numbers are part of hundreds of matrices inside the model. Prediction is mostly a lot of matrix multiplication.</p>
+
+<p>In my <a href="https://youtube.com/watch?v=mSTCzNgDJy4">Intro to AI on YouTube</a>, I showed a simple ML model with one parameter. A good start to unpack this 175B monstrosity.</p>
+
+<p>To shed light on how these parameters are distributed and used, we’ll need to open the model and look inside.</p>
+
+<p>GPT3 is 2048 tokens wide. That is its “context window”. That means it has 2048 tracks along which tokens are processed.</p>
+
+<p><img src="https://jalammar.github.io/images/gpt3/05-gpt3-generate-output-context-window.gif">
+  <br>
+
+</p>
+
+<p>Let’s follow the purple track. How does a system process the word “robotics” and produce “A”?</p>
+
+<p>High-level steps:</p>
+
+<ol>
+  <li>Convert the word to <a href="https://jalammar.github.io/illustrated-word2vec/">a vector (list of numbers) representing the word</a></li>
+  <li>Compute prediction</li>
+  <li>Convert resulting vector to word</li>
+</ol>
+
+<p><img src="https://jalammar.github.io/images/gpt3/06-gpt3-embedding.gif">
+  <br>
+
+</p>
+
+<p>The important calculations of the GPT3 occur inside its stack of 96 transformer decoder layers.</p>
+
+<p>See all these layers? This is the “depth” in “deep learning”.</p>
+
+<p>Each of these layers has its own 1.8B parameter to make its calculations. That is where the “magic” happens. This is a high-level view of that process:</p>
+
+<p><img src="https://jalammar.github.io/images/gpt3/07-gpt3-processing-transformer-blocks.gif">
+  <br>
+
+</p>
+
+<p>You can see a detailed explanation of everything inside the decoder in my blog post <a href="https://jalammar.github.io/illustrated-gpt2/">The Illustrated GPT2</a>.</p>
+
+<p>The difference with GPT3 is the alternating dense and <a href="https://arxiv.org/pdf/1904.10509.pdf">sparse self-attention layers</a>.</p>
+
+<p>This is an X-ray of an input and response (“Okay human”) within GPT3. Notice how every token flows through the entire layer stack. We don’t care about the output of the first words. When the input is done, we start caring about the output. We feed every word back into the model.</p>
+
+<p><img src="https://jalammar.github.io/images/gpt3/08-gpt3-tokens-transformer-blocks.gif">
+  <br>
+
+</p>
+
+<p>In the React code generation example (https://twitter.com/sharifshameem/status/1284421499915403264), the description would be the input prompt (in green), in addition to a couple of examples of description=&gt;code, I believe. And the react code would be generated like the pink tokens here token after token.</p>
+
+<p>My assumption is that the priming examples and the description are appended as input, with specific tokens separating examples and the results. Then fed into the model.</p>
+
+<p><img src="https://jalammar.github.io/images/gpt3/09-gpt3-generating-react-code-example.gif">
+  <br>
+
+</p>
+
+<p>It’s impressive that this works like this. Because you just wait until fine-tuning is rolled out for the GPT3. The possibilities will be even more amazing.</p>
+
+<p>Fine-tuning actually updates the model’s weights to make the model better at a certain task.</p>
+
+<p><img src="https://jalammar.github.io/images/gpt3/10-gpt3-fine-tuning.gif">
+  <br>
+
+</p>
+
+  </div></div>]]>
+            </description>
+            <link>https://jalammar.github.io/how-gpt3-works-visualizations-animations/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-23967887</guid>
+            <pubDate>Mon, 27 Jul 2020 18:22:11 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Quiet route planning for pedestrians in traffic noise polluted environments]]>
+            </title>
+            <description>
+<![CDATA[
+Score 229 | Comments 122 (<a href="https://news.ycombinator.com/item?id=23967306">thread link</a>) | @ericdanielski
+<br/>
+July 27, 2020 | http://k1z.blog.uni-heidelberg.de/2020/07/15/quiet-route-planning-for-pedestrians-in-traffic-noise-polluted-environments/ | <a href="https://web.archive.org/web/*/http://k1z.blog.uni-heidelberg.de/2020/07/15/quiet-route-planning-for-pedestrians-in-traffic-noise-polluted-environments/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+					<p>#Noise #pollution is one of the main stressors in urban environments, having negative impacts on people’s quality of life and health. For some groups of citizens, such as school children, patients, and elders, there is a need to support them in finding pedestrian routes in noise polluted areas of cities. In<a href="https://ieeexplore.ieee.org/document/9139350" target="_blank"> a new paper</a>, <a href="http://uni-heidelberg.de/gis" target="_blank">we</a> focus on the <strong>estimation of traffic noise</strong>, and present an approach to <strong>provide quiet routing services</strong>, <em>taking into account the estimated noise levels of roads</em>.</p>
+<p>By combining Volunteered Geographic Information from OpenStreetMap (OSM), official socio-economic data, and open-access GPS trajectory data, we develop a set of traffic related variables, and apply machine learning methods to perform<strong> traffic volume estimations</strong>. Given the estimated traffic information, an existing traffic noise model is then employed to derive the noise polluted areas. For generation of quiet routes, a new routing algorithm is proposed. It minimizes the exposure of pedestrians to traffic noise pollution while taking into account the route distance constraint. We apply our quiet routing approach to the city of Heidelberg (Germany). The application results demonstrate the efficacy of our algorithms in the generation of quiet routes customized to pedestrian preferences.</p>
+<blockquote><p>Z. Wang, T. Novack, Y. Yan and A. Zipf, “<a href="https://ieeexplore.ieee.org/document/9139350" target="_blank">Quiet Route Planning for Pedestrians in Traffic Noise Polluted Environments</a>,” in IEEE Transactions on Intelligent Transportation Systems, doi: 10.1109/TITS.2020.3004660.</p></blockquote>
+<p><a href="http://k1z.blog.uni-heidelberg.de/files/2020/07/noiseroutehdgisciencehd.jpg"><img src="http://k1z.blog.uni-heidelberg.de/files/2020/07/noiseroutehdgisciencehd-300x221.jpg" alt="" width="300" height="221"></a></p>
+<p>In earlier work we looked already into generating customized pleasant pedestrian routes based on several factors like greenness, noise and sociability, and added this to <a href="https://openrouteservice.org/" target="_blank">Openrouteservice</a> by <a href="http://heigit.org/" target="_blank">HeiGIT</a> &amp; <a href="http://uni-heidelberg.de/gis" target="_blank">GIScience HD</a>:</p>
+<blockquote><p><span>Novack, T.; Wang, Z.; Zipf, A. (2018):&nbsp;<a href="https://www.mdpi.com/1424-8220/18/11/3794" target="_blank">A System for Generating Customized Pleasant Pedestrian Routes Based on OpenStreetMap Data</a>. </span><em>Sensors</em><span> </span><span>2018</span><span>, </span><em>18</em><span>, 3794.</span></p></blockquote>
+<p>Also currently we started to <a href="http://k1z.blog.uni-heidelberg.de/2020/06/19/going-green-with-meingrun-today-app-launch-in-heidelberg-and-dresden/">test related approaches in Dresden and Heidelberg</a> in the context of the <a href="https://www.geog.uni-heidelberg.de/gis/meingruen_en.html" target="_blank">meinGrün</a> project.<br>
+This builds upon early work by <a href="https://www.geog.uni-heidelberg.de/md/chemgeo/geog/gis/arcviewbuch-zipf-roether.pdf" target="_blank">Zipf and Röther (2000)</a>, But nowadays the needed data sources are much more available, so that it becomes possible to scale these ideas to new levels using open data which allow to finetune and evaluate the approach using real world data.</p>
+<p>The relevance of green spaces for wellbeing and mental health in cities has been proofed by a study published in <a href="https://www.nature.com/articles/s41593-019-0451-y" target="_blank">Nature Neuroscience</a></p>
+<blockquote><p><span>H. Tost, M. Reichert, U. Braun, I. Reinhard, R. Peters, S. Lautenbach, A. Hoell, E. Schwarz, U. Ebner-Priemer, A. Zipf, and A. Meyer-Lindenberg (2019): </span><a href="https://www.nature.com/articles/s41593-019-0451-y" target="_blank">Neural correlates of individual differences in affective benefits of real-life urban green space exposure.</a><span> Nature Neuroscience. https://doi.org/10.1038/s41593-019-0451-y</span></p></blockquote>
+<blockquote><p><span>Zipf, A. &amp; Röther, S. (2000): </span><a title="im neuen Fenster öffnen" href="https://www.geog.uni-heidelberg.de/md/chemgeo/geog/gis/arcviewbuch-zipf-roether.pdf" target="_blank">Tourenvorschläge für Stadttouristen mit dem ArcView Network Analyst.</a><span> In: Liebig, W. (Hrsg.): ArcView Arbeitsbuch. Hüthig Verlag. Heidelberg.</span></p></blockquote>
+<p>Other early examples on using OpenStreetMap for specialized routing and navigation applications for large areas or specific scenarios (e.g. disaster management, wheelchairs etc.) are given below:</p>
+<blockquote><p>Neis, P. &amp; Zipf, A (2008): <a href="https://openrouteservice.org/" target="_blank">OpenRouteService.org</a> is three times “Open”: Combining OpenSource, OpenLS and OpenStreetMap. GIS Research UK (GISRUK 08). Manchester.</p>
+<p><span>Schmitz, S., Neis, P. &amp; Zipf, A. (2008): </span><a href="https://www.geog.uni-heidelberg.de/md/chemgeo/geog/gis/cmap2008.cartography-bonn.subm.pdf" target="_blank">New Applications based on Collaborative Geodata – the Case of Routing.</a><span> XXVIII INCA International Congress on Collaborative Mapping and SpaceTechnology, Gandhinagar, Gujarat, India.</span></p>
+<p><span>Rousell A. and Zipf A. (2017): </span><a href="http://www.mdpi.com/2220-9964/6/3/64" target="_blank">Towards a landmark based pedestrian navigation service using OSM data.</a><span> International Journal of Geo-Information, ISPRS IJGI, 6(3): 64.</span></p>
+<p><span>Neis, P., Singler, P. &amp; Zipf, A. (2010): </span><a href="https://www.geog.uni-heidelberg.de/md/chemgeo/geog/gis/un-osm-emergency-routing.gi-forum2010.full.pdf">Collaborative mapping and Emergency Routing for Disaster Logistics – Case studies from the Haiti earthquake and the UN portal for Afrika.</a><span> In: Car, A., Griesebner, G. &amp; Strobl, J. (Eds.): Geospatial Crossroads @ GI_Forum ‘10. Proceedings of the Geoinformatics Forum Salzburg.</span></p>
+<p><span>Zipf, A., Mobasheri, A., Rousell, A. ,Hahmann, S. (2016): </span><a title="im neuen Fenster öffnen" href="https://www.geog.uni-heidelberg.de/md/chemgeo/geog/gis/europ_handb_crowds_infozipf.pdf">Crowdsourcing for individual needs - the case of routing and navigation for mobility-impaired persons </a><span>. In: Capineri, C, Haklay, M, Huang, H, Antoniou, V, Kettunen, J, Ostermann, F and Purves, R. (eds.) European Handbook of Crowdsourced Geographic Information, p. 325–337. London: Ubiquity Press. DOI: dx.doi.org/10.5334/bax.x</span></p>
+<p><span>Miksch, J., Hahmann, S., Resch, B., Lauer, J., Zipf, A. (2017): </span><a title="im neuen Fenster öffnen" href="http://www.tandfonline.com/doi/full/10.1080/10095020.2017.1399675">Routing Through Open Spaces - A Performance Comparison Of Algorithms. </a><span>Geo-Spatial information Science, 2017. Taylor &amp; Francis. Geo-Spatial information Science, 2017. Taylor &amp; Francis. https://doi.org/10.1080/10095020.2017.1399675</span></p></blockquote>
+										<p>
+            Tags: <a href="http://k1z.blog.uni-heidelberg.de/tag/meingrun/" rel="tag">meinGrün</a>, <a href="http://k1z.blog.uni-heidelberg.de/tag/noise/" rel="tag">noise</a>, <a href="http://k1z.blog.uni-heidelberg.de/tag/openrouteservice/" rel="tag">OpenRouteService</a>, <a href="http://k1z.blog.uni-heidelberg.de/tag/osm/" rel="tag">OSM</a>, <a href="http://k1z.blog.uni-heidelberg.de/tag/routing/" rel="tag">routing</a><br> </p>
+				</div></div>]]>
+            </description>
+            <link>http://k1z.blog.uni-heidelberg.de/2020/07/15/quiet-route-planning-for-pedestrians-in-traffic-noise-polluted-environments/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-23967306</guid>
+            <pubDate>Mon, 27 Jul 2020 17:29:29 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Writing a file system from scratch in Rust]]>
+            </title>
+            <description>
+<![CDATA[
+Score 318 | Comments 54 (<a href="https://news.ycombinator.com/item?id=23967016">thread link</a>) | @carlosgaldino
+<br/>
+July 27, 2020 | https://blog.carlosgaldino.com/writing-a-file-system-from-scratch-in-rust.html | <a href="https://web.archive.org/web/*/https://blog.carlosgaldino.com/writing-a-file-system-from-scratch-in-rust.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+        <div>
+  
+  <p><span>27 Jul 2020</span></p><p>Data produced by programs need to be stored somewhere for future reference, and
+there must be some sort of organisation so we can quickly retrieve the desired
+information. A file system (FS) is responsible for this task and provides an
+abstraction over the storage devices where the data is physically stored.</p>
+
+<p>In this post, we will learn more about the concepts used by file systems, and
+how they fit together when writing your own.</p>
+
+<h2 id="structuring-the-disk">Structuring the disk</h2>
+<p>When data is stored in a hard-disk drive (HDD) or solid-state drive (SSD), it is
+written in small units called sectors (or pages in the SSD case). The drives
+don’t have any information about what that piece of data represents, for all it
+is worth, the disk is just a giant array of sectors. It is the job of the file
+system to make sense of it all.</p>
+
+<p>A file system will divide the disk into fixed-sized blocks. The FS uses the
+majority of these blocks to store user data, but some blocks are used to store
+metadata that is essential for the file system operation.</p>
+
+<p>The following figure gives an example of how a file system structures the
+information on the disk:</p>
+
+<figure>
+    <img src="https://wiki.carlosgaldino.com/public/images/io_filesystem_blocks.svg" alt="">
+    <figcaption>File system structure in a disk</figcaption>
+</figure>
+
+<p>In the next sections, we will understand what each type of block means.</p>
+
+<h3 id="superblock-and-bitmaps">Superblock and bitmaps</h3>
+
+<p>The superblock stores most of the metadata about the file system, such as the
+following: block size, timestamps, how many blocks and files are in use and how
+many are free, etc.</p>
+
+<p>Bitmaps are one way of tracking which data blocks and inodes are free. An index
+in the bitmap set to <code>0</code> indicates a free slot, and an index set to <code>1</code>
+indicates an occupied slot.</p>
+
+<h3 id="inode">Inode</h3>
+
+<p>The inode is the structure that stores metadata about a file. Attributes such as
+permissions, size, location of data blocks that form the file and more are saved
+in an inode.</p>
+
+<p>The inodes are stored in blocks that together form the <em>inode table</em> as the
+following figure shows.</p>
+
+<figure>
+    <img src="https://wiki.carlosgaldino.com/public/images/io_inode_table.svg" alt="">
+    <figcaption>Inode table (detailed view)</figcaption>
+</figure>
+
+<p>For each slot in the inode bitmap set to <code>1</code>, there will be a corresponding
+inode in the table. The index of the slot is the same as the index in the table.
+And this explains the name inode being a short name for <em>index node</em>.</p>
+
+<h3 id="data-blocks">Data blocks</h3>
+
+<p>As the name suggests, the data blocks are the blocks where the actual data
+belonging to a file is written. These blocks are also used for different
+purposes which we will see shortly.</p>
+
+<h2 id="pointing-to-data">Pointing to data</h2>
+
+<p>The inode needs to have a way of pointing to the data blocks that assemble the
+file. The simplest way is to have <strong>direct pointers</strong>. In this case, each
+pointer points to a block that has some of the file data. The problem is that
+large files; where the size exceeds the number of direct pointers an inode can
+have; are not supported in this mode. One way of overcoming this issue is to use
+<strong>indirect pointers</strong>, which instead of storing user data they store pointers to
+blocks that hold user data. For larger files, another layer of indirection is
+added with <strong>double indirect pointers</strong>. And for even larger files, <strong>triple
+indirect pointers</strong> are put to use.</p>
+
+<figure>
+    <img src="https://wiki.carlosgaldino.com/public/images/io_direct_pointers.svg" alt="">
+    <figcaption>Inode multi-level index</figcaption>
+</figure>
+
+<p>To give an idea of the largest file size that each level permit let’s run an
+example considering that each block size is 4 KiB. Research has shown that the
+majority of files are small [1] so 12 direct pointers would allow for files up
+to 48 KiB. Considering that each pointer takes 4 bytes, a single indirect
+pointer would then allow a file to be up to around 4 MiB:</p>
+
+<pre>(12 + 1024) * 4 KiB
+</pre>
+
+<p>With the addition of double indirect pointers the size would jump to around 4
+GiB:</p>
+
+<pre>(12 + 1024 + 1024<sup>2</sup>) * 4 KiB
+</pre>
+
+<p>And finally, with triple indirect pointers the files could have a size of around
+4 TiB:</p>
+
+<pre>(12 + 1024 + 1024<sup>2</sup> + 1024<sup>3</sup>) * 4 KiB
+</pre>
+
+<p>This approach might not be very efficient for handling large files. For example,
+a file of 100 MiB requires the allocation of 25600 blocks. The performance can
+be severely impacted in case the blocks were fragmented over the disk.</p>
+
+<p>Some file systems use <strong>extents</strong> to help with this situation. In this approach,
+there is a single pointer and a length to tell that the data starts at the
+address of the pointer and runs for the given range of blocks. In our example
+above, describing the same file would use a single extent of size 100 MiB.
+Multiple extents can be used to support larger files.</p>
+
+<h2 id="directories">Directories</h2>
+
+<p>You may have noticed that there isn’t a specific structure for directories. The
+reason behind it is the fact that inodes represent both files and directories.
+The difference is in what is stored in the corresponding data blocks.
+Directories are simply a list of all files that it includes. Each entry has the
+form of <code>(name, index number)</code> so when looking up a particular file (or another
+directory), the system uses the <code>name</code> to find the corresponding inode.</p>
+
+<p>Searching for a file can be slow if a directory contains a large number of
+files. This issue can be mitigated by maintaining the list sorted and using
+binary search, or instead of representing it as a list, a hash table or a
+balanced search tree could also be used.</p>
+
+<h2 id="access-paths">Access paths</h2>
+
+<h3 id="read">Read</h3>
+
+<p>When reading from a file, the file system needs to traverse the entire path,
+visiting each inode along the way until reaching the inode for the desired file.
+Assuming the user has permission to access the file, the file system consults
+which blocks are associated with it and then read the solicited data from them.</p>
+
+<h3 id="write">Write</h3>
+
+<p>When writing to a file, the same process has to happen to find the corresponding
+inode. If a new block is required for the write, the file system has to allocate
+the block, update the associated information (bitmap and inode), and write to
+the block. So one write operation requires five I/O operations: one read to the
+bitmap, one write to mark the new block as occupied, two to read and write to
+the inode, and one writing the data in the block. This number can increase when
+creating a new file because now the associated information of the directory also
+has to be read and written to reflect this new file, and operations to create a
+new inode.</p>
+
+<h2 id="gotenksfs">GotenksFS</h2>
+
+<p>As a side project, I decided to write my own file system in Rust as I’m learning
+the language. Some aspects are inspired by ext4 [2] (and family), and in this
+section, you will learn more about it. The file system uses FUSE [3], and the
+disk is represented as a regular file. The block size can be configured as 1
+KiB, 2 KiB, or 4 KiB. Files can have a size of up to 4 GiB for block sizes of 4
+KiB while the file system could theoretically be up to 16 TiB in size.</p>
+
+<h3 id="mkfs"><code>mkfs</code></h3>
+
+<p>The first step is to create the image itself with the configuration values for
+the file system. This is achieved via the <code>mkfs</code> command:</p>
+
+<div><div><pre><code><span>$ </span>./gotenksfs mkfs disk.img <span>-s</span> <span>"10 GiB"</span> <span>-b</span> 4096
+</code></pre></div></div>
+
+<p>After running the command, the image is created with a total size of 10 GiB, and
+each block in the file system has a size of 4 KiB.</p>
+
+<p>In this step, the configuration values and other structures such as a root
+directory are written to the image in the first block: the superblock. Its
+corresponding bitmap entries, and data are also written. These values will be
+necessary for the next step: mounting the file system.</p>
+
+<h3 id="mount"><code>mount</code></h3>
+
+<p>After creating the image, we need to mount it so we can start using it. The
+<code>mount</code> command is used for this:</p>
+
+<div><div><pre><code><span>$ </span>./gotenksfs mount disk.img gotenks
+</code></pre></div></div>
+
+<p>And you can see some information about it:</p>
+
+<figure>
+    <img src="https://blog.carlosgaldino.com/public/images/gotenksfs-mount.png">
+    <figcaption>File system after mounting</figcaption>
+</figure>
+
+<h3 id="on-disk-structure">On-disk structure</h3>
+
+<p>The superblock is written in the first 1024 bytes, and it holds the
+configuration values provided in the <code>mkfs</code> command.</p>
+
+<div><div><pre><code><span>pub</span> <span>struct</span> <span>Superblock</span> <span>{</span>
+    <span>pub</span> <span>magic</span><span>:</span> <span>u32</span><span>,</span>
+    <span>pub</span> <span>block_size</span><span>:</span> <span>u32</span><span>,</span>
+    <span>pub</span> <span>created_at</span><span>:</span> <span>u64</span><span>,</span>
+    <span>pub</span> <span>modified_at</span><span>:</span> <span>Option</span><span>&lt;</span><span>u64</span><span>&gt;</span><span>,</span>
+    <span>pub</span> <span>last_mounted_at</span><span>:</span> <span>Option</span><span>&lt;</span><span>u64</span><span>&gt;</span><span>,</span>
+    <span>pub</span> <span>block_count</span><span>:</span> <span>u32</span><span>,</span>
+    <span>pub</span> <span>inode_count</span><span>:</span> <span>u32</span><span>,</span>
+    <span>pub</span> <span>free_blocks</span><span>:</span> <span>u32</span><span>,</span>
+    <span>pub</span> <span>free_inodes</span><span>:</span> <span>u32</span><span>,</span>
+    <span>pub</span> <span>groups</span><span>:</span> <span>u32</span><span>,</span>
+    <span>pub</span> <span>data_blocks_per_group</span><span>:</span> <span>u32</span><span>,</span>
+    <span>pub</span> <span>uid</span><span>:</span> <span>u32</span><span>,</span>
+    <span>pub</span> <span>gid</span><span>:</span> <span>u32</span><span>,</span>
+    <span>pub</span> <span>checksum</span><span>:</span> <span>u32</span><span>,</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>The next two blocks represent the data bitmap and inode bitmap. Then, a run of
+<code>n</code> blocks are used for the inode table. And the blocks following that are the
+ones where user data will be written.</p>
+
+<p>The inode is defined as follows:</p>
+
+<div><div><pre><code><span>pub</span> <span>struct</span> <span>Inode</span> <span>{</span>
+    <span>pub</span> <span>mode</span><span>:</span> <span>libc</span><span>::</span><span>mode_t</span><span>,</span>
+    <span>pub</span> <span>hard_links</span><span>:</span> <span>u16</span><span>,</span>
+    <span>pub</span> <span>user_id</span><span>:</span> <span>libc</span><span>::</span><span>uid_t</span><span>,</span>
+    <span>pub</span> <span>group_id</span><span>:</span> <span>libc</span><span>::</span><span>gid_t</span><span>,</span>
+    <span>pub</span> <span>block_count</span><span>:</span> <span>u32</span><span>,</span> <span>// should be in 512 bytes blocks</span>
+    <span>pub</span> <span>size</span><span>:</span> <span>u64</span><span>,</span>
+    <span>pub</span> <span>created_at</span><span>:</span> <span>u64</span><span>,</span>
+    <span>pub</span> <span>accessed_at</span><span>:</span> <span>Option</span><span>&lt;</span><span>i64</span><span>&gt;</span><span>,</span>
+    <span>pub</span> <span>modified_at</span><span>:</span> <span>Option</span><span>&lt;</span><span>i64</span><span>&gt;</span><span>,</span>
+    <span>pub</span> <span>changed_at</span><span>:</span> <span>Option</span><span>&lt;</span><span>i64</span><span>&gt;</span><span>,</span>
+    <span>pub</span> <span>direct_blocks</span><span>:</span> <span>[</span><span>u32</span><span>;</span> <span>DIRECT_POINTERS</span> <span>as</span> <span>usize</span><span>],</span>
+    <span>pub</span> <span>indirect_block</span><span>:</span> <span>u32</span><span>,</span>
+    <span>pub</span> <span>double_indirect_block</span><span>:</span> <span>u32</span><span>,</span>
+    <span>pub</span> <span>checksum</span><span>:</span> <span>u32</span><span>,</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>As you can see above, inodes support double indirect pointers which means that
+for a disk with a block size of 4 KiB, the maximum capacity of a file is 4 GiB.
+The number of direct pointers is set to 12:</p>
+
+<div><div><pre><code><span>pub</span> <span>const</span> <span>DIRECT_POINTERS</span><span>:</span> <span>u64</span> <span>=</span> <span>12</span><span>;</span>
+</code></pre></div></div>
+
+<p>When starting the FS for the first time, it will create the root directory using
+the definition below:</p>
+
+<div><div><pre><code><span>pub</span> <span>struct</span> <span>Directory</span> <span>{</span>
+    <span>pub</span> <span>entries</span><span>:</span> <span>BTreeMap</span><span>&lt;</span><span>OsString</span><span>,</span> <span>u32</span><span>&gt;</span><span>,</span>
+    <span>checksum</span><span>:</span> <span>u32</span><span>,</span>
+<span>}</span>
+</code></pre></div></div>
+
+<h3 id="block-groups">Block groups</h3>
+
+<p>The inode bitmap has 4 KiB meaning that each bitmap block will have a capacity
+for 32768 inodes. Suppose we round up the size of an <code>Inode</code> to 128 bytes; the
+corresponding inode table will require 4 MiB of space. One of the ways for
+structuring them would be to have many blocks dedicated to the bitmaps, then the
+corresponding number blocks to store the inodes, and the remaining blocks for
+user data.</p>
+
+<p>Instead of doing that, we can create <em>block groups</em> that will always have one
+block for the data bitmap and one for the inode bitmap. The next 1024 blocks
+contain the inode table, and following that, 32768 blocks which are used for
+user data.</p>
+
+<!--
+For a disk as in our case of 10 GiB, how many blocks should be dedicated to inode bitmaps?
+
+Increasing the number of blocks to be inode bitmaps reduces the amount of available data blocks. And reducing the number of inode bitmaps restricts the total number of files supported by the system.
+-->
+
+<figure>
+    <img src="https://blog.carlosgaldino.com/public/images/gotenksfs_block_group.svg" alt="">
+    <figcaption>Block groups</figcaption>
+</figure>
+
+<h3 id="reading-and-writing-to-files">Reading and writing to files</h3>
+
+<p>Now that the “disk” is set up, we can start writing and reading files from it. Creating a new directory using <code>mkdir</code>:</p>
+
+<figure>
+    <img src="https://blog.carlosgaldino.com/public/images/mkdir.gif" alt="">
+    <figcaption>Creating a directory</figcaption>
+</figure>
+
+<p>The process that occurs is the following: the system searches for the …</p></div></div></div>
+<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://blog.carlosgaldino.com/writing-a-file-system-from-scratch-in-rust.html">https://blog.carlosgaldino.com/writing-a-file-system-from-scratch-in-rust.html</a></em></p>]]>
+            </description>
+            <link>https://blog.carlosgaldino.com/writing-a-file-system-from-scratch-in-rust.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-23967016</guid>
+            <pubDate>Mon, 27 Jul 2020 17:04:44 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Show HN: Your DevOps Control Plane, in Slack]]>
+            </title>
+            <description>
+<![CDATA[
+Score 70 | Comments 35 (<a href="https://news.ycombinator.com/item?id=23967015">thread link</a>) | @slajax
+<br/>
+July 27, 2020 | https://cto.ai/blog/slack-control-plane-for-devops-workflows/ | <a href="https://web.archive.org/web/*/https://cto.ai/blog/slack-control-plane-for-devops-workflows/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
+			<!-- .cover -->
+			<div>
+				<blockquote>We're <a href="https://news.ycombinator.com/show">trending on Hacker News</a> - Please join the conversation there!</blockquote><p>In today's remote first world, Slack is increasingly becoming the natural place that communication and collaboration happen in all aspects of work. Personally, I look at Slack each morning before I look at email or even social media, making it the natural jump off point for the most important interactions that I have professionally.</p><div><p>Never has this also been more true, than for complex developer workflows which teams need to share to ensure enablement across their entire development team.</p><p>Traditionally, a developer would have to interface with many different softwares in order to complete their tasks, increasing the context that they need within each domain in order to complete their job. All of this comes at the expense of developer productivity and this is why CTO.ai set out to improve the holistic developer experience by re-imagining what DevOps should look like, Slack first.</p><p>Today we are happy to announce that we're continuing to invest into our mission to make DevOps more accessible and enjoyable for the next 40 million developers with the release of our Slack Home feature, which naturally acts as an easily accessible Control Plane for all of your team's developer workflows!</p></div><!--kg-card-begin: html--><br><!--kg-card-end: html--><!--kg-card-begin: image--><figure><img src="https://cto.ai/blog/content/images/2020/07/home-tab.png"></figure><!--kg-card-end: image--><!--kg-card-begin: html--><br><!--kg-card-end: html--><!--kg-card-begin: hr--><hr><!--kg-card-end: hr--><div><p>Within the Slack Home, you can quickly navigate the CTO.ai teams which you have joined and easily execute the workflows associated to that team, simply by clicking the Run button and picking the channel that you want to run the workflow in.</p><p>This makes it even easier for DevOps teams and Senior Engineers to build and distribute their developer tools to their entire team by creating a centralized control plane for accessing these often privileged and complex workflows.</p><p>Team management has also become centralized. At a glance, leads can see what teams they have created, what channels are associated to them and who are the members of the teams. You can now add team members from this location as well.</p><p>Soon, we'll also allow you to look at Workflow Events and even Metrics associated to the custom workflows that each team has architected, which represent their deliverables and day to day work, empowering leads with a strong feedback loop.</p></div><!--kg-card-begin: html--><br><!--kg-card-end: html--><!--kg-card-begin: image--><figure><img src="https://cto.ai/blog/content/images/2020/07/home-tab-teams.png"></figure><!--kg-card-end: image--><!--kg-card-begin: html--><br><!--kg-card-end: html--><p>When a developer executes a workflow, the workflow can be then targeted to run in any channel which is associated to the team, giving the same inherit benefits which many of our users are already enjoying with SlackOps, such as; Secrets, Configs, Logs, Events and ultimately the inherent transparency and accessibility of Slack.</p><!--kg-card-begin: html--><br><!--kg-card-end: html--><!--kg-card-begin: image--><figure><img src="https://cto.ai/blog/content/images/2020/07/home-tab-runop.png"></figure><!--kg-card-end: image--><!--kg-card-begin: html--><br><!--kg-card-end: html--><p>Here is a quick video overview of how this new feature works:</p><!--kg-card-begin: embed--><figure><iframe width="480" height="270" src="https://www.youtube.com/embed/8RxGak-Bl3I?feature=oembed" frameborder="0" allow="accelerometer; autoplay; encrypted-media; gyroscope; picture-in-picture" allowfullscreen=""></iframe><figcaption>A demo of the new Slack Home - a control plane for DevOps workflows</figcaption></figure><!--kg-card-end: embed--><p>We're really excited about what this new feature does to unlock the power of DevOps to truly enable Devs to leverage the 10x power of Ops. We believe this is a huge step in the right direction that will enable inclusivity and empowerment of developers on teams all around the world to adopt DevOps in their team.</p><div><p>We’re still just getting started though so if you have any suggestions or questions feel free to reach out to <a><span data-cfemail="592a2c2929362b2d193a2d36773830">[email&nbsp;protected]</span></a>. We are building where collaboration will happen for the next 40 million developers and we can't do it alone.</p><p>Sign up for more information and to get a free demo of our platform today!</p></div><!--kg-card-begin: html--><!--[if lte IE 8]>
+<script charset="utf-8" type="text/javascript" src="//js.hsforms.net/forms/v2-legacy.js"></script>
+<![endif]-->
+
+<!--kg-card-end: html-->
+			</div><!-- .post-content -->
+			<!-- .post-footer -->
+		</article></div>]]>
+            </description>
+            <link>https://cto.ai/blog/slack-control-plane-for-devops-workflows/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-23967015</guid>
+            <pubDate>Mon, 27 Jul 2020 17:04:38 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[The Rise of Synthetic Audio Deepfakes]]>
+            </title>
+            <description>
+<![CDATA[
+Score 177 | Comments 41 (<a href="https://news.ycombinator.com/item?id=23965106">thread link</a>) | @ajay-d
+<br/>
+July 27, 2020 | https://www.nisos.com/white-papers/rise_synthetic_audio_deepfakes | <a href="https://web.archive.org/web/*/https://www.nisos.com/white-papers/rise_synthetic_audio_deepfakes">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+    <div>
+      <h6>
+        
+        
+        
+        
+        
+        6 min read
+        
+      </h6>
+        
+
+        <p><span id="hs_cos_wrapper_post_body" data-hs-cos-general-type="meta_field" data-hs-cos-type="rich_text"><div class="page" title="Page 2">
+<div>
+<div>
+<div>
+<p><strong>Can Audio Deepfakes Really Fake a Human?</strong></p>
+<p>Audio deepfakes are the new frontier for business compromise schemes and are becoming more common pathways for criminals to deceptively gain access to corporate funds. Nisos recently investigated and obtained an original attempted deepfake synthetic audio used in a fraud attempt against a technology company. The deepfake took the form of a voicemail message from the company’s purported CEO, asking an employee to call back to “finalize an urgent business deal.” The recipient immediately thought it suspicious and did not contact the number, instead referring it to their legal department, and as a result the attack was not successful.</p>
+</div>
+</div>
+</div>
+</div>
+<!--more-->
+<p>Nisos investigated the phone number the would-be attacker used and determined it was a VOIP service with no owner registration information. It was likely simply acquired and used as a “burner” for this fraud attempt only. While there was no actual voicemail message associated with the number, we made no attempt for live contact with the owner of the phone number for legal reasons.</p>
+
+<p><strong>Deepfake Audio Analysis</strong></p>
+<p>Nisos analyzed the deepfake voicemail audio recording with an audio spectrogram tool called Spectrum3d. Looking to detect any anomalies, we immediately noticed the highs spiking repeatedly in the spectrogram (see graphic below). We initially suspected the deepfake creator used audio playing over on multiple channels to help mask the voice.</p>
+<p><strong><i><img src="https://www.nisos.com/hs-fs/hubfs/pasted%20image%200%20(7).png?width=351&amp;name=pasted%20image%200%20(7).png" alt="pasted image 0 (7)" width="351" srcset="https://www.nisos.com/hs-fs/hubfs/pasted%20image%200%20(7).png?width=176&amp;name=pasted%20image%200%20(7).png 176w, https://www.nisos.com/hs-fs/hubfs/pasted%20image%200%20(7).png?width=351&amp;name=pasted%20image%200%20(7).png 351w, https://www.nisos.com/hs-fs/hubfs/pasted%20image%200%20(7).png?width=527&amp;name=pasted%20image%200%20(7).png 527w, https://www.nisos.com/hs-fs/hubfs/pasted%20image%200%20(7).png?width=702&amp;name=pasted%20image%200%20(7).png 702w, https://www.nisos.com/hs-fs/hubfs/pasted%20image%200%20(7).png?width=878&amp;name=pasted%20image%200%20(7).png 878w, https://www.nisos.com/hs-fs/hubfs/pasted%20image%200%20(7).png?width=1053&amp;name=pasted%20image%200%20(7).png 1053w" sizes="(max-width: 351px) 100vw, 351px"></i></strong><strong><i>Graphic 1: Spectrogram analysis of the deepfake audio, displaying major inconsistencies in pitch and tone.</i></strong></p>
+<p>We additionally noticed the audio was very choppy and not consistent with a similar human voice recording. When we altered the audio speed and played back at 1.2 speed, the audio then sounded more like a standard text to speech system. Most interesting, when we amplified the sound to detect any background noise we were unable to find any traces, which further indicated this was manipulated audio.</p>
+<p>We then compared the deepfake spectrogram analysis with results of a "normal" human voice on a similar recording. We can immediately see how the pitch and tone is more smoothed out, as well as the ability to detect faint background noise.</p>
+<p><strong><i><img src="https://www.nisos.com/hs-fs/hubfs/unnamed%20(4).png?width=351&amp;name=unnamed%20(4).png" alt="unnamed (4)" width="351" srcset="https://www.nisos.com/hs-fs/hubfs/unnamed%20(4).png?width=176&amp;name=unnamed%20(4).png 176w, https://www.nisos.com/hs-fs/hubfs/unnamed%20(4).png?width=351&amp;name=unnamed%20(4).png 351w, https://www.nisos.com/hs-fs/hubfs/unnamed%20(4).png?width=527&amp;name=unnamed%20(4).png 527w, https://www.nisos.com/hs-fs/hubfs/unnamed%20(4).png?width=702&amp;name=unnamed%20(4).png 702w, https://www.nisos.com/hs-fs/hubfs/unnamed%20(4).png?width=878&amp;name=unnamed%20(4).png 878w, https://www.nisos.com/hs-fs/hubfs/unnamed%20(4).png?width=1053&amp;name=unnamed%20(4).png 1053w" sizes="(max-width: 351px) 100vw, 351px"></i></strong><strong><i>Graphic 2: Spectrogram analysis of ‘normal’ human voice, displaying more consistent pitch and tone.</i></strong></p>
+<p>We were unable to determine the exact software or voice model used to create this deepfake as we would have required access to a large enough sample of the attacker’s other deepfake audio files (we would likely need tens if not hundreds of files, and this assumes the attacker made more than just this one). However, we note several complicating factors an actor would have to overcome to create a more realistic deepfake audio:</p>
+<ol>
+<li>Capturing high quality audio with little to no background noise.</li>
+<li>Staging the call for audio delivering in a realistic scenario (tone of the person talking, background noise and reason for the call) in which the person wouldn’t feel the need to call the person back.&nbsp;</li>
+<li>Finding a way to leave a message, so they can avoid an in-person conversation.</li>
+</ol>
+<p>It is likely the attacker in this scenario above utilized a feature most cell/VOIP service providers offer, which is the ability to bypass the ring option and go straight into the voice mail using the `#` key.</p>
+
+<p><strong>Has This Happened Before?</strong></p>
+<p>The most famous use of deep fake synthetic audio technology in criminal fraud was a September 2019 incident involving a British energy company. The criminals reportedly used voice-mimicking software to imitate the British executive’s speech and trick his subordinate into sending hundreds of thousands of dollars to a secret account.&nbsp;</p>
+<p>The managing director of this company, believing his boss was on the phone, followed orders to wire more than $240,000 to an account in Hungary.<sup>1</sup></p>
+<p>Symantec security researchers reported in February on three cases of audio deepfakes used against private companies by impersonating the voice of the business’s CEO.<sup>2 </sup>The criminals reportedly trained machine learning engines from audio obtained on conference calls, YouTube, social media updates and even TED talks, to copy the voice patterns of company bosses.&nbsp;</p>
+<p>They created audio deepfakes replicating the CEO’s voice and called senior members of the finance department to ask for funds to be sent urgently. There was no additional reporting on which companies these were, whether the techniques were successful, or whether Symantec was able to obtain recordings of the deepfakes themselves.</p>
+<p>Without actual digital capture of the audio, and additional forensics analysis, it is unclear whether these attempts were in fact deepfake synthetic manipulated audio. Regardless, the ability to generate synthetic audio extends an e-criminal’s toolkit and the criminal at the end of the day still has to effectively use social engineering tactics to induce someone into taking an action.&nbsp;</p>
+<p>Criminals and potentially broader nation state actors also learn from each other, so as these high-profile cases gain more notoriety and success, we anticipate more illicit actors trying them and learning from others who have paved the way.</p>
+<p>Additionally, as deepfakes become easier to create or purchase, and the quality of synthetic manipulation -both audio (and video)- increases, we anticipate wider deployment of these e-crime exploits. If a fraud operation requires the use of a completely fake doctored video or audio for maximum impact, and it is worth the money and resources, it will be used. However, Nisos researchers have not seen the ability to easily outsource this type of deepfake for single individual or mass production.</p>
+<p>Our researchers have contact with a few deepfake channels where we asked about this type of attack vector and participants were unsure something like this would be possible in the near future. The central issue with audio deepfakes has to do with capturing not only the person’s tone but also specific speech mannerisms. Future scenarios will likely materialize, however, where tools similar to a Yandex reverse image search (but for voice) could be used to gather numerous samples and then build and train a model that could help convert the source voice into the target voice.</p>
+
+<p><strong>What Can Be Done?</strong></p>
+<p>The most immediate action an employee can take, if they sense something suspicious in a voicemail (or any audio) instruction, is to call the person back directly using a known number and get them on the line.&nbsp;</p>
+<p>Deepfake technology is not sophisticated enough to mimic an entire phone call with someone. Additionally, the company can exercise a series of ‘challenge questions’ using information that is not publicly known or conversation points that an actor could not readily answer, to vet the identity of the individual on the line.</p>
+<p>This fraud scheme is a form of a business email compromise (a more sophisticated and AI-developed version) where typically the attacker will pretend to be a senior executive at a company and get a more susceptible ‘lower-level’ employee to send money to a bank account.&nbsp;</p>
+<p>We would anticipate a deepfake audio would be the first step in a series of social engineering attempts to get an employee to wire money to a specific location. Phishing emails, additional phone calls, or even deepfake videos purporting to authorize an action could be used in furtherance of the criminal scheme.&nbsp;&nbsp;</p>
+<p>Deepfake audio may also be used for reasons ancillary to the ones listed above. For example, criminals can leave fake messages instructing employees to provide network or physical access to the company, allowing attackers to easily compromise the network or physical assets of the company.</p>
+<p>The availability of this nascent but rapidly-emerging technology emphasizes the criticality with which companies must develop security practices that encompass these measures. Any time an unusual incident occurs, and certainly when large financial transactions are involved, employees should be trained to ask challenge questions to senior executives.</p>
+
+<p>Research featured in <a href="https://www.vice.com/en_us/article/pkyqvb/deepfake-audio-impersonating-ceo-fraud-attempt" rel=" noopener">Vice Article</a><span> by </span><a href="https://www.vice.com/en_us/contributor/lorenzo-franceschi-bicchierai">Lorenzo Franceschi-Bicchierai.</a></p>
+<p>Twitter Handle: Rob Volkert <a href="https://twitter.com/DiligenceWatch" rel=" noopener"><span>@DiligenceWatch</span></a></p>
+<hr>
+<p><em>1. <a href="https://www.washingtonpost.com/technology/2019/09/04/an-artificial-intelligence-first-voice-mimicking-software-reportedly-used-major-theft/" rel=" noopener">https://www.washingtonpost.com/technology/2019/09/04/an-artificial-intelligence-first-voice-mimicking-software-reportedly-used-major-theft/</a></em></p>
+<p><em>2. <a href="https://www.icaew.com/insights/features/2020/feb-2020/the-rise-of-deepfake-audio-fraud" rel=" noopener">https://www.icaew.com/insights/features/2020/feb-2020/the-rise-of-deepfake-audio-fraud</a></em></p>
+</span>
+        </p>
+        
+            
+        
+
+        
+        
+        
+    </div>
+</div></div>]]>
+            </description>
+            <link>https://www.nisos.com/white-papers/rise_synthetic_audio_deepfakes</link>
+            <guid isPermaLink="false">hacker-news-small-sites-23965106</guid>
+            <pubDate>Mon, 27 Jul 2020 13:55:32 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[It’s easier to manage four people than one person]]>
+            </title>
+            <description>
+<![CDATA[
+Score 247 | Comments 86 (<a href="https://news.ycombinator.com/item?id=23964905">thread link</a>) | @chesterarthur
+<br/>
+July 27, 2020 | https://staysaasy.com/management/2020/07/24/Managing-One-Person.html | <a href="https://web.archive.org/web/*/https://staysaasy.com/management/2020/07/24/Managing-One-Person.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+    <p>It’s easier to manage 4 people than it is to manage one person. The primary reason for this is the inherent over-reliance in the relationship between a manager and a single report. Let’s dive deeper.</p>
+
+<p>It’s not uncommon for a first-time manager to get a single direct report. Try it out. See how it goes. Here’s what this ends up looking like:</p>
+<ul>
+  <li>The new manager is over-reliant on making sure their single report likes them and is doing well. If they give feedback that their manager stinks, that’s 100% bad feedback from your reports. If the report doesn’t do well, that’s 100% of your reports that aren’t succeeding.* If the report quits, you just lost your whole team.</li>
+  <li>The manager’s over-reliance on the direct report’s success and happiness leads to risk-averse behavior, like not giving critical feedback or overcompensating. It also regularly leads to micromanagement.</li>
+  <li>The single report is isolated. They don’t have any peers on the team to reach out to for help. If their manager is bad, they don’t have any corroborating voices. Anything that goes wrong is a they-said I-said debate. Any debate inside of the team is a faceoff with your manager.</li>
+  <li>No one in this relationship has the ability to get context. With more reports, a manager gets clearer signals when they’re wrong. A report could look to teammates to corroborate or dissuade their ideas. With one report, disagreements have little additional evidence, so people have to either approach the situation with a supreme lack of ego, or they can just assume it’s the other person’s fault. Guess which option happens most.</li>
+</ul>
+
+<p>To further the problematic conditions, the single report will often be a very junior hire. This compounds the issue. Straight-from-college hires don’t have great context for what it means to be in industry, to have a manager, to work a job with no end-of-semester in sight. And hires aren’t expected to have as much autonomy in their formative early years. With these variables, the requirements on the manager are higher than average.</p>
+
+<p>It’s not uncommon for these relationships to turn sour. The manager makes mistakes as they always do. The report makes mistakes as they always do. Fingers are pointed. Times are dire. If you ever hear someone call their manager a “first-time manager”, you know the relationship has reached a special level of hell.</p>
+
+<p>To avoid this situation, consider doing the following:</p>
+<ul>
+  <li>Avoid having first time managers have a team of 1 individual contributor for a prolonged amount of time. That team size is an <a href="https://staysaasy.com/management/2020/06/21/goldilocks-management-structure.html">anti-pattern</a> for more reasons than just this one.</li>
+  <li>Try and make sure the manager of a team with 1 individual contributor is also an expert in the domain area. Sometimes managers are explicitly not the domain expert by design, but when you have 1 report, a lack of domain expertise is one of the sure-fire ways to make mistakes and a sure-fire way for your report to get the idea that you’re no good.</li>
+  <li>Avoid at all costs the combination of: new manager, 1 report, report is new-to-industry, manager is not a subject-matter expert.</li>
+</ul>
+
+<p>* Note: mangers should be very invested in their report’s success. But when the manager is <em>over-invested</em> it leads to all sorts of unsavory things, some of which are called out above. Another example is when a report is doing well-enough, but because the manager is <em>over-reliant</em> on their performance, they try to push the report beyond what they can or want to do.</p>
+
+
+    
+
+
+
+
+  </div></div>]]>
+            </description>
+            <link>https://staysaasy.com/management/2020/07/24/Managing-One-Person.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-23964905</guid>
+            <pubDate>Mon, 27 Jul 2020 13:34:43 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Double Entry Accounting for Developers]]>
+            </title>
+            <description>
+<![CDATA[
+Score 288 | Comments 140 (<a href="https://news.ycombinator.com/item?id=23964513">thread link</a>) | @adamcharnock
+<br/>
+July 27, 2020 | https://django-hordak.readthedocs.io/en/latest/accounting-for-developers.html | <a href="https://web.archive.org/web/*/https://django-hordak.readthedocs.io/en/latest/accounting-for-developers.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div role="main" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+            
+  <div id="double-entry-accounting-for-developers">
+
+<p>Hordak is inherently aimed at software developers as it provides core
+functionality only. Friendly interfaces can certainly be built on top of it, but
+if you are here there is a good chance you are a developer.</p>
+<p>If you are learning about accounting as developer you may feel – as I did – that
+most of the material available doesn’t quite relate to the developer/STEM mindset. I
+therefore provide some resources here that may be of use.</p>
+<div>
+<p>Note</p>
+<p>According to this <a href="https://news.ycombinator.com/item?id=23964513">Hacker News discussion</a>, some of what follows may be either incorrect
+or abhorrent to those with a good knowledge of accounting practices. I still
+feel the following is useful, and that taken as a whole it describes a working
+double entry accounting system.</p>
+</div>
+
+<div id="in-a-little-more-detail">
+<h2>In a little more detail<a href="#in-a-little-more-detail" title="Permalink to this headline">¶</a></h2>
+<p>I found <a href="http://www.mathstat.dal.ca/~selinger/accounting/tutorial.html">Peter Selinger’s tutorial</a> to be very enlightening and is less terse than the functional description above.
+The first section is short and covers single entry accounting, and then shows how one can expand that to create double
+entry accounting. I found this background useful.</p>
+</div>
+<div id="examples">
+<h2>Examples<a href="#examples" title="Permalink to this headline">¶</a></h2>
+<p>You live in a shared house. Everyone pays their share into a communal bank account
+every month.</p>
+<div id="example-1-saving-money-to-pay-a-bill-no-sign-flipping">
+<h3>Example 1: Saving money to pay a bill (no sign flipping)<a href="#example-1-saving-money-to-pay-a-bill-no-sign-flipping" title="Permalink to this headline">¶</a></h3>
+<p>You pay the electricity bill every three months. Therefore every month you take £100
+from everyone’s contributions and put it into Electricity Payable account (a liability
+account) in the knowledge that you will pay the bill from this account when it eventually arrives:</p>
+<p>These accounts are income &amp; liability accounts, so neither balance needs to be flipped (flipping
+only applies to asset &amp; expense accounts). Therefore:</p>
+<ul>
+<li>Balances before:<ul>
+<li><em>Housemate Contribution</em> (income): £500</li>
+<li><em>Electricity Payable</em> (liability): £0</li>
+</ul>
+</li>
+<li><strong>Transaction</strong>:<ul>
+<li>£100 from <em>Housemate Contribution</em> to <em>Electricity Payable</em></li>
+</ul>
+</li>
+<li>Balances after:<ul>
+<li><em>Housemate Contribution</em> (income): £400</li>
+<li><em>Electricity Payable</em> (liability): £100</li>
+</ul>
+</li>
+</ul>
+<p>This should also make intuitive sense. Some of the housemate contributions will be used to pay the electricity
+bill, therefore the former decreases and the latter increases.</p>
+</div>
+<div id="example-2-saving-money-to-pay-a-bill-with-sign-flipping">
+<h3>Example 2: Saving money to pay a bill (with sign flipping)<a href="#example-2-saving-money-to-pay-a-bill-with-sign-flipping" title="Permalink to this headline">¶</a></h3>
+<p>At the start of every month each housemate pays into the communal bank account. We
+should therefore represent this somehow in our double entry system (something we ignored in
+example 1).</p>
+<p>We have an account called <em>Bank</em> which is an asset account (because this is money
+we actually have). We also have a <em>Housemate Contribution</em> account which is an
+income account.</p>
+<p>Therefore, <strong>to represent the fact that we have been paid money, we must create a transaction</strong>.
+However, money cannot be injected from outside our double entry system, so how do we deal with this?</p>
+<p>Let’s show how we represent a single housemate’s payment:</p>
+<ul>
+<li>Balances before:<ul>
+<li><em>Bank</em> (asset): £0</li>
+<li><em>Housemate Contribution</em> (income): £0</li>
+</ul>
+</li>
+<li><strong>Transaction:</strong><ul>
+<li>£500 from <em>Bank</em> to <em>Housemate Contribution</em></li>
+</ul>
+</li>
+<li>Balances after:<ul>
+<li><em>Bank</em> (asset): -£500 * -1 = <strong>£500</strong></li>
+<li><em>Housemate Contribution</em>  (income): £500</li>
+</ul>
+</li>
+</ul>
+<p>Because the bank account is an asset account, we flip the sign of its balance.
+<strong>The result is that both accounts increase in value.</strong></p>
+</div>
+</div>
+</div>
+
+
+           </div>
+           
+          </div></div>]]>
+            </description>
+            <link>https://django-hordak.readthedocs.io/en/latest/accounting-for-developers.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-23964513</guid>
+            <pubDate>Mon, 27 Jul 2020 12:41:34 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Procedural cityscapes creation: Openstreetmap import in Unity and Houdini Engine]]>
+            </title>
+            <description>
+<![CDATA[
+Score 65 | Comments 13 (<a href="https://news.ycombinator.com/item?id=23964079">thread link</a>) | @liotier
+<br/>
+July 27, 2020 | http://stinaflodstrom.com/projects/osm/osm.html | <a href="https://web.archive.org/web/*/http://stinaflodstrom.com/projects/osm/osm.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div class="page">
+
+                  <div><p>
+
+                  I set up a procedural content creation pipeline that imports <a href="http://stinaflodstrom.com/projects/osm/www.openstreetmap.org">OpenStreetMap</a> data into Unity and uses the Houdini Engine to create realistic cityscapes based on real world locations. The goal was to have an as automated process as possible for generating environments based on real cities. The buildings and the roads are generated from OSM building shapes and road splines using a procedural system for building type and prop placing. Traffic lights, Crossings and Trees also get their positions from OSM. Values and procedural parameters can be tweaked in Unity making it possible to create endless variations.
+
+                  </p><p>The project was developed with the simulation team in one of the bigger automotive companies as a proof of concept for creating syntetic data for AI and render out annotated images. The environmant is complete with tags for segmentation. 
+
+                </p></div>
+
+            </div></div>]]>
+            </description>
+            <link>http://stinaflodstrom.com/projects/osm/osm.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-23964079</guid>
+            <pubDate>Mon, 27 Jul 2020 11:31:22 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[GnuTLS audit: passive cleartext recovery attack]]>
             </title>
             <description>
 <![CDATA[
-Score 69 | Comments 14 (<a href="https://news.ycombinator.com/item?id=23962840">thread link</a>) | @masklinn
+Score 146 | Comments 25 (<a href="https://news.ycombinator.com/item?id=23962840">thread link</a>) | @masklinn
 <br/>
 July 27, 2020 | https://anarc.at/blog/2020-06-10-gnutls-audit/ | <a href="https://web.archive.org/web/*/https://anarc.at/blog/2020-06-10-gnutls-audit/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content">
@@ -277,11 +1628,45 @@ away from GnuTLS and instead think of other TLS libraries like
         </item>
         <item>
             <title>
+<![CDATA[Ted Williams's Strike Zone]]>
+            </title>
+            <description>
+<![CDATA[
+Score 153 | Comments 59 (<a href="https://news.ycombinator.com/item?id=23962339">thread link</a>) | @dedalus
+<br/>
+July 26, 2020 | http://tedwilliams.com/_data/hzone.htm | <a href="https://web.archive.org/web/*/http://tedwilliams.com/_data/hzone.htm">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div height="31" rowspan="3"> 
+	  <p><span color="#51504E">&nbsp;&nbsp;&nbsp;My 
+		first rule of hitting was to get a good ball to hit. I learned down to 
+		percentage points where those good balls were. The box shows my particular 
+		preferences, from what I considered my “happy zone” - where I could hit 
+		.400 or better - to the low outside corner - where the most I could hope 
+		to bat was .230. Only when the situation demands it should a hitter go 
+		for the low-percentage pitch.<p>
+		
+		&nbsp;&nbsp;&nbsp;Since some players are better high-ball hitters than 
+		low-ball hitters, or better outside than in; each batter should work out 
+		his own set of percentages. But more important, each should learn the 
+		strike zone, because once pitchers find a batter is going to swing at 
+		bad pitches he will get nothing else. The strike zone is approximately 
+		seven balls wide (allowing for pitches on the corners). When a batter 
+		starts swinging at pitches just two inches out of that zone (shaded area), 
+		he has increased the pitcher’s target from approximately 4.2 square feet 
+		to about 5.8 square feet - an increase of 37 percent. Allow a pitcher 
+		that much of an advantage and you will be a .250 hitter.</p></span></p>
+	</div></div>]]>
+            </description>
+            <link>http://tedwilliams.com/_data/hzone.htm</link>
+            <guid isPermaLink="false">hacker-news-small-sites-23962339</guid>
+            <pubDate>Mon, 27 Jul 2020 04:56:39 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[ACCC alleges Google misled consumers about expanded use of personal data]]>
             </title>
             <description>
 <![CDATA[
-Score 265 | Comments 58 (<a href="https://news.ycombinator.com/item?id=23961881">thread link</a>) | @Khaine
+Score 370 | Comments 78 (<a href="https://news.ycombinator.com/item?id=23961881">thread link</a>) | @Khaine
 <br/>
 July 26, 2020 | https://www.accc.gov.au/media-release/accc-alleges-google-misled-consumers-about-expanded-use-of-personal-data | <a href="https://web.archive.org/web/*/https://www.accc.gov.au/media-release/accc-alleges-google-misled-consumers-about-expanded-use-of-personal-data">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><div property="content:encoded"><p><em>Correction: An earlier version of this media release used a hypothetical example that suggested that Google used information about users’ health to personalise or target advertisements. Google says that it does not show personalised ads based on health information. This example has been removed from the media release.</em></p>
@@ -401,7 +1786,7 @@ July 26, 2020 | https://www.accc.gov.au/media-release/accc-alleges-google-misled
             </title>
             <description>
 <![CDATA[
-Score 61 | Comments 20 (<a href="https://news.ycombinator.com/item?id=23961343">thread link</a>) | @vinnyglennon
+Score 73 | Comments 24 (<a href="https://news.ycombinator.com/item?id=23961343">thread link</a>) | @vinnyglennon
 <br/>
 July 26, 2020 | https://organizeyourfamilyhistory.com/reading-hard-read-gravestones/ | <a href="https://web.archive.org/web/*/https://organizeyourfamilyhistory.com/reading-hard-read-gravestones/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
@@ -416,7 +1801,7 @@ July 26, 2020 | https://organizeyourfamilyhistory.com/reading-hard-read-gravesto
             </title>
             <description>
 <![CDATA[
-Score 85 | Comments 42 (<a href="https://news.ycombinator.com/item?id=23961036">thread link</a>) | @breck
+Score 142 | Comments 136 (<a href="https://news.ycombinator.com/item?id=23961036">thread link</a>) | @breck
 <br/>
 July 26, 2020 | http://sabercapitalmgt.com/wp-content/uploads/2019/12/BuffettRaikesemails.pdf | <a href="https://web.archive.org/web/*/http://sabercapitalmgt.com/wp-content/uploads/2019/12/BuffettRaikesemails.pdf">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -431,7 +1816,7 @@ July 26, 2020 | http://sabercapitalmgt.com/wp-content/uploads/2019/12/BuffettRai
             </title>
             <description>
 <![CDATA[
-Score 146 | Comments 59 (<a href="https://news.ycombinator.com/item?id=23960735">thread link</a>) | @fortran77
+Score 214 | Comments 86 (<a href="https://news.ycombinator.com/item?id=23960735">thread link</a>) | @fortran77
 <br/>
 July 26, 2020 | https://www.puzzlemuseum.com/puzzles/amb/eng_botts/harry-eng.htm | <a href="https://web.archive.org/web/*/https://www.puzzlemuseum.com/puzzles/amb/eng_botts/harry-eng.htm">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div width="780">
@@ -502,7 +1887,7 @@ July 26, 2020 | https://www.puzzlemuseum.com/puzzles/amb/eng_botts/harry-eng.htm
             </title>
             <description>
 <![CDATA[
-Score 346 | Comments 133 (<a href="https://news.ycombinator.com/item?id=23958599">thread link</a>) | @ebcase
+Score 398 | Comments 161 (<a href="https://news.ycombinator.com/item?id=23958599">thread link</a>) | @ebcase
 <br/>
 July 26, 2020 | https://bridge.grumpy-troll.org/2020/07/small-mailserver-bcp/ | <a href="https://web.archive.org/web/*/https://bridge.grumpy-troll.org/2020/07/small-mailserver-bcp/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -739,7 +2124,7 @@ production setup; this will likely change.</li>
             </title>
             <description>
 <![CDATA[
-Score 59 | Comments 74 (<a href="https://news.ycombinator.com/item?id=23957663">thread link</a>) | @nurettin
+Score 63 | Comments 86 (<a href="https://news.ycombinator.com/item?id=23957663">thread link</a>) | @nurettin
 <br/>
 July 26, 2020 | https://quanttype.net/posts/2020-07-26-signing-jars-is-worthless.html | <a href="https://web.archive.org/web/*/https://quanttype.net/posts/2020-07-26-signing-jars-is-worthless.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -808,7 +2193,7 @@ from y’all about how you do, in fact, systematically verify the signatures.</p
             </title>
             <description>
 <![CDATA[
-Score 227 | Comments 96 (<a href="https://news.ycombinator.com/item?id=23957325">thread link</a>) | @danyspin97
+Score 239 | Comments 116 (<a href="https://news.ycombinator.com/item?id=23957325">thread link</a>) | @danyspin97
 <br/>
 July 26, 2020 | https://danyspin97.org/blog/colorize-your-cli/ | <a href="https://web.archive.org/web/*/https://danyspin97.org/blog/colorize-your-cli/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
@@ -823,7 +2208,7 @@ July 26, 2020 | https://danyspin97.org/blog/colorize-your-cli/ | <a href="https:
             </title>
             <description>
 <![CDATA[
-Score 213 | Comments 233 (<a href="https://news.ycombinator.com/item?id=23957278">thread link</a>) | @rbanffy
+Score 236 | Comments 281 (<a href="https://news.ycombinator.com/item?id=23957278">thread link</a>) | @rbanffy
 <br/>
 July 26, 2020 | https://www.seanblanda.com/our-remote-work-future-is-going-to-suck/ | <a href="https://web.archive.org/web/*/https://www.seanblanda.com/our-remote-work-future-is-going-to-suck/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -868,7 +2253,7 @@ July 26, 2020 | https://www.seanblanda.com/our-remote-work-future-is-going-to-su
             </title>
             <description>
 <![CDATA[
-Score 166 | Comments 9 (<a href="https://news.ycombinator.com/item?id=23956771">thread link</a>) | @uptown
+Score 172 | Comments 9 (<a href="https://news.ycombinator.com/item?id=23956771">thread link</a>) | @uptown
 <br/>
 July 26, 2020 | https://www.spacecamera.co/articles/2020/3/3/gene-cernans-missing-lunar-surface-camera | <a href="https://web.archive.org/web/*/https://www.spacecamera.co/articles/2020/3/3/gene-cernans-missing-lunar-surface-camera">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-nc-base="header" data-controller="AncillaryLayout">
@@ -1144,7 +2529,7 @@ July 26, 2020 | https://www.spacecamera.co/articles/2020/3/3/gene-cernans-missin
             </title>
             <description>
 <![CDATA[
-Score 231 | Comments 287 (<a href="https://news.ycombinator.com/item?id=23956671">thread link</a>) | @oaf357
+Score 239 | Comments 305 (<a href="https://news.ycombinator.com/item?id=23956671">thread link</a>) | @oaf357
 <br/>
 July 26, 2020 | https://chrisshort.net/the-aws-bill-heard-around-the-world/ | <a href="https://web.archive.org/web/*/https://chrisshort.net/the-aws-bill-heard-around-the-world/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div role="main"><div><div><article role="main"><h2 id="scene">Scene</h2><p>It was a bright, Saturday morning, July 4, 2020. I had just gotten Max all situated with breakfast and cartoons (Mighty Mike, if you’re curious). Julie was sleeping in like she usually does on every day I have off. I’m an early riser and this is a cherished part of our co-parenting. It gives Max and I time to bond (when he’s not stuffing his face and laughing at cartoons). I sat down with my laptop to plow through the week’s personal email.</p><h3 id="the-e-mail">The e-mail</h3><p>“Oh look, the AWS bill, I should have a laugh at that,” I thought to myself. Until recently, it had been pennies a month for some very light SES usage. In February, I moved off Google Cloud back to AWS. The primary motivation was that Google had so intertwined GSuite and GCP IAM that it became overly confusing.</p><p>Along with that migration came the CDN for this web site (cdn.chrisshort.net). I mean <a href="https://chrisshort.net/low-cost-content-delivery-network-cdn/">a Cloudflare fronted S3 bucket that holds assets deemed too big for git</a> when I say CDN. It’s not even <a href="https://chrisshort.net/">chrisshort.net</a> itself, as it is hosted on Netlify’s CDN and every other static site I own or manage. I’ve been a Cloudflare user for a long time. The CDN is less than 300 files and has existed for over five years on various clouds. Moving it back to AWS from GCP bumped the AWS bill to an average of $23/month. Not too bad given the <a href="https://app.usefathom.com/share/suwvjwwc/chrisshort.net">site’s traffic</a>.</p><h3 id="the-shock">The shock</h3><p>Not on this Saturday morning, nope. June 2020’s AWS bill was a heart palpitation causing <strong>$2,657.68</strong> (<a href="https://chrisshort.net/the-aws-bill-heard-around-the-world/invoice498711077_redacted.jpg">JPG</a>). I audibly gasped, “Keep your shit together.” I thought to myself. Max was leaned up against me drinking his milk. I know he could tell something was wrong because he looked at the laptop screen. I only assume when he saw letters and numbers, he thought, “Adult stuff… These cartoons and this Cinnamon Toast Crunch tho.” 2020 being the year that it is and my military history being what it is, I’ve been diagnosed with a panic disorder (on top of the PTSD and physical injuries).</p><h3 id="the-panic">The panic</h3><blockquote data-dnt="true"><div lang="en" dir="ltr"><p>Good morning, $2700 AWS bill!</p><p>Holy shit...</p></div>— Chris Short (@ChrisShort) <a href="https://twitter.com/ChrisShort/status/1279406322837082114?ref_src=twsrc%5Etfw">July 4, 2020</a></blockquote><p>I immediately began having a panic attack. As I took the mental steps to mitigate the onset of the panic attack, I started forming a battle plan. Yes, I can switch back to emergency mode, like back in the old days, when something would go bang or boom, and I’d run towards it (it’s not helpful overall, trust me).</p><p>First, Max: Maslow’s Hierarchy of Needs? Check.<br>Next, me: As if it was destined, my alert for morning medications went off.</p><p>“Daddy’s gotta grab his meds, bud.” Instinctively, Max leans off me (wow… okay… he’s used to hearing that reminder and statement shortly after that; my brain is now in overdrive). I take everything I need to conquer this while still being able to function cognitively. I refill my coffee and grab a laptop charger.</p><h2 id="incident-response">Incident response</h2><p>Check the source of truth.</p><p>What’s diverged?</p><p>How do we get things back to normal?</p><p>I login to the AWS console, hoping I got some output that was uniquely off this month. Weirder stuff has happened (like <a href="https://aws.amazon.com/message/41926/">S3 going down</a>). This bill couldn’t be more out of the norm than ever. This AWS bill is several hundred dollars more than our mortgage! I hit the AWS Billing page and am deeply saddened by what I see:</p><p><img src="https://d33wubrfki0l68.cloudfront.net/1f2dd17bc5d8e1407c22b84f7f981a7ad9888eba/8e235/the-aws-bill-heard-around-the-world/aws-bill-landing-page.png" alt="AWS Billing landing page showing a $2,657.68 balance"></p><p>There it was. <strong>$2,657.68</strong>, staring at me. “This can’t be legit.” Drilling down even further, it looks like it is indeed legitimate traffic from the cdn.chrisshort.net S3 bucket in us-east-2. In total, <strong>more than 30.6 terabytes of traffic</strong> had moved out of that one S3 bucket. WHEN?!? Did this just happen? Nope.</p><p><img src="https://d33wubrfki0l68.cloudfront.net/3373f05e910b0938aeed4a2975b4b4f48922fdc0/2e223/the-aws-bill-heard-around-the-world/aws-june-2020-data-transfer.png" alt="AWS data transfer billing break down"></p><p><img src="https://d33wubrfki0l68.cloudfront.net/46294144a86a5d64df074d306386b3024b7d882a/af2d6/the-aws-bill-heard-around-the-world/june-23-24-2020-s3-breakdown.png" alt="S3 Activity"></p><p><strong>30.6 TB?!?!</strong> how is that even possible???<br>$1,011.59 on 23 June 2020.<br>$1,639.07 on 24 June 2020.</p><p>I immediately open a ticket with AWS Support frantically wondering what broke? How is this even possible? Did someone bypass Cloudflare? What the hell is Cloudflare saying?</p><p><img src="https://d33wubrfki0l68.cloudfront.net/6cd3322753f262dc51bbca44a07fef6b19b381e9/52aec/the-aws-bill-heard-around-the-world/cloudflare_june_22_2020.png" alt="Cloudflare 22 June 2020"><br>Oh cool, Cloudflare let those 2,700 requests passthrough completely uncached? How is that not anomaly detected as a DDoS??? How is it that barely a fraction of the traffic is cached (more on that later)?</p><p><img src="https://d33wubrfki0l68.cloudfront.net/a0f7d1526c44cb74baba13f749f3d5a886bbdadb/6d2b1/the-aws-bill-heard-around-the-world/cloudflare_june_23_2020.png" alt="Cloudflare 23 June 2020"><br>Oh, another 4,400 requests the next day… Sweet, baby Jesus. Oh, but you served 9 GB from cache. Thanks, Cloudflare.</p><h2 id="help-arrives">Help Arrives</h2><p>Apparently, when you tweet something crazy af, like a $2700 AWS bill, it gets a lot of attention on a quiet holiday morning. A quarter-million people saw the tweet and a third of them interacted with it. It was enough attention that the AWS Support Twitter account was on it before, <a href="https://twitter.com/QuinnyPig/status/1186319925901586432">my friend</a> and <a href="https://www.duckbillgroup.com/">cloud economist</a>, Corey Quinn.</p><blockquote data-dnt="true"><p lang="en" dir="ltr">Oh no! 😰 Sorry to hear about this unpleasant Saturday morning surprise, Chris. Please create a support case so our agents can help get to the bottom of this: <a href="https://t.co/weTUnSYLRU">https://t.co/weTUnSYLRU</a>. 🕵️‍♀️ ^HG</p>— AWS Support (@AWSSupport) <a href="https://twitter.com/AWSSupport/status/1279424879566163970?ref_src=twsrc%5Etfw">July 4, 2020</a></blockquote><br>Praise Twitter for at least its ability to draw attention to things. I am not sure this would’ve ended up as well as it did without it.<blockquote data-dnt="true"><p lang="und" dir="ltr"><a href="https://t.co/tUrNnXqWMY">pic.twitter.com/tUrNnXqWMY</a></p>— HydroxyCoreyQuinn (@QuinnyPig) <a href="https://twitter.com/QuinnyPig/status/1279446759664611329?ref_src=twsrc%5Etfw">July 4, 2020</a></blockquote><br>I forwarded the bill to Corey almost immediately after seeing it at pre-dawn west coast time. I am forever thankful to Corey for his analysis. When he was ready, Corey sent me a list of things he needed to do an analysis (instead, I created him a regular IAM account with the proper perms 😉 and yes I cleaned up after).<p>Corey encouraged me to apply a bucket policy that would only allow Cloudflare IP addresses to access anything from the bucket. The theory here is that someone could have been bypassing Cloudflare somehow. But, thankfully, <a href="https://www.cloudflare.com/ips/">Cloudflare publishes their IP blocks</a> and they don’t change all that often. The Cloudflare support article, <a href="https://support.cloudflare.com/hc/en-us/articles/360037983412-Configuring-an-Amazon-Web-Services-static-site-to-use-Cloudflare#77nNxWyQf69T1a78gPlCi9">Configuring an Amazon Web Services static site to use Cloudflare</a> gives you an example bucket policy to do exactly that. This should become a standard practice for folks. However, it wouldn’t have mattered in this case; more on that later.</p><p>Corey Quinn’s thread on the topic covers what happened on the AWS side pretty well:</p><blockquote data-dnt="true"><p lang="en" dir="ltr">That's right--it's threading time!<a href="https://twitter.com/ChrisShort?ref_src=twsrc%5Etfw">@chrisshort</a>'s surprise <a href="https://twitter.com/awscloud?ref_src=twsrc%5Etfw">@awscloud</a> bill of $2700 looks S3 driven... <a href="https://t.co/VnXufn24iA">https://t.co/VnXufn24iA</a> <a href="https://t.co/tKLWv5rHtW">pic.twitter.com/tKLWv5rHtW</a></p>— HydroxyCoreyQuinn (@QuinnyPig) <a href="https://twitter.com/QuinnyPig/status/1280280727133642753?ref_src=twsrc%5Etfw">July 6, 2020</a></blockquote><ul><li>”…it’s almost entirely due to us-east-2 data transfer out…”</li><li>“Now, what caused this? Nobody knows!”</li><li>“Chris Short isn’t some random fool…” (Might be the nicest thing Corey’s every said about anyone he’s not related to)</li><li>”‘Surprise jackhole, your mortgage isn’t your most expensive bill this month, guess you shoulda enabled billing alarms!’ is crappy, broken, and WOULD NOT HAVE SOLVED THE PROBLEM!”</li><li><a href="https://twitter.com/QuinnyPig/status/1280289410844471296?s=20">“I want to be explicitly clear here: Chris Short didn’t do anything wrong!”</a></li></ul><h2 id="but-wait-there-s-more">But wait! There’s more!</h2><p>I had tickets in with Cloudflare (1918916) and AWS (7153956931). Cloudflare was the least helpful service I could have imagined given the circumstances. A long term user and on and off customer thinks they were attacked for two days and you don’t lift a finger? If I didn’t have reason enough to move off of Cloudflare, I do now. That’ll be an update for a later blog post. But, if you work for a CDN company and you’re relatively painless to get up and running, I’m interested in hearing from you.</p><p>After a very chaotic morning, I take Corey’s advice, disconnect, and enjoy the holiday weekend.</p><h2 id="more-help-arrives">More Help Arrives</h2><p>On July 8th, an astute AWS employee starts doing some digging around and reaches out to me. Because they see this as bafflingly as Corey and I do. How did so few requests generate so much traffic so quickly and then as soon as it appears, it’s gone again? It doesn’t seem like something intentionally malicious either because Cloudflare and AWS let it right on through.</p><h3 id="here-s-the-theory">Here’s the theory</h3><p>In hindsight, I made a poor decision to distribute a trial Windows 2019 SQL Server virtual machine images (fully patched with all necessary drivers and VM extensions) in the form of a qcow2 file. Someone became aware of the existence of this VM image. They then stood up hundreds, potentially thousands, of copies this VM using the internet accessible URL. This is, in theory, possible, with something like <a href="https://chrisshort.net/tags/kubernetes/">Kubernetes</a> and <a href="https://kubevirt.io/">Kubevirt</a>. Given that the disk image becomes a volume mount in the corresponding VMs pod. Spin up enough copies of the VM, a single YAML file can create infinite copies of a VM. If the YAML definition directly referenced the Cloudflare or S3 URL and not a locally cached copy, you can rack up the number of times you pull down an image real quick. The qcow2 image, in this case, was 13.7 GB. But it’s trickier than that.</p><h3 id="the-sharp-edge-of-the-cloud">The sharp edge of the cloud</h3><p>File this under, “Things I should’ve known but didn’t.” Did you know that “The maximum file size Cloudflare’s CDN caches <a href="https://support.cloudflare.com/hc/en-us/articles/200172516-Understanding-Cloudflare-s-CDN#:~:text=The%20maximum%20file%20size%20Cloudflare's,request%20caching%20of%20larger%20files."><strong>is 512MB</strong></a> for Free, Pro, and Business customers and 5GB for Enterprise customers.” That’s right, Cloudflare saw requests for a 13.7 GB file and sent them straight to origin every time <em>BY DESIGN</em>. <strong>Ouch!</strong></p><p>I suspected these files immediately on July 4 and moved them to an internal work GDrive for the time being. If you need the images, let me know, you’re also a suspect if you ask for them, be warned.</p><p>If you’re sitting at home doing the math, something might not be adding up. The bandwidth cost is off, there was indeed some legitimate traffic to the bucket in June, of course, But, as it turns out the intrepid AWS employee discovered that 3655 partial GETs to the object might have actually been delivered as full file requests and Cloudflare might have ever done anything with them. Yes, this is a bug somewhere and folks are looking into it. I also suggested that object size limits be a tunable S3 bucket policy. This way, I wouldn’t have even been able to upload the files to the bucket, to begin with.</p><h2 id="the-resolution">The Resolution</h2><p>As I mentioned, I’ve removed the multiple gigabyte files from the bucket the day I got the bill (July 4). <a href="https://twitter.com/QuinnyPig/status/1280282363461726208">Corey pointed that out here</a>. That might have hindered the investigation from the AWS side. I won’t be so quick to delete in the future. I will lock files down though. But, let’s face it. Now that I’m aware of the <a href="https://support.cloudflare.com/hc/en-us/articles/200172516-Understanding-Cloudflare-s-CDN#:~:text=The%20maximum%20file%20size%20Cloudflare's,request%20caching%20of%20larger%20files.">512 MB file limit at Cloudflare</a>, I am moving other larger files in that bucket to <a href="https://archive.org/">archive.org</a> for now (and will add them to my supported <a href="https://chrisshort.net/causes/">Causes</a>).</p><p>Long term, I won’t want to store files in …</p></article></div></div></div></div>
@@ -1156,11 +2541,277 @@ July 26, 2020 | https://chrisshort.net/the-aws-bill-heard-around-the-world/ | <a
         </item>
         <item>
             <title>
+<![CDATA[Show HN: Emergency Remote – Actions to win remote work]]>
+            </title>
+            <description>
+<![CDATA[
+Score 119 | Comments 31 (<a href="https://news.ycombinator.com/item?id=23956482">thread link</a>) | @oDot
+<br/>
+July 26, 2020 | https://www.emergencyremote.com/emergencyremote | <a href="https://web.archive.org/web/*/https://www.emergencyremote.com/emergencyremote">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="wrapper">
+      
+      
+      <div id="title">
+        <p><img alt="" src="https://www.emergencyremote.com/images/image1.jpg"></p>
+      </div>
+      
+      
+      
+      
+      
+
+      
+      
+      
+      <p>
+        <span>Emergency Remote is a book of opportunity. It lights the way to turn a forced
+          remote work situation into a great management success. It contains simple steps
+          that will help you not only keep operating, but blow away the competition.</span>
+      </p>
+      
+      <p>
+        <span>Some believe they can work from home as if they are in the office. "Just add
+          some tools for video calls and everything will work just fine", they say.
+          This cannot be further from the truth. Setting up video is to successful remote
+          work as setting up tables is to successful onsite work. You'll probably use
+          it, but it's not nearly enough.</span>
+      </p>
+      
+      <p>
+        <span>Emergency Remote is divided into three succinct sections. The first discusses the
+          underlying values required for remote work to function, the second ensures the
+          right tools are set up, and the third describes the five immediate actions to
+          perform for better remote work.</span>
+      </p>
+      
+      <p>
+        <span>It is an easy, quick read. In fact, the average reader will finish the book in
+          less than 15 minutes. After following it you'll have enough space to learn
+          from the vast resources on remote work </span><span>available </span><span>online and adjust them to fit your company.</span>
+      </p>
+      
+      
+      
+      
+      
+      
+      
+      
+      <p>
+        <span>Remote work is composed of three pillars that are crucial to the success of the
+          method. They are important to understand before going forward with
+          implementation.</span>
+      </p>
+      
+      <h2 id="h.rrpubh4i8p5v"><span></span></h2>
+      
+      <h2 id="h.1fqjja11bgze"><span>Trust</span></h2>
+      
+      <p>
+        <span>Trust is your belief in a colleague's ability to deliver work in the best
+          possible way. Note, this does not mean a guaranteed delivery every time, but the
+          ability to deliver. It includes asking for help if needed, recovering from
+          mistakes and improving for next time.</span>
+      </p>
+      
+      <p>
+        <span>Trust is essential because trusting others allows you to focus on your actual
+          work, knowing they'll deliver. When others trust you, you get that unique
+          peace of mind, the freedom to do your work.</span>
+      </p>
+      
+      <p>
+        <span>Without trust, employees will be agitated. Worried that their own work will be
+          wronged by employees they rely on, either directly or indirectly. That is an
+          impossible way to work, especially remotely.</span>
+      </p>
+      <h2 id="h.1cdix8fys4aq"><span> </span></h2>
+      <h2 id="h.vvx9who9kf19"><span>Evergreen Communication</span></h2>
+      
+      <p>
+        <span>Evergreen </span><span>C</span><span>ommunication achieves productive work and </span><span>always-available </span><span>conversations. Both are "evergreen"</span><span>,</span><span> meaning preserved. To accomplish </span><span>that</span><span>, </span><span>two things are needed.</span>
+      </p>
+      
+      <p>
+        <span>First</span><span>,</span><span> </span><span>asynchronous (async) communication</span><span> —</span><span> communicati</span><span>on</span><span> without the expectation of immediate response.</span>
+      </p>
+      
+      <p>
+        <span>Second</span><span>,</span><span> </span><span>history preservation</span><span>. </span><span>C</span><span>onversation</span><span>s</span><span> should be kept whole and in orde</span><span>r</span><span>, forever.</span>
+      </p>
+      
+      <p>
+        <span>Evergreen </span><span>C</span><span>ommunication is essential because it allows employees to always work on
+          what's most important, always be up to date, and have the reasoning behind
+          every decision at their fingertips. They can jump into any conversation that needs
+          them, and answer without sacrificing productive work. New employees could even
+          onboard themselves.</span>
+      </p>
+      
+      <p>
+        <span>Without </span><span>Evergreen</span><span> </span><span>Communication</span><span>, we're back to square one. Having everyone present, either in a chat, call
+          or physical room forces participants to stop ongoing productive flow. Incomplete
+          summaries, as they always are, </span><span>c</span><span>ause information loss and make the reasoning behind decisions </span><span>v</span><span>ague at best.</span>
+      </p>
+      <h2 id="h.i59vuej2ah6f"><span></span></h2>
+      <h2 id="h.30fd3thx8ylx"><span>Independence</span></h2>
+      
+      <p>
+        <span>Independence is the state where the employee(s) working on a task needs little to
+          no outside involvement. This does not mean that employees will work in silos. Some
+          tasks require more than one person to perform. If most tasks require one person,
+          it means they are small (as they should) and that team cooperation will take place
+          when joining the individual tasks to form a whole.</span>
+      </p>
+      
+      <p>
+        <span>It is essential because it makes sure each and every task is self-contained. That
+          is, the employees responsible for it have all they need in order to deliver, and
+          the risk of them being blocked is reduced. Further, increasing employees'
+          resources in this way increases innovation, which again contributes to
+          production.</span>
+      </p>
+      
+      <p>
+        <span>Without independence, productive work is undermined. The business will be tangled
+          with permissions requests, employees will be blocked by their privileged
+          counterparts, and innovation will halt at the face of bureaucracy. All of these
+          are detrimental, more so in a remote environment, where bureaucracy is harder to
+          deal with, and therefore should be prevented.</span>
+      </p>
+      
+      
+      
+      
+      
+      
+      
+      
+      <p>
+        <span>You will only need four tools to be productive remotely. A tool used as a single
+          source of truth and three tools used for the three forms of communication: async,
+          hybrid and sync. That's it.</span>
+      </p>
+      
+      <p>
+        <span>All employees should have access to as much material as your company's level
+          of transparency allows, without complex permissions or process.</span>
+      </p>
+      
+      <p>
+        <span>Each tool will have an example using a specific brand. While many brands supply
+          these tools, make sure to only use one for each categor</span><span>y</span><span>. Different teams prefer different tools, but they cause duplication and
+          fragmentation, which harms productivity.</span>
+      </p>
+      
+      
+      <h2 id="h.ga1500ptl4sj"><span></span></h2>
+      <h2 id="h.vkvqh8m4qqe0">
+        <span>Single Source of Truth</span>
+      </h2>
+      
+      <p>
+        <span>The Single Source of Truth is a website or collection of files that always
+          represent the up-to-date and true state of work. It must adhere to Evergreen
+          Communication and track changes and their reasoning, allow rollbacks to previous
+          versions and keep communications async.</span>
+      </p>
+      
+      <p>
+        <span>Once this is set up, everyone should always update the work and communicate in
+          regards to the single source of truth. Gone are the days of files scattered across
+          various emails.</span>
+      </p>
+      
+      <p>
+        <span>Example:</span><span>
+          Google Docs for a law company will hold all strategies, contracts, company
+          policies, and so on. Every change done for the client or </span><span>to</span><span>
+          company policy will be reflected immediately to all involved. Changes are always
+          tracked, previous versions preserved, and </span><span>d</span><span>iscuss</span><span>ions are evergreen</span><span>.</span>
+      </p>
+      
+      
+      
+      
+      <h2 id="h.tqqlh9vccq1a">
+        <span>Async Communication: Task Manager</span>
+      </h2>
+      
+      <p>
+        <span>Tasks should be managed using a task manager, a type of software. </span><span>They</span><span>
+          should be discussed and when done, changes should be made to the source of truth.
+          Task managers are completely async, have reproducible history to understand </span><span>past</span><span>
+          decisions, and always show the state of work, making status meetings
+          redundant.</span>
+      </p>
+      
+      <p>
+        <span>This is the hardest tool to choose, as it is company specific. Take </span><span>time</span><span>
+          to test different options. If the one you have doesn't work for you, change
+          it. Communicate this to your employees</span><span>. P</span><span>revent disruption </span><span>with gradual adoption</span><span>. </span><span>You will find one that works.</span>
+      </p>
+      
+      <p>
+        <span>Example #1:</span><span> Trello or Asana for a law firm. </span><span>E</span><span>mployees could open tasks, involve others and</span><span> jump i</span><span>n to help. A paralegal may open a task "Fix typo in website", the IT
+          person may reply "Currently overwhelmed", then a secretary may jump in
+          "I've built website</span><span>s </span><span>before, can I help?". This kind of </span><span>exchange is impossible</span><span> to achieve without the three pillars</span><span>.</span><span> </span><span>It</span><span>
+          happens in remote companies every day, boosting the heart of the</span><span>ir</span><span> production.</span>
+      </p>
+      
+      <p>
+        <span>Example #2:</span><span> GitLab for software companies. </span><span>These apps</span><span> often double as a source of truth </span><span>with</span><span> their code hosting function and as task managers </span><span>with</span><span> their ticketing (issues, pull requests) system.</span>
+      </p>
+      <h2 id="h.ga1500ptl4sj"><span></span></h2>
+
+      <h2 id="h.siasagdslt5x">
+        <span>Hybrid Communication: Chat App</span>
+      </h2>
+      
+      <p>
+        <span>While the bulk of communication should be done using the task manager, sometimes
+          we need to quickly hash things out. This is where chat apps come into play. They
+          are hybrid, neither async n</span><span>or</span><span>
+          sync. While it's possible to reply later, it's not easy. </span><span>M</span><span>essages come and go</span><span>,</span><span> pushing people to </span><span>respond immediately</span><span>.</span>
+      </p>
+      
+      <p>
+        <span>Therefore, for work talk, use these only for quick, ephemeral conversations. Any
+          long lasting or high impact communications should use the task manager. Outside of
+          work talk, chat plays a big role in socializing and enjoying each other's
+          company, an important aspect to preserve when working </span><span>remotely</span><span>.</span><span> </span><span>Avoid email or WhatsApp as much as you can. They are private by nature and make
+          it harder for people to jump in if needed.</span>
+      </p>
+      
+      <p>
+        <span>Example:</span><span> Slack</span><span> or any </span><span>app </span><span>with</span><span> private messages</span><span> and </span><span>public channels will do. Employees could publicly commend a team member for good
+          work in the general channel, or offer feedback privately. They could hop into the
+          memes and music channels for fun, ask in the IT channel if anyone noticed a system
+          slowdown, or share research about </span><span>new</span><span> strategies in the marketing channel.</span>
+      </p>
+      
+      <h2 id="h.50r9p5st2zyu"><span></span></h2>
+      <h2 id="h.9yjvjddetok5">
+        <span>Sync Communication: Video/Voice Calls</span>
+      </h2>
+      
+      <p>
+        <span>Sync communication makes sense in a few cases. Usually for brainstorms and when
+          the team still isn't well acclimated to proper remote work. Keep it available,
+          but try to avoid it as much as possible. Calls are fine …</span></p></div></div>
+<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://www.emergencyremote.com/emergencyremote">https://www.emergencyremote.com/emergencyremote</a></em></p>]]>
+            </description>
+            <link>https://www.emergencyremote.com/emergencyremote</link>
+            <guid isPermaLink="false">hacker-news-small-sites-23956482</guid>
+            <pubDate>Sun, 26 Jul 2020 12:06:57 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Demystifying MLsub – The Simple Essence of Algebraic Subtyping]]>
             </title>
             <description>
 <![CDATA[
-Score 70 | Comments 5 (<a href="https://news.ycombinator.com/item?id=23956315">thread link</a>) | @panic
+Score 75 | Comments 8 (<a href="https://news.ycombinator.com/item?id=23956315">thread link</a>) | @panic
 <br/>
 July 26, 2020 | https://lptk.github.io/programming/2020/03/26/demystifying-mlsub.html | <a href="https://web.archive.org/web/*/https://lptk.github.io/programming/2020/03/26/demystifying-mlsub.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div> <p><strong><em>Note: this web article is an older version of a paper which has now been published as an ICFP Pearl. You can find a preprint of that paper <a href="https://lptk.github.io/simple-sub-paper">here</a>.</em></strong></p> <p><strong><em>It’s probably better to read the paper rather than this post, as the paper contains more material, is more up to date, and is better explained!</em></strong></p> <p><strong>Algebraic subtyping</strong> is a new approach to global type inference in the presence of subtyping. It extends traditional Hindley-Milner type inference while preserving the principal type property — that is, it can always infer <em>the</em> most general type for any given expression. This approach was developed by <a href="http://stedolan.net/about/">Stephen Dolan</a> as part of his PhD thesis, along with Alan Mycroft.</p> <p>Algebraic subtyping was implemented in <a href="https://www.cl.cam.ac.uk/~sd601/mlsub/">the <strong>MLsub</strong> type inference engine</a>. However, the design of MLsub seems significantly more complex than the simple unification algorithms used for traditional ML languages. MLsub has proven harder to grasp, even for people already familiar with compilers and type systems, such as myself.</p> <p>Dissatisfied with this state of affairs, I wanted to get to the bottom of the algebraic subtyping approach. What really is special about it, beyond the formalism? What are the simple concepts that hide behind the strange notions of <em>biunification</em> and <em>polar types</em>?</p> <p>This article is an answer to those questions. I propose an alternative algorithm for algebraic subtyping, called <strong>Simple-sub</strong>. Simple-sub can be implemented <strong>efficiently</strong> in <strong>under 500 lines of code</strong> (including parsing, simplification, and pretty-printing), and I think it is much more familiar-looking and easier to understand than MLsub.</p> <h4 id="---you-can-try-simple-sub-online-here---"><strong>⇨ ⇨ ⇨ <em><a href="https://lptk.github.io/simple-sub/">You can try Simple-sub online here!</a></em> ⇦ ⇦ ⇦</strong></h4> <p>This article is meant to be light in formalisms and easy to consume for prospective designers of new type systems and programming languages.</p> <p><a href="https://github.com/LPTK/simple-algebraic-subtyping">The complete source code of Simple-sub is available on Github.</a></p>   <h2 id="summary">Summary</h2> <ol> <li> <p><strong><a href="#intro">Introduction</a></strong></p> </li> <li> <p><strong><a href="#algebraic-subtyping-mlsub">Algebraic Subtyping in MLsub</a></strong></p> </li> <li> <p><strong><a href="#algebraic-subtyping-simple-sub">Algebraic Subtyping in Simple-sub</a></strong></p> </li> <li> <p><strong><a href="#simplifying-types">Simplifying Types</a></strong></p> </li> <li> <p><strong><a href="#conclusions">Conclusions</a></strong></p> </li> </ol> <hr>  <p>The ML family of languages, which encompasses Standard ML, OCaml, and Haskell, have been designed around a powerful “global” approach to type inference, rooted in the work of <a href="https://doi.org/10.2307%2F1995158">Hindley</a> and <a href="https://doi.org/10.1016%2F0022-0000%2878%2990014-4">Milner</a>, later closely formalized by <a href="https://dl.acm.org/doi/10.1145/582153.582176">Damas</a>. In this approach, the type system is designed to be simple enough that types can be unambiguously inferred from terms without the help of any type annotations. That is, for any unannotated term, it is always possible to infer a <em>principal type</em> which subsumes all other types that can be assigned to this term. For instance, the term $\lambda{x}. {x}$ can be assigned types $\mathsf{bool} \to \mathsf{bool}$ and $\mathsf{int} \to \mathsf{int}$, but both of these are subsumed by the polymorphic type $\forall a.\ a \to a$, also written <code>'a -&gt; 'a</code>, which is the principal type of this term.</p> <p><strong><em>Hindley-Milner</em></strong> (HM) type inference contrasts with more restricted “local” approaches to type inference, found in languages like Scala and C#, which often require the types of variables to be annotated explicitly by programmers. On the flip side, abandoning the principal type property allows these type systems to be more expressive and to support features such as object orientation and first-class polymorphism. Note that in practice, even ML languages like OCaml and Haskell have adopted expressive type system features which, when used, break the principal type property.<sup id="fnref:1"><a href="#fn:1">1</a></sup></p> <p><strong><em>Subtyping</em></strong> is an expressive feature allowing types to be structured into hierarchies (usually a subtyping <a href="https://en.wikipedia.org/wiki/Lattice_(order)"><em>lattice</em></a>) with the property that types can be <em>refined</em> or <em>widened</em> transparently following this hierarchy. This lets us express the fact that some types are more precise (contain more information) than others, but still have a compatible runtime representation, so that no coercions between them are needed. For instance, in a system where the type <code>nat</code> is a subtype of <code>int</code>, one can transparently use a <code>nat list</code> in place where an <code>int list</code> is expected, without having to apply a coercion function on all the elements of the list. Subtyping can be emulated using somewhat heavy type system machinery (which both OCaml and Haskell occasionally do<sup id="fnref:2"><a href="#fn:2">2</a></sup>), but first-class support for subtyping gives the benefit of simpler type signatures and better type inference.</p> <p>For a long time, it was widely believed that pervasive implicit subtyping got in the way of satisfactory global type inference. Indeed, previous approaches to inferring subtypes failed to support principal types or resulted in the inference of large, unwieldy typing schemes which included sets of complex constraints, making their understanding by programmers difficult.</p> <p><strong><em>Algebraic subtyping</em></strong> was introduced by Dolan and Mycroft as an ML-style type system supporting subtyping and global type inference, while producing compact principal types. Here, <em>compact</em> refers to the fact that the inferred types are relatively simple type expressions without any visible constraints, making them easy to understand by programmer. This was achieved by carefully designing the syntax and semantics of the underlying subtyping lattice, allowing for simplifying assumptions in to be made the constraint resolution process of the type inference algorithm.</p> <p>However, <em>biunification</em>, the algorithm proposed by Dolan in order to implement algebraic subtyping, has been quite difficult to understand for many experts and non-experts alike. Indeed, on the surface it looks quite different from the usual <a href="https://en.wikipedia.org/wiki/Hindley%E2%80%93Milner_type_system#Algorithm_J"><em>Algorithm J</em></a> traditionally used for Hm type systems: it requires several additional concepts, such as bisubstitution and polar types, making it look more complicated.</p> <p>Thankfully, it turns out that algebraic subtyping admits a type inference algorithm, which I called <em>Simple-sub</em>, that is very similar to the familiar Algorithm J, and also much more efficient than biunification (or at least, than the basic syntax-driven form of biunification.<sup id="fnref:3"><a href="#fn:3">3</a></sup> In this article, I show that inferring algebraic subtypes is actually extremely easy, and can be done in under 300 lines of Scala code. Most of the complexity actually comes from simplifying the inferred type representations, which we will get to later.</p> <p>While the implementation we present is written in Scala, it is straightforward to translate into any other functional programming language.</p> <p><strong><em>The goal of this article</em></strong> is to recast algebraic subtyping into a simpler mold, allowing more prospective designers of type systems and programming languages to benefit from the great insights that this approach offers.</p> <hr>  <p>Let’s start by briefly reviewing what algebraic subtyping and MLsub are and what they are not, and by trying to assess their expressiveness.</p> <h2 id="term-language">Term Language</h2> <p>The term syntax of MLsub is given below. I have omitted boolean literals and if-then-else, as they can easily be typed as primitive combinators. I also used only one form of variables $x$, which will be sufficient for our use (Dolan’s MLsub formalism distinguishes lambda-bound variables from let-bound variables for technical reasons).</p> <table> <thead> <tr> <th>name</th> <th>formal syntax</th> <th>ML pseudo-syntax</th> </tr> </thead> <tbody> <tr> <td>variable</td> <td>$x$</td> <td><code>x</code></td> </tr> <tr> <td>lambda</td> <td>$\lambda{x}. {e}$</td> <td><code>fun x -&gt; e</code></td> </tr> <tr> <td>application</td> <td>$e\ e$</td> <td><code>e e</code></td> </tr> <tr> <td>record creation</td> <td>$\{\ l_0 = e \,;\; … \,;\; l_n = e\ \}$</td> <td><code>{ l_0 = e; ...; l_n = e }</code></td> </tr> <tr> <td>field selection</td> <td>$e.l$</td> <td><code>e.l</code></td> </tr> <tr> <td>let bindings</td> <td>$\mathsf{let}\ x = e\ \mathsf{in}\ e$</td> <td><code>let x = e in e</code></td> </tr> </tbody> </table> <h2 id="type-language">Type Language</h2> <p>The type syntax of MLsub, summarized below, consists in booleans, function types, record types, type variables, top $\top$ (the type of all values — supertype of all types), bottom $\bot$ (the type of no values — subtype of all types), type union $\sqcup$, type intersection $\sqcap$, and recursive types $\mu{\alpha}. {\tau}$.</p> <table> <thead> <tr> <th>name</th> <th>formal syntax</th> <th>ML pseudo-syntax</th> </tr> </thead> <tbody> <tr> <td>primitives</td> <td>$\mathsf{bool}$, $\mathsf{int}$, …</td> <td><code>bool</code>, <code>int</code>, …</td> </tr> <tr> <td>function</td> <td>$\tau \to \tau$</td> <td><code>t -&gt; t</code></td> </tr> <tr> <td>record</td> <td>$\set{\ l_0: \tau \,,\; … \,,\; l_n: \tau\ }$</td> <td><code>{ l_0: t, ..., t_n: t }</code></td> </tr> <tr> <td>variable</td> <td>$\alpha $</td> <td><code>'a</code></td> </tr> <tr> <td>top</td> <td>$\top$</td> <td><code>⊤</code></td> </tr> <tr> <td>bottom</td> <td>$\bot$</td> <td><code>⊥</code></td> </tr> <tr> <td>union</td> <td>$\tau \sqcup \tau$</td> <td><code>∨</code></td> </tr> <tr> <td>intersection</td> <td>$\tau \sqcap \tau$</td> <td><code>∧</code></td> </tr> <tr> <td>recursive</td> <td>$\mu\alpha. \tau$</td> <td><code>t as 'a</code></td> </tr> </tbody> </table> <h2 id="informal-semantics-of-types">Informal Semantics of Types</h2> <p>While most MLsub type forms are usual and unsurprising, two kinds of types require our special attention: set-theoretic types (more specifically union and intersection types), and recursive types.</p> <h3 id="set-theoretic-types">Set-Theoretic Types</h3> <p>To a first approximation, union and intersection types can be understood in set-theoretic terms: the type term $\tau_0 \sqcup \tau_1$ (resp. $\tau_0 \sqcap \tau_1$) represents the type of values that are <em>either</em> (resp. <em>both</em>) of type $\tau_0 $ <em>or</em> (resp. <em>and</em>) of type $\tau_1$.</p> <p>MLsub uses these types to indirectly constrain inferred type variables; for instance, one type inferred for term $\lambda{x}. {\set{l = x - 1 \,;\; r = x}}$ could be $\alpha \sqcap \mathsf{int} \to \set{l: \mathsf{int} \,,\; r: \alpha}$. This type reflects the fact that the original argument, of type $\alpha$, is returned in the $r$ field of the result record, as the input type $\alpha$ ends up in that position, but also that this argument should be able to be treated as an $\mathsf{int}$, expressed via the type intersection $\alpha \sqcap \mathsf{int}$ on the left-hand side of the function type. Keeping track of the precise argument type $\alpha$ is important: it could be later substituted with a more specific type than $\mathsf{int}$, such as $\alpha = \mathsf{nat}$, which would give us $\mathsf{nat} \to \set{l: \mathsf{int} \,;\; r: \mathsf{nat}}$.</p> <p>On the other hand, there may be type signatures where some $\alpha$ becomes undistinguishable from $\mathsf{int}$. For instance, consider the term $\lambda{x}. {\mathsf{if}\ \mathsf{true}\ \mathsf{then}\ {x - 1}\ \mathsf{else}\ {x}}$, whose simplified inferred type would be just $\mathsf{int} \to \mathsf{int}$, as the seemingly-more precise type $\alpha \sqcap \mathsf{int} \to \alpha \sqcup \mathsf{int}$ does not actually contain more information (see the MLsub paper for details).</p> <p>The beauty of algebraic subtyping is that this sort of reasoning scales to arbitrary flows of variables and higher-order functions; for instance, the previous example can be generalized by passing in a function $f$ to stand for the $\cdot - 1$ operation, as in …</p></div></div>
@@ -1176,7 +2827,7 @@ July 26, 2020 | https://lptk.github.io/programming/2020/03/26/demystifying-mlsub
             </title>
             <description>
 <![CDATA[
-Score 228 | Comments 186 (<a href="https://news.ycombinator.com/item?id=23955596">thread link</a>) | @thierryzoller
+Score 230 | Comments 190 (<a href="https://news.ycombinator.com/item?id=23955596">thread link</a>) | @thierryzoller
 <br/>
 July 26, 2020 | https://blog.zoller.lu/2020/05/how-to-effectively-evade-gdpr-and-reach.html | <a href="https://web.archive.org/web/*/https://blog.zoller.lu/2020/05/how-to-effectively-evade-gdpr-and-reach.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>This is a post in a series of posts :</p>
@@ -1327,7 +2978,7 @@ CNIL</span></p>
             </title>
             <description>
 <![CDATA[
-Score 206 | Comments 48 (<a href="https://news.ycombinator.com/item?id=23955527">thread link</a>) | @maxraz
+Score 209 | Comments 49 (<a href="https://news.ycombinator.com/item?id=23955527">thread link</a>) | @maxraz
 <br/>
 July 26, 2020 | https://paveldogreat.github.io/WebGL-Fluid-Simulation/?play | <a href="https://web.archive.org/web/*/https://paveldogreat.github.io/WebGL-Fluid-Simulation/?play">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1351,7 +3002,7 @@ July 26, 2020 | https://paveldogreat.github.io/WebGL-Fluid-Simulation/?play | <a
             </title>
             <description>
 <![CDATA[
-Score 233 | Comments 295 (<a href="https://news.ycombinator.com/item?id=23954846">thread link</a>) | @seesawtron
+Score 237 | Comments 300 (<a href="https://news.ycombinator.com/item?id=23954846">thread link</a>) | @seesawtron
 <br/>
 July 25, 2020 | https://montreal.ctvnews.ca/mobile/no-more-religious-exemptions-montreal-is-taxing-churches-1.3415164 | <a href="https://web.archive.org/web/*/https://montreal.ctvnews.ca/mobile/no-more-religious-exemptions-montreal-is-taxing-churches-1.3415164">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1403,7 +3054,7 @@ July 25, 2020 | https://montreal.ctvnews.ca/mobile/no-more-religious-exemptions-
             </title>
             <description>
 <![CDATA[
-Score 95 | Comments 47 (<a href="https://news.ycombinator.com/item?id=23954234">thread link</a>) | @bluedino
+Score 95 | Comments 51 (<a href="https://news.ycombinator.com/item?id=23954234">thread link</a>) | @bluedino
 <br/>
 July 25, 2020 | https://gekk.info/articles/dosapps.html | <a href="https://web.archive.org/web/*/https://gekk.info/articles/dosapps.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><tr><td>
