@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Tue, 08 Sep 2020 12:30:07 GMT</lastBuildDate>
+        <lastBuildDate>Tue, 08 Sep 2020 16:24:24 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-50.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Tue, 08 Sep 2020 12:30:07 GMT</pubDate>
+        <pubDate>Tue, 08 Sep 2020 16:24:24 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,1122 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[PostgreSQL B-Tree index deduplication]]>
+            </title>
+            <description>
+<![CDATA[
+Score 127 | Comments 14 (<a href="https://news.ycombinator.com/item?id=24395825">thread link</a>) | @petergeoghegan
+<br/>
+September 6, 2020 | https://blog.rustprooflabs.com/2020/09/postgres-beta3-btree-dedup | <a href="https://web.archive.org/web/*/https://blog.rustprooflabs.com/2020/09/postgres-beta3-btree-dedup">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+                    <p>By Ryan Lambert -- Published September 06, 2020</p><p>PostgreSQL 13 development is coming along nicely, Postgres 13 Beta3 was
+<a href="https://www.postgresql.org/about/news/2060/">released on 8/13/2020</a>.
+The Postgres Beta 1 and 2 releases were released in May and June 2020.
+One of the features that has my interest in Postgres 13 is the B-Tree deduplication effort.  B-Tree indexes are the default indexing method
+in Postgres, and are likely the most-used indexes in production 
+environments.
+Any improvements to this part of the database are likely to have wide-reaching benefits.
+Removing duplication from indexes keeps their physical size smaller,
+reduces I/O overhead, and should help keep <code>SELECT</code> queries fast!</p>
+<!--endteaser-->
+
+<blockquote>
+<p>This post is part of the series <a href="https://blog.rustprooflabs.com/2018/06/pg-series-toc"><em>PostgreSQL:  From Idea to Database</em></a>.</p>
+</blockquote>
+<p>There is a good summary of the what and how of this improvement
+in <a href="https://www.cybertec-postgresql.com/en/b-tree-index-deduplication/">Laurenz Albe's post</a> from early in June 2020, presumably using
+Pg13 Beta1.  <a href="https://www.highgo.ca/2020/07/06/features-in-pg13-deduplication-in-b-tree-indexes/">Hamid Akhtar's post in July</a>
+covered this feature using Pg13 Beta2 and a different approach including
+a look at the performance using <code>EXPLAIN</code>.
+This post takes yet another look at this improvement using Pg13 Beta3.
+I intend to see how well this improvement pans out on a data set I use in production.  For that task my go-to is
+<a href="https://www.openstreetmap.org/">OpenStreetMap</a> data loaded to Postgres/PostGIS <a href="https://blog.rustprooflabs.com/2020/01/postgis-osm-load-2020">using osm2pgsql</a>.</p>
+<h2>Install Postgres 13 Beta 3</h2>
+<p>The first step is to install the two versions of Postgres (12 and 13beta3) 
+on a single Ubuntu 18 host.  In the past when I have tested pre-production
+releases I have built Postgres from source instead of using <code>apt</code>.
+This time around I decided to use <code>apt install</code>, so am including the
+basic process for that.</p>
+<p>The advised way to install PostgreSQL is from the pgdg (PostgreSQL Global Development Group) repositories,
+see <a href="https://wiki.postgresql.org/wiki/Apt">the Postgres wiki</a> for more.
+To enable the beta versions, the line needed in <code>/etc/apt/sources.list.d/pgdg.list</code> is:</p>
+<pre><code>deb http://apt.postgresql.org/pub/repos/apt/bionic-pgdg main 13
+</code></pre>
+<p>With that in place, update the sources and install Postgres and PostGIS.</p>
+<pre><code>sudo apt update
+# Postgres 12
+sudo apt install postgresql-12 postgresql-12-postgis-3
+# Postgres 13 (Currently Beta)
+sudo apt install postgresql-13 postgresql-13-postgis-3
+</code></pre>
+<p>On Ubuntu, installing multiple versions will create multiple instances running on different ports. The test server I'm using to write this post
+currently has three versions of Postgres installed, only two are currently running. Postgres 12 was installed first so "won" the default port of 5432.  Postgres 11 was installed second and was assigned 5433, and Pg13 beta 3 was installed last and was assigned port 5434.  The <code>pg_lsclusters</code> is avaiable on Debian/Ubuntu hosts as part of the wrapper around <code>pg_ctl</code>.</p>
+<pre><code>sudo -u postgres pg_lsclusters
+Ver Cluster Port Status Owner    Data directory              Log file
+11  main    5433 down   postgres /var/lib/postgresql/11/main /var/log/postgresql/postgresql-11-main.log
+12  main    5432 online postgres /var/lib/postgresql/12/main /var/log/postgresql/postgresql-12-main.log
+13  main    5434 online postgres /var/lib/postgresql/13/main /var/log/postgresql/postgresql-13-main.log
+</code></pre>
+<blockquote>
+<p>This post does not use Postgres 11 beyond this example.</p>
+</blockquote>
+<p>When working with multiple versions installed it is helpful to verify
+versions match what you expect them to be.
+First, the port 5432 for Postgres 12 version.</p>
+<pre><code>psql -d pgosm -p 5432 -c "select version();"
+â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”�
+â”‚                                   version                                    â”‚
+â•žâ•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•¡
+â”‚ PostgreSQL 12.4 (Ubuntu 12.4-1.pgdg18.04+1) on x86_64-pc-linux-gnu, compiledâ€¦â”‚
+â”‚â€¦ by gcc (Ubuntu 7.5.0-3ubuntu1~18.04) 7.5.0, 64-bit                          â”‚
+â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+</code></pre>
+<p>Now, port 5434 for Postgres 13 version.</p>
+<pre><code>psql -d pgosm -p 5434 -c "select version();"
+â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”�
+â”‚                                   version                                    â”‚
+â•žâ•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•¡
+â”‚ PostgreSQL 13beta3 (Ubuntu 13~beta3-1.pgdg18.04+1) on x86_64-pc-linux-gnu, câ€¦â”‚
+â”‚â€¦ompiled by gcc (Ubuntu 7.5.0-3ubuntu1~18.04) 7.5.0, 64-bit                   â”‚
+â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+</code></pre>
+<h2>Create Indexes</h2>
+<p>Both versions of Postgres were loaded with the same Colorado OpenStreetMap
+data loaded <a href="https://blog.rustprooflabs.com/2020/01/postgis-osm-load-2020">using osm2pgsql</a>.
+The osm2pgsql does not create any B-Tree indexes on its own, only the GIST
+indexes on geometries.
+For this post, we examine B-Tree index sizes created on four columns:
+<code>osm_id</code>, <code>highway</code>, <code>waterway</code>, and <code>natural</code>.
+Looking at the stats on the <code>public.planet_osm_line</code> table I can make 
+a couple guesses where we will and will not see gains based on <code>n_distinct</code>.
+I can guess we will not see major gains in the
+<code>osm_id</code>, there is only a small amount of duplication in those values.
+The other three columns (<code>highway</code>, <code>natural</code> and <code>waterway</code>) have a small number of distinct values
+and varying amounts of <code>NULL</code> values.  These three columns would all
+be candidates for partial indexes to avoid indexing the <code>NULL</code> values,
+thus reducing the size of the created index.
+I have hopes to see the benefits in Postgres 13 on these columns, possibly
+making the use of partial indexes less frequent.</p>
+<pre><code> SELECT attname, n_distinct, null_frac
+    FROM pg_catalog.pg_stats
+    WHERE tablename = 'planet_osm_line'
+        AND attname IN ('osm_id', 'highway', 'waterway', 'natural')
+;
+
+â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”�
+â”‚ attname  â”‚ n_distinct â”‚ null_frac  â”‚
+â•žâ•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•ªâ•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•ªâ•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•¡
+â”‚ osm_id   â”‚  -0.833553 â”‚          0 â”‚
+â”‚ highway  â”‚         26 â”‚ 0.41616666 â”‚
+â”‚ natural  â”‚          4 â”‚      0.994 â”‚
+â”‚ waterway â”‚          9 â”‚     0.6663 â”‚
+â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+</code></pre>
+<h3>Index on <code>osm_id</code></h3>
+<p>First up is the <code>osm_id</code> column, a nearly unique set of positive and 
+negative values.  The index to create in both versions:</p>
+<pre><code>CREATE INDEX ix_osm_line_osm_id ON public.planet_osm_line (osm_id);
+</code></pre>
+<p>The following query is used throughout to report out index sizes.
+The query itself will not be repeated, as only the filter would change.</p>
+<pre><code>SELECT ai.schemaname AS s_name, ai.relname AS t_name,
+        ai.indexrelname AS index_name,
+        pg_size_pretty(pg_relation_size(quote_ident(ai.schemaname)::text || '.' || quote_ident(ai.indexrelname)::text)) AS index_size,
+        pg_relation_size(quote_ident(ai.schemaname)::text || '.' || quote_ident(ai.indexrelname)::text) AS index_size_bytes
+    FROM pg_catalog.pg_stat_all_indexes ai
+    WHERE ai.indexrelname LIKE 'ix_osm_line%'
+    ORDER BY index_name
+;
+</code></pre>
+<p>Due to the low number of duplicates, it is no surprise that the
+show only a tiny reduction in the size.  The reduction
+would not be detectable from only the <code>index_size</code> column (in MB), the
+<code>index_size_bytes</code> shows the slight reduction in size (29,515,776 bytes vs. 29,384,704 bytes).</p>
+<p>Pg 12.</p>
+<pre><code>â”Œâ”€[ RECORD 1 ]â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”�
+â”‚ s_name           â”‚ public             â”‚
+â”‚ t_name           â”‚ planet_osm_line    â”‚
+â”‚ index_name       â”‚ ix_osm_line_osm_id â”‚
+â”‚ index_size       â”‚ 28 MB              â”‚
+â”‚ index_size_bytes â”‚ 29515776           â”‚
+â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+</code></pre>
+<p>Pg 13.</p>
+<pre><code>â”Œâ”€[ RECORD 1 ]â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”�
+â”‚ s_name           â”‚ public             â”‚
+â”‚ t_name           â”‚ planet_osm_line    â”‚
+â”‚ index_name       â”‚ ix_osm_line_osm_id â”‚
+â”‚ index_size       â”‚ 28 MB              â”‚
+â”‚ index_size_bytes â”‚ 29384704           â”‚
+â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+</code></pre>
+<h3>Index on <code>highway</code></h3>
+<p>The <code>highway</code> data in the <code>planet_osm_line</code> data is a good example of when
+a
+<a href="https://www.postgresql.org/docs/current/indexes-partial.html">partial index</a>
+might typically be a good idea to minimize index size.  My hunch (and hope)
+is that the de-duplication will make a partial index here a moot point by reducing the size required to index a large number of <code>NULL</code> values.</p>
+<p>Create two indexes, one partial covering the non-<code>NULL</code> values and one full
+index on the entire table.</p>
+<pre><code>CREATE INDEX ix_osm_line_highway_partial 
+    ON public.planet_osm_line (highway)
+    WHERE highway IS NOT NULL;
+CREATE INDEX ix_osm_line_highway_full
+    ON public.planet_osm_line (highway);
+</code></pre>
+<p>The two indexes in Postgres 12, notice the partial index cuts out about 1/3 of the size from the full index.</p>
+<pre><code>â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”…</code></pre></div></div>
+<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://blog.rustprooflabs.com/2020/09/postgres-beta3-btree-dedup">https://blog.rustprooflabs.com/2020/09/postgres-beta3-btree-dedup</a></em></p>]]>
+            </description>
+            <link>https://blog.rustprooflabs.com/2020/09/postgres-beta3-btree-dedup</link>
+            <guid isPermaLink="false">hacker-news-small-sites-24395825</guid>
+            <pubDate>Mon, 07 Sep 2020 00:39:39 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Introduction to Computational Thinking]]>
+            </title>
+            <description>
+<![CDATA[
+Score 159 | Comments 5 (<a href="https://news.ycombinator.com/item?id=24395700">thread link</a>) | @guiambros
+<br/>
+September 6, 2020 | https://mitmath.github.io/18S191/Fall20/ | <a href="https://web.archive.org/web/*/https://mitmath.github.io/18S191/Fall20/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+
+<!-- Content appended here -->
+<div>
+<p>Welcome to the new course <strong>MIT 18.S191</strong>, the debut edition, <strong>Fall 2020</strong>!</p>
+<p> This is an introductory course on Computational Thinking. We use the <a href="http://www.julialang.org/">Julia programming language</a> to approach real-world problems in varied areas applying data analysis and computational and mathematical modeling.  In this class you will learn computer science, software, algorithms, applications, and mathematics as an integrated whole.</p>
+<p>Topics include:</p>
+<ul>
+<li><p>Image analysis</p>
+</li>
+<li><p>Particle dynamics and ray tracing</p>
+</li>
+<li><p>Epidemic propagation</p>
+</li>
+<li><p>Climate modeling</p>
+</li>
+</ul>
+<h2 id="professors"><a href="#professors">Professors</a></h2>
+<p><a href="http://math.mit.edu/~edelman">Alan Edelman</a>, <a href="http://sistemas.fciencias.unam.mx/~dsanders/">David P. Sanders</a>, <a href="https://www.3blue1brown.com/about">Grant Sanderson</a>, &amp; <a href="https://eapsweb.mit.edu/people/jars">James Schloss</a></p>
+<h2 id="introduction_video"><a href="#introduction_video">Introduction video</a></h2>
+<iframe id="course-intro" width="800" height="474" src="https://www.youtube.com/embed/vxjRWtWoD_w" frameborder="0" allow="accelerometer; autoplay; encrypted-media; gyroscope; picture-in-picture" allowfullscreen=""></iframe>
+
+<h2 id="logistics"><a href="#logistics">Logistics</a></h2>
+<p>Course materials will be published on the accompanying website: <a href="https://mitmath.github.io/18S191/Fall20/">https://mitmath.github.io/18S191/Fall20/</a></p>
+<p>TR 2:30–3:30pm EST, online (Go to the lecture page on this site to stream it.)</p>
+<ul>
+<li><p>Tuesdays: Prerecorded videos, released on YouTube and played live on this site.</p>
+</li>
+<li><p>Thursdays: Live sessions (same YouTube link 2:30–3) and MIT-only discussion (3-3:30); link to follow</p>
+</li>
+</ul>
+<p>Start date: September 1, 2020</p>
+<p>Office hours TBD.</p>
+<h3 id="discussion_forum_and_homework_submission"><a href="#discussion_forum_and_homework_submission">Discussion forum and homework submission</a></h3>
+<ul>
+<li><p><a href="https://discord.gg/Z5qnVf8">Discord</a>: discussion (we encourage you to hang out here during class!)</p>
+</li>
+<li><p><a href="https://piazza.com/class/kd33x1xnfyq3b1">Piazza</a>: (MIT only) allows for anonymity to other students, discussion</p>
+</li>
+<li><p><a href="https://canvas.mit.edu/courses/5637">Canvas</a>: (MIT only) homework submission. If you're a non-MIT student, please find a partner to cross-grade homeworks via Discord.</p>
+</li>
+</ul>
+<h3 id="evaluation"><a href="#evaluation">Evaluation</a></h3>
+<ul>
+<li><p>12 weekly problem sets with equal weight; your lowest score will be dropped. </p>
+</li>
+<li><p>Released on Thursdays and due before the following Thursday's class. (No problem set during Thanskgiving week.)</p>
+</li>
+<li><p>No exams</p>
+</li>
+</ul>
+<p>Problem sets consist of code. MIT students enrolled in the course must submit homeworks via Canvas. If you are not a student then we encourage you to join the Discord and find a cross-grading partner.</p>
+<div>
+  <p>
+    Last modified: September 06, 2020. Website built with <a href="https://github.com/tlienart/Franklin.jl">Franklin.jl</a>.
+  </p>
+</div>
+</div><!-- CONTENT ENDS HERE -->
+
+    </div></div>]]>
+            </description>
+            <link>https://mitmath.github.io/18S191/Fall20/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-24395700</guid>
+            <pubDate>Mon, 07 Sep 2020 00:08:28 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Elixir Is Erlang, not Ruby]]>
+            </title>
+            <description>
+<![CDATA[
+Score 290 | Comments 115 (<a href="https://news.ycombinator.com/item?id=24395695">thread link</a>) | @stanislavb
+<br/>
+September 6, 2020 | https://preslav.me/2020/09/06/elixir-is-not-ruby-elixir-is-erlang/ | <a href="https://web.archive.org/web/*/https://preslav.me/2020/09/06/elixir-is-not-ruby-elixir-is-erlang/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+              
+              <p>Try to remember the first time you heard about this fascinating language called <a href="https://elixir-lang.org/">Elixir</a>. Chances are, you had by the time been developing software using Ruby. If that's the case, Elixir seems to have appeared out of nowhere until suddenly, it became the solution for all your previous problems. It is fast, clean, scales extremely well. It was <strong>almost</strong> like the Ruby you've always wanted to have, but never got.</p><p>I say <strong>almost</strong>, because as much as you want it to be, <strong>Elixir is not Ruby</strong>. The familiar syntax has definitely helped the language win the hearts of the broader developer community. Yet, under the hood, <strong>Elixir is all about Erlang.</strong> The <a href="https://elixir-lang.org/">Erlang</a> that everyone tells stories about, as if it were some mythical creature, but no one dares to touch.</p><figure><img src="https://preslav.me/content/images/2020/09/book-cover.png" alt="" width="500" height="700"><figcaption>Elixir for Non-Ruby Programmers</figcaption></figure><p>Why am I saying all of this? First, because I would love to see greater adoption of Elixir outside Ruby/Rails community. It was among that group of people where the idea first sparked, and I fully respect the fact. Nevertheless, I would love to see it growing out. As someone who discovered Elixir after years of doing Java, &nbsp;.NET and more recently, Go, I can say that there is enough goodness in it for everyone. Moreover, bringing people with different backgrounds (both technical and non-technical) will lead to an explosion of new ideas. Having more diverse minds will help us better understand and make use of the elephant in the room-Erlang.</p><p>This brings me to my second point. Erlang is not obscure at all, once you give it enough attention. It is actually oddly satisfying, once you start reading code written in it. I have had my few a-ha moments, when I figured the original inspiration for most constructs in Elixir. The point is, we shouldn't fear Erlang, but try to understand it. This applies both to when things go well, as well as when they go south.</p><p>My biggest hope of all is that by understanding Erlang well enough, the Elixir community will start looking for new uses for it. Uses that go beyond being a scalable replacement for Rails apps. More daring and more ambitious uses, where Erlang's resilience model can prove to be critical for the success of the mission. I'd love to see it used in transportation, space, as well as the domain that started it all- telecommunications.</p><blockquote>“Shoot for the moon. Even if you miss it you will land among the stars.”<br><strong>Les Brown</strong></blockquote>
+                <section>
+                  
+                  <ul>
+                      <li>
+                        <a href="https://preslav.me/tag/elixir/" title="Elixir">Elixir</a>
+                      </li>
+                      <li>
+                        <a href="https://preslav.me/tag/programming/" title="Programming">Programming</a>
+                      </li>
+                      <li>
+                        <a href="https://preslav.me/tag/ruby/" title="Ruby">Ruby</a>
+                      </li>
+                      <li>
+                        <a href="https://preslav.me/tag/erlang/" title="Erlang">Erlang</a>
+                      </li>
+                      <li>
+                        <a href="https://preslav.me/tag/2-cents/" title="2 Cents">2 Cents</a>
+                      </li>
+                  </ul>
+                </section>
+            </div></div>]]>
+            </description>
+            <link>https://preslav.me/2020/09/06/elixir-is-not-ruby-elixir-is-erlang/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-24395695</guid>
+            <pubDate>Mon, 07 Sep 2020 00:07:39 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Lending app publicly shames you when you’re late on loan payment]]>
+            </title>
+            <description>
+<![CDATA[
+Score 79 | Comments 67 (<a href="https://news.ycombinator.com/item?id=24395363">thread link</a>) | @danso
+<br/>
+September 6, 2020 | https://restofworld.org/2020/okash-microlending-public-shaming/ | <a href="https://web.archive.org/web/*/https://restofworld.org/2020/okash-microlending-public-shaming/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+			
+<p><span>T</span>he only person David Kiragu lied to about the texts was his mom. To those close to him, like his partner, friends, former schoolmates, and work colleagues, he explained what was going on. To more distant contacts, including annoying relatives, he said nothing.</p>
+
+
+
+<p>His mother probably knew he was lying — mothers often do — but she let it slide.</p>
+
+
+
+<p>“I couldn’t tell her the truth,” Kiragu said to me last December. “So I told her it was one of those prison scams and she should ignore it.”</p>
+
+
+
+<p>He owed money. Not a lot of it, but that didn’t matter. His fintech creditor was still telling everyone in Kiragu’s inner circle that he was a deadbeat.</p>
+
+
+
+<p>It happened like this: Toward the end of March 2018, Kiragu found himself in a bind. At 32, he earned a solid income as a manager at an iNGO in Nairobi. But for the first time in his life, he couldn’t make rent.</p>
+
+
+
+<p>His choices were limited. He could always borrow the remainder from friends, family, or somebody else in his network. The problem was that if he did, people would know he was living beyond his means.</p>
+
+
+
+<p>But then one morning Kiragu logged into his Facebook account and saw an ad for a fintech app called OKash that promised to be the discreet friend who would spot him some cash and never mention it again. Offering the ability to “process loans in seconds,” OKash is one of many fintech apps that have sprung up in Kenya since 2012. All he needed to do was download the app, enter his financial details, and let the algorithm generate a credit rating. He would get the money he needed and could pay it back once he was liquid.</p>
+
+
+
+<p>He doesn’t remember that day too well now, but Kiragu thinks it took just minutes to apply for his loan. His money arrived right away, so he paid his bills and moved on. “I started with about $15, which I repaid [on time], and my loan limit expanded. Then I borrowed about $35, which I also repaid,” he told me as we sat on the balcony of a chic restaurant in a mall outside Nairobi.</p>
+
+
+
+<p>It was the third loan that upended his life. He needed it to top up his rent, because by then a vicious cycle had begun, wherein he would pay off his loan then borrow again to fill the hole that the last payment had left in his finances.</p>
+
+
+
+<p>Kiragu started getting calls even before that deadline passed.</p>
+
+
+
+<p>“Will you repay your OKash loan?” Kiragu remembers a caller asking him, before warning that if he missed a payment, the company would notify everyone on his contact list. In texts he showed me on his phone, an OKash representative had written an hour before the deadline lapsed, “Despite several polite reminders on your OKash loan . . . No PAYMENT received yet . . . Note that we are going to invade your privacy according to Terms of Service clause 8, IF NOT CLEARED BY 4PM.” The clause in question reads as follows: “In the event we cannot get in contact with you or your emergency contact, you also expressly authorise us to contact any and all persons in your contact list.”</p>
+
+
+
+<p>In the days after the deadline, debt collectors hounded Kiragu, calling three to four times every hour. They also cast a wide net. “They texted just about everyone I know,” Kiragu says. His parents and many friends got messages. One of his colleagues even shared a screenshot of a text from OKash in an office-wide WhatsApp Group.</p>
+
+
+
+<p>“Some [people] sympathized with me,” Kiragu wrote in a Facebook post about the experience. “Some were laughing at me and some were actually very annoyed that OKash is exposing and shaming me . . . Even my boss called me to ask if everything is okay.”</p>
+
+
+
+<p>But his colleagues weren’t his main concern. What worried him more was what his parents would think. After an estranged aunt shared the message within his village, Kiragu’s father accused him of bringing shame on the family.</p>
+
+
+
+<p>This was nearly two years ago, but the memory is still raw, so much so that Kiragu asked to use a pseudonym for this article. “If you pay on time, they are angels,” Kiragu said as he sipped his tea and stared at a potted plant behind me. “They keep texting you to take out another loan with them. If you do and won’t or can’t pay, then it’s pretty simple: Pay or we damage what you value most.”</p>
+
+
+		<figure>
+			<div>
+				<p><img src="https://149346090.v2.pressablecdn.com/wp-content/uploads/2020/05/h_21.00183863-scaled-1-40x27.jpg" data-src="https://149346090.v2.pressablecdn.com/wp-content/uploads/2020/05/h_21.00183863-scaled-1-648x432.jpg" data-srcset="https://149346090.v2.pressablecdn.com/wp-content/uploads/2020/05/h_21.00183863-scaled-1-2560x1575.jpg 2560w, https://restofworld.org/wp-content/uploads/2020/05/h_21.00183863-scaled-1-648x432.jpg 648w, " sizes="(max-width: 640px) 100vw, calc(100vw - 40px)" alt="A M-Pesa kiosk in Nairobi in 2014.
+
+Credit:
+Sven Torfinn/Panos Pictures Panos/Redux
+
+Naomi Wanjiku, a M-Pesa agent, arranges a customer's transaction at a M-Pesa kiosk in South B, a residential area of the city. M-Pesa, (M for mobile, pesa is Swahili for money), is a Kenyan cellphone-based money transfer service. The majority of its customers have no bank accounts, but they withdraw cash and make payments or send money using their cell phones. A network of appointed agents, scattered all over the country, provide the cashing handling services. 
+ 
+Creation Date: Kenya">
+					
+				</p>
+			</div>
+						<figcaption itemprop="caption description">
+				
+				<span itemprop="copyrightHolder">Sven Torfinn/Panos Pictures Panos/Redux</span>
+			</figcaption>
+		</figure>
+
+
+<hr>
+
+
+
+<p><strong>In 2007, Safaricom</strong>, Kenya’s biggest telecoms provider, launched M-Pesa, a mobile wallet that allowed users to send and receive money and buy airtime. Smartphones were just becoming popular, so Safaricom tailored its fintech product to the basic cell phones most Kenyans already owned. It was immediately hailed as a revolutionary way to bring millions of “unbanked” customers into the formal financial sector. The Clinton Global Initiative and other major philanthropic organizations were vocal supporters, and it was soon being taught as a case study in business schools around the world. It was also a success on the ground: Safaricom aimed to sign up 350,000 M-Pesa users by the end of 2007, but by November it had already attracted over 1 million. From there, it only continued to grow. As of last September, 23.6 million Kenyans — nearly half of the country’s population — were using it regularly.</p>
+
+
+
+<p>M-Pesa was initially meant to be a microfinance project; its first sales pitch to users was “Send Money Home.” It was banking on the fact that while working-class Kenyans who lived away from home wanted to support their families, cash is expensive. This was not a new concept; among Somalis, the Hawala system exists to address this same problem. If you want to send money to someone, you give it to a local agent, who then contacts a second agent located in the same area as the intended recipient, and that agent then disburses the money. Both agents earn a small commission, and they sort each other out.</p>
+
+
+
+<p>In Kenya, there were several factors behind M-Pesa’s rapid ascent. One was that 2007 was an election year, and when violence erupted over the results, having a way to transfer money without leaving the house felt to Kenyans like a godsend. Another, more structural, reason was that before M-Pesa, the country’s banking sector served only a portion of the population. Kenya’s economy collapsed four times between the mid-1980s and the early 2000s, by which point the banks were heavily regulated. It was nearly impossible for low-income Kenyans, including millennials, to get loans. No such legal barriers applied to fintech.</p>
+
+
+
+<p>When fintech took off, banks, Silicon Valley–backed products, private-equity products, and Kenyan companies all began competing for the same clients. One of the first savings-and-lending apps, called M-Shwari, was launched in 2012 through a partnership between a local bank and Safaricom. Some of its earliest users were Kenyans in the informal economy. In a 2017 social media post, for example, a business journalist noted that “up to a third of loans are taken between the hours of 3am and 5am. Most are repaid within twenty-four hours.” When the Central Bank looked into what was going on, they discovered that a typical user was a market seller who would wake up early and borrow enough money to pay everybody in her supply chain that day. She would then work until evening, pay back the loan, and repeat the cycle again the next morning.</p>
+
+
+
+<p>Within a few years, credit-app use had started to spread throughout Kenyan society. Over a 13-year period, financial inclusion<a href="https://fsdkenya.org/publication/finaccess2019/"> jumped</a> from nearly 27 percent, in 2006, to almost 83 percent. And the product side grew as well. As of September 2018, according to a report from Financial Sector Deepening Kenya (FSD), the two main app stores offered 110 credit apps.</p>
+
+
+
+<p>Almost all of these companies make their money by providing short-term loans with high interest rates. But that’s often where transparency around the business model ends. Since there is no regulatory framework governing fintech, it is hard to know who exactly owns an app or even where the money is coming from. The absence of regulation has many perks for the sector and one major liability: As companies soon discovered, if a user does not pay back what they have borrowed, plus interest, there is little a digital lender can do. Users can simply delete the app and move on. One solution to this problem has been to flag defaulters to one of Kenya’s three credit reference bureaus (CRBs), effectively locking them out of the credit market. It’s unclear how effective this strategy is, but it’s frequently used. Between 2014 and 2017, about 2.7 million Kenyans were negatively listed with a CRB, 15 percent of them for defaulting on loans of less than about $2. Last year, “how to check CRB status” was among the most-Googled questions in Kenya, between “how to be successful in life” and “how to get pregnant.”</p>
+
+
+
+<p>Before long, digital lenders started looking into other methods of recouping their investments. Skip tracing, the ancient art of finding someone who owes you money and making them pay, was virtually nonexistent among fintech companies until early 2018. Coincidentally, that was the same year that Opay, a fintech company partially owned by the software-maker Opera, launched OKash in Kenya. The majority of Opera’s operations had been bought by a consortium of Chinese investors two years earlier, and shortly afterward, the company went on an expansion spree, announcing plans to invest $100 million in East Africa. While Opera’s then managing director, a former banker&nbsp; named Edward Ndichu, said at the time that the app would protect users’ personal information, he never explained how the company planned to safeguard its financial investment. But the answer was buried in OKash’s terms and conditions: When users download the app, they give it permission to access their contacts.</p>
+
+
+		<figure>
+			<div>
+				<p><img src="https://149346090.v2.pressablecdn.com/wp-content/uploads/2020/03/Contact-List-2-40x29.png" data-src="https://149346090.v2.pressablecdn.com/wp-content/uploads/2020/03/Contact-List-2-590x432.png" data-srcset="https://149346090.v2.pressablecdn.com/wp-content/uploads/2020/03/Contact-List-2-590x432.png 590w, " sizes="(max-width: 640px) 100vw, (max-width: 992px) calc(100vw - 40px), (max-width: 1140px) calc(100vw - 290px), calc(100vw - ((100vw - 640px)/2))" alt="">
+					
+				</p>
+			</div>
+						<figcaption itemprop="caption description">
+				
+				<span itemprop="copyrightHolder"><a href="https://www.simoulalva.com/" target="_blank" rel="noopener noreferrer">Simoul Alva for Rest of World</a></span>
+			</figcaption>
+		</figure>
+
+
+<hr>
+
+
+
+<p><strong>Reports of OKash</strong> using social shaming started to surface almost as soon as the app went live. And people immediately felt the fallout. A University of Nairobi …</p></div></div>
+<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://restofworld.org/2020/okash-microlending-public-shaming/">https://restofworld.org/2020/okash-microlending-public-shaming/</a></em></p>]]>
+            </description>
+            <link>https://restofworld.org/2020/okash-microlending-public-shaming/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-24395363</guid>
+            <pubDate>Sun, 06 Sep 2020 23:06:20 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[CubeSat interplanetary exploration is heating up]]>
+            </title>
+            <description>
+<![CDATA[
+Score 90 | Comments 24 (<a href="https://news.ycombinator.com/item?id=24392811">thread link</a>) | @tectonic
+<br/>
+September 6, 2020 | http://orbitalindex.com/archive/2020-09-02-Issue-80/ | <a href="https://web.archive.org/web/*/http://orbitalindex.com/archive/2020-09-02-Issue-80/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div replace-ids="_main" link-selector="a[href]:not([href*='/assets/']):not(.external):not(.no-push-state)" duration="250" script-selector="script:not([type^='math/tex'])" prefetch=""><main id="_main" role="main" data-color="#4fb1ba" data-theme-color="black" data-image="/assets/img/sidebar-bg.jpg" data-overlay=""><article class="page" role="article"><header></header><div id="mc-archive"> <center> <!--[if (gte mso 9)|(IE)]><table align="center" border="0" cellspacing="0" cellpadding="0" width="600" style="width:600px;"><tr><td align="center" valign="top" width="600" style="width:600px;"> <![endif]--><table><tbody><tr><td id="templatePreheader"></td></tr><tr><td id="templateHeader"><div> <!--[if mso]><table align="left" border="0" cellspacing="0" cellpadding="0" width="100%" style="width:100%;"><tr> <![endif]--> <!--[if mso]><td valign="top" width="600" style="width:600px;"> <![endif]--><div><div><p>Issue No. 80&nbsp;|&nbsp;Sep 2, 2020</p><p>   <span>🚀 🌍 🛰</span></p></div></div><!--[if mso]> <![endif]--> <!--[if mso]></table><![endif]--></div></td></tr><tr><td id="templateBody"><div> <!--[if mso]><table align="left" border="0" cellspacing="0" cellpadding="0" width="100%" style="width:100%;"><tr> <![endif]--> <!--[if mso]><td valign="top" width="600" style="width:600px;"> <![endif]--><div><p><a href="#cubesat-interplanetary-exploration-is-heating-up">¶</a><strong id="cubesat-interplanetary-exploration-is-heating-up">CubeSat interplanetary exploration is heating up.</strong> The twin <a href="https://www.jpl.nasa.gov/cubesat/missions/marco.php" target="_blank">MarCO 6U cubesats</a> (<a href="https://solarsystem.nasa.gov/resources/2373/marco-3d-model/" target="_blank">3D model</a>) made history when they <a href="https://www.jpl.nasa.gov/spaceimages/details.php?id=PIA22833" target="_blank">flew past Mars</a> and successfully relayed Mars InSight’s landing in real time (+ speed-of-light delay, natch). Now, many more lunar and interplanetary CubeSats are under development. From NASA comes <a href="https://www.jpl.nasa.gov/cubesat/missions/lunar_flashlight.php" target="_blank">Lunar Flashlight</a>, <a href="https://www.nasa.gov/feature/goddard/2019/lunar-icecube-mission-to-locate-study-resources-needed-for-sustained-presence-on-moon" target="_blank">Lunar IceCube</a>, and <a href="https://www.nasa.gov/content/nea-scout/" target="_blank">NEAScout</a> (a <em>solar sailing</em> small near-Earth asteroid explorer). ESA is working on <a href="http://www.esa.int/ESA_Multimedia/Images/2017/06/M_Argo" target="_blank">M-ARGO</a>, to explore small, rapidly spinning asteroids, and <a href="https://www.esa.int/Safety_Security/Hera/CubeSats_joining_Hera_mission_to_asteroid_system" target="_blank">2 cubesats that will tag along with their Hera mission</a> to the Didymos/Didymoon system (which will have already been attacked by NASA’s <a href="https://www.nasa.gov/planetarydefense/dart" target="_blank">DART kinetic impactor</a> along with its <a href="https://www.argotec.it/online/liciacube-nasa-choose-italian-excellence-to-monitor-a-space-impact-between-a-satellite-and-an-asteroid/" target="_blank">LICIACube</a> companion CubeSat). Caltech is working on <a href="https://trailblazer.caltech.edu/" target="_blank">Lunar Trailblazer</a> to map the lunar water cycle, while University of Arizona’s <a href="https://lunahmap.asu.edu/" target="_blank">LunaH-Map</a> will perform a high resolution search for water in permanently shadowed regions on the Moon’s poles. CubeSats can also enable less resourced countries and private entities to do deep space exploration. Poland and Virgin Orbit <a href="https://virginorbit.com/satrevolution-virgin-orbit-and-polish-universities-establish-mars-consortium/" target="_blank">are collaborating on a Mars cubesat</a>. <a href="https://www.theverge.com/21292753/rocket-lab-nasa-capstone-moon-mission-photon-hypercurie-engine" target="_blank">Rocket Lab is planning a mission to the Moon next year</a> (check out <a href="https://www.rocketlabusa.com/lunar/" target="_blank">Rocket Lab’s lunar site</a>), and Rocket Lab CEO Peter Beck is even <a href="https://www.space.com/rocket-lab-private-venus-mission-2023.html" target="_blank">investigating a private mission to Venus</a>—the upgraded Electron should be able to deliver around 25 kg to Mars or Venus (Venus requires an additional ∆v of ~1,000 m/s according to the handy chart at the end of this issue, ignoring aerobraking). Slightly larger upcoming vehicles like Firefly's Alpha and Relativity Space’s Terran 1 “<a href="https://arstechnica.com/science/2020/07/how-small-satellites-are-radically-remaking-space-exploration/2/" target="_blank"><em>probably could put CubeSats beyond the asteroid belt, toward Jupiter or beyond.</em></a>” Related: JPL’s "Honey, I Shrunk the NASA Payload" challenge <a href="https://www.herox.com/NASApayload/131-meet-the-winners" target="_blank">recently ended with awards for miniaturized lunar payloads</a>. Also Related: Astrobotic’s <a href="https://www.astrobotic.com/2019/10/2/astrobotic-s-cuberover-program-awarded-2-million-contract-by-nasa" target="_blank">CubeRover</a> is pretty cute.</p></div><!--[if mso]> <![endif]--> <!--[if mso]></table><![endif]--></div><div> <!--[if mso]><table align="left" border="0" cellspacing="0" cellpadding="0" width="100%" style="width:100%;"><tr> <![endif]--> <!--[if mso]><td valign="top" width="600" style="width:600px;"> <![endif]--><div><p><a href="#a-busy-weekend-in-launch">¶</a><strong id="a-busy-weekend-in-launch">A Busy Weekend in Launch. </strong>ULA, Rocket Lab, and SpaceX all had scheduled launches over the weekend. ULA kicked the weekend off with a Delta IV Heavy launch of an NRO spy satellite. The aging heavy lifter, which will be phased out and replaced by <a href="https://www.ulalaunch.com/rockets/vulcan-centaur" target="_blank">Vulcan</a> over the next few years, had a <a href="https://twitter.com/torybruno/status/1299623698090135552" target="_blank">T-3 sec hotfire abort</a> complete with a dramatic fireball (<a href="https://youtu.be/1jkjgo0Cs_8" target="_blank">video</a>). The rocket and payload are undamaged, but launch is delayed a week or more while expendable ground systems are replaced. Next up was SpaceX, launching <a href="https://space.skyrocket.de/doc_sdat/saocom-1.htm" target="_blank">SAOCOM-1B</a> into a polar orbit, the <a href="https://www.nasaspaceflight.com/2020/08/spacex-polar-cape-50-years/" target="_blank">first such southward flight path from Florida since 1969</a> when <a href="http://www.digitaljournal.com/tech-and-science/science/herd-shot-around-the-world-the-last-east-coast-polar-launch/article/567614" target="_blank">booster debris landed on Cuba</a> and <a href="https://www.mapfreglobalrisks.com/risks/images/Seguros_de_satelites_ENU_tcm1366-435032.pdf" target="_blank">killed a cow named Rufina</a> 🐮. Returning to this flight path was only possible due to the Falcon 9’s automated self-destruct systems—rocket exhaust in this flight path can block manually radioed abort messages. This launch was also temporarily halted due to its overflight of ULA’s aborted NROL-44 payload (expensive!) and required last minute approval from the NRO. To cap the weekend off,&nbsp;<a href="https://www.rocketlabusa.com/missions/completed-missions/i-cant-believe-its-not-optical/" target="_blank">Rocket Lab returned to flight with their 14th mission</a> (and announced that they will be conducting a first soft ocean splashdown of the booster for their 17th mission). Their&nbsp;<em>I Can’t Believe It’s Not Optical</em> mission was a dedicated launch for <a href="https://www.capellaspace.com/technology" target="_blank">Capella Space</a>, a startup focused on capturing 0.5 m resolution <a href="https://en.wikipedia.org/wiki/Synthetic-aperture_radar" target="_blank">synthetic aperture radar</a> (SAR) data as a service, the first of an eight satellite constellation. (<em>Ed., amusingly, this satellite was originally supposed to launch as a rideshare with SAOCOM-1B, but when that mission was delayed, Capella switched to Rocket Lab, which was then delayed by a July 4th failure, eventually launching just a few hours after the original mission. You just can’t get ahead. </em>🤷‍♂️)</p></div><!--[if mso]> <![endif]--> <!--[if mso]></table><![endif]--></div><div> <!--[if mso]><table align="left" border="0" cellspacing="0" cellpadding="0" width="100%" style="width:100%;"><tr> <![endif]--> <!--[if mso]><td valign="top" width="600" style="width:600px;"> <![endif]--><div><p><a href="#etc">¶</a><strong id="etc">Etc.</strong></p><ul><li>Explore Mars has <a href="https://www.exploremars.org/wp-content/uploads/2020/08/H2MR_2020_Web_v1.pdf" target="_blank">released their annual Humans to Mars report</a> detailing progress towards human exploration of the planet in the 2030s.</li><li>The US Department of Education has&nbsp;<a href="https://www.ctemissioncubesat.com/" target="_blank">announced a CubeSat mission design and prototyping challenge for High School students</a>. Project submission is October 16th, with a Phase 2 scheduled for January.</li><li>Chris Cassidy shared <a href="https://twitter.com/Astro_SEAL/status/1298703689960443904" target="_blank">dramatic views of Hurricane Laura from the ISS</a>.</li><li> <a href="https://www.tylermw.com/a-step-by-step-guide-to-making-3d-maps-with-satellite-imagery-in-r/" target="_blank">A Step-by-Step Guide to Making 3D Maps with Satellite Imagery in R</a>.</li><li><a href="https://ideas.esa.int/servlet/hype/IMT?documentTableId=45087622658433786&amp;userAction=Browse&amp;templateName=&amp;documentId=3817af91809ba52ab7cd2323267d5582" target="_blank">Submit new space mission ideas and concepts to ESA.</a></li><li>Cave of the Winds (<a href="https://www.nasa.gov/sites/default/files/files/Cave_of_the_Winds.pdf" target="_blank">pdf</a>) is a book about the history of NASA Langley’s <a href="https://www.nasa.gov/centers/langley/news/factsheets/30X60.html" target="_blank">Full-Scale Wind Tunnel</a>, which was in operation for 64 years until it closed in 1995. It was “<em>used to test everything from World War II fighters, to submarines, to the Mercury capsule to concepts for a supersonic transport.</em>”</li><li> <a href="https://satnogs.org/2020/08/introducing-the-brand-new-satnogs-db/" target="_blank">SatNOGS DB launched with a new UI</a>, you can use it to learn about all the satellites they track.</li><li> <a href="https://history.nasa.gov/afj/ap11fj/cm-107_graffiti.html" target="_blank">Analysis of Handwritten Notes Inside the Cabin of Apollo 11 Spacecraft CM-107 "Columbia"</a>. The level of detail is wonderful.</li><li> <a href="http://beza1e1.tuxen.de/lore/moon_phases.html" target="_blank">Software that failed based on the phase of the Moon</a> at CERN: “<em>A few desperate engineers discovered the truth; the error turned out to be the result of a tiny change in the geometry of the 27km circumference ring, physically caused by the deformation of the Earth by the passage of the Moon!</em>”</li></ul></div><!--[if mso]> <![endif]--> <!--[if mso]></table><![endif]--></div><div> <!--[if mso]><table align="left" border="0" cellspacing="0" cellpadding="0" width="100%" style="width:100%;"><tr> <![endif]--> <!--[if mso]><td valign="top" width="600" style="width:600px;"> <![endif]--><div><p><a href="#jobs">¶</a><strong id="jobs">Jobs</strong>.</p><ul><li>The newly launched <a href="https://spacetalent.org/" target="_blank">SpaceTalent.org</a> is a clearing house for finding a job in the industry, including resources for making the switch into aerospace.</li><li> <a href="https://www.pldspace.com/es/" target="_blank">PLD Space</a>, a European NewSpace startup working on reusable liquid fueled micro launchers, is <a href="https://twitter.com/pld_space/status/1300478458888290310?s=21" target="_blank">hiring a Senior Propulsion Engineer</a>.</li><li>NASA is seeking their <a href="https://twitter.com/Interplanetypod/status/1300816238873137153" target="_blank">next class of Flight Directors for Human Spaceflight missions</a>.</li></ul></div><!--[if mso]> <![endif]--> <!--[if mso]></table><![endif]--></div></td></tr><tr></tr></tbody></table><!--[if (gte mso 9)|(IE)]></table><![endif]--> </center></div></article></main><hy-drawer threshold="10" touch-events="" prevent-default=""></hy-drawer> </div></div>]]>
+            </description>
+            <link>http://orbitalindex.com/archive/2020-09-02-Issue-80/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-24392811</guid>
+            <pubDate>Sun, 06 Sep 2020 17:07:17 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Attention is your scarcest resource]]>
+            </title>
+            <description>
+<![CDATA[
+Score 544 | Comments 136 (<a href="https://news.ycombinator.com/item?id=24391686">thread link</a>) | @adambyrtek
+<br/>
+September 6, 2020 | https://www.benkuhn.net/attention/ | <a href="https://web.archive.org/web/*/https://www.benkuhn.net/attention/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article><p>Like many people, I have most of my best ideas in the shower.</p><p>This is sometimes annoying: I could use more than one shower’s worth of good ideas a day, but I’d rather not end up as a shrivelled yet insightful prune. Mostly, though, shower ideas are the incentive that keeps me smelling okay, so I grudgingly accept the constraint.</p><p>The time when it was most constraining was the first time I became a manager. I only had a few reports, so managing them wasn’t a full-time job. But I was very bad at it, and so it <em>should have</em> been what I spent all my shower insights on.</p><p>Unfortunately, I was spending my non-management time on programming. And even if I tried to use my showers to think about my thorny and awkward people issues, my mind somehow always wandered off to tackle those nice, juicy software design problems instead.</p><p>Management Attempt #1 didn’t go very well; being distracted by programming, I made lots of embarrassing mistakes that made my reports’ lives harder, which in turn made me feel stressed and guilty. I ended up bouncing back to being an individual contributor after a few months.</p><p>That experience of mine resonates strongly with Byrne Hobart’s <a href="https://diff.substack.com/p/the-future-of-remote-work-is-not" target="_blank">observation about focus in knowledge work</a>:</p><blockquote><p>The output of knowledge workers is extremely skewed based on focus. The productivity tiers seem to be:</p><ol><li><p>&lt;10% focused on the job at hand: meaningful risk of getting fired.</p></li><li><p>10-50% focus: “meets expectations,” gets regular raises.</p></li><li><p>50%+ focus: superstar, 10x engineer, destined for greatness.</p></li></ol></blockquote><p>“50%+ focus” is roughly when something becomes <a href="http://www.paulgraham.com/top.html" target="_blank">the top idea in your mind</a>. It’s when you start caring enough to think about it in the shower. It’s when you start habitually asking “how could this go faster?” It’s when you get <a href="http://www.paulgraham.com/relres.html" target="_blank">relentlessly resourceful</a>. It’s around when you start <a href="https://www.benkuhn.net/impatient/">annoying your coworkers and/or significant other</a>, although that part is avoidable with practice.</p><p>Most importantly, you can only be 50%+-focused on one thing at a time—or zero, in bad cases. That makes it critical to conserve your attention, so that you can spend it on what matters.</p><p>I’ve found a few different strategies that help me with this:</p><h3 id="care-viscerally">Care viscerally</h3><p>It’s hard to recruit 50%+ of your brain to work on something just because you feel like you “should” do it. Your superego might listen to this newfangled “logic” and “reason” stuff, but the monkey-era parts of your brain can’t be fooled so easily. To be reliably able to focus on something, you need to be intuitively, emotionally invested in the outcome.</p><p>For me, that’s not automatic—for instance, even though <a href="https://www.benkuhn.net/work/">I’m incredibly excited about what Wave is doing</a>, my day-to-day motivation gets worse if I work remotely for too long without visiting our operations in Senegal. Unless I can periodically see for myself that people are using the things we’re building, it starts feeling a little bit fake, like the so-called “real world” is a simulation that I can only communicate with via Slack channels and <code>git push</code>.</p><h3 id="monotask">Monotask</h3><p>As a programmer, I tried to make sure that I was only ever working on one thing at a time. Even if I got stuck on that one thing—say I was blocked on waiting for a tech partner to give me API documentation—I’d let myself stay stuck instead of sliding off to work on something else.</p><p>In the short term, this made me less efficient, because I’d spend less time programming and more time staring vacantly at the ceiling. But if I stared vacantly for long enough, I’d eventually get mad enough to, e.g., reverse-engineer the partner’s API in a fit of rage. This resulted in me shipping my most important projects faster, hence getting <a href="https://www.benkuhn.net/impatient/#startups">faster compounding growth</a>.</p><h3 id="evade-obligations">Evade obligations</h3><p>As a manager, it became impossible to “only work on one thing:” there were too many small tasks and too many projects going on in parallel. But I have a similar principle: I can only have one <em>obligation to other people</em>. “Give advice on this project?” Whenever you want! “Review my 1,000-line change?” Only if review isn’t blocking you from shipping it. “Check in every so often to make sure this doesn’t go off the rails?” Sorry, I have to, uh, powder my nose. “Figure out what the process should be?” I’ll get back to you in a couple years. (The best process is no process, right?)</p><p>During Management Attempt #1, my programming project distracted me so much because other people cared a lot that I finished it—if I ever had to de-prioritize it, I would make those people sad. This made it take up my attention (by worrying about letting people down) even when I wasn’t working on it. Unfortunately, since management work comes in urgent bursts, I’d often end up in a situation where I had to delay either the programming or the management—i.e., choose between making two different sets of people sad—and in those cases it was very hard for me to control my focus.</p><p>Now that I’ve noticed this, I allow myself to contribute to multiple things in parallel, as long as they don’t tax my object permanence skills—if I totally forgot about this project today, would anything bad happen? As long as the answer is no (usually because someone else is the one taking initiative to move things forward), I can be pretty sure that project won’t try to colonize my brain in the shower.</p><h3 id="timebox-bullshit">Timebox bullshit</h3><p>Even if I have only one major project that other people depend on, I somehow always end up with a bunch of minor chores to do—responding to emails, deflecting secondary obligations, buying household necessities, powdering my nose, filing expense reports, etc.</p><p>For these, I employ a “bullshit timebox”—a one-hour period a few times a week when I do <a href="http://paulgraham.com/vb.html" target="_blank">all the things life is too short for</a>. During the remaining 165 hours per week, I do my resolute best not to think about any of the bullshit, no matter how much people bug me about whether a <a href="https://thume.ca/2019/03/03/my-tungsten-cube/" target="_blank">1.5” tungsten cube</a> is really a legitimate work expense.</p><p>In order for bullshit not to distract me for the rest of the week, I try to minimize my number of “open loops”—projects or processes that I’ve started but not completed. Much like how I single-task on programming until it’s done, I’ll make phone calls instead of email threads, or, God forbid, texts or instant messaging. It took a while for me to train my friends not to instant message me, but by now they remember my rants about how distracting it is, practically word-for-word.</p><hr><p>Management Attempt #2 didn’t go great for me either. But I finally did an okay job at Management Attempt #3. Part of this was because I avoided repeating the particular mistakes of Attempts #1 and #2. But part of it was that on Attempt #3, our engineering team grew quickly enough that I went from “no managing” straight to “full-time managing” with no transitional period in which to be distracted, screw up and be miserable.</p><p>Once I was full-time managing, I had no shiny distractions and was able to spend my showers focusing on how to be a better manager. And once I was 50%+ focused, well, I haven’t become a “superstar 10x manager” yet, but I quickly stopped being 0.1x.</p></article></div>]]>
+            </description>
+            <link>https://www.benkuhn.net/attention/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-24391686</guid>
+            <pubDate>Sun, 06 Sep 2020 14:46:18 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Understanding OAuth2 and OpenID Connect]]>
+            </title>
+            <description>
+<![CDATA[
+Score 121 | Comments 50 (<a href="https://news.ycombinator.com/item?id=24391612">thread link</a>) | @bswamina
+<br/>
+September 6, 2020 | https://www.polarsparc.com/xhtml/OAuth2-OIDC.html | <a href="https://web.archive.org/web/*/https://www.polarsparc.com/xhtml/OAuth2-OIDC.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
+    <br>
+    
+    
+    <p>Understanding OAuth2 and OpenID Connect</p>
+    <br>
+    
+    <hr>
+    
+    <p>Overview</p>
+    <div id="para-div">
+      <p>There seems to be a lot of confusion around <span>OAuth2</span> and <span>OpenID Connect</span>
+        (<span>OIDC</span> for short). In this article, we will go on a journey to understand and clarify what
+        OAuth2 and OIDC really are.</p>
+      <p>Alice is hosting a party and wants to send an invite a select group of friends. She plans to send a digital invitation via
+        a site called <span>KoolInvitez</span>. The site needs a list of emails to send out the invitation. Alice stores
+        all her contacts (as a collection of groups) in a site called <span>EzGroupContacts</span>. How should Alice
+        provide access to the group called 'CloseFriends' in EzGroupContacts to KoolInvitez to send the invites ??? Should Alice
+        provide her credentials for EzGroupContacts to KoolInvitez so it can access the contacts in the group 'CloseFriends' ???
+        This is a security <span>anti-pattern</span> and *<span>NOT</span>* recommended. This is
+        where OAuth2 comes in handy. Think of OAuth2 as a way of handing someone a <span>Valet</span> key, who will
+        have limited access to perform their task. In other words, OAuth2 is an open standard for users to grant access to their
+        information on a site or application to another site, but without revealing their credentials.</p>
+      <p>OIDC, on the other hand, is an extension on top of OAuth2, that is used to verify the identify of a user (authentication)
+        in a standard way. As an example, there are many sites that do not have any user registration and rely on Google or Facebook
+        for identity verification (authentication).</p>
+    </div>
+    <p>Before we go any further, let us define some terms that will be useful in the context of OAuth2 and OIDC as follows:</p>
+    <table id="col2-table">
+      <thead><tr>
+        <th>Term</th>
+        <th>Description</th>
+      </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><span>Resource</span></td>
+          <td>Data or information that a user owns (Ex: the contact list 'CloseFriends')</td>
+        </tr>
+        <tr>
+          <td><span>Resource Owner</span></td>
+          <td>The owner of a Resource (Ex: Alice)</td>
+        </tr>
+        <tr>
+          <td><span>Resource Server</span></td>
+          <td>The server where the Resource is hosted (Ex: EzGroupContacts)</td>
+        </tr>
+        <tr>
+          <td><span>Client</span></td>
+          <td>An application or a site that needs access to a user Resource (Ex: KoolInvitez)</td>
+        </tr>
+        <tr>
+          <td><span>Authorization Server</span></td>
+          <td>The OAuth2/ODIC server where a user grants a consent to a Client, to access their Resource(s)</td>
+        </tr>
+        <tr>
+          <td><span>Access Token</span></td>
+          <td>A security token which the Client can present to the Resource Server to get access to a user's
+            Resource</td>
+        </tr>
+        <tr>
+          <td><span>Front Channel</span></td>
+          <td>Requests coming from a user agent (such as a web browser) to a server</td>
+        </tr>
+        <tr>
+          <td><span>Back Channel</span></td>
+          <td>Requests coming from a server to another server. This is done for security reasons</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>The basic *<span>FUNDAMENTAL</span>* flow of OAuth2 is referred to as the <span>Autorization
+        Code</span> flow and all the other flows are variations of this basic flow. The Auorization Code flow works as follows:</p>
+    <div id="para-div">
+      <ul id="blue-sqr-ul">
+        <li>
+          <p><span>1</span> :: the Resource Owner launches the Client to initiate the flow</p>
+        </li>
+        <li>
+          <p><span>2</span> :: the Client makes a request to the Authorization Server from the Front Channel for an
+            authorization code (<span>/auth_code</span>) passing in an URL to respond back to (<span>/callback
+            </span>) at the Client</p>
+        </li>
+        <li>
+          <p><span>3</span> :: the Authorization Server redirects the Resource Owner to the Resource Server for user
+            authentication and access grant</p>
+        </li>
+        <li>
+          <p><span>4</span> :: the Resource Owner enters valid credentials that is verified by the Resource Server and
+            redirects back to the Authorization Server</p>
+        </li>
+        <li>
+          <p><span>5</span> :: the Authorization Server generates an Authorization Code and responds back to the Client
+            with the authorization code on the Back Channel at the specified URL (<span>/callback</span>)</p>
+        </li>
+        <li>
+          <p><span>6</span> :: the Client makes a request to the Authorization Server for an Access Token through the
+            Back Channel</p>
+        </li>
+        <li>
+          <p><span>7</span> :: the Authorization Server responds back to the Client with an Access Token on the Back
+            Channel</p>
+        </li>
+        <li>
+          <p><span>8</span> :: the Client uses the Access Token to make a request to access the Resource at the Resource
+            Server</p>
+        </li>
+        <li>
+          <p><span>9</span> :: the Resource Server responds with the data associated with the Resource</p>
+        </li>
+      </ul>
+    </div>
+    <p>The following diagram illustrates the basic Authorization Code flow:</p>
+    <br>
+    <div id="img-outer-div"> <p><img src="https://www.polarsparc.com/xhtml/images/oauth-01.png" alt="Basic Flow"></p><p>Figure.1</p>
+    </div>
+    
+    <p><span>NOTE</span> :: In some cases, the Authorization Server and the Resource Server may be ONE.</p>
+    <p>Installation and Setup</p>
+    <div id="para-div">
+      <p>The installation will be on a <span>Ubuntu 20.04 LTS</span> based Linux desktop.</p>
+      <p>Ensure <span>Docker</span> is installed on the system. Else, follow the instructions provided in the article
+        <a href="https://www.polarsparc.com/xhtml/Docker.html" target="_blank"><span>Introduction to Docker</span></a>
+        to complete the installation.</p>
+    </div>
+    <p>There are few open source implementations of the Authorization Server that implement the OAuth2/OIDC standards as follows:</p>
+    
+    <div id="para-div">
+      <p>For our setup and demonstration, we will use the <span>Keycloak</span> Authorization Server in conjuction
+        with the <span>PostgreSQL</span> database.</p>
+      <p>Check the latest stable version for <a href="https://hub.docker.com/_/postgres" target="_blank"><span>Postgres
+        </span></a> docker image. Version <span>12.4</span> was the latest at the time of this article.</p>
+      <p>To download the latest docker image for <span>Postgres</span>, execute the following command:</p>
+    </div>
+    <p>$ docker pull postgres:12.4</p>
+    <p>The following would be a typical output:</p>
+    <div id="out-div">
+      <h4>Output.1</h4>
+      <pre>12.4: Pulling from library/postgres
+bf5952930446: Pull complete 
+9577476abb00: Pull complete 
+2bd105512d5c: Pull complete 
+b1cd21c26e81: Pull complete 
+34a7c86cf8fc: Pull complete 
+274e7b0c38d5: Pull complete 
+3e831b350d37: Pull complete 
+38fa0d496534: Pull complete 
+c989da35e5c0: Pull complete 
+26dc6fdd7b2d: Pull complete 
+3c5032512cf3: Pull complete 
+26910ececf99: Pull complete 
+0339413523e8: Pull complete 
+d61df7db53da: Pull complete 
+Digest: sha256:9f325740426d14a92f71013796d98a50fe385da64a7c5b6b753d0705add05a21
+Status: Downloaded newer image for postgres:12.4
+docker.io/library/postgres:12.4</pre>
+    </div>
+    <div id="para-div">
+      <p>Check the latest stable version for <a href="https://hub.docker.com/r/jboss/keycloak" target="_blank"><span>
+        Keycloak</span></a> docker image. Version <span>11.0.1</span> was the latest at the time of this article.</p>
+      <p>To download the latest docker image for <span>Keycloak</span>, execute the following command:</p>
+    </div>
+    <p>$ docker pull jboss/keycloak:11.0.1</p>
+    <p>The following would be a typical output:</p>
+    <div id="out-div">
+      <h4>Output.2</h4>
+      <pre>11.0.1: Pulling from jboss/keycloak
+41ae95b593e0: Pull complete 
+f20f68829d13: Pull complete 
+6c304f8c55f0: Pull complete 
+7db1d4725e09: Pull complete 
+59cf4c955406: Pull complete 
+Digest: sha256:d7cb114cdb5dcc4b2c9b56ac7b827249596491db02bb82177edb42413056aa13
+Status: Downloaded newer image for jboss/keycloak:11.0.1
+docker.io/jboss/keycloak:11.0.1</pre>
+    </div>
+    <p>To create a new bridge network called <span>my-iam-net</span>, execute the following command:</p>
+    <p>$ docker network create my-iam-net</p>
+    <p>The following would be a typical output:</p>
+    <div id="out-div">
+      <h4>Output.3</h4>
+      <pre>64852330d28ade21943e0d8acfcf91fe4037c4f378d40c97f5b902e70674003d</pre>
+    </div>
+    <div id="para-div">
+      <p>We will store the database files in the directory <span>$HOME/Downloads/DATA/postgres</span> on the host.</p>
+      <p>To start the Postgres database, execute the following command:</p>
+    </div>
+    <p>$ docker run -d --rm --name postgres --net my-iam-net -e POSTGRES_DB=keycloak -e POSTGRES_USER=keycloak -e POSTGRES_PASSWORD=keycloak\$123 -p 5432:5432 -v $HOME/Downloads/DATA/postgres:/var/lib/postgresql/data postgres:12.4</p>
+    <p>The following would be a typical output:</p>
+    <div id="out-div">
+      <h4>Output.4</h4>
+      <pre>26e000434238aea7a1f6cace9be81d243a3a37f6ab7cfdef3625ed03b0e296f1</pre>
+    </div>
+    <p>To check the Postgres database logs, execute the following command:</p>
+    <p>$ docker logs postgres</p>
+    <p>The following would be a typical output:</p>
+    <div id="out-div">
+      <h4>Output.5</h4>
+      <pre>...
+...
+...
+PostgreSQL init process complete; ready for start up.
+
+2020-08-29 17:07:00.296 UTC [1] LOG:  starting PostgreSQL 12.4 (Debian 12.4-1.pgdg100+1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 8.3.0-6) 8.3.0, 64-bit
+2020-08-29 17:07:00.296 UTC [1] LOG:  listening on IPv4 address "0.0.0.0", port 5432
+2020-08-29 17:07:00.296 UTC [1] LOG:  listening on IPv6 address "::", port 5432
+2020-08-29 17:07:00.299 UTC [1] LOG:  listening on Unix socket "/var/run/postgresql/.s.PGSQL.5432"
+2020-08-29 17:07:00.316 UTC [65] LOG:  database system was shut down at 2020-08-29 17:07:00 UTC
+2020-08-29 17:07:00.321 UTC [1] LOG:  database system is ready to accept connections</pre>
+    </div>
+    <br>
+    <div id="warn-div">
+      <h4>!!! ATTENTION !!!</h4>
+      <pre>Logs in the article have been trimmed to just show the pieces relevant to the context<br>The lines with three dots '...' indicates code that has been truncated</pre>
+    </div>
+    <p>To start the Keycloak OAuth2/ODIC server, execute the following command:</p>
+    <p>$ docker run --name keycloak --net my-iam-net -e DB_VENDOR=POSTGRES -e DB_DATABASE=keycloak -e DB_SCHEMA=public -e DB_ADDR=postgres -e DB_PORT=5432 -e DB_USER=keycloak -e DB_PASSWORD=keycloak\$123 -e KEYCLOAK_USER=admin -e KEYCLOAK_PASSWORD=kc_admin\$123 -p 8080:8080 jboss/keycloak:11.0.1</p>
+    <p>The following would be a typical output:</p>
+    <div id="out-div">
+      <h4>Output.6</h4>
+      <pre>Added 'admin' to '/opt/jboss/keycloak/standalone/configuration/keycloak-add-user.json', restart server to load user
+-b 0.0.0.0
+=========================================================================
+
+  Using PostgreSQL database
+
+=========================================================================
+
+17:12:51,436 INFO  [org.jboss.modules] (CLI command executor) JBoss Modules version 1.10.1.Final
+17:12:51,486 INFO  [org.jboss.msc] (CLI command executor) JBoss MSC version 1.4.11.Final
+17:12:51,494 INFO  [org.jboss.threads] (CLI command executor) JBoss Threads version 2.3.3.Final
+17:12:51,585 INFO  [org.jboss.as] (MSC service thread 1-2) WFLYSRV0049: Keycloak 11.0.1 (WildFly Core 12.0.3.Final) starting
+17:12:51,668 INFO  [org.jboss.vfs] (MSC service thread 1-7) VFS000002: Failed to clean existing content for temp file provider of type temp. Enable DEBUG level log to find what caused this
+...
+...
+...
+The batch executed successfully
+17:12:55,936 INFO  [org.jboss.as] (MSC service thread 1-3) WFLYSRV0050: Keycloak 11.0.1 (WildFly Core 12.0.3.Final) stopped in 14ms
+=========================================================================
+
+  JBoss Bootstrap Environment
+
+  JBOSS_HOME: /opt/jboss/keycloak
+
+  JAVA: java
+
+  JAVA_OPTS:  -server -Xms64m -Xmx512m …</pre></div></div>
+<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://www.polarsparc.com/xhtml/OAuth2-OIDC.html">https://www.polarsparc.com/xhtml/OAuth2-OIDC.html</a></em></p>]]>
+            </description>
+            <link>https://www.polarsparc.com/xhtml/OAuth2-OIDC.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-24391612</guid>
+            <pubDate>Sun, 06 Sep 2020 14:37:09 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[A Meta-Layer for Notes]]>
+            </title>
+            <description>
+<![CDATA[
+Score 91 | Comments 24 (<a href="https://news.ycombinator.com/item?id=24391166">thread link</a>) | @julian_digital
+<br/>
+September 6, 2020 | https://julian.digital/2020/09/04/a-meta-layer-for | <a href="https://web.archive.org/web/*/https://julian.digital/2020/09/04/a-meta-layer-for">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+ 		
+<h3>What’s the digital equivalent of sticky notes?</h3>
+
+
+
+<p><span>01</span> Hey</p>
+
+
+
+<p>This was originally supposed to be a blog post about <a href="https://www.hey.com/">Hey</a>. I wanted to write a longer essay about Basecamp’s new email tool and test if the app actually lives up to its hype.</p>
+
+
+
+<p>After playing around with it for a few weeks, my conclusion is this: <strong>Hey’s most interesting aspect is not its radical approach to email – but its fresh approach to note taking!</strong></p>
+
+
+
+<p>We have long treated notes as a distinct silo in our productivity stack, when we should have integrated them right into our workflows instead. While email might need an overhaul, I see a way bigger opportunity in rethinking digital note taking.</p>
+
+
+
+<p>So instead of my Hey review, let’s talk about notes and my idea for a radically new kind of note taking app.</p>
+
+
+
+<p><span>02</span> A Closer Look at Notes in Hey</p>
+
+
+
+<p>Hey has two interesting notes features.</p>
+
+
+
+<p>The first are so-called <a href="https://hey.com/features/thread-notes/">Thread Notes</a>. These are basically emails to yourself within an email thread that only you can see. You might have seen similar internal notes features in shared inbox tools like Zendesk or Front. Thread Notes in Hey are effectively the single player version of those.</p>
+
+
+
+<p><img src="https://julian.digital/wp-content/uploads/2020/08/threadnotes.png"></p><p>I’d find Thread Notes super useful in combination with snoozed emails: <em>“Show me this email again in [insert time] and remind me of [insert note]”</em></p>
+
+
+
+<p>This feels like a way better workflow than adding a note in a separate reminder, to-do, CRM, or note taking app.</p>
+
+
+
+<p>a) Because there’s no need for context/app switching.<br>b) You might not even remember that you took a note related to an email when it resurfaces in your inbox a few weeks later.</p>
+
+
+
+<p>To-do and reminder apps (and calendars!) work great for tasks that are tied to a specific day or time. But many tasks – and especially notes – are not dependent on time. Their relevance is based on other trigger points. Only when certain conditions are met, should these notes resurface: <em>“If [insert event] is true, then show [note]”</em></p>
+
+
+
+<p>In the case of our email, the note becomes relevant in <em>[insert snooze time]</em> or whenever the recipient replies to the email thread. The fact that many tasks have external dependencies (which are usually linked to an email thread)  is one of the reasons I believe that your email inbox should also be the place where you manage your to-dos. <a href="http://julian.digital/2020/01/17/superhuman-the-productivity-meta-layer/">You shouldn’t need a separate to-do app</a>.</p>
+
+
+
+<center>—</center>
+
+
+
+<p>The second note feature in Hey are <a href="https://hey.com/features/inbox-notes/">Inbox Notes</a>.</p>
+
+
+
+<p>As the name suggests, these notes are added to individual emails in your inbox. Similar to Thread Notes, you can use them to quickly jot down things you need to remember, but they also help you to highlight specific emails.</p>
+
+
+
+<p><img src="https://julian.digital/wp-content/uploads/2020/09/inboxnotesimp.png"></p><p>Thread Notes and Inbox Notes feel similar, but they serve two slightly different use cases. Thread Notes work more like reminders (<em>“Don’t forget X when you reply”</em>), whereas Inbox Notes feel more like bookmarks that highlight the most important messages in a long list of emails. </p>
+
+
+
+<p>Together, they remind me of one of my all-time favorite note taking tools: <a href="https://en.wikipedia.org/wiki/Post-it_Note">Post-it Notes</a>.</p>
+
+
+
+<p><span>03</span> Post-it Notes</p>
+
+
+
+<p>I’m a huge fan of physical note taking and there are two writing tools that I use every single day: A physical notebook (for longer thoughts, including first drafts of my blog posts) and post-it notes (for all kinds of quick notes).</p>
+
+
+
+<p>(Disclaimer: When I say “post-it notes” I’m referring to all types of sticky notes, not just those sold by 3M.)</p>
+
+
+
+<p>Post-it notes serve two of the same functions that Hey’s note features offer: highlights and reminders.</p>
+
+
+
+<p>One of the reasons I still read a lot of non-fiction in physical book form is because it’s easier to bookmark and annotate passages that I quickly want to find again later. Similar to Thread Notes, sticky note bookmarks help me <strong>highlight</strong> the most important items in a long list.</p>
+
+
+
+<p><img src="https://julian.digital/wp-content/uploads/2020/08/postithighlight-1.png"></p><p>Apart from helping you find important passages in a book later on, sticky note bookmarks also allow you to add additional context to the section you highlighted (e.g. *why* you bookmarked a particular section or thoughts you had about it). </p>
+
+
+
+<p>You could write down notes like this in a separate notebook, but then you’d lose the connection to the source they are based on. <strong>What makes post-it notes so interesting is the spatial relationship between the notes and their respective context.</strong></p>
+
+
+
+<p>It’s this spatial relationship that also make post-it notes great <strong>reminders</strong>.</p>
+
+
+
+<p><img src="https://julian.digital/wp-content/uploads/2020/08/postitreminders.png"></p><p>Post-it note reminders are similar to Hey’s Thread Notes in that they are triggered not based on time but on events that don’t have a (forecastable) deadline. They are essentially like notifications that appear when you look at specific objects.</p>
+
+
+
+<p>A post-it note on your front door, for example, is like a notification that pops up when you’re about to leave the house: <em>“Before you go, don’t forget to [insert note]”</em>. A shopping list on your fridge is a data request notification that surfaces when you are most likely to have new items to add to your list.</p>
+
+
+
+<p>Together, post-its essentially become a notes layer that augments the real world. Instead of a physical notebook that lists all your notes and tasks in chronological order, post-it notes are scattered around your house but tied to specific places or objects where they are most relevant.</p>
+
+
+
+<p>The question is: <strong>Why isn’t there a digital note taking tool that works like this?</strong></p>
+
+
+
+<p><span>04</span> A Spatial Note Taking Layer</p>
+
+
+
+<p>There are dozens of great note taking apps out there: Evernote, Google Keep, Apple Notes, Workflowy, Notion, Roam … the list goes on and on. Every one of these tools has its own unique angle on note taking, but they all have one thing in common: They are stand-alone apps.</p>
+
+
+
+<p>This strikes me as suboptimal. Neither the creation nor the consumption of notes should be treated as separate workflows.</p>
+
+
+
+<p>As John Palmer points out in his brilliant posts on <a href="https://darkblueheaven.com/spatialinterfaces/">Spatial Interfaces</a> and <a href="https://darkblueheaven.com/spatialsoftware">Spatial Software</a>, “Humans are spatial creatures [who] experience most of life in relation to space”. Post-it notes are so powerful because they have a spatial relationship to their context.</p>
+
+
+
+<p>Many notes shouldn’t live in a dedicated note taking app that you explicitly have to open and search. Notes should emerge automatically whenever and *wherever* they are most relevant.</p>
+
+
+
+<p><img src="https://julian.digital/wp-content/uploads/2020/08/statusquonotes-1.png"></p><p>As long as note taking remains separated, users constantly have to switch back and forth between different applications, which is not ideal. It reminds me of <a href="https://kwokchain.com/2019/08/16/the-arc-of-collaboration/">the recent discussion around productivity and collaboration</a> – which have historically also been treated as two separate, isolated workflows:</p>
+
+
+
+<p><i>The platonic flow of productivity should minimize time spent not productive, with collaboration as aligned and unblocking with that flow as possible. By definition, any app that requires you to switch out of your productivity app to collaborate is blocking and cannot be maximally aligned. It’s fine to leave your productivity app for exceptions and breaks. But not ideal when working.</i></p>
+
+
+
+<p>The same applies to notes. You shouldn’t have to switch apps and context to take or consume notes. It should stay within the same workflow!</p>
+
+
+
+<p>(Side Note: You could argue that note taking is essentially single-player collaboration where you communicate with your future self – but that’s a whole new discussion I’ll save for another blog post.)</p>
+
+
+
+<p>Natively built in note taking features like email notes in Hey feel like a good step in the right direction – but email is just one distinct silo in your productivity stack. Imagine you had to buy different sets of post-it notes for every single room or object in your house.</p>
+
+
+
+<p>What we need instead is a spatial meta layer for notes on the OS-level that lives across all apps and workflows. This would allow you to instantly take notes without having to switch context. Even better yet, the notes would automatically resurface whenever you revisit the digital location you left them at.</p>
+
+
+
+<p><img src="https://julian.digital/wp-content/uploads/2020/08/noteslayer-1.png"></p><p>Let’s look at a few examples.</p>
+
+
+
+<p><span>05</span> Examples</p>
+
+
+
+<p>One use case that immediately came to mind when I thought about spatial notes is bookmarking.</p>
+
+
+
+<p>Most of us don’t use just one bookmarking app for everything. We use different bookmarking apps or bookmarking features depending on the type of object we want to save for later: Podcasts are usually saved in a dedicated podcast app, for example. Articles are bookmarked in Pocket, books on Goodreads, songs on Spotify, places on Foursquare, products on Amazon … you get my point.</p>
+
+
+
+<p>Bookmarks are great to remember *what* you want to revisit later – but not *why* you saved something in the first place. I would love to be able to add notes to my bookmarks directly in each app so that I have some context on why these objects are important when I return to them later.</p>
+
+
+
+<p><img src="https://julian.digital/wp-content/uploads/2020/09/podcastnote.png"></p><p>Ideally, these notes wouldn’t just show up in the one place I originally left them, but across all apps and websites that reference the (semantic) object I bookmarked. A note attached to a book I want to read in Goodreads, for example, should also emerge when I see that book in my Amazon search results – or when someone mentions it in my Twitter timeline.</p>
+
+
+
+<p><img src="https://julian.digital/wp-content/uploads/2020/09/goodamznnotes.png"></p><p>People are a similar type of semantic object you could tie notes to. Instead of a stand-alone CRM tool, you would leave a note attached to a person straight from your current workflow (e.g. your email client). That note would then automatically re-surface whenever the person it references becomes relevant again:</p>
+
+
+
+<ul><li>When you’re in an email thread with them</li><li>When you add them to a calendar event</li><li>When you’re visiting their LinkedIn page</li><li>When you look them up in your phone book</li><li>etc</li></ul>
+
+
+
+<center>—</center>
+
+
+
+<p>Another use case for spatial notes are instructions on how to use specific software features or improve workflows. These could be quick reminders to add permissions to new calendar events or to use Filtered Views in Google Sheets. You could also use these notes to train users on keyboard shortcuts.</p>
+
+
+
+<p><img src="https://julian.digital/wp-content/uploads/2020/09/relief.png"></p><p>You could imagine employers shipping corporate laptops with pre-installed notes to make it easier to transfer (previously tacit) knowledge and thus improve the onboarding process for new hires.</p>
+
+
+
+<p><span>06</span> Closing Notes</p>
+
+
+
+<p>I could go on and on …</p></div></div>
+<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://julian.digital/2020/09/04/a-meta-layer-for">https://julian.digital/2020/09/04/a-meta-layer-for</a></em></p>]]>
+            </description>
+            <link>https://julian.digital/2020/09/04/a-meta-layer-for</link>
+            <guid isPermaLink="false">hacker-news-small-sites-24391166</guid>
+            <pubDate>Sun, 06 Sep 2020 13:31:56 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Common color mistakes and how to avoid them]]>
+            </title>
+            <description>
+<![CDATA[
+Score 734 | Comments 111 (<a href="https://news.ycombinator.com/item?id=24391049">thread link</a>) | @hunvreus
+<br/>
+September 6, 2020 | https://blog.datawrapper.de/beautifulcolors/ | <a href="https://web.archive.org/web/*/https://blog.datawrapper.de/beautifulcolors/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div itemprop="articleBody">
+            <p><img alt="header image" data-src="/img/full-200805_goodcolors34.png" data-src-thumb="/img/thumb-200805_goodcolors34.png" src="https://blog.datawrapper.de/img/thumb-200805_goodcolors34.png"></p>
+<p>Choosing good colors for your charts is hard. This article tries to make it easier.</p>
+<p>I want you to feel more confident in your color choices. And if you have no sense for colors at all, here’s my attempt to help you find good ones anyway. We’ll talk about common color mistakes I see out there in the wild, and how to avoid them.</p>
+<p>This is not the right article for you if you’re trying to find good gradients or shades. But if you need to find beautiful, distinctive colors for different <strong>categories (e.g. continents, industries, bird species)</strong> for your line charts, pie charts, stacked bar charts, etc., read on.</p>
+<p><img alt="different data visualizations" data-src="/img/full-200805_goodcolors-f.png" data-src-thumb="/img/thumb-200805_goodcolors-f.png" src="https://blog.datawrapper.de/img/thumb-200805_goodcolors-f.png"><em>Visualized categories by <a href="https://fivethirtyeight.com/features/the-56-best-and-weirdest-charts-we-made-in-2019/" target="_blank" rel="noopener">FiveThirtyEight</a>, <a href="https://whydocatsanddogs.com/cats" target="_blank" rel="noopener">Nadieh Bremer</a>, <a href="https://congress.pudding.cool/" target="_blank" rel="noopener">The Pudding</a>, <a href="https://www.nytimes.com/interactive/2019/10/14/us/politics/democrats-political-facebook-ads.html" target="_blank" rel="noopener">New York Times</a>, <a href="https://infographics.economist.com/2019/AChristmasGiftForYou/AYearInGraphicDetail.pdf" target="_blank" rel="noopener">The Economist</a> and <a href="https://medium.com/accurat-studio/beautiful-reasons-c1c6926ab7d7" target="_blank" rel="noopener">Akkurat</a></em></p>
+<h4 id="Index">Index</h4>
+<p><a href="#0"><b>00</b> Before we start…</a><br>
+<a href="#1"><b>01</b> Broaden your understanding of colors</a><br>
+<a href="#2"><b>02</b> Don’t dance all over the color wheel</a><br>
+<a href="#3"><b>03</b> Use saturation and lightness to make your hues work</a><br>
+<a href="#4"><b>04</b> Use warm colors &amp; blue</a><br>
+<a href="#5"><b>05</b> When using green, make it a yellow or blue one</a><br>
+<a href="#6"><b>06</b> Avoid pure colors</a><br>
+<a href="#7"><b>07</b> Avoid bright, saturated colors</a><br>
+<a href="#8"><b>08</b> Combine colors with different lightness</a><br>
+<a href="#9"><b>09</b> Make your colors similarly “colorful”</a><br>
+<a href="#10"><b>10</b> Avoid too little contrast to the background</a><br>
+<a href="#11"><b>11</b> Avoid too much contrast to the background</a><br>
+<a href="#12"><b>12</b> Choose a background that’s desaturated enough</a><br>
+<a href="#13"><b>13</b> Copy colors, or understand them</a></p>
+
+<h4 id="Before-we-start…">Before we start…</h4>
+<p>I will mention saturation, brightness and hue a lot. The HSB (<strong>H</strong>ue, <strong>S</strong>aturation, <strong>B</strong>rightness) or HSV (<strong>H</strong>ue, <strong>S</strong>aturation, <strong>V</strong>alue) color spaces work fairly well to check them:</p>
+<ul>
+<li><strong>Hue</strong> ranges from 0° to 360°…that’s your typical color wheel: <span>⬤</span><span>⬤</span><span>⬤</span></li>
+<li><strong>Saturation</strong> ranges from 0% (grey) to 100% (super duper colorful!!): <span>⬤</span><span>⬤</span><span>⬤</span></li>
+<li><strong>Brightness/Value</strong> ranges from 0% (black) to 100% (the actual color): <span>⬤</span><span>⬤</span><span>⬤</span></li>
+</ul>
+<p>To convert your colors from HEX (e.g. <code>#cc0000</code>) or RGB (e.g. <code>rgb(207, 176, 58)</code>) to HSB/HSV, use a tool like <a href="http://colorizer.org/" target="_blank" rel="noopener"><strong>colorizer.org</strong></a>.</p>
+<p>A relative of HSB/HSV is the <a href="https://en.wikipedia.org/wiki/HCL_color_space" target="_blank" rel="noopener">HCL</a> color space. It uses the same parameters (<strong>H</strong>ue, <strong>C</strong>hroma = saturation, <strong>L</strong>ightness), but is closer to “how we really see colors”. <a href="https://academy.datawrapper.de/article/255-how-to-pick-colors-in-datawrapper" target="_blank" rel="noopener"><strong>Datawrapper</strong> uses the HCL color space</a> for its color picker:</p>
+<p><img alt="HCL color picker in Datawrapper" data-src="/img/full-200805_goodcolors31.png" data-src-thumb="/img/thumb-200805_goodcolors31.png" src="https://blog.datawrapper.de/img/thumb-200805_goodcolors31.png"></p>
+<p>But since you won’t find HCL in Adobe Photoshop or <a href="http://colorizer.org/" target="_blank" rel="noopener">colorizer.org</a>, every time I mention degrees (like 0°) or percentages, I’ll be talking about the HSB/HSV color space.</p>
+<p>Alright, let’s do this:</p>
+
+<h4 id="Broaden-your-understanding-of-colors">Broaden your understanding of colors</h4>
+<p><img alt="" data-src="/img/full-200805_goodcolors30.png" data-src-thumb="/img/thumb-200805_goodcolors30.png" src="https://blog.datawrapper.de/img/thumb-200805_goodcolors30.png"></p>
+<p>You might think like this: “I need five colors for my chart. So I use green and yellow and blue and red. And …um…maybe orange? Or purple!”</p>
+<p>If you haven’t thought much about colors since you were a kid coloring out your coloring book, this thought makes sense. So today I’m here to tell you: They are more colors than that.</p>
+<p>Look at this graphic and compare them with the basic colors <span>⬤</span><span>⬤</span><span>⬤</span><span>⬤</span><span>⬤</span><span>⬤</span>:</p>
+<p><img alt="" data-src="/img/full-200805_goodcolors13.png" data-src-thumb="/img/thumb-200805_goodcolors13.png" src="https://blog.datawrapper.de/img/thumb-200805_goodcolors13.png"><em><a href="https://whydocatsanddogs.com/cats" target="_blank" rel="noopener">Why do Cats and Dogs?</a> by Nadieh Bremer</em></p>
+<p>They’re different. The red that Nadieh uses <span>⬤</span> is different from your typical red <span>⬤</span>. The green <span>⬤</span> is…can you even call it a green <span>⬤</span>?</p>
+<p>So before we impose rules that limit us, let me freak you out a bit: There are thousands of colors you can use. There is yellow-ish red <span>⬤</span> and blue-ish red <span>⬤</span> and everything in between. There is grey <span>⬤</span>, but there is also cold grey <span>⬤</span> and there is warm grey <span>⬤</span>. And then there is blue. So much blue! Like this <span>⬤</span>, this <span>⬤</span>, this <span>⬤</span>, this <span>⬤</span> and this <span>⬤</span>. And we haven’t even talked about orange and yellow.</p>
+<p>You have <em>lots</em> of options. Which means you can stay in a small area of the color wheel and still have many options. Which means:</p>
+
+<h4 id="Don’t-dance-all-over-the-color-wheel">Don’t dance all over the color wheel</h4>
+<p><img alt="" data-src="/img/full-200805_goodcolors28.png" data-src-thumb="/img/thumb-200805_goodcolors28.png" src="https://blog.datawrapper.de/img/thumb-200805_goodcolors28.png"></p>
+<p>There’s no need to rely on hues from all around the color wheel like <span>⬤</span><span>⬤</span><span>⬤</span><span>⬤</span><span>⬤</span><span>⬤</span> for your visualizations. It will look more professional – and therefore more trustworthy – when it only uses a few hues and their neighbors.</p>
+<p>Here’s where it becomes a good idea to actually look at a color wheel. You can use <a href="https://color.adobe.com/create/color-wheel" target="_blank" rel="noopener">Adobe Color</a> or <a href="https://www.sessions.edu/color-calculator/" target="_blank" rel="noopener">Color Calculator</a> to do so.</p>
+<p><img alt="" data-src="/img/full-200805_goodcolors21.png" data-src-thumb="/img/thumb-200805_goodcolors21.png" src="https://blog.datawrapper.de/img/thumb-200805_goodcolors21.png"><em><a href="https://www.sessions.edu/color-calculator/" target="_blank" rel="noopener">Color Calculator</a> harmonies</em></p>
+<p>Lots of these tools let you choose different harmonies. One of them is called “square” or “tetradic”. <strong>Don’t use it.</strong> It will result in too many hues –&nbsp;and we’re on a mission to avoid that.</p>
+<video autoplay="" loop="" muted="">
+  <source src="https://blog.datawrapper.de/img/200805_goodcolors20.mp4" type="video/mp4">
+</video>
+<p>In the video above, I used the color tool <a href="https://paletton.com/" target="_blank" rel="noopener">Paletton</a> to start with a tetradic harmony and then decrease the distance. Note how more beautiful the color combinations become.</p>
+<p>If the distance becomes small enough, you’re basically using <strong>complementary</strong> colors. And that’s a great choice! Lots of complementary color pairs work awesome together. <strong>If in doubt, use complementary colors and their neighbors.</strong></p>
+<p>So let’s do this –&nbsp;this time with Adobe Color:</p>
+<p><img alt="" data-src="/img/full-200805_goodcolors22.png" data-src-thumb="/img/thumb-200805_goodcolors22.png" src="https://blog.datawrapper.de/img/thumb-200805_goodcolors22.png"><em>Our complementary colors in <a href="https://color.adobe.com/create/color-wheel" target="_blank" rel="noopener">Adobe Color</a></em></p>
+<p>Our colors are opposite each other on the color wheel, so they’re clearly complementary. Yay! But they’re also unusable: The two oranges are way too similar. And everything looks so…bright.</p>
+<p>There’s where we need to change the saturation and lightness:</p>
+
+<h4 id="Use-saturation-and-lightness-to-make-your-hues-work">Use saturation and lightness to make your hues work</h4>
+<p><img alt="" data-src="/img/full-200805_goodcolors27.png" data-src-thumb="/img/thumb-200805_goodcolors27.png" src="https://blog.datawrapper.de/img/thumb-200805_goodcolors27.png"></p>
+<p>Saturation and brightness are as important as hue. In fact, you can create new colors when you just change the saturation and brightness. Here are two color pairs with the same hue, just different saturation and lightness: <span>⬤</span><span>⬤</span> / <span>⬤</span><span>⬤</span>. (If you change the hue just a tiny bit, you’ll achieve even better results: <span>⬤</span><span>⬤</span> / <span>⬤</span><span>⬤</span>.)</p>
+<p>Let’s come back to our color combination: <span>⬤</span><span>⬤</span><span>⬤</span><span>⬤</span>. After playing around with the saturation and darkness, it becomes this:</p>
+<p><img alt="" data-src="/img/full-200805_goodcolors23.png" data-src-thumb="/img/thumb-200805_goodcolors23.png" src="https://blog.datawrapper.de/img/thumb-200805_goodcolors23.png"><em>Our better (!) complementary colors in <a href="https://color.adobe.com/create/color-wheel" target="_blank" rel="noopener">Adobe Color</a></em></p>
+<p>I desaturated the light blue <span>⬤</span> and the lighter orange <span>⬤</span> and made every color darker except the lighter orange. Heck yeah, we can work with that!</p>
+<p>So if your color combination doesn’t look awesome yet, don’t immediately add another hue. <strong>Change the saturation and lightness first and see if that’s better.</strong></p>
+<p>That’s what I did to all of these color palettes: <span>⬤</span><span>⬤</span><span>⬤</span><span>⬤</span> and <span>⬤</span><span>⬤</span><span>⬤</span><span>⬤</span><span>⬤</span> and <span>⬤</span><span>⬤</span><span>⬤</span><span>⬤</span>. They’re all roughly complementary, and they all come with different saturations and lightness. That’s what makes them work.</p>
+
+<h4 id="Use-warm-colors-blue">Use warm colors &amp; blue</h4>
+<p><img alt="" data-src="/img/full-200805_goodcolors29.png" data-src-thumb="/img/thumb-200805_goodcolors29.png" src="https://blog.datawrapper.de/img/thumb-200805_goodcolors29.png"></p>
+<p>There’s a complementary color combination that is especially loved by data visualization designers: <strong>yellow/orange/red and blue</strong>. Scroll through graphics portfolios like the one from the <a href="https://multimedia.scmp.com/culture/article/SCMP-printed-graphics-memory/" target="_blank" rel="noopener">South China Morning Post</a> or this one by <a href="https://infographics.economist.com/2019/AChristmasGiftForYou/AYearInGraphicDetail.pdf" target="_blank" rel="noopener">The Economist (PDF)</a> and you’ll notice that they use these colors far more often than colors like purple or green.</p>
+<p><img alt="" data-src="/img/full-200805_goodcolors19.png" data-src-thumb="/img/thumb-200805_goodcolors19.png" src="https://blog.datawrapper.de/img/thumb-200805_goodcolors19.png"><em><a href="https://multimedia.scmp.com/culture/article/SCMP-printed-graphics-memory/" target="_blank" rel="noopener">Three pages by The South China Morning Post</a></em></p>
+<p>That’s because these warm colors and blue are super versatile for categories. Yellow and orange and red look very pleasing together, but people will still perceive them as different colors: <span>⬤</span><span>⬤</span><span>⬤</span> –&nbsp;which is exactly what we want for categorical colors. And blue is more flexible than any other hue: Lots of blues, no matter if dark <span>⬤</span> or light <span>⬤</span> or saturated <span>⬤</span> or not saturated <span>⬤</span>, look pleasing, calming and professional.</p>
+<p>And they are accessible: colorblind people can easily distinguish blue and orange/red from each other.</p>
+<p>So if in doubt, use an orange/red with blue.</p>
+
+<h4 id="When-using-green-make-it-a-yellow-or-blue-one">When using green, make it a yellow or blue one</h4>
+<p><img alt="" data-src="/img/full-200805_goodcolors26.png" data-src-thumb="/img/thumb-200805_goodcolors26.png" src="https://blog.datawrapper.de/img/thumb-200805_goodcolors26.png"></p>
+<p>Forest green covers a full sixth on the color wheel, from approximately 90° <span>⬤</span> to 150° <span>⬤</span>, with 120° as its peak <span>⬤</span>. However, you will find few well-designed visualizations that use it. Why is that?</p>
+<p>First, forest green is just very dark. And lightening up the forest green means going into an awkward neon <span>⬤</span>. So you need to lighten up <em>and</em> desaturate green enormously – more than other colors –&nbsp;to get to a nice one. That’s exactly what the Washington Post does with their green <span>⬤</span> here:</p>
+<p><img alt="" data-src="/img/full-200805_goodcolors17.png" data-src-thumb="/img/thumb-200805_goodcolors17.png" src="https://blog.datawrapper.de/img/thumb-200805_goodcolors17.png"><em><a href="https://www.washingtonpost.com/graphics/politics/trump-rolling-back-obama-rules/" target="_blank" rel="noopener">How Trump is rolling back Obama’s legacy<br>
+</a> by The Washington Post</em></p>
+<p>It’s a 142° green, but only 14% saturated. Here’s what the same hue with the same brightness would look like 100% saturated: <span>⬤</span>. Yikes.</p>
+<p>And remember our colorblind friends: A pure green in combination with red, orange or brown is hard for them to distinguish.</p>
+<p>So when using green, make it a bit yellow or a bit blue. You can see this in the examples at the top of this article: All of the greens except FiveThirtyEight’s one <span>⬤</span> have a hue greater than 160° (=bluer) <span>⬤</span><span>⬤</span><span>⬤</span> or lower than 60° (=more yellow) <span>⬤</span><span>⬤</span>. Nadieh uses both yellow green and blue green in this project we’ve already seen:</p>
+<p><img alt="" data-src="/img/full-200805_goodcolors13.png" data-src-thumb="/img/thumb-200805_goodcolors13.png" src="https://blog.datawrapper.de/img/thumb-200805_goodcolors13.png"><em><a href="https://whydocatsanddogs.com/cats" target="_blank" rel="noopener">Why do Cats and Dogs?</a> by Nadieh Bremer</em></p>
+<p>Looks like you can use them in your visualization as two different colors as Nadieh does: Win-win!</p>
+
+<h4 id="Avoid-pure-colors">Avoid pure colors</h4>
+<p><img alt="" data-src="/img/full-200805_goodcolors5.png" data-src-thumb="/img/thumb-200805_goodcolors5.png" src="https://blog.datawrapper.de/img/thumb-200805_goodcolors5.png"></p>
+<p>“Pure” hues are the ones that are located at exactly 60°, 120°, 180°, 240°, 300° or 360°/0° in the color wheel:</p>
+<p><img alt="" data-src="/img/full-200805_goodcolors7.png" data-src-thumb="/img/thumb-200805_goodcolors7.png" src="https://blog.datawrapper.de/img/thumb-200805_goodcolors7.png"></p>
+<p>Here’s an example: In HSV/HSB, the <strong>H</strong>ue value of this bright blue <span>⬤</span> is 180°, the <strong>S</strong>aturation value is 67% and the <strong>L</strong>ightness value is 91%. You can also check the RGB values of your color: If at least two of the values are the same, they’re “pure”. For example, our <span>⬤</span> is a <code>rgb(77, 232, 232)</code>.</p>
+<p>To make your colors look more natural and pleasing to the eyes of your readers, you can either tune down the saturation of pure colors or make them darker. <strong>If you want to have bright, saturated colors, rely on mixed colors</strong> that are at least 5-10° away from the pure colors.</p>
+<p>In the image above, the red and orange, the blues and the greens have the same saturation and lightness. The only difference is the hue: The red <span>⬤</span> (0°), blue <span>⬤</span> (240°) and green <span>⬤</span> (120°) look more colorful than the orange <span>⬤</span> (40°), medium blue <span>⬤</span> (211°) and blue-ish green <span>⬤</span> (170°).</p>
+
+<h4 id="Avoid-bright-saturated-colors">Avoid bright, saturated colors</h4>
+<p><img alt="" data-src="/img/full-200805_goodcolors4.png" data-src-thumb="/img/thumb-200805_goodcolors4.png" src="https://blog.datawrapper.de/img/thumb-200805_goodcolors4.png"></p>
+<p>Neon colors will definitely attract the attention of readers. But these readers won’t thank you. Most of us get a bit stressed out when we see them: “Highly saturated, light colors will NOT be appropriate [to communicate] Serious or Trust, or Calm,” as Bartram, Patra &amp; Stone explain in their paper “Affective Color in Visualization” from 2017 (<a href="https://research.tableau.com/sites/default/files/Affective%20Color%20CHI%202017.pdf" target="_blank" rel="noopener">PDF</a>).</p>
+<p>If your colors come close to 100% saturation <strong>and</strong> 100% brightness, it’s likely your colors are too colorful. That’s definitely the case for pure colors like <span>⬤</span><span>⬤</span><span>⬤</span><span>⬤</span>.</p>
+<p>“But I’ve seen such crazy colors before, and they look good,” you might say, and refer to projects like these ones:</p>
+
+<p>If you compare the colors from these examples with colors like <span>⬤</span><span>⬤</span><span>⬤</span><span>⬤</span>, you see how they former ones are all less saturated or darker. A 100% saturated and 100% bright green <span>⬤</span> becomes less saturated in the New York Times <span>⬤</span>, and less saturated <em>and</em> darker in both the Bloomberg article <span>⬤</span> and the Pudding article <span>⬤</span>.</p>
+<p>They…</p></div></div>
+<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://blog.datawrapper.de/beautifulcolors/">https://blog.datawrapper.de/beautifulcolors/</a></em></p>]]>
+            </description>
+            <link>https://blog.datawrapper.de/beautifulcolors/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-24391049</guid>
+            <pubDate>Sun, 06 Sep 2020 13:05:26 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[The Ocean Is Struggling to Breathe, Too]]>
+            </title>
+            <description>
+<![CDATA[
+Score 77 | Comments 12 (<a href="https://news.ycombinator.com/item?id=24390568">thread link</a>) | @dnetesn
+<br/>
+September 6, 2020 | http://oceans.nautil.us/feature/613/the-ocean-is-struggling-to-breathe-too | <a href="https://web.archive.org/web/*/http://oceans.nautil.us/feature/613/the-ocean-is-struggling-to-breathe-too">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
+        <p><span>P</span>eople afflicted by Covid-19, particularly those with bad cases, experience difficulty breathing.&nbsp; We need oxygen in our tissues to keep our bodies working and our brains clear; viral damage to our lungs deprives bodies of this vital dissolved gas.&nbsp;&nbsp;<br></p>
+
+<p>	This oxygen-starved condition is called hypoxia, and itâ€™s also a serious condition in many parts of the worldâ€™s ocean, as well as in estuaries, lagoons, rivers, and lakes. Marine hypoxia receives much less public attention than ocean acidification or warming—but in many parts of the world its effects may be just as profound, and the problem is worsening.</p>
+<p>	The causes of marine hypoxia are twofold. The first, which has been studied the most, is the too-much-of-a-good-thing problem of nutrient over-enrichment. Vast loads of nutrients are applied to farm fields as fertilizers, spill from our sewage and septic systems, and waft from the tailpipes of automobiles. Inevitably some of these make their way into water, stimulating blooms of tiny plankton that eventually die and decay.&nbsp;The process of decaying consumes the oxygen, and hypoxia ensues. Wastewater treatment plants have helped but are not enough. Some nutrient-loaded hypoxic waters are now-infamous â€œdead zones,â€� such as the northern Gulf of Mexico, the Chesapeake Bay, and Lake Erie most summers.&nbsp;</p>
+<p>	The other major cause is global warming.&nbsp;Warmer water canâ€™t hold as much dissolved oxygen as colder water. Itâ€™s lighter, too, and therefore tends to float above cooler layers, cutting them off from atmospheric exchange so that they eventually become deoxygenated as well. This phenomenon isnâ€™t directly associated with nutrient over-enrichment, but can exacerbate and intensify dead zones and impact deep ocean waters that have few nutrients. Warming is a global problem affecting the oxygen status of all waters—and it also fuels blooms of algae that die and decay, again setting off the cycle of oxygen loss.</p>
+<p>	The general public—and even many scientists—are unaware of the rapidly expanding scale of deoxygenation. Among the first researchers to describe it were marine ecologists Bob Diaz and Rutger Rosenberg, who in the 1980s began to study the impacts on bottom-dwelling organisms in estuaries and coastal seas. In 1995 they wrote, "There is no other environmental variable of such ecological importance to coastal marine ecosystems that has changed so drastically in such a short period as dissolved oxygen." &nbsp;</p>
+<p>	In 2008, Diaz and Rosenberg published a landmark study in the journal <em>Science</em>, documenting over 400 such zones and showing that their growth was exponential.&nbsp;By 2019 their tally exceeded 700, and possibly as many as 1000, coastal dead zones.&nbsp;If we make a chart of the known history of increase and color-code it by Gross World Product, an index of global economic output, we can appreciate the linkage of these dead zones to human activity:</p>
+<figure><img src="https://s3.amazonaws.com/nautilus-vertical/oceans_423219c2026b77bfba722aa122b966a6.jpg" alt="dead zones and GWP chart"><figcaption><span>Growth in the number of coastal marine ecosystems classified as â€œdead zonesâ€� by Diaz and Rosenberg (2008) and Diaz et al. (2019).  The colors indicate levels of Gross World Product (GWP), and show that as economic output has increased exponentially, so has the number of polluted, deoxygenated dead zones. </span><br><span>GWP data: World Bank and CIA Factbook (compiled in Wikipedia).</span></figcaption></figure>
+<p>Deoxygenation in open oceans, away from coasts, extends farther and deeper, and is largely caused by the aforementioned tendency of warm water to seal off the cool waters below. The extent and spread of these so-called oxygen minimum zones wasnâ€™t fully appreciated until around 15 years ago, when improved instrumentation allowed scientists to measure them.&nbsp;Ten years ago their total area was estimated at 8 percent of Earth's ocean surface area—11.7 million square miles altogether, an area larger than North America and comparable in size to the entire African continent. That area is expanding today.<br></p>
+<p>Brief periods of hypoxia—or even no oxygen, a phenomenon called anoxia—are common in nature and many organisms adapt by moving away or going temporarily dormant.&nbsp;A very few species are exceptionally tolerant and even have specialized metabolic pathways to cope in these circumstances.&nbsp;As the scale of deoxygenation increases, however, we see low-oxygen events so large and long that even highly mobile organisms, like fish, canâ€™t always escape.&nbsp;Some may be able to survive but become so weak that they have difficulty moving and finding food, let alone digesting it.&nbsp;Think of the Covid-19 sufferers who are so exhausted from lack of oxygen that they can barely move.&nbsp;Itâ€™s the same basic issue.&nbsp;As scientists study the problem of marine deoxygenation, we are increasingly seeing the effects on everything from fish growth to reproductive impairment. &nbsp;</p>
+<p>Although most of the studies on biotic effects of deoxygenation have taken place in laboratories, my colleague Ben Walther and I, together with our students and colleagues, have learned to decipher signs of hypoxia exposure that are â€œrecordedâ€� in tiny bones within fish heads, called otoliths or ear-stones.&nbsp;These calcium carbonate deposits grow incrementally and take up various trace elements including the element manganese, which becomes available only at very low oxygen concentrations.&nbsp;By studying the lifetime uptake of manganese, biologist Michele Casini and I showed that periods of intense hypoxia have profound impacts on the growth and health of Atlantic cod in the Baltic Sea. With less oxygen available, cod have less energy for foraging and fighting off parasites and infections. As a result, they are unhealthy and shrunken compared to cod living in better environments. By age three, cod with high levels of hypoxia exposure are one-third smaller than healthy cod from oxygen-rich waters. Multiply that by population size and you have an epic loss of biomass. This has direct economic consequences and likely causes enormous suffering for the fish themselves.</p>
+<figure><img src="https://s3.amazonaws.com/nautilus-vertical/oceans_15b7f377d5e469878f05995df3610167.jpg" alt="Cod before-and-after"><figcaption><span>Left: Cod caught in 1981 off the island of Gotland, Sweden. Right: Cod caught in 2020 in the same vicinity. Baltic cod today are affected by several stressors, foremost among them hypoxia. </span><br><span>K. Limburg and Y. Heimbrand</span></figcaption></figure>
+<p>Deoxygenation impacts ripple through entire ecosystems, too.&nbsp;Recent work has shown that in large stretches of the ocean even zooplankton, the microscopic animals who feed fish, often live on the edge of metabolic collapse. A study in the eastern tropical North Pacific oxygen minimum zone found that zooplankton there migrate in and out of microhabitats with extremely low oxygen; they are among the most hypoxia-tolerant organisms, yet are already at their metabolic limits. Projected further declines in oxygen may put them over the edge, with important consequences for carbon cycling and other biogeochemical processes in the open ocean.&nbsp;Food webs become compromised, particularly those on sea bottoms; there are many documented cases of sensitive invertebrate communities falling victim to hypoxic events since they cannot flee. Hypoxia has even been found to cause mass mortality in coral reef ecosystems, and in some instances may play as important a role as the better-known culprit of elevated water temperatures. Even open-water ecosystems change as the volume of healthy habitat shrinks and species crowd together, leading to novel food-web interactions. Covid-19â€™s web of long-term complications presents an uncanny parallel.<br></p>
+<p>	Fortunately for humanity, a vaccine for Covid-19 should be available in 2021.&nbsp;The outlook for the oceans is not so optimistic, but neither is it hopeless.&nbsp;Think about the initial response to the virus, which was hamstrung by shortages of necessary medical supplies and technology, including masks and respirators; once the issues were recognized, it became possible to prioritize production to deal with the problem.&nbsp;</p>
+<p>In the case of coastal hypoxia, nutrient pollution reductions coupled with wetland and seagrass restoration are akin to masks and respirators. They help protect the ecosystems and build up their resiliency. Those approaches resulted in greatly improved water quality and subsequent return of biodiversity in the waters off Tampa Bay, Florida, for example. And after decades of nutrient management, some parts of the Baltic Sea and Chesapeake Bay are beginning to show signs of recovery.&nbsp;</p>
+<p>	The looming, elephant-in-the-room challenge is to deal with global warming, which will require new economic policies at national and global scales and the commitment of governments and citizens everywhere. Although overshadowed in the news cycle by Covid-19, global warming is still on the rise, fueled by human outputs of greenhouse gases.&nbsp;We <em>must</em> bend the curve on greenhouse gas emissions, just as we must flatten the Covid-19 curve. Without such change, we are headed in a dark, scary direction where nobody really wants to go.</p>
+
+<ul><li> is a professor of Environmental Biology at the State University of New York College of Environmental Science and Forestry, and also a visiting professor at the Department of Aquatic Resources, Swedish University of Agricultural Sciences.</li></ul>
+<p>Lead image: Each summer an oxygen-starved zone, shown in red, forms in the Gulf of Mexico. Almost nothing can live beneath surface waters. Credit: NOAA</p>
+    </article></div>]]>
+            </description>
+            <link>http://oceans.nautil.us/feature/613/the-ocean-is-struggling-to-breathe-too</link>
+            <guid isPermaLink="false">hacker-news-small-sites-24390568</guid>
+            <pubDate>Sun, 06 Sep 2020 11:14:19 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Daniel J. Bernstein's IM2000 email proposal is not a good idea]]>
             </title>
             <description>
 <![CDATA[
-Score 51 | Comments 40 (<a href="https://news.ycombinator.com/item?id=24389143">thread link</a>) | @todsacerdoti
+Score 61 | Comments 51 (<a href="https://news.ycombinator.com/item?id=24389143">thread link</a>) | @todsacerdoti
 <br/>
 September 5, 2020 | https://utcc.utoronto.ca/~cks/space/blog/tech/IM2000NotGoodIdea | <a href="https://web.archive.org/web/*/https://utcc.utoronto.ca/~cks/space/blog/tech/IM2000NotGoodIdea">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><h2>Daniel J. Bernstein's IM2000 email proposal is not a good idea</h2>
@@ -140,7 +1251,7 @@ the web where you usually at least have to go looking for things.</p>
             </title>
             <description>
 <![CDATA[
-Score 64 | Comments 22 (<a href="https://news.ycombinator.com/item?id=24389036">thread link</a>) | @xisnextbigthing
+Score 106 | Comments 38 (<a href="https://news.ycombinator.com/item?id=24389036">thread link</a>) | @xisnextbigthing
 <br/>
 September 5, 2020 | https://gasoved.github.io/webbew/ | <a href="https://web.archive.org/web/*/https://gasoved.github.io/webbew/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="maintextbox">
@@ -261,33 +1372,10 @@ September 5, 2020 | https://gasoved.github.io/webbew/ | <a href="https://web.arc
             </title>
             <description>
 <![CDATA[
-Score 59 | Comments 50 (<a href="https://news.ycombinator.com/item?id=24388849">thread link</a>) | @mmm_grayons
+Score 103 | Comments 78 (<a href="https://news.ycombinator.com/item?id=24388849">thread link</a>) | @mmm_grayons
 <br/>
 September 5, 2020 | https://silahreport.com/2019/08/23/the-last-gunsmiths-of-the-khyber-pass/ | <a href="https://web.archive.org/web/*/https://silahreport.com/2019/08/23/the-last-gunsmiths-of-the-khyber-pass/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="post-3339">
-	<div>
-		<div>
-						<div>
-																		<div>
-						<div>
-							<p>Fog clings to a never-ending row of low-rise buildings down the length of a dusty road, it’s early, around eight o’clock on a cool April morning. The fog clears and voices breakthrough and you see the first glimpses of the large bazaar, sounds of shutters slamming open, doors being unlocked and people greeting each other as their day starts. The occasional chatter of gunfire can be heard as firearms are test fired nearby.</p>
-<p><em>Darra Adam Khel</em>. This bustling town is situated in modern-day <em>Pakistan</em>, a stone’s throw from the Pak-Afghan border. <em>What makes it so special?</em> You may ask and the answer lies within the myriad of myths and legends put out over the years.</p>
-
-<p><span><iframe width="1160" height="653" src="https://www.youtube.com/embed/J-f7j-RlN_Q?version=3&amp;rel=1&amp;fs=1&amp;autohide=2&amp;showsearch=0&amp;showinfo=1&amp;iv_load_policy=1&amp;wmode=transparent" allowfullscreen="true"></iframe></span></p>
-<p>As of this year, 2019, <em>Darra</em> is the last main tribal arms market and manufacturing town that remains in the Pak-Afghan FATA region (Federally-Administered Tribal Region – FATA pronounced Faa-Thaa locally), the last vestige of old-world freedom in the area. Over the last few years, the other manufacturing hubs and markets in towns like <em>Landi Kotal</em>, just a few minutes’ drive from <em>Torkham</em> border on the <em>Khyber Pass</em>, have finally died out leaving a handful of shops and a couple of gunsmiths who repair the large number of firearms still found across the region. <em>Peshawar’s</em> massive arms bazaars have also disappeared leaving a few licensed manufacturers in a small industrial estate on its outskirts and a few licensed dealers scattered throughout the city.</p>
-<p><em>Darra</em> held out against the threat of the <em>Taliban</em> in the early 2010s, fighting them off on a number of occasions seeing as they had the arms, supplies and manpower to fend for themselves. They are no friend to these <em>Taliban</em> as you can see even though they have been linked by a few journalistic sources with selling them an enormous number of arms and ammunition. Contrary to popular belief that the market is now dead or not operating, the bazaar still thrives with many firearms bought and sold daily in its now-legendary bazaar. Yes, there were times were the shutters ere down but this was always just a façade, something that happened on the face and business continued in the back alleys and dusty basements.</p>
-<p>However, the town of thousands of arms dealers and manufacturing workshops has been relegated to around a thousand of both due to the global war on terror and its impact on the global arms trade and international smuggling routes. They do not get as much as they used to though they still have a steady but small supply of items that get through to them even to this day. Due to this war on terror, the FATA area – which for many years managed to retain its autonomy, was regulated to prohibit the sale and ownership of explosive type ordnance and large-caliber arms such as HMG’s (e.g: DsHK / KPV) and up to the general population there. Fortunately, <em>Darra</em> still maintains its hold on the trade of tribal arms throughout the now regulated tribal areas and still holds a monopoly on arms manufactured there that are sold within <em>Pakistan</em> and <em>Afghanistan</em> too.</p>
-<p>The war on terror has a lot of detriments with the main one being that it has increased the price of arms so much; that now an AK rifle which would have cost approximately Rs10,000 (~£55/~$67), around fifteen years ago, now costs a minimum of around ten times that. Yes, as with all markets, prices do fluctuate depending on many local and regional factors but prices still remain relatively high due to this. Genuine, original factory-made arms command a high premium on the market as a whole throughout the Pak-Afghan region and this has meant that locally made arms are sold more than originals due to the somewhat extortionate prices that can be seen. Due to soaring inflation and prices of raw material, locally made arms now cost the same as originals were only a decade or so ago.</p>
-<div id="attachment_3346"><p><img aria-describedby="caption-attachment-3346" data-attachment-id="3346" data-permalink="https://silahreport.com/20190414_101021-min/" data-orig-file="https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101021-min.jpg?fit=5312%2C2988&amp;ssl=1" data-orig-size="5312,2988" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="20190414_101021-min" data-image-description="" data-medium-file="https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101021-min.jpg?fit=300%2C169&amp;ssl=1" data-large-file="https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101021-min.jpg?fit=1024%2C576&amp;ssl=1" src="https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101021-min.jpg?resize=1160%2C653" alt="20190414_101021-min" width="1160" height="653" srcset="https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101021-min.jpg?w=5312&amp;ssl=1 5312w, https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101021-min.jpg?resize=300%2C169&amp;ssl=1 300w, https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101021-min.jpg?resize=768%2C432&amp;ssl=1 768w, https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101021-min.jpg?resize=1024%2C576&amp;ssl=1 1024w, https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101021-min.jpg?resize=89%2C50&amp;ssl=1 89w, https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101021-min.jpg?resize=650%2C366&amp;ssl=1 650w, https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101021-min.jpg?resize=1000%2C563&amp;ssl=1 1000w, https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101021-min.jpg?resize=50%2C28&amp;ssl=1 50w, https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101021-min.jpg?w=2320&amp;ssl=1 2320w, https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101021-min.jpg?w=3480&amp;ssl=1 3480w" sizes="(max-width: 1160px) 100vw, 1160px" data-recalc-dims="1"></p><p id="caption-attachment-3346">Right face: Three samples of SMLE rifles produced in Darra, New and used examples shown.</p></div>
-<div id="attachment_3345"><p><img aria-describedby="caption-attachment-3345" data-attachment-id="3345" data-permalink="https://silahreport.com/20190414_101054/" data-orig-file="https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101054.jpg?fit=5312%2C2988&amp;ssl=1" data-orig-size="5312,2988" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;1.9&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;SM-G920F&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;1555236654&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;4.3&quot;,&quot;iso&quot;:&quot;100&quot;,&quot;shutter_speed&quot;:&quot;0.02&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;1&quot;}" data-image-title="20190414_101054" data-image-description="" data-medium-file="https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101054.jpg?fit=300%2C169&amp;ssl=1" data-large-file="https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101054.jpg?fit=1024%2C576&amp;ssl=1" src="https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101054.jpg?resize=1160%2C653" alt="20190414_101054" width="1160" height="653" srcset="https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101054.jpg?w=5312&amp;ssl=1 5312w, https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101054.jpg?resize=300%2C169&amp;ssl=1 300w, https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101054.jpg?resize=768%2C432&amp;ssl=1 768w, https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101054.jpg?resize=1024%2C576&amp;ssl=1 1024w, https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101054.jpg?resize=89%2C50&amp;ssl=1 89w, https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101054.jpg?resize=650%2C366&amp;ssl=1 650w, https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101054.jpg?resize=1000%2C563&amp;ssl=1 1000w, https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101054.jpg?resize=50%2C28&amp;ssl=1 50w, https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101054.jpg?w=2320&amp;ssl=1 2320w, https://i2.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_101054.jpg?w=3480&amp;ssl=1 3480w" sizes="(max-width: 1160px) 100vw, 1160px" data-recalc-dims="1"></p><p id="caption-attachment-3345">Left face: Three samples of SMLE rifles produced in Darra, New and used examples shown.</p></div>
-<p>Some older background information would be needed to understand why such a place even exists on such a scale as it is or even was. During the British Raj period of the 1800s where the British Empire ruled over these tribal areas, small workshops opened up in many areas across the region to produce exact copies of arms used by the British to fight back against them. Gunsmiths started with muskets and then progressed onto Lee-Enfield action rifles and that was their mainstay for a lengthy period continuing to upgrade and produce newer variations, turning those small shops into larger ones. That is how <em>Darra</em> and many other manufacturing towns and bazaars got their start and from then, the markets grew and grew becoming what they then were known as. <em>Darra’s</em> second major call to fame was that it supplied arms and ammunition to the <em>Mujahideen</em> in <em>Afghanistan</em> during the 1979-1989 Soviet-Afghan War, some say it was even supported by the federal government too at this point. More recently, <em>Darra’s</em> notoriety came to surface as ill-informed people conducting poor journalism claimed it was a black market and that the gunsmiths manufactured guns in mud huts, with basic tools using their bare hands. Putting this to rest, let me start with calling it a black market; this is incorrect as the areas where these markets were/are based comes under its own tribal laws and governance much different to the rest of <em>Pakistan</em>, they are operating well within their own laws therefore it is not a black market in any sense within these borders. There is an element of truth to the thought of mud huts, bare hands and rudimentary methods but the times long past, when this was the norm, are not an indication of how things are in this day and age. Yes, some processes such as heat-treating and finishing are done in so-called mud huts and outdoors under makeshifts structures (this is much needed for ventilation) however the actual workshops are almost always in brick structures and the gunsmiths utilize milling machines, CNC machines and other tools to make their products. Yes, they do use basic tools but those are used to fit and finish the firearm and not to actually manufacture or produce it.</p>
-<div id="attachment_3350"><p><img aria-describedby="caption-attachment-3350" data-attachment-id="3350" data-permalink="https://silahreport.com/2019/08/23/the-last-gunsmiths-of-the-khyber-pass/20190414_110542-min/" data-orig-file="https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110542-min.jpg?fit=5312%2C2988&amp;ssl=1" data-orig-size="5312,2988" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="20190414_110542-min" data-image-description="" data-medium-file="https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110542-min.jpg?fit=300%2C169&amp;ssl=1" data-large-file="https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110542-min.jpg?fit=1024%2C576&amp;ssl=1" src="https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110542-min.jpg?resize=1160%2C653" alt="20190414_110542-min" width="1160" height="653" srcset="https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110542-min.jpg?w=5312&amp;ssl=1 5312w, https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110542-min.jpg?resize=300%2C169&amp;ssl=1 300w, https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110542-min.jpg?resize=768%2C432&amp;ssl=1 768w, https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110542-min.jpg?resize=1024%2C576&amp;ssl=1 1024w, https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110542-min.jpg?resize=89%2C50&amp;ssl=1 89w, https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110542-min.jpg?resize=650%2C366&amp;ssl=1 650w, https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110542-min.jpg?resize=1000%2C563&amp;ssl=1 1000w, https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110542-min.jpg?resize=50%2C28&amp;ssl=1 50w, https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110542-min.jpg?w=2320&amp;ssl=1 2320w, https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110542-min.jpg?w=3480&amp;ssl=1 3480w" sizes="(max-width: 1160px) 100vw, 1160px" data-recalc-dims="1"></p><p id="caption-attachment-3350">Right face: An Enfield produced Martini Henry type rifle, a Darra STEN copy and a Darra Martini Henry action type rifle.</p></div>
-<div id="attachment_3351"><p><img aria-describedby="caption-attachment-3351" data-attachment-id="3351" data-permalink="https://silahreport.com/2019/08/23/the-last-gunsmiths-of-the-khyber-pass/20190414_110604-min/" data-orig-file="https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110604-min.jpg?fit=5312%2C2988&amp;ssl=1" data-orig-size="5312,2988" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="20190414_110604-min" data-image-description="" data-medium-file="https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110604-min.jpg?fit=300%2C169&amp;ssl=1" data-large-file="https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110604-min.jpg?fit=1024%2C576&amp;ssl=1" src="https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110604-min.jpg?resize=1160%2C653" alt="20190414_110604-min" width="1160" height="653" srcset="https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110604-min.jpg?w=5312&amp;ssl=1 5312w, https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110604-min.jpg?resize=300%2C169&amp;ssl=1 300w, https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110604-min.jpg?resize=768%2C432&amp;ssl=1 768w, https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110604-min.jpg?resize=1024%2C576&amp;ssl=1 1024w, https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110604-min.jpg?resize=89%2C50&amp;ssl=1 89w, https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110604-min.jpg?resize=650%2C366&amp;ssl=1 650w, https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110604-min.jpg?resize=1000%2C563&amp;ssl=1 1000w, https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110604-min.jpg?resize=50%2C28&amp;ssl=1 50w, https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110604-min.jpg?w=2320&amp;ssl=1 2320w, https://i1.wp.com/silahreport.com/wp-content/uploads/2019/08/20190414_110604-min.jpg?w=3480&amp;ssl=1 3480w" sizes="(max-width: 1160px) 100vw, 1160px" data-recalc-dims="1"></p><p id="caption-attachment-3351">Left face: An Enfield produced Martini Henry type rifle, a Darra STEN copy and a Darra Martini Henry action type rifle.</p></div>
-<p>A negative misconception in regards to the firearms produced is the thought that they aren’t heat-treated or are of poor quality. This isn’t true for the most part as they do go through a heat-treating process, however the detractor is that the method of heat-treating leaves a lot to be desired, especially in the cheaper copies. Many users of lower quality copies complain of metal warping and deformation causing a firearm to become inoperable or dangerous to use, this is what leads to people surmising that all arms made in such areas are no good. This is an issue for lower quality copies, a lower quality firearm will have its flaws as it is not built using quality material and to the same tolerances as a firearm made to exact specs with all care taken in production. At the end of the day, you must repeat the same phrase to people who ask why a cheap item is no good; you get what you pay for – if you want a cheap item, you will get a cheap item that will end up having issues or breaking much like any cheap thing you buy.</p>
-<p>Moving away from the negatives, let us talk about positives. Apart from the exquisite food that the food gurus cook up there, <em>Darra</em> is also famous for some of the firearms designs to come out of its shops – most notable is the infamous AKMSU which resides in the Royal Armouries, Leeds, UK. Even though that particular firearm could have been made elsewhere in FATA or <em>Afghanistan</em> by a number of other gunsmiths, it has been linked to <em>Darra</em> due to the town being the main source of arms for sale and the similar types of AK designed copies/modifications known to have come out of there. I could list an almost infinite number of firearms designs displaying their know-how such as the modified SKS made to resemble an AK, or the well-known 8mm bolt-action faux AK and even the more recent AK M4geries. Forget all of those firearms, the gunsmiths themselves are the ones to keep this market and tradition alive, it’s them you have to appreciate as without them there would be more-or-less nothing left of the industry. The ingenuity and skill they have has made <em>Darra</em> a household name throughout the region and extending to much of the world, even to those who are not versed on firearms.</p>
-<div id="attachment_2986"><p><img aria-describedby="caption-attachment-2986" data-attachment-id="2986" data-permalink="https://silahreport.com/2019/07/25/when-darra-gunsmiths-went-mainstream-the-akmsu/attachment/111/" data-orig-file="https://i1.wp.com/silahreport.com/wp-content/uploads/2019/07/111.jpg?fit=900%2C334&amp;ssl=1" data-orig-size="900,334" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;11&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;Canon EOS DIGITAL REBEL&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;315532888&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;31&quot;,&quot;iso&quot;:&quot;100&quot;,&quot;shutter_speed&quot;:&quot;0.0166666666667&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="" data-image-description="" data-medium-file="https://i1.wp.com/silahreport.com/wp-content/uploads/2019/07/111.jpg?fit=300%2C111&amp;ssl=1" data-large-file="https://i1.wp.com/silahreport.com/wp-content/uploads/2019/07/111.jpg?fit=900%2C334&amp;ssl=1" src="https://i1.wp.com/silahreport.com/wp-content/uploads/2019/07/111.jpg?resize=900%2C334" alt="" width="900" height="334" srcset="https://i1.wp.com/silahreport.com/wp-content/uploads/2019/07/111.jpg?w=900&amp;ssl=1 900w, https://i1.wp.com/silahreport.com/wp-content/uploads/2019/07/111.jpg?resize=300%2C111&amp;ssl=1 300w, https://i1.wp.com/silahreport.com/wp-content/uploads/2019/07/111.jpg?resize=768%2C285&amp;ssl=1 768w" sizes="(max-width: 900px) 100vw, 900px" data-recalc-dims="1"></p><p id="caption-attachment-2986">AKMSU – Royal Armouries, Leeds, UK. Image courtesy of Rob stott (AK Catalogue)</p></div>
-<p><em>Darra</em> has managed to stand against the tide of time and change in an increasingly connected world and holds its own against all odds but has still found a way to use newer technologies and retain its own methods &amp; procedures of manufacturing in its regular business. Even with all that, there is now news that changes things, FATA and Darra with it, will finally be incorporated into the neighboring <em>KPK</em> (<em>Khyber</em> <em>Pakhtunkhwa</em>) province of <em>Pakistan</em>. Regrettably, this means that their own tribal laws will now be abolished and government/regional laws and regulations will be implemented in its place there. The whole town’s industry will be made to register for licenses in either manufacturing or dealing sectors or be shut down. It is said that they will have easier access to raw materials and the costs of business will hopefully decrease, this is something that we can only hope does not destroy this historic industry. <em>Darra</em> will move into the new age with much newer equipment and tooling plus workshops and industrial estates that are planned to be built there and in other places with support of the current federal government of <em>Pakistan</em>. It is planned that arms manufactured there will be available to international markets via some …</p></div></div></div></div></div></article></div>
-<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://silahreport.com/2019/08/23/the-last-gunsmiths-of-the-khyber-pass/">https://silahreport.com/2019/08/23/the-last-gunsmiths-of-the-khyber-pass/</a></em></p>]]>
+<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
             </description>
             <link>https://silahreport.com/2019/08/23/the-last-gunsmiths-of-the-khyber-pass/</link>
             <guid isPermaLink="false">hacker-news-small-sites-24388849</guid>
@@ -299,7 +1387,7 @@ September 5, 2020 | https://silahreport.com/2019/08/23/the-last-gunsmiths-of-the
             </title>
             <description>
 <![CDATA[
-Score 56 | Comments 16 (<a href="https://news.ycombinator.com/item?id=24388753">thread link</a>) | @Ninroot
+Score 102 | Comments 24 (<a href="https://news.ycombinator.com/item?id=24388753">thread link</a>) | @Ninroot
 <br/>
 September 5, 2020 | https://reflexio.debec.eu/principles-for-better-design | <a href="https://web.archive.org/web/*/https://reflexio.debec.eu/principles-for-better-design">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -394,11 +1482,453 @@ Learning to write clean code is hard work. It requires more than just the knowle
         </item>
         <item>
             <title>
+<![CDATA[PDP 11/70 Emulator (2020)]]>
+            </title>
+            <description>
+<![CDATA[
+Score 56 | Comments 26 (<a href="https://news.ycombinator.com/item?id=24388412">thread link</a>) | @threeme3
+<br/>
+September 5, 2020 | https://skn.noip.me/pdp11/pdp11.html | <a href="https://web.archive.org/web/*/https://skn.noip.me/pdp11/pdp11.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
+    <div>
+      <div>
+        
+        <p>digital equipment corporation • maynard, massachusetts</p>
+      </div>
+      
+      
+      
+      <div>
+      
+
+        <div>
+          <p><img src="https://skn.noip.me/pdp11/pdp11-70.svg" alt="pdp11-70" width="114px"></p>
+          
+          
+        </div>
+
+        
+
+        
+      </div>
+    </div>
+
+    <p>console
+      <br>
+      
+      <br>
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+    </p>
+     <p><label>Paper tape reader file</label>
+     </p>
+    <br>
+    
+    <br>
+    
+    <br>
+    
+    
+    <br>
+    <h3>PDP 11/70 Emulator - v3.1 August 2020</h3>
+    <p>
+      This emulator came about because years ago I was a programmer for RSTS/E on a PDP 11/45 and had admired the console idle loop light pattern - but I couldn't quite remember how it looked. Given the unavailability of real systems it became time to write
+      an emulator!
+    </p>
+    <p>
+      I was going to start with a PDP 11/45 emulator but the extra memory of a PDP 11/70 became far too attractive (a whole 4MB!). It took some time before I finally produced a
+      <a href="https://skn.noip.me/pdp11/pdp11-45.html">PDP 11/45</a> version.
+    </p>
+    <p>
+      I have met my core objective - I can now see the RSTS/E console light pattern that I was looking for, and found that newer versions (eg v9.6) have a different light pattern. Also I have now seen some of the light patterns for other OSes. RSX and BSD 2.11
+      have their own different patterns and Unix V5 and Ultrix operate with absolute minimum light movement (I'm assuming they operates mostly in WAIT mode).
+    </p>
+    <p>
+      Getting all of the operating systems used here presents its own set of challenges - one of which is finding the software in the first place. But one of the most interesting was RSTS/E V06C which has its own
+      <a href="https://skn.noip.me/pdp11/RSTSv06c.html">story</a>.
+    </p>
+    <p>
+      Note: The boot code in this emulator is a custom PDP 11 program running with it's own set of light patterns. It is initially loaded at address 140000 and has a LIGHTS command which operates by mapping and executing a WAIT instruction from a pattern of virtual addresses located in Supervisor
+      mode. You can also use the BOOT command to start one of the guest operating systems listed below, or the ODT command to start a version of the Octal Debugging Tool.
+    </p>
+    <p>
+      However boot code like this was not part of early PDP 11s. These systems had no BIOS or other software to help get the bare metal started. If you were lucky perhaps the previous boot code would still be intact in non-volatile magnetic core memory, but in general booting the system required toggling in a small bootstrap loader from the front panel. There are listings of bootstrap loaders for various devices
+      <a href="https://www.sydney.edu.au/science/psychology/pdp-11/bootstraps.html">here</a>.
+      If you are a purist don't use the boot code! Instead find the bootstrap code for the device you want to boot from and toggle it in through the switches. However be warned - the boot program will not work unless toggled in perfectly which often takes a few goes.
+    </p>
+    <p>
+      Here is an example of the switch commands for booting from an RK05 where the value at address 1002 selects the unit number (rk0, rk1, rk2, etc). Goodluck!
+    </p>
+    <pre><b>
+Address Data    Code           Switch commands
+</b>
+                               HALT, 001000, LOAD ADDRESS
+001000  012737  mov #unit,rkda 012737, DEPOSIT
+001002  000000                 000000, DEPOSIT or 020000 for rk1, 040000 for rk2, etc
+001004  177412                 177412, DEPOSIT
+001006  012700  mov #rkwc, r0  012700, DEPOSIT
+001010  177406                 177406, DEPOSIT
+001012  012710  mov #-256,(r0) 012710, DEPOSIT
+001014  177400                 177400, DEPOSIT
+001016  012740  mov #5,-(r0)   012740, DEPOSIT
+001020  000005                 000005, DEPOSIT
+001022  105710  tstb (r0)      105710, DEPOSIT
+001024  100376  bpl .-2        100376, DEPOSIT
+001026  005007  clr pc         005007, DEPOSIT
+                               001000, LOAD ADDRESS, ENABLE, START
+</pre>
+    <p>
+      If you wish to toggle in a simple light chaser to the front panel then here are some switch commands which can be used:
+    </p>
+    <pre><b>
+Address Data    Code        Switch commands
+</b>
+                            HALT, 001000, LOAD ADDRESS
+001000  012700  mov #1,r0   012700, DEPOSIT
+001002  000001              000001, DEPOSIT
+001004  006100  rol r0      006100, DEPOSIT
+001006  000005  reset       000005, DEPOSIT
+001010  000775  br .-4      000775, DEPOSIT
+                            001000, LOAD ADDRESS, ENABLE, START
+</pre>
+To restart the initial boot code (if it has not been overwritten) use the switch commands:
+    <pre>HALT, 140000, LOAD ADDRESS, ENABLE, START
+</pre>
+    <p>
+      If you plan to run the emulator repeatedly or for a project, consider downloading the emulator to your own machine or server.
+      This will <b>significantly</b> speed any of the emulator disk accesses and response times. All files and emulator OS
+      disks can be found in the top level folder of
+      <b><a href="https://skn.noip.me/pdp11/">http://skn.noip.me/pdp11/</a></b> or in the zip file
+      <b><a href="https://skn.noip.me/pdp11/pdp11.zip">pdp11.zip</a></b> Please note that browser security
+      policy may prevent local emulator pages from booting disk images so please read the information in <b>StartChrome.cmd</b>
+    </p>
+    <p>
+      If you are interested in how the emulator works then you can browse the source files on
+      <b><a href="https://github.com/paulnank/nankervis-pdp11-js">Github</a></b>.
+      The main Javascript files are pdp11.js, fpp.js and iopage.js
+    </p>
+    <p>
+      There are many PDP emulators out there and I have never seen what I consider to be a complete list. Some of the really interesting ones can be found by googling terms such as "vhdl pdp 11". However the gold standard is SIMH at
+      <a href="http://simh.trailing-edge.com/">Trailing Edge</a>.
+      A different approach to Javascript PDP 11 emulation can be found at
+      <a href="http://www.pcjs.org/devices/pdp11/">www.pcjs.org</a>.
+    </p>
+    <p>
+      I believe that the first PDP 11 emulator would be SIM-11 written in FORTRAN before the first PDP 11/20 hardware was even built - see
+      <a href="http://www.hampage.hu/pdp-11/birth.html"> How the PDP-11 Was Born</a>. There is more PDP 11 history at
+      <a href="http://www.hampage.hu/pdp-11/main.html">www.hampage.hu</a>.
+    </p>
+    <p>
+      Of course if you want your own PDP 11/70 front panel you might consider a
+      <a href="http://obsolescence.wixsite.com/obsolescence/pidp-11">PiDP-11</a>.
+    </p>
+    <p>
+      Happy emulating!
+    </p>
+    <p>
+      Paul Nankervis
+    </p>
+    <p>
+      This emulator matches approximately the following SIMH configuration:
+    </p>
+    <pre>set cpu 11/70 1912K nofpp  !1912K is not actually SIMH legal - use 2M instead
+set clk 50hz
+attach rk0 rk0.dsk  !RK05 image of Unix V5
+attach rk1 rk1.dsk  !RK05 image of RT11 v4.0
+attach rk2 rk2.dsk  !RK05 image of RSTS V06C-03
+attach rk3 rk3.dsk  !RK05 image of XXDP
+attach rk4 rk4.dsk  !RK05 image of RT-11 3B
+attach rk5 rk5.dsk  !RK05 image of RT-11 V5.4F
+set rl0 RL02
+attach rl0 rl0.dsk  !RL02 image of BSD 2.9
+set rl1 RL02
+attach rl1 rl1.dsk  !RL02 image of RSX 11M v3.2
+set rl2 RL01
+attach rl2 rl2.dsk  !RL01 image of RSTS/E v7.0
+set rl3 RL02
+attach rl3 rl3.dsk  !RL02 image of XXDP+
+set rp0 RP06
+attach rp0 rp0.dsk  !RP06 image of ULTRIX-11 V3.1
+set rp1 RP06
+attach rp1 rp1.dsk  !RP06 image of BSD 2.11
+set rp2 RP04
+attach rp2 rp2.dsk  !RP04 image of RSTS/E v9.6
+set rp3 RP04
+attach rp3 rp3.dsk  !RP04 image of RSX 11M v4.6
+set rp4 RP04
+attach rp4 rp4.dsk  !RP04 image of RSTS/E v10.1
+attach tm0 tm0.tap  !Backup of RSTS 4B-17
+attach tm1 tm1.tap  !Distribution for RSTS V06C-03
+attach tm2 tm2.tap  !Distribution for RSTS V7.0
+</pre>
+    <h3>List of guest OS's:
+    </h3>
+    <table>
+      <tbody><tr>
+        <td>
+          <b>Disk
+          </b>
+        </td>
+        <td>
+          <b>OS
+          </b>
+        </td>
+        <td>
+          <b>Comment
+          </b>
+        </td>
+      </tr>
+      <tr>
+        <td>
+          <b>RK0
+          </b>
+        </td>
+        <td>Unix V5
+        </td>
+        <td>Boot using:
+          <b>unix
+          </b> then login as
+          <b>root
+          </b>
+        </td>
+      </tr>
+      <tr>
+        <td>
+          <b>RK1
+          </b>
+        </td>
+        <td>RT11 v4.0
+        </td>
+        <td>The lightest/fastest OS here
+        </td>
+      </tr>
+      <tr>
+        <td>
+          <b>RK2
+          </b>
+        </td>
+        <td>RSTS V06C-03
+        </td>
+        <td>Boot and login as
+          <b>1,2
+          </b> with password
+          <b>SYSTEM
+          </b> or as
+          <b>11,70
+          </b> using
+          <b>PDP
+          </b>
+        </td>
+      </tr>
+      <tr>
+        <td>
+          <b>RK3
+          </b>
+        </td>
+        <td>XXDP
+        </td>
+        <td>Diagnostic OS and utilities
+        </td>
+      </tr>
+      <tr>
+        <td>
+          <b>RK4
+          </b>
+        </td>
+        <td>RT-11 3B
+        </td>
+        <td>Distribution for RT-11 Version 3B
+        </td>
+      </tr>
+      <tr>
+        <td>
+          <b>RK5
+          </b>
+        </td>
+        <td>RT-11 V5.4F
+        </td>
+        <td>Distribution for RT-11 Version 5.4F
+        </td>
+      </tr>
+      <tr>
+        <td>
+          <b>TM0
+          </b>
+        </td>
+        <td>RSTS 4B-17
+        </td>
+        <td>Boot ROLLIN from TM0 and restore DK0 with "DK:&lt;MT:VIXEN/REW". Reboot from DK0 with "/BO:DK" to auto-login as
+          <b>1,2
+          </b> (password is
+          <b>SYSTEM
+          </b>) Relogin as
+          <b>11,70
+          </b> with password
+          <b>PDP
+          </b> Commands are case sensitive.
+        </td>
+      </tr>
+      <tr>
+        <td>
+          <b>RL0
+          </b>
+        </td>
+        <td>BSD 2.9
+        </td>
+        <td>Boot using:
+          <b>rl(0,0)rlunix
+          </b> &nbsp; CTRL/D to exit single user and start multiuser - login as
+          <b>root
+          </b> (no password)
+        </td>
+      </tr>
+      <tr>
+        <td>
+          <b>RL1
+          </b>
+        </td>
+        <td>RSX 11M v3.2
+        </td>
+        <td>Login as
+          <b>1,2
+          </b> with password
+          <b>SYSTEM
+          </b>
+        </td>
+      </tr>
+      <tr>
+        <td>
+          <b>RL2
+          </b>
+        </td>
+        <td>RSTS/E v7.0
+        </td>
+        <td>Option: &lt;LF&gt; Suboption: &lt;LF&gt; ... Login as
+          <b>1,2
+          </b> using
+          <b>SYSTEM
+          </b> or
+          <b>11,70
+          </b> using
+          <b>PDP
+          </b>
+        </td>
+      </tr>
+      <tr>
+        <td>
+          <b>RL3
+          </b>
+        </td>
+        <td>XXDP
+        </td>
+        <td>Larger version of diagnostics - including PDP 11/70 utilities
+        </td>
+      </tr>
+      <tr>
+        <td>
+          <b>RP0
+          </b>
+        </td>
+        <td>ULTRIX-11 V3.1
+        </td>
+        <td>CTRL/D to enter multiuser mode. Login as
+          <b>root
+          </b> with no password
+        </td>
+      </tr>
+      <tr>
+        <td>
+          <b>RP1
+          </b>
+        </td>
+        <td>BSD 2.11
+        </td>
+        <td>Will autoboot and enter multiuser mode. Login as
+          <b>root
+          </b> with no password
+        </td>
+      </tr>
+      <tr>
+        <td>
+          <b>RP2
+          </b>
+        </td>
+        <td>RSTS/E v9.6
+        </td>
+        <td>Answer boot questions and login as
+          <b>1,2
+          </b> (password
+          <b>SYSTEM
+          </b>) or
+          <b>11,70
+          </b> (no password)
+        </td>
+      </tr>
+      <tr>
+        <td>
+          <b>RP3
+          </b>
+        </td>
+        <td>RSX 11M v4.6
+        </td>
+        <td>Starts logged in as
+          <b>1,2
+          </b> (password
+          <b>SYSTEM
+          </b>) - user accounts
+          <b>200,1
+          </b> (no password) or
+          <b>11,70
+          </b> (password
+          <b>PDP
+          </b>)
+        </td>
+      </tr>
+      <tr>
+        <td>
+          <b>RP4
+          </b>
+        </td>
+        <td>RSTS/E v10.1
+        </td>
+        <td>Answer boot questions and login as
+          <b>1,2
+          </b> (password
+          <b>SYSTEM
+          </b>) or
+          <b>11,70
+          </b> (no password)
+        </td>
+      </tr>
+    </tbody></table>
+    <p>
+      <b>Note:
+      </b> Disks are shown in approximately order size. The
+      <a href="https://en.wikipedia.org/wiki/RK05">RK05
+      </a> disks at the top are small …</p></div>
+<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://skn.noip.me/pdp11/pdp11.html">https://skn.noip.me/pdp11/pdp11.html</a></em></p>]]>
+            </description>
+            <link>https://skn.noip.me/pdp11/pdp11.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-24388412</guid>
+            <pubDate>Sun, 06 Sep 2020 02:03:19 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Getting Color Output out of a TI-99/4A]]>
             </title>
             <description>
 <![CDATA[
-Score 71 | Comments 29 (<a href="https://news.ycombinator.com/item?id=24387027">thread link</a>) | @commons-tragedy
+Score 75 | Comments 34 (<a href="https://news.ycombinator.com/item?id=24387027">thread link</a>) | @commons-tragedy
 <br/>
 September 5, 2020 | https://netzhansa.com/ti99-4a-color/ | <a href="https://web.archive.org/web/*/https://netzhansa.com/ti99-4a-color/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="main">
@@ -495,7 +2025,7 @@ around 70 Euros.</p>
             </title>
             <description>
 <![CDATA[
-Score 100 | Comments 36 (<a href="https://news.ycombinator.com/item?id=24386867">thread link</a>) | @panic
+Score 116 | Comments 55 (<a href="https://news.ycombinator.com/item?id=24386867">thread link</a>) | @panic
 <br/>
 September 5, 2020 | http://yosefk.com/blog/i-cant-believe-im-praising-tcl.html | <a href="https://web.archive.org/web/*/http://yosefk.com/blog/i-cant-believe-im-praising-tcl.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -559,7 +2089,7 @@ $ pmem 0 pc<br>
             </title>
             <description>
 <![CDATA[
-Score 115 | Comments 21 (<a href="https://news.ycombinator.com/item?id=24386826">thread link</a>) | @tekknolagi
+Score 124 | Comments 29 (<a href="https://news.ycombinator.com/item?id=24386826">thread link</a>) | @tekknolagi
 <br/>
 September 5, 2020 | https://bernsteinbear.com/blog/compiling-a-lisp-4/ | <a href="https://web.archive.org/web/*/https://bernsteinbear.com/blog/compiling-a-lisp-4/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -873,7 +2403,7 @@ implementation simplicity, so I’m not going to do that.</p>
             </title>
             <description>
 <![CDATA[
-Score 62 | Comments 72 (<a href="https://news.ycombinator.com/item?id=24386326">thread link</a>) | @anarbadalov
+Score 66 | Comments 76 (<a href="https://news.ycombinator.com/item?id=24386326">thread link</a>) | @anarbadalov
 <br/>
 September 5, 2020 | https://www.worksinprogress.co/issue/the-evolution-of-psychiatry/ | <a href="https://web.archive.org/web/*/https://www.worksinprogress.co/issue/the-evolution-of-psychiatry/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -918,7 +2448,7 @@ September 5, 2020 | https://www.worksinprogress.co/issue/the-evolution-of-psychi
             </title>
             <description>
 <![CDATA[
-Score 110 | Comments 133 (<a href="https://news.ycombinator.com/item?id=24385532">thread link</a>) | @pkz
+Score 124 | Comments 162 (<a href="https://news.ycombinator.com/item?id=24385532">thread link</a>) | @pkz
 <br/>
 September 5, 2020 | https://personal.jatan.space/2020/04/18/onlyoffice-better-than-libreoffice/ | <a href="https://web.archive.org/web/*/https://personal.jatan.space/2020/04/18/onlyoffice-better-than-libreoffice/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -991,11 +2521,127 @@ September 5, 2020 | https://personal.jatan.space/2020/04/18/onlyoffice-better-th
         </item>
         <item>
             <title>
+<![CDATA[The Stack Monoid]]>
+            </title>
+            <description>
+<![CDATA[
+Score 177 | Comments 44 (<a href="https://news.ycombinator.com/item?id=24385095">thread link</a>) | @raphlinus
+<br/>
+September 5, 2020 | https://raphlinus.github.io/gpu/2020/09/05/stack-monoid.html | <a href="https://web.archive.org/web/*/https://raphlinus.github.io/gpu/2020/09/05/stack-monoid.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div aria-label="Content">
+      <div>
+        <article itemscope="" itemtype="http://schema.org/BlogPosting">
+
+  
+
+  <div itemprop="articleBody">
+    <p>(Updated 2020-09-06 with pointers to related work and a bit more explanation)</p>
+
+<p>This is a bit of a followup to <a href="https://raphlinus.github.io/personal/2018/05/10/toward-gpu-json-parsing.html">Towards GPGPU JSON parsing</a>. That proposed a rather roundabout way to parallelize a simple parsing task. Having had more GPU programming experience under my belt, I don’t expect that particular approach to work well, but it did suggest that parallelism exists in the problem.</p>
+
+<p>This post is a writeup of a new idea, but with a caution, no implementation. It probably contains some mistakes, and maybe the idea is flawed. But if it holds up, I think it’s an exciting line of research on how to port sequential algorithms to GPU.</p>
+
+<p>For this post, I’m going to pose an even more simplified version of the problem: for each open bracket, record the index of the parent in the parse tree, and for each close bracket, the index of the corresponding open bracket.</p>
+
+<p>This is a simple sequential program:</p>
+
+<div><div><pre><code>    <span>stack</span> <span>=</span> <span>[</span><span>None</span><span>]</span>
+    <span>for</span> <span>i</span><span>,</span> <span>token</span> <span>in</span> <span>input</span><span>:</span>
+        <span>result</span><span>[</span><span>i</span><span>]</span> <span>=</span> <span>stack</span><span>[</span><span>len</span><span>(</span><span>stack</span><span>)</span> <span>-</span> <span>1</span><span>]</span>
+        <span>if</span> <span>token</span> <span>==</span> <span>'['</span><span>:</span>
+            <span>stack</span><span>.</span><span>push</span><span>(</span><span>i</span><span>)</span>
+        <span>elif</span> <span>token</span> <span>==</span> <span>']'</span><span>:</span>
+            <span>stack</span><span>.</span><span>pop</span><span>()</span>
+</code></pre></div></div>
+
+<p>To follow the running example from the JSON post, assume the input <code>[[][[][][[]]][][]]</code>. The result is:</p>
+
+<div><div><pre><code>index 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17
+input [  [  ]  [  [  ]  [  ]  [  [  ]  ]  ]  [  ]  [  ]  ]
+value -  0  1  0  3  4  3  6  3  8  9  8  3  0 13  0 15  0
+</code></pre></div></div>
+
+<p>Can it be parallelized? It’s challenging to see how, as there are dependencies on previous state. Further, the state itself has unbounded size. It can be O(n); a pathological case is a million open brackets followed by a million close. In practice, depending on the workloads, we might expect more modest nesting depth, but ideally we’d like an algorithm that can handle all cases at least reasonably well.</p>
+
+<p>Maybe we can do something. To longtime readers of my blog (and the “rope science” series before that), it will be no surprise I’ll try to use monoids.</p>
+
+<p>So let’s turn this sequential program into a monoid. If I had a time portal, I’d lens forward in time and use the handy automated tool that some enterprising PhD student will has done by then. But, failing that, I’ll do it in my head.</p>
+
+<p>The monoid is basically a sequence of pops followed by a sequence of pushes. Since the pop operations (in this case) don’t have a payload, they can be represented simply as a count. So the monoid is the pair <code>(n_pops, elements)</code>. The primitive for push is <code>(0, [element])</code>, and for pop it’s <code>(1, [])</code>. The monoid operation is:</p>
+
+<div><div><pre><code><span>def</span> <span>combine</span><span>(</span><span>m1</span><span>,</span> <span>m2</span><span>):</span>
+    <span>n1</span><span>,</span> <span>s1</span> <span>=</span> <span>m1</span>
+    <span>n2</span><span>,</span> <span>s2</span> <span>=</span> <span>m2</span>
+    <span>if</span> <span>n2</span> <span>&gt;=</span> <span>len</span><span>(</span><span>s1</span><span>):</span>
+        <span>return</span> <span>(</span><span>n1</span> <span>+</span> <span>n2</span> <span>-</span> <span>len</span><span>(</span><span>s1</span><span>),</span> <span>s2</span><span>)</span>
+    <span>else</span><span>:</span>
+        <span>return</span> <span>(</span><span>n1</span><span>,</span> <span>s1</span><span>[:</span><span>len</span><span>(</span><span>s1</span><span>)</span> <span>-</span> <span>n2</span><span>]</span> <span>+</span> <span>s2</span><span>)</span>
+</code></pre></div></div>
+
+<p>And of course, the identity element is <code>(0, [])</code>. One intuition for this monoid is that it represents a function from the state at the beginning of a sequence of tokens to the state at the end. If it indeed computes this function for arbitrary subsequences, then it it follows that it’s a monoid from the fact that function composition is associative.</p>
+
+<p>Running scan, or generalized <a href="https://raphlinus.github.io/gpu/2020/04/30/prefix-sum.html">prefix sum</a>, on this monoid, will result in the desired result at the top of the stack, i.e. the last element of the sequence in the monoid.</p>
+
+<p><strong>Exercise:</strong> Show that this monoid is associative.</p>
+
+<p>I do believe that an automated tool for translating these kinds of simple sequential programs is possible, and that there’s a theory behind it that illuminates ways in which monoids do and do not compose. Some composition is possible, for example you could fairly easily extend this idea so that each child knows its sequence number relative to its siblings. To do that, blend in the “counting monoid,” which is just integer addition.</p>
+
+<p><strong>Exercise:</strong> Extend the monoid to handle sequence numbers.</p>
+
+<p>If we had a bound on stack depth, we’d be pretty well set. The problem is the unbounded case. My original thinking was to have a window of (let’s say size k) elements, and each pass would handle a slice of the stack of size k. I think this can be made to work, but at heart it requires a number of passes proportional to stack depth, so in the worst case O(n^2).</p>
+
+<p>My new idea is to retain the single pass scan, but use a purpose-built data structure to represent the stack. At the top is a window of k elements, then after that is a linked list (or perhaps a linked list of chunks; honestly I haven’t worked through all the implications, much less actually implemented and done performance measurement).</p>
+
+<p>The combine operation tries to fit the new combined sequence in the window (up to a shared link, which it can just retain). But if it overflows, then it must allocate, most likely using an atomic bump allocator into global memory, as is often done in piet-gpu.</p>
+
+<h2 id="performance-analysis">Performance analysis</h2>
+
+<p>To do a <em>real</em> performance analysis would require an implementation, but it should be possible to reason about it a bit.</p>
+
+<p>Clearly performance will be excellent if stack depth is shallow. The rate at which the linked list will be invoked will depend on the workload, and also the parallelism patterns. It’s worth noting that if the scan is run sequentially, then the linked list operations will always be cheap. This is because the concatenation at the heart of the monoid operation is <em>asymmetrical</em> when using a linked list - a large sequence on the left is cheap when the sequence on the right is small, but not the other way around. When running the scan purely sequentially, the monoid on the right is always of size 1 at most.</p>
+
+<p>And the decoupled lookback implementation of scan, which is state of the art, runs essentially sequentially at large granularity; it just tries to exploit as much parallelism as the hardware provides at smaller granularity. Even with extremly deep nesting, it should build and retain a linked list of the stack as it scans, with a relatively smaller window for the part of the problem currently in flight.</p>
+
+<p>There is another reason to be optimistic about performance. While the bandwidth of communication between partitions scales with the window size, that’s not necessarily true for processing <em>within</em> a partition. Putting aside for a moment the relatively challenging problem of implementing an efficient GPU kernel (which by necessity would exploit SIMD parallelism), consider a decoupled look-back implementation running on a more traditional multicore CPU, where each thread is sequential.</p>
+
+<p>Basically, the first pass runs the traditional, sequential stack algorithm, with the modification that some of the input stack might not be available. At the end is the monoid, with “n_pops” being a count of the number of times that happened, and the sequence containing all the elements pushed inside that partition.</p>
+
+<p>In the decoupled lookback phase, this monoid is published for consumption of partitions to the right, and the partition also computes the aggregate from partitions to the left. The cost of the monoid operations in this phase <em>will</em> be proportional to the size of the window, but keep in mind that the number of aggregates is orders of magnitude less than the number of elements.</p>
+
+<p>Finally, in the second pass over the elements, the stack algorithm is run again, and this time elements that were missing in the first pass are available, from the aggregate obtained during the decoupled lookback phase. As another potential optimization, the second pass might “jump over” subtrees that were computed entirely locally within the partition in the first pass, only doing work on subtrees that cross partition boundaries.</p>
+
+<p>Thus, my analysis is that the work factor is <em>extremely</em> good for this algorithm, meaning that on a 64 core processor, it might come within striking distance of 64 times faster than a single core sequential implementation (obviously modulo all the usual other factors that make this challenging).</p>
+
+<p>As I mentioned, an efficient GPU kernel is likely to be challenging, probably requiring tricky techniques to exploit SIMD (warp) parallelism without spending too much time computing the monoid composition, but the fact that it seems to work so well in the multicore case is an encouraging sign that an efficient, fully GPU-tuned implementation is possible.</p>
+
+
+
+<p>In an earlier draft, I asked for relevant literature related to this idea. I still haven’t found anything that presents this particular monoid, or a tool that can derive it from its sequential source, but there is a fair amount of related work.</p>
+
+<p>Obviously, <a href="https://github.com/simdjson/simdjson">simdjson</a> is an important exploration of deriving more parallelism from the JSON parsing task, with impressive results. It is, I think, complementary to this exploration, as it exploits parallelism at a fine grain, where this monoid approach is geared towards the larger grain of tree structure. But both are necessary for a performant GPU implementation; anyone intending to really parse JSON on GPU is well advised to study it.</p>
+
+<p>Parsing CSV has some of the same problems as JSON, though not the (potentially deeply) nested tree structure. A recent preprint, <a href="https://arxiv.org/pdf/1905.13415.pdf">ParPaRaw: Massively Parallel Parsing of Delimiter-Separated Raw Data</a> presents a GPU implementation.</p>
+
+<p>This <a href="https://github.com/rapidsai/cudf/pull/1512">PR to cudf</a> implements “JSON Lines” parsing, which seems to me more similar to CSV than full tree-structured JSON parsing, but I haven’t dug into it in detail.</p>
+
+<p>There is also a large literature on incremental parsing, which is related to parallel parsing as well (monoids are useful to both); a relevant example is <a href="https://www.cambridge.org/core/journals/journal-of-functional-programming/article/efficient-parallel-and-incremental-parsing-of-practical-contextfree-languages/4D620F0BFADE2B588F854AAAEA252F5C">Efficient parallel and incremental parsing of practical context-free languages</a>.</p>
+
+<p>I linked it in my previous blog, but <a href="https://scholarworks.iu.edu/dspace/handle/2022/24749">Aaron Hsu’s PhD thesis</a> is a remarkable full compiler implementation (for an APL-derived language) on GPU. It <em>does</em> address tree structure, and I believe generally uses adjacency matrices to represent that.</p>
+
+<p>An interesting paper on converting a sequential program into a monoid is <a href="https://dl.acm.org/doi/pdf/10.1145/3018882.3018891">Functional Parallels of Sequential Imperatives</a>, and that has a lot of pointers into other literature. I haven’t (yet) read it carefully enough to know whether it could derive the monoid stated above. …</p></div></article></div></div></div>
+<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://raphlinus.github.io/gpu/2020/09/05/stack-monoid.html">https://raphlinus.github.io/gpu/2020/09/05/stack-monoid.html</a></em></p>]]>
+            </description>
+            <link>https://raphlinus.github.io/gpu/2020/09/05/stack-monoid.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-24385095</guid>
+            <pubDate>Sat, 05 Sep 2020 17:06:57 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[A Brief Explanation of Greg Egan’s Dust Theory]]>
             </title>
             <description>
 <![CDATA[
-Score 100 | Comments 121 (<a href="https://news.ycombinator.com/item?id=24384051">thread link</a>) | @43t344efsg
+Score 101 | Comments 129 (<a href="https://news.ycombinator.com/item?id=24384051">thread link</a>) | @43t344efsg
 <br/>
 September 5, 2020 | https://cephalopods.blog/2020/08/14/a-brief-explanation-of-egans-dust-theory/ | <a href="https://web.archive.org/web/*/https://cephalopods.blog/2020/08/14/a-brief-explanation-of-egans-dust-theory/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="post-409">
@@ -1057,7 +2703,7 @@ September 5, 2020 | https://cephalopods.blog/2020/08/14/a-brief-explanation-of-e
             </title>
             <description>
 <![CDATA[
-Score 214 | Comments 37 (<a href="https://news.ycombinator.com/item?id=24383648">thread link</a>) | @matt_d
+Score 228 | Comments 45 (<a href="https://news.ycombinator.com/item?id=24383648">thread link</a>) | @matt_d
 <br/>
 September 5, 2020 | https://www.reenigne.org/blog/8086-microcode-disassembled/ | <a href="https://web.archive.org/web/*/https://www.reenigne.org/blog/8086-microcode-disassembled/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1298,7 +2944,7 @@ IDIV/DIV rmw      8</pre>
             </title>
             <description>
 <![CDATA[
-Score 566 | Comments 512 (<a href="https://news.ycombinator.com/item?id=24383276">thread link</a>) | @uncertainquark
+Score 593 | Comments 531 (<a href="https://news.ycombinator.com/item?id=24383276">thread link</a>) | @uncertainquark
 <br/>
 September 5, 2020 | https://personal.jatan.space/2020/09/05/ubuntu-snap-obsession-has-snapped-me-off-of-it/ | <a href="https://web.archive.org/web/*/https://personal.jatan.space/2020/09/05/ubuntu-snap-obsession-has-snapped-me-off-of-it/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1395,7 +3041,7 @@ September 5, 2020 | https://personal.jatan.space/2020/09/05/ubuntu-snap-obsessio
             </title>
             <description>
 <![CDATA[
-Score 131 | Comments 36 (<a href="https://news.ycombinator.com/item?id=24382589">thread link</a>) | @lftherios
+Score 135 | Comments 37 (<a href="https://news.ycombinator.com/item?id=24382589">thread link</a>) | @lftherios
 <br/>
 September 5, 2020 | https://radicle.xyz/radicle-link.html | <a href="https://web.archive.org/web/*/https://radicle.xyz/radicle-link.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section id="radicle-link">
