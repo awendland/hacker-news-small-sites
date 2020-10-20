@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Tue, 20 Oct 2020 12:37:04 GMT</lastBuildDate>
+        <lastBuildDate>Tue, 20 Oct 2020 16:36:23 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-1.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Tue, 20 Oct 2020 12:37:04 GMT</pubDate>
+        <pubDate>Tue, 20 Oct 2020 16:36:23 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -979,7 +979,213 @@ fs.readFile("./data/data.json", { encoding: "utf-8" }, (err, data)�
 Score 2 | Comments 0 (<a href="https://news.ycombinator.com/item?id=24823658">thread link</a>) | @cezarypiatek
 <br/>
 October 18, 2020 | https://cezarypiatek.github.io/post/async-analyzers-p2/ | <a href="https://web.archive.org/web/*/https://cezarypiatek.github.io/post/async-analyzers-p2/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
+		<header>
+			
+			  
+			<p><i></i> <time>18 October 2020</time></p>
+			<hr>
+			
+		</header>
+		
+			<img src="https://cezarypiatek.github.io/post/async-analyzers-p2/splashscreen.jpg" width="100%">
+			
+		
+		<p>This blog post continues the series which is a guide through the code analyzers available on the market and their possibilities. I’m trying to help you answer the question: <strong>“Which analyzer package should I use and how to configure it to avoid problems related to async/await?"</strong>. In <a href="https://cezarypiatek.github.io/post/async-analyzers-p1/">the previous episode</a>, I presented the first seven most common code smells related to asynchronous programming. Today, I present the next seven traps from this area. Lucky you, they can be easily avoided with an appropriate analyzer - for every issue, I provide entries for <code>.editorconfig</code> that configure analyzers that can detect it. Links to NuGet packages, as well as a complete list of analyzers’ rules, can be found in the previous article.</p>
+<h2 id="async-code-smells">Async Code Smells<a href="#async-code-smells" arialabel="Anchor"> 🔗︎</a> </h2>
+<h3 id="8-synchronous-waits">8. Synchronous waits<a href="#8-synchronous-waits" arialabel="Anchor"> 🔗︎</a> </h3>
+<p><code>async/await</code> keywords are viral, which means if you want to await asynchronous expression and you are in the non-asyc method, then you are forced to rewrite the whole call chain to asynchronous. The easier solution seems to be calling <code>Wait</code> or <code>Result</code> on the returned task but it’s just asking for trouble. This solution will cost you two threads for that execution, or even result in a deadlock. This problem is more widely described in <a href="https://github.com/davidfowl/AspNetCoreDiagnosticScenarios/blob/master/AsyncGuidance.md#avoid-using-taskresult-and-taskwait">
+ASP.NET Core Diagnostic Scenarios - Asynchronous Programming</a>. I highly recommend reading this article - you will find there even more asynchronous code smells.</p>
+<p>❌ Wrong</p>
+<pre><code>void DoSomething()
+{
+    Thread.Sleep(1); // Reported diagnostics: MA0045
+    Task.Delay(2).Wait();  // Reported diagnostics: VSTHRD002, MA0045
+    var result1 = GetAsync().Result; // Reported diagnostics: VSTHRD002, MA0045, AsyncifyInvocation
+    var result2 = GetAsync().GetAwaiter().GetResult(); // Reported diagnostics: VSTHRD002, MA0045
+    var unAwaitedResult3 = GetAsync();
+    var result3 = unAwaitedResult3.Result; // Reported diagnostics:  VSTHRD002, MA0045, AsyncifyVariable
+}
+</code></pre>
+<p>✔️ Correct</p>
+<pre><code>async Task DoSomething()
+{
+    await Task.Delay(1);
+    await Task.Delay(2);    
+    var result1 = await GetAsync();
+    var result2 = await GetAsync();
+}
+</code></pre>
+<p>🛠️ Configuration</p>
+<pre><code># VSTHRD002: Avoid problematic synchronous waits
+dotnet_diagnostic.VSTHRD002.severity = error
+
+# MA0045: Do not use blocking call (make method async)
+dotnet_diagnostic.MA0045.severity = error
+
+# AsyncifyInvocation: Use Task Async
+dotnet_diagnostic.AsyncifyInvocation.severity = error
+
+# AsyncifyVariable: Use Task Async
+dotnet_diagnostic.AsyncifyVariable.severity = error
+
+</code></pre>
+<p><code>Asyncify</code> package has a very simple diagnostic - it only detects usage of <code>Task.Result</code> property. <strong>However, it has a very powerful code fix which can automatically rewrite the whole synchronous call chain to the one that uses <code>async/await</code> keywords:</strong></p>
+<p>
+<a href="https://cezarypiatek.github.io/post/async-analyzers-p2/rewrite_async.jpg"><img src="https://cezarypiatek.github.io/post/async-analyzers-p2/rewrite_async.jpg" alt="Auto rewrite sync to async"></a>
+</p>
+<p><code>vs-threading</code> has a similar code fix, unfortunately right now it is totally broken <a href="https://github.com/microsoft/vs-threading/issues/454">Issue #454</a>.</p>
+<h3 id="9-missing-configureawaitbool">9. Missing ConfigureAwait(bool)<a href="#9-missing-configureawaitbool" arialabel="Anchor"> 🔗︎</a> </h3>
+<p>By default, when we await asynchronous operation using the <code>await</code> keyword, the continuation is scheduled using captured SynchronizationContext or TaskScheduler. This comes with additional performance cost and might result in a deadlock, depending on the SynchronizationContext/TaskScheduler provided by the environment - especially in <code>WindowsForms</code>, <code>WPF</code> and old <code>ASP.NET</code> application (yes, ASP.NET Core is not using SynchronizationContext). <code>ConfigureAwait</code> method wraps returned task into <code>ConfiguredTaskAwaitable</code> structure which changes the logic of scheduling the continuation. By calling <code>ConfigureAwait(continueOnCapturedContext: false)</code> we are ensuring that the current context (if provided) is ignored while invoking the continuation. Setting <code>continueOnCapturedContext</code> parameter to <code>true</code> doesn’t make any sense. If you want to go into the details about this subject, I recommend reading <a href="https://devblogs.microsoft.com/dotnet/configureawait-faq/">ConfigureAwait FAQ</a> by <code>Stephen Toub</code>.</p>
+<p>❌ Wrong</p>
+<pre><code>async Task DoSomethingAsync()
+{
+    await DoSomethingElse(); //Reported diagnostics: ASYNC0004, MA0004, RCS1090, VSTHRD111, CA2007
+}
+</code></pre>
+<p>✔️ Correct</p>
+<pre><code>async Task DoSomethingAsync()
+{
+    await DoSomethingElse().ConfigureAwait(false);
+}
+</code></pre>
+<p>🛠️ Configuration</p>
+<pre><code># ASYNC0004: Use ConfigureAwait(false) on await expression
+dotnet_diagnostic.ASYNC0004.severity = error
+
+# MA0004: Use .ConfigureAwait(false)
+dotnet_diagnostic.MA0004.severity = error
+
+# RCS1090: Call 'ConfigureAwait(false)'.
+dotnet_diagnostic.RCS1090.severity = error
+
+# VSTHRD111: Use ConfigureAwait(bool)
+dotnet_diagnostic.VSTHRD111.severity = error
+
+# CA2007: Consider calling ConfigureAwait on the awaited task
+dotnet_diagnostic.CA2007.severity = error
+
+</code></pre>
+<p>All of the above analyzers offer appropriate code fixes. You can easily add “ConfigureAwait(false)` to all await expressions in one go:</p>
+<p>
+<img src="https://cezarypiatek.github.io/post/async-analyzers-p2/configure_await_whole_solution_animated.png" alt="Apply code fix to whole solution">
+</p>
+<h3 id="10-returning-null-from-a-task-returning-method">10. Returning null from a Task-returning method<a href="#10-returning-null-from-a-task-returning-method" arialabel="Anchor"> 🔗︎</a> </h3>
+<p>Returning <code>null</code> value from a non-async method that declares <code>Task/Task&lt;&gt;</code> as a returning type results in <code>NullReferenceException</code> if somebody awaits the method invocation. To avoid that, you should always return the result from this kind of method using <code>Task.CompletedTask</code> or <code>Task.FromResult&lt;T&gt;(null)</code> helpers.</p>
+<p>❌ Wrong</p>
+<pre><code>Task DoAsync() 
+{
+    return null; //Reported diagnostics: MA0022, VSTHRD114
+}
+
+Task&lt;object&gt; GetSomethingAsync() 
+{
+    return null;  //Reported diagnostics: MA0022, VSTHRD114, RCS1210
+}
+
+Task&lt;HttpResponseMessage&gt; TryGetAsync(HttpClient httpClient)
+{
+    return httpClient?.GetAsync("/some/endpoint"); //Reported diagnostics: RCS1210
+}
+</code></pre>
+<p>✔️ Correct</p>
+<pre><code>Task DoAsync() 
+{
+    return Task.CompletedTask;
+}
+
+Task&lt;object&gt; GetSomethingAsync() 
+{
+    return Task.FromResult&lt;object&gt;(null);
+}
+
+Task&lt;HttpResponseMessage&gt; TryGetAsync(HttpClient httpClient)
+{
+    return httpClient?.GetAsync("/some/endpoint") ?? Task.FromResult(default(HttpResponseMessage));
+}
+</code></pre>
+<p>🛠️ Configuration</p>
+<pre><code># MA0022: Return Task.FromResult instead of returning null
+dotnet_diagnostic.MA0022.severity = error
+
+# RCS1210: Return Task.FromResult instead of returning null.
+dotnet_diagnostic.RCS1210.severity = error
+
+# VSTHRD114: Avoid returning a null Task
+dotnet_diagnostic.VSTHRD114.severity = error
+</code></pre>
+<p>Right now, none of the analyzers is able to detect all three cases, so we should go with one of two combinations: <code>RCS1210</code> with <code>VSTHRD114</code> or <code>RCS1210</code> with <code>MA0022</code>.</p>
+<h3 id="11-asynchronous-method-names-should-end-with-async">11. Asynchronous method names should end with Async<a href="#11-asynchronous-method-names-should-end-with-async" arialabel="Anchor"> 🔗︎</a> </h3>
+<p>I’m not a fan of this rule. It adds unnecessary noise and reminds me of the <a href="https://en.wikipedia.org/wiki/Hungarian_notation">hungarian notation</a>. In the description of <a href="https://github.com/microsoft/vs-threading/blob/master/doc/analyzers/VSTHRD200.md">VSTHRD200</a> we can see:</p>
+<blockquote>
+<p><code>The .NET Guidelines for async methods includes that such methods should have names that include an "Async" suffix.</code></p>
+</blockquote>
+<p>However, I wasn’t able to find the original document and there’s nothing about it in the <a href="https://docs.microsoft.com/en-us/dotnet/standard/design-guidelines/naming-guidelines">Framework Design Guidelines - Naming Guidelines</a>. IMHO, this naming convention only makes sense when a class provides both synchronous and asynchronous versions of a given method - this is the case mostly for APIs that were created before the <code>async/await</code> era. Anyway, if this rule belongs to your coding standard, you can easily spot all the violations with the following diagnostics: <code>VSTHRD200</code>, <code>ASYNC0001</code>, <code>RCS1046</code>.</p>
+<p>❌ Wrong</p>
+<pre><code>async Task DoSomething() //Reported diagnostics: VSTHRD200, ASYNC0001, RCS1046
+{
+    await Task.Yield();
+}
+</code></pre>
+<p>✔️ Correct</p>
+<pre><code>async Task DoSomethingAsync()
+{
+    await Task.Yield();
+}
+</code></pre>
+<p>🛠️ Configuration</p>
+<pre><code># ASYNC0001: Asynchronous method names should end with Async
+dotnet_diagnostic.ASYNC0001.severity = error
+
+# VSTHRD200: Use "Async" suffix for async methods
+dotnet_diagnostic.VSTHRD200.severity = error
+
+#RCS1046: Asynchronous method name should end with 'Async'.
+dotnet_diagnostic.RCS1046.severity = error
+</code></pre>
+<h3 id="12-non-asynchronous-method-names-shouldnt-end-with-async">12. Non asynchronous method names shouldn’t end with Async<a href="#12-non-asynchronous-method-names-shouldnt-end-with-async" arialabel="Anchor"> 🔗︎</a> </h3>
+<p>This rule definitely makes more sense for me than the previous one. Adding <code>Async</code> suffix to the non-asynchronous method might cause confusion. I think this code smell is rather a result of careless refactoring or requirement changes than intended action.</p>
+<p>❌ Wrong</p>
+<pre><code>void DoSomethingAsync() //Reported diagnostics: VSTHRD200, ASYNC0002, CS1047
+{    
+}
+</code></pre>
+<p>✔️ Correct</p>
+<pre><code>void DoSomething()
+{    
+}
+</code></pre>
+<p>🛠️ Configuration</p>
+<pre><code># VSTHRD200: Use "Async" suffix for async methods
+dotnet_diagnostic.VSTHRD200.severity = error
+
+# ASYNC0002: Non asynchronous method names should end with Async
+dotnet_diagnostic.ASYNC0002.severity = error
+
+# RCS1047: Non-asynchronous method name should not end with 'Async'.
+dotnet_diagnostic.RCS1047.severity = error
+
+</code></pre>
+<p>It’s worth pointing out that <code>VSTHRD200</code> is tracking both naming deviations, it simply checks if the <code>Async</code> suffix is applied correctly. It might be good if you need both rules, but if you just need to check if the <code>Async</code> suffix is not applied to synchronous methods, then you should rather use <code>ASYNC0002</code> or <code>RCS1047</code>.</p>
+<h3 id="13-pass-cancellation-token">13. Pass cancellation token<a href="#13-pass-cancellation-token" arialabel="Anchor"> 🔗︎</a> </h3>
+<p>Forgetting about passing the cancellation token might cost you a lot of trouble. Log running operation without a cancellation token can block the action of stopping the application or can result in thread starvation when there’s a lot of canceled web requests. To avoid such problems, you should always provide and pass a cancellation token to the methods that accept it, even if it’s an optional parameter. <code>Meziantou.Analyzer</code> package implements two diagnostics which can detect missing cancellation token: <code>MA0032</code> is reported always when we skip cancellation token parameter and <code>MA0040</code> is reported only when there’s a cancellation token in current scope that can be used. You can find more details about those analyzers in the article from analyzers author <a href="https://www.meziantou.net/detect-missing-cancellationtoken-using-a-roslyn-analyzer.htm">
+Detect missing CancellationToken using a Roslyn Analyzer</a>.</p>
+<p>❌ Wrong</p>
+<pre><code>public async Task&lt;string&gt; GetSomethingA(HttpClient httpClient, CancellationToken cancellationToken)
+{
+    var response = await httpClient.GetAsync(new Uri("/some/endpoint")); //Reported diagnostics: MA0040
+    return await response.Content.ReadAsStringAsync();
+}
+
+public async Task&lt;string&gt; GetSomethingB(HttpClient httpClient)
+{
+    var response = await httpClient.GetAsync(new Uri("/some/endpoint")); //Reported diagnostics: MA0032
+    return await response.Content.ReadAsStringAsync();
+}
+</code></pre>
+<p>✔️ Correct</p>
+<pre><code>public async Task&lt;string&gt; GetSomething(HttpClient httpClient, CancellationToken …</code></pre></article></div>
+<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://cezarypiatek.github.io/post/async-analyzers-p2/">https://cezarypiatek.github.io/post/async-analyzers-p2/</a></em></p>]]>
             </description>
             <link>https://cezarypiatek.github.io/post/async-analyzers-p2/</link>
             <guid isPermaLink="false">hacker-news-small-sites-24823658</guid>
@@ -1412,7 +1618,7 @@ Score 6 | Comments 2 (<a href="https://news.ycombinator.com/item?id=24823541">th
 October 18, 2020 | https://talk.hyvor.com/blog/future-of-online-commenting/ | <a href="https://web.archive.org/web/*/https://talk.hyvor.com/blog/future-of-online-commenting/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
 <p><span></span>
-<span>150</span>
+<span>151</span>
 </p>
 <p>Technology has become as pervasive as the air we breathe today. While our reliance on technology keeps on increasing, there are a myriad of problems that complement the acceptance of these solutions for inconvenience. For instance, social media may have started as a force for good, but it possibly has <a href="https://www.theguardian.com/commentisfree/2020/sep/19/the-social-dilemma-a-wake-up-call-for-a-world-drunk-on-dopamine">devolved into a state of dysfunction</a>, one that is all about <a href="https://www.theguardian.com/technology/2019/jan/20/shoshana-zuboff-age-of-surveillance-capitalism-google-facebook">surveillance capitalism</a>. Likewise, online commenting may have built a degree of community and credibility over the years, but it has also led to a vast array of problems like online toxicity, <a href="https://www.salon.com/2017/08/05/why-facebooks-racism-problem-might-never-be-solved/">online disinhibition</a> and misogyny.&nbsp;</p>
 <p>I believe it was Albert Einstein who adroitly stated that — <em>It has become appallingly obvious that our technology has exceeded our humanity</em>. Possible, but this is why checks and balances need to be put in effect to ensure that there is more than just a modicum of control. As more and more people are converted to a digitalized life, there are sure to be more issues that come to the forefront. If there are problems created by technology then technology will create solutions to those problems as well.</p>
@@ -5686,93 +5892,7 @@ October 18, 2020 | https://inboxstash.com/newsletter/the-daily-dropout/ | <a hre
 Score 3 | Comments 2 (<a href="https://news.ycombinator.com/item?id=24819798">thread link</a>) | @bra-ket
 <br/>
 October 18, 2020 | https://www.bygonely.com/soviet-moscow-1950s/ | <a href="https://web.archive.org/web/*/https://www.bygonely.com/soviet-moscow-1950s/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="primary">
-				<div id="content" role="main">
-
-					
-
-<article id="post-74649" itemscope="&quot;&quot;" itemtype="http://schema.org/Article">
-	<div>
-		
-		
-
-		
-		<div itemprop="articleBody">
-			<p><a href="https://www.bygonely.com/old-moscow-1931-photos/">Moscow</a> was the center, heart, and soul of the Soviet Union in the 1950s. The country was recovering from <a href="https://www.bygonely.com/wwii-colorized-photographs/">World War II</a>, and moving towards the rapid development and prosperity. The city housed the headquarters of the Soviet secret service, the KGB, and the developing nuclear and aerospace breakthroughs of the Soviet Union during the Cold War.</p>
-<p>New architectures, theatres, skyscrapers, and hotels were built in the city during the 1950s. The Hilton Moscow Leningrad kaya, one of Moscow’s Seven Sisters Skyscrapers, was also built-in 1954. Moscow also hosted the 1957 Ice Hockey World Championships and 6th World Festival of Youth and Students.</p>
-<p>Here below are some stunning vintage photos that will take you back to the Soviet Moscow in the 1950s.</p>
-
-
-
-		</div>
-	</div><!-- .todo -->
-
-		<section itemscope="" itemtype="http://schema.org/Person">
-		<div>
-			<div>
-
-				<figure>
-					<a href="https://www.bygonely.com/members/aung/profile/home/">
-						<img data-expand="600" alt="" src="https://www.bygonely.com/wp-content/uploads/avatars/7/5c3ac08c1f58c-bpfull.jpg" http%3a%2f%2fwww.w3.org%2f2000%2fsvg'="" viewbox%3d'0="" 0="" 80="" 80'%2f%3e'="" data-src="https://www.bygonely.com/wp-content/uploads/avatars/7/5c3ac08c1f58c-bpfull.jpg" data-srcset="https://www.bygonely.com/wp-content/uploads/avatars/7/5c3ac08c1f58c-bpfull.jpg 2x" height="80" width="80" loading="lazy" srcset="https://www.bygonely.com/wp-content/uploads/avatars/7/5c3ac08c1f58c-bpfull.jpg 2x">
-					</a>
-				</figure>
-
-				<header>
-										
-
-									</header>
-
-								<p>Husband + Father + librarian + Poet + Traveler + Proud Buddhist. I love you with the breath, the smiles and the tears of all my life.</p>
-				
-				
-			</div>
-		</div>
-	</section>
-
-
-
-
-
-
-
-
-	
-
-	
-
-
-
-		
-
-
-	
-
-
-
-	<meta itemprop="mainEntityOfPage" content="https://www.bygonely.com/soviet-moscow-1950s/">
-	<meta itemprop="dateModified" content="2020-10-18T09:16:00">
-
-	<span itemprop="publisher" itemscope="" itemtype="http://schema.org/Organization">
-		<meta itemprop="name" content="Bygonely">
-		<meta itemprop="url" content="https://www.bygonely.com">
-		<span itemprop="logo" itemscope="" itemtype="http://schema.org/ImageObject">
-			<meta itemprop="url" content="https://www.bygonely.com/wp-content/uploads/2020/01/BG-logo.png">
-		</span>
-	</span>
-			<span itemprop="image" itemscope="" itemtype="http://schema.org/ImageObject">
-						<meta itemprop="url" content="https://www.bygonely.com/wp-content/uploads/2020/10/featured_Soviet_Moscow_1950s.jpg">
-			<meta itemprop="width" content="900">
-			<meta itemprop="height" content="538">
-		</span>
-			<span itemscope="" itemprop="author" itemtype="http://schema.org/Person">
-			<meta itemprop="name" content="Aung Budhh">
-		</span>
-			<meta itemprop="datePublished" content="2020-10-18">
-	</article>
-
-
-				</div><!-- #content -->
-			</div></div>]]>
+<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
             </description>
             <link>https://www.bygonely.com/soviet-moscow-1950s/</link>
             <guid isPermaLink="false">hacker-news-small-sites-24819798</guid>
@@ -6872,7 +6992,42 @@ October 18, 2020 | https://www.braims.org/post/fundraising.founder.we.are.puttin
 Score 2 | Comments 3 (<a href="https://news.ycombinator.com/item?id=24818755">thread link</a>) | @lucgommans
 <br/>
 October 18, 2020 | https://lucgommans.nl/p/indicative-covid19-symptoms.html | <a href="https://web.archive.org/web/*/https://lucgommans.nl/p/indicative-covid19-symptoms.html">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="wrapper">
+<p>
+This tool might help determine whether your symptoms were likely to be COVID-19
+or not by implementing the model from this paper:
+<a href="https://www.nature.com/articles/s41591-020-0916-2" rel="noopener" target="_blank">https://www.nature.com/articles/s41591-020-0916-2</a>.<br>
+The study was published in May 2020, using about 7000 known-positive COVID-19
+cases with self-reported symptoms to derive and test said model. Note that
+this does <i>not</i> predict whether you currently have COVID-19 but whether
+you <i>have had</i> COVID-19.
+</p>
+
+<p>
+<strong>Note that this is NOT validated or endorsed by the authors of that paper
+and that this is <span>NOT a replacement for a real test</span>!</strong><br>
+I personally compared the results with doing the calculation manually, but
+regardless, the uncertainty in this implementation and the uncertainty in the
+original model compound. The result below is a vague indication only.
+</p>
+
+<p>Your answers are not sent anywhere, there are no cookies, no nothing.</p>
+
+<div>
+	<p>Loading script...</p>
+	<!-- Not all noscript-like add-ons trigger the noscript tag, so can't really use that... -->
+	<p>If this takes more than a second or two, might JavaScript be turned off?</p>
+	<p>
+	Because the data must not leave your browser, the computation is done with
+	JavaScript and there is no fallback pure HTML form. Your browser does not
+	appear to support JavaScript and so this calculation will not work. There
+	are no scripts on the page except the test itself: no visitor counting, no
+	ads, no tracking, no nothing.
+	</p>
+</div>
+
+
+</div></div>]]>
             </description>
             <link>https://lucgommans.nl/p/indicative-covid19-symptoms.html</link>
             <guid isPermaLink="false">hacker-news-small-sites-24818755</guid>
@@ -8355,7 +8510,102 @@ df2 = df |&gt;
 Score 2 | Comments 1 (<a href="https://news.ycombinator.com/item?id=24817834">thread link</a>) | @johnjamess
 <br/>
 October 18, 2020 | http://healthyhabitteam.com/airbnb-pushes-ipo-despite-coronavirus-uncertainty/ | <a href="https://web.archive.org/web/*/http://healthyhabitteam.com/airbnb-pushes-ipo-despite-coronavirus-uncertainty/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+                
+<p>The vacation rental platform Airbnb, Inc. is bracing for an initial public offering (IPO) targeted for December 2020, despite the significant impact wrought on its business and the travel and tourism industry more generally by the coronavirus pandemic</p>
+
+
+
+<p>The San Francisco-based company is aiming to raise some US$3 billion in its IPO. Airbnb’s public offering comes after the company laid off a quarter of its workforce earlier in the year and was forced to seek new avenues of funding to keep the business afloat.</p>
+
+
+
+<p>Yet, despite the difficulties it faced at the height of the pandemic, Airbnb’s business has rebounded quicker than expected. Investors and executives alike are keen to begin the IPO process as soon as possible, which could provide the company with extra capital and a higher valuation, perhaps undoing the damage caused by lockdown orders and a global shutdown in travel and tourism.</p>
+
+
+
+<p>With a travel and tourism industry that’s still in tatters and a virus yet to be fully brought under control, Airbnb’s IPO still has significant uncertainty with which to deal with.</p>
+
+
+
+<p>Coronavirus rebound<br>With the onset of the coronavirus pandemic around the world, Airbnb faced an unprecedented challenge to its business operations.</p>
+
+
+
+<p>With lockdown orders and the decline in global travel and tourism, Airbnb’s core business, its popular short-term home rentals for vacationers and travelers, was under immediate jeopardy.</p>
+
+
+
+<p>In response to the pandemic, Airbnb allowed its customers in March to cancel their bookings without penalties, while also providing hosts financial support that accounted for some of the revenue lost by future guests canceling their bookings with no penalties.</p>
+
+
+
+<p>In addition, the company secured funding from private equity firms Silver Lake and Sixth Street Partners, raising US$1 billion in debt from the two firms. Silver Lake co-chief executive officer Egon Durban claimed the funding was not a “bailout,” but a strategic investment in “Airbnb’s diverse, global, and resilient business model.”</p>
+
+
+
+<p>With the massive drop in bookings, with cancellations amounting to around US$1 billion in lost revenue, Airbnb executives were nonetheless forced to make cuts. In May, the home-rental platform announced it was laying off around 1,900 of it’s 7,500 strong global workforce, about 25%.</p>
+
+
+
+<p>The announced layoffs were mostly concentrated in Airbnb’s noncore products, such as its transportation, Airbnb Studios, hotels and lux efforts.</p>
+
+
+
+<p>In cutting back these sectors it had hoped to expand its operations into, Airbnb was focusing on its core product: short-term home rentals, particularly in rural areas away from coronavirus hot spots and cities, that were within driving distance.</p>
+
+
+
+<p>This strategy largely worked. Despite laying off thousands of its workers, Airbnb’s focus on providing short-term home rentals saw bookings slowly increase once more, especially as customers were unwilling to patronize hotels in proximity to large numbers of other people.</p>
+
+
+
+<p>In the midst of the pandemic, Airbnb touted its strengths in continuing to provide an experience for customers that was both safe and enjoyable. The ability of guests to rent a home solely for themselves and a spotlight on new coronavirus cleaning guidelines, with more than one million listings declared as possessing an “Enhanced Clean” certification in August, was largely responsible for the slow uptick in Airbnb bookings.</p>
+
+
+
+<p>Airbnb’s slow rebound mirrored a broader resilience in the tech industry. Despite the pandemic and subsequent economic crisis, funding for tech startups continued to flow. In the second quarter of 2020, startups in the United States raised some US$34.3 billion, down only slightly from the US$36 billion the previous year.</p>
+
+
+
+<p>According to Airbnb co-founder and chief executive Brian Cheksy, Airbnb’s gradual recovery, despite the broader collapse in travel and tourism, showed that “people want to travel, they just don’t want to get on airplanes … they don’t want to go for business.”</p>
+
+
+
+<p>What they did want, however, was the ability to stay away from home, but away from other people, a service that put Airbnb ahead of traditional hotel rivals during the pandemic.</p>
+
+
+
+<p>With its recovery ongoing, the hopes of an Airbnb IPO in 2020 seem to be reignited. In 2019, the company promised it would go public in 2020 and despite the uncertainty caused by the coronavirus pandemic, this promise appears largely on track to being met.</p>
+
+
+
+<p>In August, the home-rental platform confidentially filed to go public, joining an ongoing deluge of tech startups filing to go public in 2020, such as the data company Palantir Technologies Inc. and delivery platform DoorDash Inc.</p>
+
+
+
+<p>It has not been an easy year for Airbnb, by any metrics. On top of its spring layoffs, the company reported a US$400 million adjusted loss in the second quarter of 2020 and its company valuation, which once topped over US$30 billion, declined to around US$18 billion.</p>
+
+
+
+<p>But the company hopes to now take advantage of the tech IPO frenzy, pull in new capital to pay off its debts raised during the pandemic and reward early Airbnb employees and investors who have been waiting nearly a decade to cash out.</p>
+
+
+
+<p>The company hopes to raise around US$3 billion through an IPO, which could potentially boost the platform’s valuations back to its pre-coronavirus numbers.</p>
+
+
+
+<p>Uncertain future<br>Airbnb’s executives can point to several talking points to demonstrate why it remains an attractive investment opportunity. In 2017 and 2018 the company turned a profit on earnings before interest, taxes and expenses and guest numbers have continued to rise over the last few years. Company spending has also been streamlined, with Airbnb’s marketing budget cut by 14% in the first quarter of 2020 on a year-on-year basis.</p>
+
+
+
+<p>Despite its confidence, Airbnb’s planned IPO still faces an uncertain world. International travel (which is directly connected to Airbnb’s core business) is not expected to return to 2019 levels until 2023 and the fate of the US economy remains uncertain, for the time being, with second stimulus talks remaining stuck.</p>
+
+
+
+<p>Regardless of the uncertainty, Airbnb’s IPO remains one of the most anticipated in recent years. As Airbnb investor Zach Aarons told Bloomberg, “Airbnb is a very recognizable name; people know it like they know Coca Cola.” Investors will soon see just how much this name recognition is worth.</p>
+            </div></div>]]>
             </description>
             <link>http://healthyhabitteam.com/airbnb-pushes-ipo-despite-coronavirus-uncertainty/</link>
             <guid isPermaLink="false">hacker-news-small-sites-24817834</guid>
@@ -8623,7 +8873,7 @@ October 18, 2020 | https://www.politico.eu/article/eu-pledges-e10-billion-to-pow
 <p>ETNO, the association representing Europe’s leading telecom operators, applauded the move.</p>
 <p>“EU governments and the public sector need to be fully committed to the initiative by fully shifting to cloud services. We call for EU targets and commitments that reflect the demand side of the cloud investment story,” said Lise Fuhr, ETNO’s director general.</p>
 <p>Tech lobby DigitalEurope was equally supportive, and announced it was applying for membership in Gaia-X.</p>
-<p><em>Want more analysis from </em><span>POLITICO</span><em>? </em><span>POLITICO</span><em> Pro is our premium intelligence service for professionals. From financial services to trade, technology, cybersecurity and more, Pro delivers real time intelligence, deep insight and breaking scoops you need to keep one step ahead. Email <a href="https://www.politico.eu/cdn-cgi/l/email-protection#364644597646595a5f425f5559185343" target="_blank"><span data-cfemail="3a4a48557a4a5556534e535955145f4f">[email&nbsp;protected]</span></a> to request a complimentary trial.</em></p>
+<p><em>Want more analysis from </em><span>POLITICO</span><em>? </em><span>POLITICO</span><em> Pro is our premium intelligence service for professionals. From financial services to trade, technology, cybersecurity and more, Pro delivers real time intelligence, deep insight and breaking scoops you need to keep one step ahead. Email <a href="https://www.politico.eu/cdn-cgi/l/email-protection#4434362b04342b282d302d272b6a2131" target="_blank"><span data-cfemail="077775684777686b6e736e6468296272">[email&nbsp;protected]</span></a> to request a complimentary trial.</em></p>
  <div> <h3>  Also On POLITICO  </h3>   <div data-block-attributes="[]" data-page="0"> <div> <div> <p><a href="https://www.politico.eu/article/eu-cloud-new-front-with-us-tech-giants/"> <img src="https://www.politico.eu/wp-content/uploads/2020/09/iStock-1160479733-765x540.jpg" sizes="(max-width: 765px) 100vw, 765px" alt="EU cloud regulation opens new front with US tech giants" width="765" height="540" data-thumbnail-size="ev-pro-lead" loading="lazy"></a> </p>   </div><div> <p><a href="https://www.politico.eu/article/beyond-tiktok-us-chinese-app-crackdown/"> <img src="https://www.politico.eu/wp-content/uploads/2020/08/GettyImages-1068921922-1-765x540.jpg" sizes="(max-width: 765px) 100vw, 765px" alt="Beyond TikTok, US eyes Chinese apps and cloud for crackdown" width="765" height="540" data-thumbnail-size="ev-pro-lead" loading="lazy"></a> </p>   </div> </div> </div>    </div> 								</div></div>]]>
             </description>
             <link>https://www.politico.eu/article/eu-pledges-e10-billion-to-power-up-industrial-cloud-sector/</link>
@@ -8925,7 +9175,102 @@ October 18, 2020 | https://mco.dev/beating-the-casino/ | <a href="https://web.ar
 Score 2 | Comments 0 (<a href="https://news.ycombinator.com/item?id=24816862">thread link</a>) | @susam
 <br/>
 October 18, 2020 | http://www.spitenet.com/cave/ | <a href="https://web.archive.org/web/*/http://www.spitenet.com/cave/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="wrapper">
+<div>
+
+<p><img src="http://www.spitenet.com/cave/images/ColossalCavetext.jpg" width="758" height="66" alt="Colossal Cave Adventure text game"></p>
+
+<p>Yes, there you were, maybe 30 years ago, standing at the end of a road before 
+a small brick building.</p>
+<p>After enduring miles of twisty little passages through the years, all alike 
+yet all different, you find yourself again searching with lantern in hand for 
+the way back to the cave. And you remember:</p>
+<blockquote>
+	<p>ducking axes and knives thrown by threatening little dwarves<br>
+	the agony of the first time a pirate stole your hard earned treasure<br>
+	the panic at finding you had lost everything when you were reincarnated<br>
+	the exhilaration from solving the Plover Problem</p>
+</blockquote>
+<p>You missed appointments, dreamt the strangest dreams and drew maps... lots of 
+them... revised over and over...</p>
+<p><img src="http://www.spitenet.com/cave/images/MapsText.jpg" width="158" height="65" alt="MAP"></p>
+<p>If you have Master Adventurer status and you've found the repository, then I hope you 
+will find my map nostalgic.</p>
+<p>If you haven't, then please don't look. You may be frustrated at the moment 
+by the shadowy figure waving back at you from across the pit or you may be at 
+Witt's End, but stick with it <i>without</i> looking at the map.</p>
+<p>My map is based on my perception of the Colossal Cave Adventure 350 point 
+version game, originally written by Will Crowther (1975) and revised by Will Crowther 
+and Don Woods (1976). I've included a web-viewable .jpg, mobile phone sized .jpg, and a PDF print 
+version. Since the PDF version is for printing on 8 1/2 x 11 inch paper, the file 
+size is large (1.3 MB). Please download the file if you want to print out the map. 
+I've set the link for it to go straight to the download pop-up to save on 
+bandwidth. The .jpg version is large enough to clearly view in your browser, but 
+the print quality would be poor.</p>
+<p>There are two version of the map below:</p>
+
+<ul><li>COMPLETE Spoiler Version: This version has it all - the room names, where the treasures are found and the compass points.</li>
+<li>NO CLUES Version: You can navigate through the cave with this map, but the rooms are unnamed and the treasures are not marked. Might be fun if you've played the game for awhile and keep getting lost. You can fill in the room names and compass directions yourself as you go.</li>
+</ul>
+
+<p>Please feel free to <a href="mailto:mari.michaelis@spitenet.com?subject=Colossal_Cave">
+drop me a line</a> and share your caving memories if you like. <br>It'll be nice to 
+know if other wizards appreciate the map.</p>
+
+<p>COMPLETE Spoiler version:&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;NO CLUES version:</p>
+
+<p><img src="http://www.spitenet.com/cave/images/AdventureMapTH.jpg" width="250" height="333" alt="Colossal Cave Adventure Map">
+<img src="http://www.spitenet.com/cave/images/AdventureMap-noCluesTH.jpg" width="250" height="333"></p><p><br>Click here to view the COMPLETE Spoiler Map <br>
+  web .jpg version: <a target="_blank" href="http://www.spitenet.com/cave/images/AdventureMap.jpg">AdventureMap.jpg</a></p>
+<p>Click here to download the Complete Spoiler Map printable PDF: 
+<a href="http://www.spitenet.com/cave/ColossalCaveAdventureMap.php">ColossalCaveAdventureMap.pdf</a></p>
+<hr>
+<p>Click here to view the NO CLUES Map<br>
+  web .jpg version: <a target="_blank" href="http://www.spitenet.com/cave/images/AdventureMap-noClues.jpg">AdventureMap-noClues.jpg</a></p>
+<p>Click here to download the NO CLUES Map printable PDF: 
+<a href="http://www.spitenet.com/cave/CCAdventureMapNoClues.php">CCAdventureMapNoClues.pdf</a></p>
+<hr>
+<p>Click below to view the <strong>Mobile</strong> versions, if you use the SMS text version. Right-click to download and save the jpg.<br>
+<a target="_blank" href="http://www.spitenet.com/cave/images/AdventureMap-m.jpg">AdventureMap-m.jpg</a><br>
+<a target="_blank" href="http://www.spitenet.com/cave/images/AdventureMap-m-NoClues.jpg">AdventureMap-m-NoClues.jpg</a></p><div>
+<p><img src="http://www.spitenet.com/cave/images/lantern.png" width="75" height="174" alt="Take Lamp"></p><p><img src="http://www.spitenet.com/cave/images/links.jpg" width="282" height="66">&nbsp;Links to Adventurous websites:</p>
+
+<p><a href="http://www.computerhistory.org/revolution/computer-games/16/190" target="_blank">Computer History Museum</a> - in Mountain View, CA, featured my cave map in one of their exhibits! <br>Well worth the visit if you are in California.</p>
+
+<p><a href="http://www.getlamp.com/" target="_blank">Get Lamp</a> - Jason Scott's documentary film about adventures in text.<br>Jason Scott is also the webmaster of <a href="http://www.textfiles.com/" target="_blank">textfiles.com</a>, a collection of textfiles from the good ol' days of BBS.</p>
+
+<div><p><a target="_blank" href="https://youtu.be/PbdpW-yAeQo">Colossal Cave Adventure -<strong>SMS Text</strong></a> - Play the game via texting! If you are interested in how this Python version came to be, click the YouTube link above. <strong>Christopher Swenson</strong> gives a great lecture
+about his adventure in trying to understand the Fortran language (what a kid!) it was written in and the complexities involved in porting it to Python. </p><p>
+...Or just start playing by typing anything to <strong>+1 (669) 238-3683</strong> ("669 ADVENT3")<br>
+The database will remember your phone number and you can play at your leisure. <br>See mobile phone versions of the map above.</p></div>
+
+<p><a target="_blank" href="http://www.rickadams.org/adventure/">The Colossal Cave Adventure Page</a> - Rick Adams' definitive website: history, hints, downloads, 
+XYZZY sightings, and more.</p>
+
+<p><a target="_blank" href="http://forums.delphiforums.com/xyzzy/start">Colossal 
+Cave Adventure Forum</a> hosted by Rick Adams</p>
+
+<p><a href="http://www.ifarchive.org/if-archive/games/source/adv350win.zip">
+Colossal Cave Adventure 350</a> download the DOS version adv350win.zip. This 
+version was updated by Al Whinery and the games can be saved.</p>
+
+<p><a target="_blank" href="http://www.wesleyholland.com/misc/adventure/adventure.html">
+Online Flash Version</a> by Wesley Holland</p>
+
+<p><a target="_blank" href="http://www.astrodragon.com/zplet/advent.html">Online 
+Java Version</a> by Matthew Russotto</p>
+
+<p><a href="http://pr-if.org/" target="_blank">People's Republic of Interactive Fiction</a> - Interactive Fiction aka text adventures, are alive and well! Get inspired to write your own adventure.</p>
+
+<p><img src="http://www.spitenet.com/cave/images/tunnel988.png" width="988" height="72">
+</p></div> 
+<!-- end DIV clearboth -->
+
+</div> <!-- end DIV content -->
+
+ <!-- end DIV footer -->
+
+</div></div>]]>
             </description>
             <link>http://www.spitenet.com/cave/</link>
             <guid isPermaLink="false">hacker-news-small-sites-24816862</guid>
@@ -9480,506 +9825,7 @@ October 18, 2020 | https://www.younglingfeynman.com/essays/learningandperformanc
 Score 3 | Comments 0 (<a href="https://news.ycombinator.com/item?id=24816425">thread link</a>) | @piotrzientara
 <br/>
 October 18, 2020 | https://yonatankra.com/askql-nodejs-quickstart/ | <a href="https://web.archive.org/web/*/https://yonatankra.com/askql-nodejs-quickstart/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
-			<p><span><span>Estimated Reading Time: </span> <span>4</span> <span>minutes</span></span></p><p>AskQL is a new query language that is also a programming language. I’ve written <a href="https://yonatankra.com/introduction-to-askql/" data-type="post" data-id="453">an introduction about it in the former post</a>.</p>
-
-
-
-<p>In this article we will see how it can be setup in a nodejs server.</p>
-
-
-
-<h2>Quickly setting a server</h2>
-
-
-
-<p>To setup a server with AskQL, we first need a server. Let’s set it up quickly</p>
-
-
-
-<ol><li>Clone the express demo repository:<br><code>git clone https://github.com/YonatanKra/askql-demo.git</code></li><li>Enter into the folder:<br><code>cd askql-demo</code></li><li>Checkout the express-quick-start tag:<br><code>git checkout express-quick-start</code></li><li>npm i</li><li>npm run dev</li></ol>
-
-
-
-<hr>
-
-
-
-<p>Now you have a working <em><a rel="noreferrer noopener" href="https://expressjs.com/" target="_blank">express</a></em> repository.</p>
-
-
-
-<figure><blockquote><p>Express is a web framework for nodejs. It helps you setup a flexible and easily extendible web server in a really short amount of time.</p></blockquote></figure>
-
-
-
-<p>The setup is pretty simple – in <code>index.js</code> (Code snippet #1) the server is setup with 3 middleware: <code>logRequestMiddleware</code>, <code>logResultsMiddleware</code> and <code>errorHandler</code>. They are being used in the <code>/ask</code> endpoint.</p>
-
-
-
-<p>There’s also a public html page that will serve as our client.</p>
-
-
-
-<div><div>
-<figure><div><div id="gist105935433">
-    <div>
-      <div>
-        <div>
-  <div id="file-index-js">
-    
-
-  <div itemprop="text">
-      
-<table data-tab-size="8" data-paste-markdown-skip="">
-      <tbody><tr>
-        <td id="file-index-js-L1" data-line-number="1"></td>
-        <td id="file-index-js-LC1"><span>import</span> <span>express</span>  <span>from</span> <span>'express'</span><span>;</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L2" data-line-number="2"></td>
-        <td id="file-index-js-LC2"><span>import</span> <span>bodyParser</span> <span>from</span> <span>'body-parser'</span><span>;</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L3" data-line-number="3"></td>
-        <td id="file-index-js-LC3"><span>import</span> <span>{</span><span>logRequestMiddleware</span><span>,</span> <span>logResultsMiddleware</span><span>,</span> <span>logError</span><span>}</span> <span>from</span> <span>"./logger/logger.js"</span><span>;</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L4" data-line-number="4"></td>
-        <td id="file-index-js-LC4">
-</td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L5" data-line-number="5"></td>
-        <td id="file-index-js-LC5"><span>const</span> <span>port</span> <span>=</span> <span>8080</span><span>;</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L6" data-line-number="6"></td>
-        <td id="file-index-js-LC6"><span>const</span> <span>app</span> <span>=</span> <span>express</span><span>(</span><span>)</span><span>;</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L7" data-line-number="7"></td>
-        <td id="file-index-js-LC7">
-</td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L8" data-line-number="8"></td>
-        <td id="file-index-js-LC8"><span>app</span><span>.</span><span>use</span><span>(</span><span>bodyParser</span><span>.</span><span>json</span><span>(</span><span>)</span><span>)</span><span>;</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L9" data-line-number="9"></td>
-        <td id="file-index-js-LC9"><span>app</span><span>.</span><span>use</span><span>(</span><span>bodyParser</span><span>.</span><span>urlencoded</span><span>(</span><span>{</span> <span>extended</span>: <span>true</span> <span>}</span><span>)</span><span>)</span><span>;</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L10" data-line-number="10"></td>
-        <td id="file-index-js-LC10"><span>app</span><span>.</span><span>use</span><span>(</span><span>express</span><span>.</span><span>static</span><span>(</span><span>'public'</span><span>)</span><span>)</span><span>;</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L11" data-line-number="11"></td>
-        <td id="file-index-js-LC11"><span>app</span><span>.</span><span>post</span><span>(</span><span>'/ask'</span><span>,</span> <span>[</span><span>logRequestMiddleware</span><span>,</span> <span>logResultsMiddleware</span><span>,</span> <span>logError</span><span>]</span><span>)</span><span>;</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L12" data-line-number="12"></td>
-        <td id="file-index-js-LC12"><span>app</span><span>.</span><span>listen</span><span>(</span><span>port</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L13" data-line-number="13"></td>
-        <td id="file-index-js-LC13">    <span>console</span><span>.</span><span>log</span><span>(</span><span>`Server listening at http://localhost:<span><span>${</span><span>port</span><span>}</span></span>`</span><span>)</span><span>;</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L14" data-line-number="14"></td>
-        <td id="file-index-js-LC14"><span>}</span><span>)</span><span>;</span></td>
-      </tr>
-</tbody></table>
-
-
-  </div>
-
-  </div>
-</div>
-
-      </div>
-      
-    </div>
-</div>
-</div><figcaption>Code Snippet #1: A simple express server with.  Line 10: Static assets are being served. Line 11: 3 middleware are set for the <code>/ask</code> entry point.  Line 12: The server starts to listen to port 8080.</figcaption></figure>
-</div></div>
-
-
-
-<p>If you go to the client (<a href="http://localhost:8080/" target="_blank" rel="noreferrer noopener">http://localhost:8080</a>) and submit the form, you will see that the submit has been logged. The output should be something like:</p>
-
-
-
-<figure><img loading="lazy" width="1024" height="712" src="https://yonatankra.com/wp-content/uploads/2020/10/image-4-1024x712.png" alt="" srcset="https://yonatankra.com/wp-content/uploads/2020/10/image-4-1024x712.png 1024w, https://yonatankra.com/wp-content/uploads/2020/10/image-4-300x209.png 300w, https://yonatankra.com/wp-content/uploads/2020/10/image-4-768x534.png 768w, https://yonatankra.com/wp-content/uploads/2020/10/image-4-129x90.png 129w, https://yonatankra.com/wp-content/uploads/2020/10/image-4-390x270.png 390w, https://yonatankra.com/wp-content/uploads/2020/10/image-4.png 1312w" sizes="(max-width: 1024px) 100vw, 1024px"><figcaption><strong>Figure 1</strong>: Logging a submit in our express server</figcaption></figure>
-
-
-
-<p>The output shown in <strong>Figure 1</strong> is not very exciting. You can see something that looks like code (actually, it is called <code>AskScript</code>) but it doesn’t do anything.</p>
-
-
-
-<p>Let’s install AskQL so it would be able to parse our script.</p>
-
-
-
-<h2>Setting up AskQL</h2>
-
-
-
-<p>First we need to install AskQL: <em><code>npm i askql</code></em></p>
-
-
-
-<p>Now that AskQL is installed, we can import its utilities and classes in our express app.</p>
-
-
-
-<p>Let’s import an AskQL middleware:</p>
-
-
-
-<pre><code>import middlewareFactory from "askql/askExpressMiddleware/askExpressMiddleware.js";
-const { askExpressMiddleware } = middlewareFactory;</code></pre>
-
-
-
-<p>The <em>askExpressMiddleware </em>is a function that accepts some resources and configuration objects and returns a middleware function:</p>
-
-
-
-<pre><code>const askMiddleware = askExpressMiddleware( 
-{ resources, values },  { callNext: true, passError: true}
-);</code></pre>
-
-
-
-<p>Resources are dynamic AskQL resources that can be accessed in the AskScript. </p>
-
-
-
-<p>Resources can be functions, data handlers (like filter, map etc.) mathematical operators and actually anything a function can do (even 3rd party npm modules you import).</p>
-
-
-
-<p>Values are static values that exist in the server.&nbsp; The <code>values</code> object is a regular object that holds numbers, strings, booleans, arrays or other objects.</p>
-
-
-
-<p>Let’s take the resources that are coming from AskQL and define some values:</p>
-
-
-
-<pre><code>import askql from 'askql';
-const {resources} = askql;
-const values = {    
-  names: ['Johnny', 'Rita', 'Jane', 'Martha', 'Clark'],
-  powers: ['Nerd', 'C#', 'Cool', 'Superman\'s mom', 'Superman']
-};</code></pre>
-
-
-
-<p>The configuration object is a means to customise the middleware – for instance, how to handle errors.</p>
-
-
-
-<p>Now that the middleware is ready, we can add it to the list of middleware between the two loggers and restart the server.</p>
-
-
-
-<p>The final <code>index.js</code> looks like this:</p>
-
-
-
-<div id="gist105906597">
-    <div>
-      <div>
-        <div>
-  <div id="file-index-js">
-    
-
-  <div itemprop="text">
-      
-<table data-tab-size="8" data-paste-markdown-skip="">
-      <tbody><tr>
-        <td id="file-index-js-L1" data-line-number="1"></td>
-        <td id="file-index-js-LC1"><span>import</span> <span>express</span>  <span>from</span> <span>'express'</span><span>;</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L2" data-line-number="2"></td>
-        <td id="file-index-js-LC2"><span>import</span> <span>bodyParser</span> <span>from</span> <span>'body-parser'</span><span>;</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L3" data-line-number="3"></td>
-        <td id="file-index-js-LC3"><span>import</span> <span>{</span><span>logRequestMiddleware</span><span>,</span> <span>logResultsMiddleware</span><span>,</span> <span>logError</span><span>}</span> <span>from</span> <span>"./logger/logger.js"</span><span>;</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L4" data-line-number="4"></td>
-        <td id="file-index-js-LC4"><span>import</span> <span>middlewareFactory</span> <span>from</span> <span>"askql/askExpressMiddleware/askExpressMiddleware.js"</span><span>;</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L5" data-line-number="5"></td>
-        <td id="file-index-js-LC5"><span>import</span> <span>askql</span> <span>from</span> <span>'askql'</span><span>;</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L6" data-line-number="6"></td>
-        <td id="file-index-js-LC6">
-</td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L7" data-line-number="7"></td>
-        <td id="file-index-js-LC7"><span>const</span> <span>{</span>resources<span>}</span> <span>=</span> <span>askql</span><span>;</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L8" data-line-number="8"></td>
-        <td id="file-index-js-LC8">
-</td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L9" data-line-number="9"></td>
-        <td id="file-index-js-LC9"><span>const</span> <span>values</span> <span>=</span> <span>{</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L10" data-line-number="10"></td>
-        <td id="file-index-js-LC10">    <span>names</span>: <span>[</span><span>'Johnny'</span><span>,</span> <span>'Rita'</span><span>,</span> <span>'Jane'</span><span>,</span> <span>'Martha'</span><span>,</span> <span>'Clark'</span><span>]</span><span>,</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L11" data-line-number="11"></td>
-        <td id="file-index-js-LC11">    <span>powers</span>: <span>[</span><span>'Nerd'</span><span>,</span> <span>'C#'</span><span>,</span> <span>'Cool'</span><span>,</span> <span>'Superman\'s mom'</span><span>,</span> <span>'Superman'</span><span>]</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L12" data-line-number="12"></td>
-        <td id="file-index-js-LC12"><span>}</span><span>;</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L13" data-line-number="13"></td>
-        <td id="file-index-js-LC13">
-</td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L14" data-line-number="14"></td>
-        <td id="file-index-js-LC14"><span>const</span> <span>{</span> askExpressMiddleware <span>}</span> <span>=</span> <span>middlewareFactory</span><span>;</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L15" data-line-number="15"></td>
-        <td id="file-index-js-LC15"><span>const</span> <span>askMiddleware</span> <span>=</span> <span>askExpressMiddleware</span><span>(</span><span>{</span> resources<span>,</span> values <span>}</span><span>,</span>  <span>{</span> <span>callNext</span>: <span>true</span><span>,</span> <span>passError</span>: <span>true</span> <span>}</span><span>)</span><span>;</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L16" data-line-number="16"></td>
-        <td id="file-index-js-LC16">
-</td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L17" data-line-number="17"></td>
-        <td id="file-index-js-LC17"><span>const</span> <span>port</span> <span>=</span> <span>8080</span><span>;</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L18" data-line-number="18"></td>
-        <td id="file-index-js-LC18"><span>const</span> <span>app</span> <span>=</span> <span>express</span><span>(</span><span>)</span><span>;</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L19" data-line-number="19"></td>
-        <td id="file-index-js-LC19">
-</td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L20" data-line-number="20"></td>
-        <td id="file-index-js-LC20"><span>app</span><span>.</span><span>use</span><span>(</span><span>bodyParser</span><span>.</span><span>json</span><span>(</span><span>)</span><span>)</span><span>;</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L21" data-line-number="21"></td>
-        <td id="file-index-js-LC21"><span>app</span><span>.</span><span>use</span><span>(</span><span>bodyParser</span><span>.</span><span>urlencoded</span><span>(</span><span>{</span> <span>extended</span>: <span>true</span> <span>}</span><span>)</span><span>)</span><span>;</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L22" data-line-number="22"></td>
-        <td id="file-index-js-LC22"><span>app</span><span>.</span><span>use</span><span>(</span><span>express</span><span>.</span><span>static</span><span>(</span><span>'public'</span><span>)</span><span>)</span><span>;</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L23" data-line-number="23"></td>
-        <td id="file-index-js-LC23">
-</td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L24" data-line-number="24"></td>
-        <td id="file-index-js-LC24"><span>app</span><span>.</span><span>post</span><span>(</span><span>'/ask'</span><span>,</span> <span>[</span><span>logRequestMiddleware</span><span>,</span> <span>askMiddleware</span><span>,</span> <span>logResultsMiddleware</span><span>,</span> <span>logError</span><span>]</span><span>)</span><span>;</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L25" data-line-number="25"></td>
-        <td id="file-index-js-LC25"><span>app</span><span>.</span><span>listen</span><span>(</span><span>port</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L26" data-line-number="26"></td>
-        <td id="file-index-js-LC26">    <span>console</span><span>.</span><span>log</span><span>(</span><span>`Server listening at http://localhost:<span><span>${</span><span>port</span><span>}</span></span>`</span><span>)</span><span>;</span></td>
-      </tr>
-      <tr>
-        <td id="file-index-js-L27" data-line-number="27"></td>
-        <td id="file-index-js-LC27"><span>}</span><span>)</span><span>;</span></td>
-      </tr>
-</tbody></table>
-
-
-  </div>
-
-  </div>
-</div>
-
-      </div>
-      
-    </div>
-</div>
-
-
-
-
-<h2>Let’s see it in action</h2>
-
-
-
-<p>The client is a form that sends AskScript to the <em>ask</em> access point (a post request).</p>
-
-
-
-<p>Let’s try out the first code we can possibly think of:</p>
-
-
-
-<pre><code>ask { 'Hello World!' }</code></pre>
-
-
-
-<p>Write it down in the text area and submit.</p>
-
-
-
-<p>Surprisingly, it returns “Hello World!”</p>
-
-
-
-<p>Now, instead of just asking for a value from the server, let’s ask for a value from a variable that exists on our server (via the <code>values</code> we sent to our askMiddleware):</p>
-
-
-
-<pre><code>ask { names }</code></pre>
-
-
-
-<p>And we get all the names in the group.</p>
-
-
-
-<p>Now let’s query for their powers (or maybe I should have used the word traits):</p>
-
-
-
-<pre><code>ask { powers }</code></pre>
-
-
-
-<p>That was wonderful.&nbsp;</p>
-
-
-
-<p>Now we see how easy it is to access values we know about on the server.&nbsp; What about combining resources with values? Let’s do something more interesting:</p>
-
-
-
-<pre><code>ask {&nbsp; &nbsp; &nbsp; &nbsp; 
-  let arr = [];
-&nbsp; for (let i = 0; i &lt; names:length; i = i + 1) { 
-&nbsp;   arr = arr:set(i, {
-                       name: names:at(i), 
-                       power:powers:at(i)
-    });
-  }
-  arr&nbsp;
-}</code></pre>
-
-
-
-<p>What do you think the above piece of code will do? You probably guessed right – it is a map! </p>
-
-
-
-<p>AskQL has us covered with yet another core resource:</p>
-
-
-
-<pre><code>ask {
-  names:map(fun(name, i) {&nbsp; &nbsp; &nbsp; &nbsp; 
-    {name, power: powers:at(i)}&nbsp; &nbsp; 
-  })
-}</code></pre>
-
-
-
-<p>The two last snippets would both have the same result!</p>
-
-
-
-<h2>What Else?</h2>
-
-
-
-<p>AskQL has lots of resources.</p>
-
-
-
-<p>Let’s say we want to find one of our heroes according to the hero’s power? We just use the <code>find</code> resource:</p>
-
-
-
-<pre><code>ask {
-  names:find(fun(c, i) {
-    return powers:at(i):equals('Innocent')
-  })
-}</code></pre>
-
-
-
-<p>There are a lot more resources for AskQL.</p>
-
-
-
-<h2>Summary</h2>
-
-
-
-<p>In this post, we’ve setup a nodejs server that allows a very flexible API without doing anything server side – just expose some data.</p>
-
-
-
-<p>Anyone using microservices?</p>
-
-
-
-<p>Let’s say there’s a microservice that serves some crucial data. How do we access it immediately?</p>
-
-
-
-<pre><code>ask {
-   fetch('https://swapi.dev/api/people'):at('results')
-}</code></pre>
-
-
-
-<p>That script will return a list of Star Wars characters via the public StarWars API. </p>
-
-
-
-<p>With AskQL we are not limited by anything. We can not only use the built in resources in order to created flexible scripts. We can also create our own custom resources!</p>
-
-
-
-<p>In the next post, I’ll expand on this example and show how to create a custom resource to manipulate MongoDB.</p>
-
-
-
-<p>I invite you to the <a rel="noreferrer noopener" href="https://github.com/xFAANG/askql" target="_blank">AskQL repository</a> to contribute and be involved with a promising technology. There’s also <a rel="noreferrer noopener" href="https://discord.gg/D4haZp" target="_blank">the discord server</a> where you can hang out with the core team.</p>
-
-
-
-<p>Thanks a lot to&nbsp;<a rel="noreferrer noopener" href="https://twitter.com/Piotr_Zientara" target="_blank">Piotr</a>&nbsp;from&nbsp;<a rel="noreferrer noopener" href="https://twitter.com/XFaang" target="_blank">xFAANG</a>&nbsp;and&nbsp;<a rel="noreferrer noopener" href="https://twitter.com/jodoron" target="_blank">Yonatan Doron</a>&nbsp;from&nbsp;<a rel="noreferrer noopener" href="https://hodash.dev/" target="_blank">Hodash.dev</a> for the kind and thorough review.</p>
-		</div></div>]]>
+<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
             </description>
             <link>https://yonatankra.com/askql-nodejs-quickstart/</link>
             <guid isPermaLink="false">hacker-news-small-sites-24816425</guid>
@@ -11301,23 +11147,23 @@ October 17, 2020 | https://www.matthewball.vc/all/audiotech | <a href="https://w
           <article data-page-sections="5d8e94500fa50d2aaaa7c406" id="sections">
   
     <section data-section-id="5d8e94500fa50d2aaaa7c408" data-controller="SectionWrapperController, MagicPaddingController" data-current-styles="{
-  &quot;imageOverlayOpacity&quot;: 0.15,
-  &quot;video&quot;: {
-    &quot;playbackSpeed&quot;: 0.5,
-    &quot;filter&quot;: 1,
-    &quot;filterStrength&quot;: 0,
-    &quot;zoom&quot;: 0
-  },
-  &quot;backgroundWidth&quot;: &quot;background-width--full-bleed&quot;,
-  &quot;sectionHeight&quot;: &quot;section-height--medium&quot;,
-  &quot;customSectionHeight&quot;: 10,
-  &quot;horizontalAlignment&quot;: &quot;horizontal-alignment--center&quot;,
-  &quot;verticalAlignment&quot;: &quot;vertical-alignment--middle&quot;,
-  &quot;contentWidth&quot;: &quot;content-width--wide&quot;,
-  &quot;customContentWidth&quot;: 50,
-  &quot;sectionTheme&quot;: &quot;&quot;,
-  &quot;sectionAnimation&quot;: &quot;none&quot;,
-  &quot;backgroundMode&quot;: &quot;image&quot;
+&quot;imageOverlayOpacity&quot;: 0.15,
+&quot;video&quot;: {
+  &quot;playbackSpeed&quot;: 0.5,
+  &quot;filter&quot;: 1,
+  &quot;filterStrength&quot;: 0,
+  &quot;zoom&quot;: 0
+},
+&quot;backgroundWidth&quot;: &quot;background-width--full-bleed&quot;,
+&quot;sectionHeight&quot;: &quot;section-height--medium&quot;,
+&quot;customSectionHeight&quot;: 10,
+&quot;horizontalAlignment&quot;: &quot;horizontal-alignment--center&quot;,
+&quot;verticalAlignment&quot;: &quot;vertical-alignment--middle&quot;,
+&quot;contentWidth&quot;: &quot;content-width--wide&quot;,
+&quot;customContentWidth&quot;: 50,
+&quot;sectionTheme&quot;: &quot;&quot;,
+&quot;sectionAnimation&quot;: &quot;none&quot;,
+&quot;backgroundMode&quot;: &quot;image&quot;
 }" data-animation="none">
   
   <div>
@@ -11986,7 +11832,7 @@ source env</span>/bin/activate
 
 
 <span>class</span> <span>EmailClient</span><span>:</span>
-    <span>SENDER</span> <span>=</span> <span>"AWS Cost Alert &lt;<a href="https://www.learnaws.org/cdn-cgi/l/email-protection" data-cfemail="2445464c4d574c414f64484145564a4553570a4b5643">[email&nbsp;protected]</a>&gt;"</span>
+    <span>SENDER</span> <span>=</span> <span>"AWS Cost Alert &lt;<a href="https://www.learnaws.org/cdn-cgi/l/email-protection" data-cfemail="88e9eae0e1fbe0ede3c8e4ede9fae6e9fffba6e7faef">[email&nbsp;protected]</a>&gt;"</span>
     <span>SUBJECT</span> <span>=</span> <span>"Daily AWS Billing Report"</span>
     <span># The email body for recipients with non-HTML email clients.
 </span>    <span>BODY_TEXT</span> <span>=</span> <span>"""AWS Billing Alerts </span><span>\r\n</span><span>
@@ -12014,7 +11860,7 @@ source env</span>/bin/activate
 </span>    <span>CHARSET</span> <span>=</span> <span>"UTF-8"</span>
 
     <span># recipient email address
-</span>    <span>RECIPIENT</span> <span>=</span> <span>"<a href="https://www.learnaws.org/cdn-cgi/l/email-protection" data-cfemail="3253505a5b415a5759725e5753405c5345411c5d4055">[email&nbsp;protected]</a>"</span>
+</span>    <span>RECIPIENT</span> <span>=</span> <span>"<a href="https://www.learnaws.org/cdn-cgi/l/email-protection" data-cfemail="0564676d6c766d606e45696064776b6472762b6a7762">[email&nbsp;protected]</a>"</span>
 
     <span>def</span> <span>__init__</span><span>(</span><span>self</span><span>):</span>
         <span>self</span><span>.</span><span>client</span> <span>=</span> <span>boto3</span><span>.</span><span>client</span><span>(</span><span>"ses"</span><span>)</span>
@@ -16311,7 +16157,7 @@ Could also keep adding to this, adding a 'OrderBy' to order it by mass.</p></fig
 <li>At any time you can switch to text mode to edit, with autocomplete for variable names and immediate error updates. </li>
 </ul>
 <p>Here is the same script switched to text mode and edited, checking if the Entity has a 'Primitive Component' set on it, and if it does it prints the value of the Entity's <span v="Physics Material Asset"><span>Physics Material Asset</span><span><span><strong>Physics Material Asset</strong> - <!-- -->Physics Material Asset sets a Entity physics properties - including it's mass, it's Physics Sound Type, and on damage/collision effects</span></span></span> : </p>
-</div><p><img src="https://cdn.readme.io/img/book-icon.svg?1602868082802"> Updated 2 days ago</p><hr></section><section><nav data-reactroot=""><ul><li><a href=""><i></i>Table of Contents</a></li><ul>
+</div><p><img src="https://cdn.readme.io/img/book-icon.svg?1602868082802"> Updated 3 days ago</p><hr></section><section><nav data-reactroot=""><ul><li><a href=""><i></i>Table of Contents</a></li><ul>
 <li><a href="#creating-scripts">Creating Scripts</a></li>
 <li><a href="#video-tutorials">Video Tutorials</a></li>
 <li><a href="#events">Events</a></li>
@@ -17262,23 +17108,23 @@ October 17, 2020 | https://www.matthewball.vc/all/audiotech | <a href="https://w
           <article data-page-sections="5d8e94500fa50d2aaaa7c406" id="sections">
   
     <section data-section-id="5d8e94500fa50d2aaaa7c408" data-controller="SectionWrapperController, MagicPaddingController" data-current-styles="{
-  &quot;imageOverlayOpacity&quot;: 0.15,
-  &quot;video&quot;: {
-    &quot;playbackSpeed&quot;: 0.5,
-    &quot;filter&quot;: 1,
-    &quot;filterStrength&quot;: 0,
-    &quot;zoom&quot;: 0
-  },
-  &quot;backgroundWidth&quot;: &quot;background-width--full-bleed&quot;,
-  &quot;sectionHeight&quot;: &quot;section-height--medium&quot;,
-  &quot;customSectionHeight&quot;: 10,
-  &quot;horizontalAlignment&quot;: &quot;horizontal-alignment--center&quot;,
-  &quot;verticalAlignment&quot;: &quot;vertical-alignment--middle&quot;,
-  &quot;contentWidth&quot;: &quot;content-width--wide&quot;,
-  &quot;customContentWidth&quot;: 50,
-  &quot;sectionTheme&quot;: &quot;&quot;,
-  &quot;sectionAnimation&quot;: &quot;none&quot;,
-  &quot;backgroundMode&quot;: &quot;image&quot;
+&quot;imageOverlayOpacity&quot;: 0.15,
+&quot;video&quot;: {
+  &quot;playbackSpeed&quot;: 0.5,
+  &quot;filter&quot;: 1,
+  &quot;filterStrength&quot;: 0,
+  &quot;zoom&quot;: 0
+},
+&quot;backgroundWidth&quot;: &quot;background-width--full-bleed&quot;,
+&quot;sectionHeight&quot;: &quot;section-height--medium&quot;,
+&quot;customSectionHeight&quot;: 10,
+&quot;horizontalAlignment&quot;: &quot;horizontal-alignment--center&quot;,
+&quot;verticalAlignment&quot;: &quot;vertical-alignment--middle&quot;,
+&quot;contentWidth&quot;: &quot;content-width--wide&quot;,
+&quot;customContentWidth&quot;: 50,
+&quot;sectionTheme&quot;: &quot;&quot;,
+&quot;sectionAnimation&quot;: &quot;none&quot;,
+&quot;backgroundMode&quot;: &quot;image&quot;
 }" data-animation="none">
   
   <div>
@@ -17718,7 +17564,60 @@ rclone mount my_drive: ~/google_drive --vfs-cache-mode writes
 Score 2 | Comments 0 (<a href="https://news.ycombinator.com/item?id=24809543">thread link</a>) | @fanf2
 <br/>
 October 17, 2020 | https://myst-parser.readthedocs.io/en/latest/ | <a href="https://web.archive.org/web/*/https://myst-parser.readthedocs.io/en/latest/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="main-content">
+        <div>
+        
+              <div>
+                
+  <div id="myst-markedly-structured-text">
+
+<p><a href="https://pypi.org/project/myst-parser"><img alt="PyPI" src="https://img.shields.io/pypi/v/myst-parser.svg"></a>
+<a href="https://anaconda.org/conda-forge/myst-parser"><img alt="Conda" src="https://anaconda.org/conda-forge/myst-parser/badges/version.svg"></a></p>
+<p><strong>A fully-functional markdown flavor and parser for Sphinx.</strong></p>
+<p>MyST allows you to write Sphinx documentation entirely in markdown.
+MyST markdown provides a markdown equivalent of the reStructuredText syntax,
+meaning that you can do anything in MyST that you can do with reStructuredText.
+It is an attempt to have the best of both worlds: the flexibility
+and extensibility of Sphinx with the simplicity and readability of Markdown.</p>
+<p>MyST has the following main features:</p>
+<dl>
+<dt><span></span> <a href="https://myst-parser.readthedocs.io/en/latest/using/intro.html#parse-with-sphinx"><span>A markdown parser for Sphinx</span></a></dt><dd><p>You can write your entire <a href="https://www.sphinx-doc.org/en/master/usage/quickstart.html" title="(in Sphinx v4.0.0+)"><span>Sphinx documentation</span></a> in Markdown.</p>
+</dd>
+<dt><span></span> <a href="https://myst-parser.readthedocs.io/en/latest/using/syntax.html#syntax-directives"><span>Call Sphinx directives and roles from within Markdown</span></a></dt><dd><p>Allowing you to extend your document via Sphinx extensions.</p>
+</dd>
+<dt><span></span> <a href="https://myst-parser.readthedocs.io/en/latest/using/syntax.html#extended-block-tokens"><span>Extended Markdown syntax for useful rST features</span></a></dt><dd><p>Such as line commenting and footnotes.</p>
+</dd>
+<dt><span></span> <a href="https://myst-parser.readthedocs.io/en/latest/using/use_api.html"><span>A Sphinx-independent parser of MyST markdown</span></a></dt><dd><p>This can be extended to add new functionality and outputs for MyST.</p>
+</dd>
+<dt><span></span> <a href="https://commonmark.org/">A superset of CommonMark markdown</a></dt><dd><p>Any CommonMark markdown (such as Jupyter Notebook markdown) is natively supported by the MyST parser.</p>
+</dd>
+</dl>
+<p>You may use MyST markdown <strong>in addition to</strong> using reStructuredText in Sphinx.
+See <a href="https://myst-parser.readthedocs.io/en/latest/using/intro.html"><span>Getting Started</span></a> to get started.</p>
+
+<div id="why-myst-markdown">
+<h2>Why MyST markdown?<a href="#why-myst-markdown" title="Permalink to this headline">¶</a></h2>
+<p>While markdown is ubiquitous, it is not powerful enough for writing modern,
+fully-featured documentation. Some flavors of markdown support features needed for this,
+but there is no community standard around various syntactic choices for these features.</p>
+<p>Sphinx is a documentation generation framework written in Python. It heavily-utilizes
+reStructuredText syntax, which is another markup language for writing documents. In
+particular, Sphinx defines two extension points that are extremely useful:
+<strong><a href="https://www.sphinx-doc.org/en/master/usage/restructuredtext/basics.html#rst-roles-alt" title="(in Sphinx v4.0.0+)"><span>in-line roles</span></a></strong> and <strong><a href="https://www.sphinx-doc.org/en/master/usage/restructuredtext/basics.html#rst-directives" title="(in Sphinx v4.0.0+)"><span>block-level directives</span></a></strong>.</p>
+<p><strong>This project is an attempt at combining the simplicity and readability of Markdown
+with the power and flexibility of reStructuredText and the Sphinx platform.</strong> It
+starts with the <a href="https://commonmark.org/">CommonMark markdown specification</a>, and selectively adds a few extra
+syntax pieces to utilize the most powerful parts of reStructuredText.</p>
+
+</div>
+
+</div>
+
+
+              </div>
+              
+        </div>
+    </div></div>]]>
             </description>
             <link>https://myst-parser.readthedocs.io/en/latest/</link>
             <guid isPermaLink="false">hacker-news-small-sites-24809543</guid>
@@ -19903,7 +19802,9 @@ October 16, 2020 | http://jwmason.org/slackwire/on-cryptocurrencies/ | <a href="
 	<!-- .entry-header -->
 
 	<div>
-		<p><em>(This is an edited and expanded version of a talk I gave in Trento, Italy in June 2018, on a panel <a href="https://www.ineteconomics.org/perspectives/blog/why-digital-currency-wont-save-us">with Sheila Dow</a>.)</em></p>
+		<p><em><a href="https://i1.wp.com/jwmason.org/wp-content/uploads/2020/10/BAD47499-86BA-466D-9AB9-FD3BF59D28A5.jpeg"><img loading="lazy" src="https://i1.wp.com/jwmason.org/wp-content/uploads/2020/10/BAD47499-86BA-466D-9AB9-FD3BF59D28A5.jpeg?resize=660%2C880" alt="" width="660" height="880" srcset="https://i1.wp.com/jwmason.org/wp-content/uploads/2020/10/BAD47499-86BA-466D-9AB9-FD3BF59D28A5.jpeg?w=720 720w, https://i1.wp.com/jwmason.org/wp-content/uploads/2020/10/BAD47499-86BA-466D-9AB9-FD3BF59D28A5.jpeg?resize=225%2C300 225w" sizes="(max-width: 660px) 100vw, 660px" data-recalc-dims="1"></a><br>
+</em></p>
+<p><em>(This is an edited and expanded version of a talk I gave in Trento, Italy in June 2018, on a panel <a href="https://www.ineteconomics.org/perspectives/blog/why-digital-currency-wont-save-us">with Sheila Dow</a>.)</em></p>
 <p>The topic today is “Digital currencies: threat or opportunity?”</p>
 <p>I’d like to offer a third alternative: New digital currencies like bitcoin are neither a threat or an opportunity. They do not raise any interesting economic questions and do not pose any significant policy problems. They do not represent any kind of technological advance on existing payment systems, which are of course already digital. They are just another asset bubble, based on the usual mix of fraud and fantasy. By historical standards, they are not a very large or threatening bubble. There is nothing important about them at all.</p>
 <p>Why might you conclude that the new digital currencies don’t matter?</p>
@@ -19927,7 +19828,7 @@ October 16, 2020 | http://jwmason.org/slackwire/on-cryptocurrencies/ | <a href="
 <p>In the quantity view, money and credit are two distinct things. We start with money, which might then be lent. This is how we learn it as children. In the ledger view, money is just anything that settles an obligation. And that is constantly done by promises or IOUs. The fact that “banks create money” in our modern economy isn’t some kind of innovation out of an original situation of cash-on-the-barrelhead exchange. Rather, it is a restriction of money-creation from the historical situation where third-party IOUs of all kinds circulated as payment.</p>
 <p>Related to this are two different views of central banks. In the quantity view, the fundamental role of the central bank is in some sense setting or managing the money supply. In the ledger view, where money is just an arbitrary subset of payments media, which is constantly being created and destroyed in the course of making payments, “the money supply” is a nonsense term. What central banks are doing in this view is controlling the elasticity of the credit system. In other words, they are managing the willingness and ability of economic units to make promises to each other.</p>
 <p>There are a variety of objectives in this; two important ones today are to control the pace of real activity via the elasticity of money commitments (e.g. to <a href="https://www.jacobinmag.com/2016/01/federal-reserve-interest-rate-increase-janet-yellen-inflation-unemployment/">keep the wage share within certain bounds</a> by controlling the level of aggregate employment) and to maintain the integrity of the payments system in a crisis where a wave of self-perpetuating defaults is possible.</p>
-<p>In either case the thing which the central bank seeks to make more scarce or abundant is not the quantity of some asset labeled as “money”, but the capacity to make promises. To reduce the level of real activity, for example, the central bank needs to make it more difficult for economic units to make claims on real resources on the basis of promises of future payments. To avoid or resolve a crisis the central bank needs to increase the trustworthiness of units so they can settle outstanding obligations by making new promises; alternatively it can substitute its own …</p></div></article></div>
+<p>In either case the thing which the central bank seeks to make more scarce or abundant is not the quantity of some asset labeled as “money”, but the capacity to make promises. To reduce the level of real activity, for example, the central bank needs to make it more difficult for economic units to make claims on real resources on the basis of promises of future payments. To avoid or resolve a crisis the central bank needs to increase the trustworthiness of units so they can settle outstanding obligations by making new promises; alternatively it can substitute its …</p></div></article></div>
 <br/><p><em>Article truncated for RSS feed. Read the full article at <a href="http://jwmason.org/slackwire/on-cryptocurrencies/">http://jwmason.org/slackwire/on-cryptocurrencies/</a></em></p>]]>
             </description>
             <link>http://jwmason.org/slackwire/on-cryptocurrencies/</link>
