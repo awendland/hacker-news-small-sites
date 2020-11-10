@@ -1,12 +1,21 @@
 import * as E from "fp-ts/lib/Either"
-import { JSDOM, VirtualConsole } from "jsdom"
 import Readability from "mozilla-readability"
+// const JSDOMParser = require("mozilla-readability/JSDOMParser.js")
+// import parse5 from "parse5"
+import * as HTMLParser from "node-html-parser"
 
-const blackholeConsole = new VirtualConsole()
+// const blackholeConsole = new VirtualConsole()
 
 export class NotAnArticleError extends Error {}
 
 export class NotReadableError extends Error {}
+
+var Document = function (url: string, html: HTMLElement) {
+  this.documentURI = url;
+  this.styleSheets = [];
+  this.childNodes = [];
+  this.children = [html];
+};
 
 /**
  * Use mozilla/readability with JSDOM to create a readable version of
@@ -20,14 +29,22 @@ export class NotReadableError extends Error {}
 export const readablify = (url: string, data: Buffer) =>
   E.tryCatch(
     () => {
-      const page = new JSDOM(data, { url, virtualConsole: blackholeConsole })
+      console.warn(`JSDOM start for ${url}`)
+      // const page = new JSDOM(data, { url, virtualConsole: blackholeConsole })
+      // console.log(JSDOMParser)
+      // const jsdom = new JSDOMParser()
+      // const page = jsdom.parse(parse5.serialize(parse5.parse(data.toString('utf-8' /* TODO correctly detect this */))))
+      const page = HTMLParser.parse(data.toString("utf-8"))
+      const document =  Document(url, page)
       // Run a simple heuristic to see if the document is a valid webpage or
       // not. This should filter out any resources such as PDFs from trying
       // to be treated as Readability compatible articles.
-      if (page.window.document.querySelectorAll("p").length < 1)
+      if (document.querySelectorAll("p").length < 1)
         throw new NotAnArticleError(`Unable to find any <p> tags in ${url}`)
 
-      const parsed = new Readability(page.window.document).parse()
+      console.warn(`Readability start for ${url}`)
+      const parsed = new (Readability as any).Readability(document as any).parse()
+      console.warn(`Readability end for ${url}`)
       if (!parsed)
         throw new NotReadableError(
           `Unable to create a readable version of ${url}`
