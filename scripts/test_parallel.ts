@@ -3,7 +3,7 @@ import { Worker, WorkerOptions } from "worker_threads"
 import * as Comlink from "comlink"
 import nodeEndpoint from "comlink/dist/umd/node-adapter"
 
-const workerTs = (file: string, wkOpts: WorkerOptions = {}) => {
+const newWorkerTS = (file: string, wkOpts: WorkerOptions = {}) => {
   wkOpts.eval = true
   if (!wkOpts.workerData) {
     wkOpts.workerData = {}
@@ -11,7 +11,7 @@ const workerTs = (file: string, wkOpts: WorkerOptions = {}) => {
   wkOpts.workerData.__filename = file
   return new Worker(
     `const wk = require('worker_threads');
-     require('ts-node').register();
+     require('ts-node').register({ transpileOnly: true });
      let file = wk.workerData.__filename;
      delete wk.workerData.__filename;
      require(file);
@@ -26,7 +26,8 @@ const generateWorkerFactory = <T>(workerFile: string) =>
 
     async create() {
       console.log(`parent: create worker`)
-      const worker = workerTs(workerFile)
+      const worker = newWorkerTS(workerFile)
+      await new Promise((resolve) => worker.once('online', () => resolve()))
       const proxy = Comlink.wrap<T>(nodeEndpoint(worker))
       this.#comlinkToWorker.set(proxy, worker)
       return proxy
