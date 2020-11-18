@@ -17,7 +17,7 @@ export class NotReadableError extends Error {}
  * @param url
  * @param data
  */
-export const readablify = (url: string, data: Buffer) =>
+export const readablify = (url: string, data: Uint8Array) =>
   E.tryCatch(
     () => {
       const page = new JSDOM(data, { url, virtualConsole: blackholeConsole })
