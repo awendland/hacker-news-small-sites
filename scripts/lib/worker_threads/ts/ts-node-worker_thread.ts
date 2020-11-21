@@ -28,3 +28,27 @@ export const newTSWorker = (
     workerOptions
   )
 }
+
+/**
+ * Dynamically handles worker creation based on file path.
+ *
+ * To support isomorphic ts-node and transpiled worker code make sure not
+ * to include a file extension. The extension will be automatically resolved at runtime
+ * and the correct worker type will be loaded appropriately.
+ *
+ * Mappings:
+ * * .ts --> newTSWorker(...)
+ * * else --> new Worker(...)
+ * @param modulePath
+ * @param workerOptions
+ * @param tsNodeOptions
+ */
+export const newDynamicWorker = (
+  modulePath: string,
+  workerOptions: WorkerOptions = {},
+  tsNodeOptions: RegisterOptions = { transpileOnly: true }
+) => {
+  const file = require.resolve(modulePath)
+  if (file.match(/ts?$/)) return newTSWorker(file, workerOptions, tsNodeOptions)
+  else return new Worker(file, workerOptions)
+}

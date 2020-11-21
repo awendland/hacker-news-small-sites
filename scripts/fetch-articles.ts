@@ -20,6 +20,9 @@ import { fetchBuffer } from "./lib/fetch"
 import { RequestError } from "got/dist/source"
 import clip from "text-clipper"
 import * as PathReporter from "io-ts/lib/PathReporter"
+import { newDynamicWorker } from "./lib/worker_threads/ts/ts-node-worker_thread"
+import { createLazyComlinkWorkersFor } from "./lib/worker_threads/worker_thread-pool"
+import { cpus } from "os"
 
 export const CDATA = t.type({
   __cdata: t.string,
@@ -97,11 +100,16 @@ export async function run() {
       description: "maximum length of the article, in characters",
       default: 10_000,
     })
-    .option("parallelism", {
-      alias: "j",
+    .option("fetchConcurrency", {
       type: "number",
-      description: "number of parallel fetch requests to run at once",
+      description: "number of concurrent fetch requests to run at once",
       default: 20,
+    })
+    .option("readablifyPoolSize", {
+      type: "number",
+      description:
+        "number of parallelized workers to spin up to readablify articles; set to 0 to run readablify operation on main thread",
+      default: cpus().length - 1,
     })
     .option("logLevel", {
       description: "verbosity of logging output",
@@ -110,6 +118,14 @@ export async function run() {
     }).argv
 
   Log.setLevelByString(args.logLevel)
+
+  const readablifyPool = createLazyComlinkWorkersFor<
+    typeof import("./lib/readablify")
+  >(__dirname + "/lib/readablify", {
+    maxSize: args.readablifyPoolSize,
+    eagerInit: true,
+    logTraceInfo: true,
+  })
 
   const readFeed = (feedPath: string) =>
     pipe(
@@ -143,10 +159,19 @@ export async function run() {
         maxResponseSize: args.fetchMaxSize,
         timeout: args.fetchTimeout,
       }),
+      TE.chainW((r) =>
+        args.readablifyPoolSize === 0
+          ? () => Promise.resolve(readablify(url, r.rawBody))
+          : () =>
+              Promise.resolve(
+                readablifyPool.use(async (worker) => {
+                  return await worker.readablify(url, r.rawBody)
+                })
+              )
+      ),
       TE.chainEitherK((r) => {
         return pipe(
-          readablify(url, r.rawBody),
-          E.map((p) => p.content),
+          E.right(r.content),
           E.chain((h) =>
             pipe(
               E.tryCatch(
@@ -238,7 +263,7 @@ export async function run() {
           ),
           (items) =>
             batchTraverse(TE.taskEither)(
-              A.chunksOf(args.parallelism)(items),
+              A.chunksOf(args.fetchConcurrency)(items),
               addContentToItems
             ),
           TE.bimap(
@@ -265,6 +290,8 @@ export async function run() {
     getOrThrow(await updateFeed(feedPath)())
   }
   Log.groupEnd(Log.LogLevel.INFO)
+  Log.info(`Shutting down worker pool...`)
+  await readablifyPool.drain().then(() => readablifyPool.clear())
   Log.info(`Done`)
   // TODO a silent exit occurs sometimes at very high levels of parallelism
 }
