@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Tue, 14 Dec 2021 08:35:29 GMT</lastBuildDate>
+        <lastBuildDate>Tue, 14 Dec 2021 12:47:32 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-5.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Tue, 14 Dec 2021 08:35:29 GMT</pubDate>
+        <pubDate>Tue, 14 Dec 2021 12:47:32 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -42,7 +42,54 @@ December 11, 2021 | http://www.news.cn/english/2021-12/04/c_1310351231.htm | <a 
 Score 120 | Comments 14 (<a href="https://news.ycombinator.com/item?id=29527053">thread link</a>) | @G4E
 <br/>
 December 11, 2021 | https://sherief.fyi/post/arkham-quixote/ | <a href="https://web.archive.org/web/*/https://sherief.fyi/post/arkham-quixote/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+    <blockquote>
+<p>&nbsp;&nbsp;&nbsp;&nbsp; “There’s that sort of sense that many technical people will see or feel when you see something and you know what it could be, and you know it could be important, and you see companies just doing it wrong — there’s that powerful desire to fix it and do it right and show them sort of how it’s supposed to be done”</p>
+</blockquote>
+
+<p>— <a href="https://www.youtube.com/watch?v=-dIUBGf1RHU&amp;t=9m17s">John Carmack at GDC 2015</a></p>
+
+<p>Ever since its release in 2015, Batman: Arkham Knight has had a terrible performance profile. The initial release had absolutely horrid performance that was best covered by a <a href="https://www.youtube.com/watch?v=bFBd5GgGkMs">Total Biscuit video</a> in which he described seeing “hitching and frame-rate drops, especially when driving or flying fast around the city”, and that wasn’t an isolated experience — the situation got so bad that the PC version was removed from sale.</p>
+
+<p>The game later returned to retail with an update which <a href="https://www.youtube.com/watch?v=KiHnM6mMbEc">Digital Foundry covered in a 2015 video</a> and found to be neither good-enough nor efficient: hitches and stuttering were still around, and the GPU was far from being fully utilized. Digital Foundry revisited Arkham Knight again in a <a href="https://www.youtube.com/watch?v=w3g4QQnIqco">2018 video</a>, with the video title calling it “One of PC’s Worst ports” and the intro voice-over referring to it as “The dreaded PC version” — and then again in a <a href="https://www.youtube.com/watch?v=ia0s959QMew">2019 video</a> covering the re-release on the Epic Games Store which comes sans DRM. Richard Leadbetter even calls Arkham Knight’s performance “a puzzle [he’s] been trying to crack for years now”. I liked the game a lot yet suffered from its performance even on top-tier hardware — and technical puzzles, especially ones related to game performance, captivate me. So I decided I’d take a stab at this one. FWIW, all my work has been with the GameWorks effects turned off.</p>
+
+<p>The fact that the GPU isn’t fully utilized pointed a finger towards the CPU-side code, and the stutters being associated with traversing the world via gliding or the Batmobile made the game’s streaming system the primary culprit, so I decided to investigate further. This turned out to be more difficult than usual — I have the DRM-laden Steam version, and it seemed to resist any frame capture tools I throw at it like Renderdoc et al. I still wanted to know how the CPU is spending its time, so I decided to get a bit creative.</p>
+
+<p>I grabbed the <a href="https://github.com/crosire/reshade">source code for ReShade</a>, which implements a layer that intercepts Direct3D 11 API calls, and integrated the <a href="https://bitbucket.org/wolfpld/tracy">Tracy Profiler</a> into it, so I can get an idea of what API calls the game’s making and how much time it spends in each of them. That worked beautifully, and while I wasn’t able to hook the DXGI Swapchain’s Present() call and get accurate per-frame timings, I was able to see the D3D11 calls and I immediately saw a giant red warning flag:</p>
+
+<p><img src="https://sherief.fyi/arkham-knight/d3d11-calls.png" alt="Arkham Knight's D3D11 calls"></p>
+
+<p>There were a few <code>CreateTexture2D()</code> calls taking over a millisecond each:</p>
+
+<p><img src="https://sherief.fyi/arkham-knight/create-texture-call.png" alt="Long CreateTexture2D call"></p>
+
+<p>When a 60 FPS framerate allocates an ~= 16 milliseconds budget for the entire frame this is quite a problem. Tracy gathers aggregate statistics, and inspecting them revealed that <code>CreateTexture2D</code> calls taking a long times are quite frequent. Another smoking gun potentially pointing to the streaming system, but I still wanted to check one more data point.</p>
+
+<p>I added code to wrap the 2D texture objects and track their lifetime, in addition to tracking the number of texture creation calls, and the results were interesting:</p>
+
+<p><img src="https://sherief.fyi/arkham-knight/texture-lifetime.png" alt="Texture lifetime graphs"></p>
+
+<p>The game hovered around 11,000 live textures at any one time, but the number of <code>CreateTexture2D()</code> calls kept climbing — an indication that the streaming system is almost certainly never recycling texture objects, which is a big no-no. While an efficient streaming system would maintain a pool of textures to reuse and update as the player moves through the open world, this system just kept calling into the graphics driver again and again asking for new textures and almost certainly causing a ton of fragmentation in the process.</p>
+
+<p>I wanted to see how much this lack of texture reuse is hurting performance, and since I was already wrapping D3D device and texture objects it was relatively simple to implement a texture pool. I decided to skip the actual updating of texture contents until I could see what kind of performance impact this strategy would achieve, so all I added was a quick-and-dirty pooling strategy that matches texture descriptions exactly and ignores the <code>pInitialData</code> argument of <a href="https://docs.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11device-createtexture2d">ID3D11Device::CreateTexture2D</a>.</p>
+
+<p>The performance improvement was dramatic — even with a very naive implementation of a texture pool, moving around the city was a lot smoother than what I was used to, so that direction looked promising. Skipping the initial data upload lead, unsurprisingly, to some image corruption, and the next step was to fix that and see whether the performance improvement remains. On the bright side, some of the corruption was fun to watch:</p>
+
+<p><img src="https://sherief.fyi/arkham-knight/suit.png" alt="Corrupted Batsuit"></p>
+
+<p>I ended up copying the initial data provided at the time of <code>CreateTexture2D()</code> call, then flushing it to the actual texture via a call to <a href="https://docs.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-updatesubresource">ID3D11DeviceContext::UpdateSubresource</a> before executing any draw calls. My first implementation used a <code>deque</code> and allocated memory once for every <code>CreateTexture2D</code> call, and even with this amount of overhead most of the stutter was gone; as expected this fixed the visual corruption issues. I later moved to using a preallocated area of system memory with a linear allocator — that way no calls to <code>malloc()</code> would be happening in the middle of asset streaming: this seemed to fix the remaining stutters related to texture uploads.</p>
+
+<p>Buffers exhibited similar behavior to textures, but the impact on performance wasn’t as bad. Still, a pooling system (as inefficient as the one I ended up using is) fixed more stutters, and at that point I was able to play the game at a near-locked 60 FPS as long as my GPU can actually push the pixels on screen — which is quite the dramatic change from how things have been since, well, forever.</p>
+
+<p>There’s still some low-hanging fruit to be picked: my pooling code matches on exact texture description, so an RGBA8_UNORM texture cannot be used to satisfy an RGBA8_SRGB allocation — converting to typeless DXGI formats before pooling would be a straightforward improvement to make, and based on the data I already have it would improve the number of pool hits. The buffer pooling code is even worse, matching on the <em>exact</em> buffer size, where a much better strategy would be to pad buffers to the nearest multiple of N kilobytes, then basically have multiple buckets with each bucket fit to satisfy all allocation requests within a certain size range. But at this point my incentive isn’t as high since I was able to get to the point of being GPU-bound merely by throwing more than enough CPU, RAM, and VRAM at the problem given the newer hardware I have now.</p>
+
+<p>I was blown away, and quite a bit disappointed, by the fact that such a straightforward optimization (implemented in under a week) was able to get such a dramatic performance improvement in a game this notorious for bad performance. I wonder how the people responsible for this implementation found it acceptable, and whether they realize how much money was thrown away by something that could’ve been fixed in a single man-week of work. I argue a lot for craftsmanship-for-craftsmanship’s-sake, and I realize how that usually doesn’t make financial sense, but in this case a little attention and care could have saved the publisher millions of dollars in actual costs, and only god-knows-how-much in reputation and goodwill. Sloppy engineering has a cost, good craftsmanship has actual value, and the next time someone is allowed to ship something this terrible we might not be lucky enough to be able to develop such a fix.</p>
+
+<p>The fix is available in this <a href="https://sherief.fyi/arkham-knight/dxgi.dll">drop-in replacement DXGI dll</a> — to use it just copy the <code>dxgi.dll</code> file to the same directory as <code>BatmanAK.exe</code>, the game’s executable, and be sure to disable all GameWorks effects and any overlays other than the Steam overlay as some overlays are known to cause crashes. The source code for my changes is available in the <code>batman</code> branch in this <a href="https://code.sherief.fyi/sherief/arkham-fixer/src/branch/batman">git repo</a>.</p>
+
+<p>Update: In case you run into crashes with this, it should generate some <code>.dmp</code> files in the same directory as the DLL. Share the dump files with <a href="https://twitter.com/SheriefFYI">me</a> and I’ll do my best to investigate the issue.</p>
+
+  </div></div>]]>
             </description>
             <link>https://sherief.fyi/post/arkham-quixote/</link>
             <guid isPermaLink="false">hacker-news-small-sites-29527053</guid>
@@ -392,7 +439,173 @@ John …</p></div></div>
 Score 7 | Comments 0 (<a href="https://news.ycombinator.com/item?id=29526335">thread link</a>) | @SteveNuts
 <br/>
 December 11, 2021 | https://www.nutanix.dev/2021/12/09/latencies-schedulers-interrupts-oh-my-the-epic-story-of-a-linux-kernel-upgrade/ | <a href="https://web.archive.org/web/*/https://www.nutanix.dev/2021/12/09/latencies-schedulers-interrupts-oh-my-the-epic-story-of-a-linux-kernel-upgrade/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-id="7f524eb0" data-element_type="widget" data-widget_type="theme-post-content.default">
+				<div>
+			
+<p>By <a href="https://www.linkedin.com/in/harshitagg/" data-type="URL" data-id="https://www.linkedin.com/in/harshitagg/" target="_blank" rel="noreferrer noopener">Harshit Agarwal</a> and <a href="https://www.linkedin.com/in/sgaver/" target="_blank" rel="noreferrer noopener">Samuel Gaver</a></p>
+
+
+
+<h2>Introduction</h2>
+
+
+
+<p>Nutanix is a hyperconverged platform, and all its services (including storage services) run on a special virtual machine (VM) called the <a href="https://www.nutanixbible.com/2c-book-of-basics-hyperconverged-platform.html" target="_blank" rel="noreferrer noopener">controller VM (CVM)</a>. This CVM currently runs the CentOS Linux distribution with kernel version 3.10. Unfortunately, this kernel version is quite old and poses a few challenges, which motivated Nutanix to upgrade to a newer version.&nbsp;</p>
+
+
+
+<h3>Why upgrade?</h3>
+
+
+
+<ul><li>Eliminate painful backports: When we encountered a bug or a security issue, we would occasionally have to backport a change from a newer version of the kernel to 3.10.x. These backports are incredibly time consuming and require a lot of developer effort to ensure that the changes are still applicable and ported correctly. Additionally, manual backports burden QA teams, as they have to test and validate each change.</li><li>Take advantage of new features: More recent kernels provide new features like io_uring and BBR, improving CPU efficiency and performance in our I/O stack and allowing us to handle more demanding workloads.&nbsp;</li><li>Align with LTS support: 3.10 support ended in 2017. Using a recent LTS kernel helps us get support from the Linux community, which backports all the necessary bug fixes. Coordinating with the LTS train is significantly better than manually monitoring fixes and then backporting them.</li><li>Improve performance: Better compute performance on AMD Zen and <a href="https://lwn.net/Articles/842385/" target="_blank" rel="noreferrer noopener">fast commits in ext4</a> are two of the new kernel’s improvements that can help us achieve better performance with the same hardware.</li></ul>
+
+
+
+<h3>What’s the problem?</h3>
+
+
+
+<p>We chose 5.10 because it was the latest kernel LTS version when we started this work. The transition from the old 3.10 kernel to the new 5.10 kernel was a giant version leap that affected many services in the CVM, especially performance-sensitive services. Most of the problems that weren’t related to performance resulted from kernel behavior changes between the two versions. One such change was the way they differed in cgroup memory accounting. This accounting change caused several services to encounter out-of-memory errors, which forced us to revisit each service limit.&nbsp;</p>
+
+
+
+<p>In the following sections, we go over the performance-related problems in more detail. We describe each problem we faced, then follow up with how we tried to address it—including what worked and what didn’t.</p>
+
+
+
+<p>Note that we obtained the performance numbers we refer to in this post in a test environment. We provide these numbers to show relative differences in performance between test runs, not to represent the real-world performance of Nutanix clusters in production.</p>
+
+
+
+<h2>Problem 1: Overall slow random I/O performance</h2>
+
+
+
+<p>When we started with the 5.10 kernel, we saw an overall 10 percent degradation in random I/O performance. The next table presents the external benchmark result.</p>
+
+
+<div id="footable_parent_62638">
+                <table data-ninja_table_instance="ninja_table_instance_0" data-footable_id="62638" data-filter-delay="1000" aria-label="Perf Reg Article - Table 1" id="footable_62638" data-unique_identifier="ninja_table_unique_id_1951280608_62638">
+                <colgroup>
+                            <col>
+                            <col>
+                            <col>
+                    </colgroup>
+        <thead>
+<tr>
+                                                        <th scope="col">Test</th><th scope="col">Kernel Version 3.10</th><th scope="col">Kernel Version 5.10</th></tr>
+</thead>
+<tbody>
+
+        <tr data-row_id="1">
+            <td>rand_write (IOPS)</td><td>38,196</td><td>35,106</td>        </tr>
+            <tr data-row_id="2">
+            <td>rand_read (IOPS)</td><td>44,876</td><td>48,621</td>        </tr>
+    </tbody><!--ninja_tobody_rendering_done-->
+    </table>
+    
+    
+    
+</div>
+
+
+
+
+<p>Test Notes:</p>
+
+
+
+<ul><li>Test tool: VDBench</li><li>8 KB block size</li><li>1 outstanding I/O per user VM (UVM) disk</li><li>8 disks per UVM with 8 UVMs = 64 UVM disks total</li></ul>
+
+
+
+<h3>Testbed</h3>
+
+
+
+<p>To understand the problem, we eliminated as many variables as possible to reproduce the slowdown. First, we ran our test locally on the CVM, removing any additional complexity involved in the I/O path in the hypervisor. Next, we used the built-in performance testing tools embedded in our I/O controller, which reduced our exposure to the interprocess communication (IPC) traffic encountered with tools like fio. Finally, to eliminate any network-related issues, we conducted these experiments with a replication factor of 1 and created clusters with only one node.</p>
+
+
+
+<p>Nutanix distributed storage manages all I/O with a process called <a href="https://www.nutanixbible.com/4c-book-of-aos-dsf.html" target="_blank" rel="noreferrer noopener">Stargate</a>. Stargate has a built-in utility called perf_test that can drive I/O with different storage access patterns and block sizes. With the perf_test utility, we ran both random and sequential workloads and reliably reproduced the performance issue across multiple runs. Random workloads consistently showed performance degradation, while sequential workloads saw a slight improvement.&nbsp;</p>
+
+
+
+<p>The hardware setup used for this test was a basic all-flash node, the most popular deployment among our customers. We also set up an equivalent cluster with the same hardware specification to run the older 3.10 kernel. By eliminating so many potential factors, we could confirm that the problem was somewhere in the kernel, as the difference in performance between the 3.10 and 5.10 kernel versions was clear.&nbsp;</p>
+
+
+
+<p>When debugging performance issues, it’s critical to have a short test like this one that can reproduce the issue. This reproducible and straightforward setup helped us iterate quickly to understand the problem and confidently validate the solution.</p>
+
+
+
+<h3>Debugging</h3>
+
+
+
+<p>Once we had traced the problem to Stargate, we started looking at it from two angles: either the disk I/O was slow, or Stargate was not getting enough CPU cycles. To give some context, Stargate is very compute-heavy and consumes most of the resources on the CVM. Therefore, even a tiny variance in CPU availability for Stargate causes large fluctuations in I/O performance. To minimize I/O latency, Nutanix uses real-time (RT) scheduling for data services, including Stargate, to overcome any unexpected delays caused by the default Completely Fair Scheduler (CFS). RT scheduling also gives the higher priority data services precedence over noncritical background and maintenance services.</p>
+
+
+
+<p>We ran a few benchmarks for disk I/O, and they all looked similar across both kernels. Nothing stood out in the disk stats, either. However, we saw that Stargate consumed significantly less CPU in the 5.10 kernel than it did in 3.10. Using our internal stats in Stargate to dive deeper for threads driving I/O, we could see that the dip in CPU consumption correlated with the gap in performance across the two kernels. This find shifted our focus to CPU and specifically to RT scheduling, which Stargate relies on heavily. High-performance data services use RT scheduling and have affinity established with a set of CPU cores, allowing them to use the bound cores extensively without starving out background services that can run on the remaining cores.</p>
+
+
+
+<p>There have been many changes between these two kernel versions in the scheduler, especially the RT element. Because we wanted to bring the 5.10 performance up to the 3.10 level, we started looking at the relevant scheduler code changes and the corresponding scheduling feature flags. To begin with, we found the following differences and similarities between the two kernels.</p>
+
+
+
+<h2><img loading="lazy" src="https://lh5.googleusercontent.com/qaOvjUNl9HHwy9wuVECJzOBgc_ritnV7FMpXbT__coHaphQkb5oCQo19LQJJBQpwm7iHQ5kKY88qCZcxIVpIzQOPBHYtjQQJkArqaB6PUKt5WNIWfVzyAmVQRezSwz5VdbzJJ4e5" width="634" height="332"></h2>
+
+
+
+<h3>Differences</h3>
+
+
+
+<h4>Utilization estimation</h4>
+
+
+
+<p>UTIL_EST and UTIL_EST_FASTUP are two options that are not present in the 3.10 kernel. The scheduler’s per-entity load tracking (PELT) module tracks various metrics for the scheduling entities and computes a task’s average utilization. The load contribution of the task decays over time such that the most recent utilization contributes the most load. Because the averages for periodic tasks decay while the tasks sleep, even though their expected utilization remains the same when running, they have to <a href="http://retis.santannapisa.it/~luca/ospm-summit/2017/Downloads/OSPM_PELT_DecayClampingVsUtilEst.pdf" target="_blank" rel="noreferrer noopener">ramp up again when they resume</a>. This task ramp-up is an issue for Dynamic Voltage and Frequency Scaling (DVFS) architectures, as they can enter a low-power state where required CPU may not be available. <a href="https://www.kernel.org/doc/Documentation/scheduler/schedutil.txt" target="_blank" rel="noreferrer noopener">Two options</a> can help alleviate this ramp-up penalty: updating the utilization estimate to use the Exponentially Weighted Moving Average (EWMA) and changing the time an entity spends running on the CPU on dequeue.</p>
+
+
+
+<p>Because we aren’t relying on DVFS, we turned off these flags altogether to avoid any overhead or unexpected scheduler behavior changes.</p>
+
+
+
+<h4>Wake affinity methods</h4>
+
+
+
+<p>Wake affinity methods in the scheduler (wake_affine_idle and wake_affine_weight) determine the first CPU that can be available to run a task. These methods tend to put a wakee task close to the waker task, intending for the tasks to share caches on the same CPU. The wa_idle option specifies that if the previous CPU is idle and has cache affinity, then the task migrates to the previous CPU from the CPU that woke up the task. This approach prefers idle CPU over cache affinity. Along similar lines, the wa_weight option considers the average scheduling latency of the CPUs and targets workloads that leave no idle CPU where wa_idle regresses. However, because various performance-critical processes have CPU affinity, including the interrupt request (IRQ) handler on the CVM, disabling these flags prevents unnecessary migrations and results in better overall throughput.</p>
+
+
+
+<h4>Using interrupt to trigger RT task push migration</h4>
+
+
+
+<p>When RT_PUSH_IPI is enabled, the interprocessor interrupt (IPI) goes to the overloaded CPU to initiate a push operation. If many RT tasks are waiting to run on a single CPU and that CPU schedules another RT task of lower priority, the system initiates pull logic in case there’s a higher priority RT task on another CPU waiting to run. However, when one of the CPUs is overloaded with RT tasks and multiple CPUs are idle, the idle CPUs initiate the pull simultaneously. As part of the pull operation, they all contend for the run queue lock. However, because only one CPU can get the lock at a time, the others end up waiting.&nbsp;</p>
+
+
+
+<p>Push logic is designed to reduce this contention. It sends one IPI to the first overloaded CPU and pushes any tasks that it can. Then it looks for the next overloaded CPU that can push to the source CPU. The IPIs stop when all overloaded CPUs with pushable tasks that have priorities greater than those on the source CPU are covered.</p>
+
+
+
+<p>The push mechanism uses IPI, and the IPI latencies added <a href="https://www.spinics.net/lists/kernel/msg2287724.html" target="_blank" rel="noreferrer noopener">more overhead to our system than benefits</a>. The advantages of this mechanism may be more apparent on systems with high core counts and when RT processes don’t have affinity with a limited subset of those cores.</p>
+
+
+
+<h3>Fixes and Results</h3>
+
+
+
+<p>Aft…</p></div></div></div>
+<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://www.nutanix.dev/2021/12/09/latencies-schedulers-interrupts-oh-my-the-epic-story-of-a-linux-kernel-upgrade/">https://www.nutanix.dev/2021/12/09/latencies-schedulers-interrupts-oh-my-the-epic-story-of-a-linux-kernel-upgrade/</a></em></p>]]>
             </description>
             <link>https://www.nutanix.dev/2021/12/09/latencies-schedulers-interrupts-oh-my-the-epic-story-of-a-linux-kernel-upgrade/</link>
             <guid isPermaLink="false">hacker-news-small-sites-29526335</guid>
@@ -407,7 +620,189 @@ December 11, 2021 | https://www.nutanix.dev/2021/12/09/latencies-schedulers-inte
 Score 40 | Comments 11 (<a href="https://news.ycombinator.com/item?id=29526193">thread link</a>) | @jonny2112
 <br/>
 December 11, 2021 | https://www.dzombak.com/blog/2021/12/Building-the-atomic-clock-I-ve-always-wanted.html | <a href="https://web.archive.org/web/*/https://www.dzombak.com/blog/2021/12/Building-the-atomic-clock-I-ve-always-wanted.html">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
+  <header>
+    
+    <span>
+      
+      <time pubdate="" datetime="2021-12-07T19:02:38-06:00">
+      <span>December</span>
+      <span>07,</span>
+      <span>2021</span>
+      </time>
+       • 
+      
+      
+      <span>Tagged:</span> <a href="https://www.dzombak.com/blog/tag/esp8266/">esp8266</a> <a href="https://www.dzombak.com/blog/tag/arduino/">arduino</a> <a href="https://www.dzombak.com/blog/tag/platformio/">platformio</a> <a href="https://www.dzombak.com/blog/tag/3d-printing/">3d-printing</a> 
+      
+    </span>
+  </header>
+
+  
+  
+  <p>Part of the <a href="https://www.dzombak.com/blog/series/project-logs.html">Project Logs</a> series.</p>
+
+<p>For years &amp; years, I have wanted to own an actual atomic clock. There’s no practical reason for this; I am, after all, currently wearing a GPS-enabled wristwatch. I just thought it would be pretty neat to have a household atomic clock.</p>
+
+<p>Around half a decade ago, roughly in the 2014-2016 era, I began periodically searching eBay for “atomic clock” and related terms. This led, in 2016, to the $120 purchase of a used <a href="https://www.microsemi.com/product-directory/embedded-clocks-frequency-references/3961-sa-22c">Symmetricom rubidium oscillator</a>. It outputs an electronic pulse <em>exactly</em> once per second, so building a clock around it using an Arduino should, theoretically, be easy.</p>
+      <h2 id="it-wasnt-that-easy">
+        
+        
+          It wasn’t that easy. <a href="#it-wasnt-that-easy"></a>
+        
+        
+      </h2>
+    
+<p>Some troublesome details led to me overcomplicating and then abandoning the project in 2016:</p>
+
+<p>I’d need to set the time on the clock, meaning I’d have to build some sort of user interface. This being my first embedded development project in 5 years or so, I wasn’t eager to hack together a bunch of buttons and end up with something harder to program than a VCR. Plus, it would be difficult to get the clock set perfectly accurately that way. I decided instead I could connect the Arduino to a computer over a serial port, and some software on the computer would set the time on the atomic clock over the serial interface.</p>
+
+<p>Then, I decided the clock needed an integrated battery backup, since I did not want to have to connect the clock to my computer every time I had to unplug it from the wall. This further complicated the design — and made it heavier; this particular rubidium oscillator requires around 18 watts of power at startup, and consumes around 8 watts in normal operation, so I’d need a relatively large battery.</p>
+
+<p>Finally, what sort of enclosure would I physically put this clock in? My woodworking skills precluded building a pretty wooden enclosure, and I knew hacking holes into a random plastic box wouldn’t make for a nice display piece.</p>
+
+<p>I got so far as powering the oscillator up and verifying it worked — more difficult than it sounds, for reasons I’ll discuss below — and then the oscillator, Arduino, and other parts I’d accumulated sat in a box for 5 years.</p>
+      <h2 id="using-the-sa22c-rubidium-oscillator">
+        
+        
+          Using the SA.22c Rubidium Oscillator <a href="#using-the-sa22c-rubidium-oscillator"></a>
+        
+        
+      </h2>
+    
+<p>I’ll get back to the story in a moment, but first I wanted to review the oddities and difficulties that made using this oscillator a challenge. (I’ll also note that, with a larger budget, I could have chosen any of several <a href="https://www.microsemi.com/product-directory/timing-synchronization/3932-embedded-clocks-frequency-references">newer oscillators</a> that alleviate a lot of these pain points.)</p>
+
+<p>You can follow along and learn more, if you’d like, by referring to the <a href="https://www.dzombak.com/files/sa22c/SA22c%20Datasheet.pdf">SA.22c’s datasheet</a> and <a href="https://www.dzombak.com/files/sa22c/SA22c%20User%20Guide.pdf">user guide</a> (PDFs).</p>
+      <h3 id="power">
+        
+        
+          Power <a href="#power"></a>
+        
+        
+      </h3>
+    
+<p>The oscillator requires both a 15 volt and 5 volt supply. It draws up to 1.2 amps at 15 volts, and only up to 100 mA at 5 volts.</p>
+
+<p>This is unusual for an Arduino project, which led to the question: how will I supply that, while also supplying the 7~12 volts required by the the <a href="https://store.arduino.cc/products/arduino-mega-2560-rev3">Arduino Mega</a> (the Arduino I had chosen for this project)?</p>
+
+<p>The solution, helpfully suggested by my dad, was a “buck-boost switching regulator” — in this case, a <a href="https://www.maximintegrated.com/en/products/power/switching-regulators/MAX16930.html">MAX16930</a>. I got an evaluation board for this regulator, and modified it to provide the necessary 15V, 8V, and 5V outputs from a 12V input.</p>
+
+<p>I don’t remember exactly what I did to that board — this was over 5 years ago — but <a href="https://www.dzombak.com/files/atomclock/Power%20Supply%20Notes.pdf">here are my notes from that project</a> (PDF).</p>
+      <h3 id="2mm-pitch-connector">
+        
+        
+          2mm-pitch Connector <a href="#2mm-pitch-connector"></a>
+        
+        
+      </h3>
+    
+<p>The oscillator’s connector is an oddball one, with a 2mm pitch instead of the much more common 2.54mm pitch standard on everything in the Arduino and Raspberry Pi world. It was difficult even to find a large-enough protoboard with a 2mm pitch, and of course I wouldn’t be able to mount any 2.54mm-pitch components to the board.</p>
+
+<p>Once I did, I noticed that the connector on the oscillator was significantly inset, so the mating connector had to be mounted maybe 2mm off the protoboard, rather than flush. That, of course, complicated soldering wires to the connector on the opposite side of the protoboard. Getting good connections here was an issue several times during this project.</p>
+      <h3 id="heat">
+        
+        
+          Heat <a href="#heat"></a>
+        
+        
+      </h3>
+    
+<p>This wasn’t as much of a pain as the oscillator’s power requirements and odd connector, but it still bears mentioning. The oscillator literally contains a heater, and it needs to be warm but not too hot to operate. Its user guide recommends attaching a heat sink.</p>
+
+<p>So, my enclosure design includes an opening for a heat sink, and it does indeed get hot: it seems to stabilize at around 125ºF.</p>
+
+<p><img src="https://www.dzombak.com/img/blog/2021/atomclock/IMG211206164429.jpg" alt="Thermal photo of the rear of the clock."></p>
+      <h2 id="2021-design-discussion">
+        
+        
+          2021 Design Discussion <a href="#2021-design-discussion"></a>
+        
+        
+      </h2>
+    
+<!-- TK: 8266 BLOG SERIES PAGE LINK -->
+
+<p>Recently I’ve been playing with Arduino on the ESP8266 platform, and it occurred to me that this could solve all my problems around setting the clock: once the oscillator is ready, I can simply have the microcontroller connect to WiFi, sync the current time via NTP, and then disconnect from the network, relying on the rubidium oscillator’s 1 pulse per second (1PPS) output to keep time. Since the clock will now have calendar information, this also allows the microcontroller to display the current date, local time, and UTC time — and even account for daylight saving time!</p>
+
+<p>This updated concept is much simpler. I don’t need <em>any</em> user interface for setting the time, and I don’t have to worry about a battery backup, since the clock will just fetch the current time via NTP whenever it boots.</p>
+
+<p>The design, at a block-diagram level, is straightforward. It’s essentially just the power supply, the oscillator, the ESP8266, and the display. There is, however, the new complication that the ESP8266 requires a 3.3 volt supply and 3.3 volt logic levels. So, I added a 3.3V regulator and a level shifter, allowing the ESP8266 to interface with the oscillator’s 5V logic levels.</p>
+
+<p>I started working from this rough-but-functional block diagram:</p>
+
+<p><img src="https://www.dzombak.com/img/blog/2021/atomclock/block-diagram.png" alt="Rough, handwritten block diagram for the atomic clock"></p>
+
+<p>You’ll notice some confusion on the right-hand side of the diagram. I’d initially assumed that the display I chose — <a href="https://www.adafruit.com/product/716">this easy-to-use RGB character display from Adafruit</a> — would work with 3.3 volts, but it requires 5 volts. (Always check your assumptions! I thankfully found this error before I actually began wiring this part of the circuit.)</p>
+
+<p>This created another issue, though. The level shifter I’d obtained (a <a href="https://www.ebay.com/itm/4-Channel-IIC-I2C-Logic-Level-Converter-Bi-Directional-Module-5V-to-3-3V-US-Sell-/254606508786">cheap one from eBay intended for I<sup>2</sup>C buses</a>) could only handle 4 signals, and now I needed 5:</p>
+
+<ul>
+  <li>1PPS signal from the oscillator</li>
+  <li>Ready indicator from the oscillator<sup id="fnref:lock" role="doc-noteref"><a href="#fn:lock" rel="footnote">1</a></sup></li>
+  <li>Service indicator from the oscillator<sup id="fnref:svc" role="doc-noteref"><a href="#fn:svc" rel="footnote">2</a></sup></li>
+  <li>I<sup>2</sup>C SDA between the ESP8266 and display</li>
+  <li>I<sup>2</sup>C SCL between the ESP8266 and display</li>
+</ul>
+
+<p>Initially, I planned to use the level shifter for everything except the oscillator’s service signal, and I used a simple voltage divider to convert the service signal from 5V to 3.3V. (Thankfully, all the oscillator → microcontroller communication is one-way.)</p>
+
+<p>This didn’t quite work out. The 5V 1PPS signal from the oscillator is a very short pulse; it lasts 400 nanoseconds:</p>
+
+<p><img src="https://www.dzombak.com/img/blog/2021/atomclock/IMG_0197_edit.jpg" alt="5V 1PPS pulse from SA.22c oscillator"></p>
+
+<p>The level shifter was not intended for this type of usage. After passing through the level shifter, these pulses barely reached above 1.5V — hardly the 3.3V they should have. They simply didn’t last long enough for the level shifter’s output to reach a logical high.</p>
+
+<p>Instead, I moved the service signal to the level shifter, and I used a voltage divider (500 ohms / 1000 ohms) on the 1PPS signal. The result still isn’t pretty, but it reaches 3 volts and gets the job done:</p>
+
+<p><img src="https://www.dzombak.com/img/blog/2021/atomclock/IMG_0105_edit.jpg" alt="1PPS pulse after 3.3v voltage divider"></p>
+
+<p>The ESP8266 won’t trigger an interrupt on the rising edge of this signal, but I found it’ll trigger reliably on the falling edge. And the oscillator’s ready and service signals make it through the level shifter just fine, as do the I<sup>2</sup>C signals between the microcontroller and the display.</p>
+
+<p>The other major change from 2016 is that <a href="https://www.dzombak.com/blog/2021/09/I-got-into-3D-printing-and-it-feels-like-magic.html">I now have a 3D printer</a>. This allowed me to solve two problems:</p>
+
+<ul>
+  <li>What enclosure will I put the clock in?</li>
+  <li>How do I keep the various electronic boards &amp; parts together while I’m assembling them?</li>
+</ul>
+      <h2 id="assembling-the-electronics">
+        
+        
+          Assembling the Electronics <a href="#assembling-the-electronics"></a>
+        
+        
+      </h2>
+    
+<p>I started by designing and 3D-printing a carrier assembly which would keep the oscillator board, power supply board, and other electronics safely together. This alleviated a problem I ran into in 2016 — an ad-hoc assembly of several boards sitting on a desk is fragile.</p>
+
+<p>Armed with the carrier assembly, a completed block diagram, and <a href="https://www.dzombak.com/files/atomclock/IMG_0085.jpeg">carefully-considered pin assignments</a>, I began putting everything together.</p>
+
+<p>At this point, I had the oscillator (the silver rectangle hiding inside the white plastic assembly) powered up, and I verified it still worked:</p>
+
+<p><img src="https://www.dzombak.com/img/blog/2021/atomclock/IMG_0079.jpeg" alt="Oscillator, power supply board, and ESP8266 mounted in carrier assembly"></p>
+
+<p>Later, with all electronics connected and working, the project looked like this:</p>
+
+<p><img src="https://www.dzombak.com/img/blog/2021/atomclock/IMG_0183.jpeg" alt="IMG_0183"></p>
+
+<p>Definitely messy, but at least everything was held together securely.</p>
+
+<p>If I were starting totally from scratch, I’d likely try to design a custom PCB for this. That would let me consolidate the multiple protoboards, the level shifter board, and the ESP8266 board into one unit despite the oscillator’s oddball 2mm-pitch connector. However, since I had already successfully mounted the oscillator to a protoboard, I decided I’d just wire everything together and hot-glue the various smaller boards in place.</p>
+      <h2 id="enclosure-design--production">
+        
+        
+          Enclosure Design &amp; Production <a href="#enclosure-design--production"></a>
+        
+        
+      </h2>
+    
+<p>I designed a vaguely retro-tech-style enclosure in Fusion 360, complete with an electron shell diagram of the rubidium atom<sup id="fnref:artwork" role="doc-noteref"><a href="#fn:artwork" rel="footnote">3</a></sup>:</p>
+
+<p><img src="https://www.dzombak.com/img/blog/2021/atomclock/enclosure%20front%20render.png" alt="Render of front of clock enclosure"></p>
+
+<p><img src="https://www.dzombak.com/img/blog/2021/atomclock/enclosure%20rear%20render.png" alt="Render of rear of clock enclosure"></p>
+
+<p>The electronics carrier assembly simply screws onto a backplate, which is then screwed to the back of the clock enclosure. The screen is screwed into specifically-designed mounts on the inside of the case, allowing the front …</p></article></div>
+<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://www.dzombak.com/blog/2021/12/Building-the-atomic-clock-I-ve-always-wanted.html">https://www.dzombak.com/blog/2021/12/Building-the-atomic-clock-I-ve-always-wanted.html</a></em></p>]]>
             </description>
             <link>https://www.dzombak.com/blog/2021/12/Building-the-atomic-clock-I-ve-always-wanted.html</link>
             <guid isPermaLink="false">hacker-news-small-sites-29526193</guid>
@@ -422,7 +817,82 @@ December 11, 2021 | https://www.dzombak.com/blog/2021/12/Building-the-atomic-clo
 Score 8 | Comments 0 (<a href="https://news.ycombinator.com/item?id=29526102">thread link</a>) | @kevin_nisbet
 <br/>
 December 11, 2021 | https://badger.com/technical-post-mortem | <a href="https://web.archive.org/web/*/https://badger.com/technical-post-mortem">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><div><div><div><h3>Investigators Believe Unauthorized API Key Allowed Malicious Snippet to Set User Web3 Permission to Attacker Wallet</h3>
+<h2>Summary of Findings</h2>
+<p>On Dec 2 2021, a <a target="_blank" rel="noredirect" href="https://badger.com/exploit/updates">series of unauthorized transactions</a> occurred, resulting in the loss of funds from Badger users. Following the exploit, Badger engineers worked with cybersecurity firm <a target="_blank" rel="noredirect" href="https://www.mandiant.com/">Mandiant</a> to investigate the incident and have prepared the following initial report.</p>
+<p>At this time, Badger believes that, as publicly reported, the phishing incident that occurred on 2 Dec, 2021 was the result of a maliciously injected snippet provided by <a target="_blank" rel="noredirect" href="https://developers.cloudflare.com/workers/runtime-apis/html-rewriter">Cloudflare Workers.</a>&nbsp; Cloudflare Workers is an interface to run scripts that operate on and alter web traffic as it flows through Cloudflare proxies. The attacker deployed the worker script via a compromised API key that was created without the knowledge or authorization of Badger engineers.&nbsp; The attacker(s) used this API access to periodically inject malicious code into the Badger application such that it only affected a subset of the user base.</p>
+<h2>Sequence of Events</h2>
+<p>Badger appreciates our Community’s patience while we figure out how to balance our commitment to transparency with the fact that this is still an ongoing investigation with rapidly changing information. We are sharing the following sequence of events at this time to help protect our Community and to help others who might be similarly targeted.</p>
+<ul>
+<li>In late September, users on a Cloudflare community support forum reported that unauthorized users were able to create accounts and were also able to create and view (Global) API keys (which cannot be deleted or deactivated) before email verification was completed (see <a target="_blank" rel="noredirect" href="https://web.archive.org/web/20211202160431/https://community.cloudflare.com/t/someone-else-can-create-an-account-and-api-token-on-your-email-address/309492/5">Cloudflare Forum Post</a>). It was noted that an attacker could then wait for the email to be verified, and for the account creation to be completed, and they would then have API access.</li>
+<li>Upon reviewing Cloudflare logs after the exploit, Badger identified unauthorized account creation and API key generation for three Badger accounts; two in late August, one in early September.</li>
+<li>In mid-September, Badger unknowingly completed the account creation for one of these three compromised accounts, which were used for legitimate Cloudflare management activities. The UI did not make it obvious that the account had already been created and an API key was accordingly generated.</li>
+<li>On November 10, the attacker began using their API access to inject malicious scripts via Cloudflare Workers into the html of <a href="http://app.badger.com/">app.badger.com</a>. The script intercepted web3 transactions and prompted users to allow a foreign address approval to operate on ERC-20 tokens in their wallet.&nbsp; On November 20, the first on-chain malicious <a target="_blank" rel="noredirect" href="https://etherscan.io/tx/0x9a900fbe6136a44bbfd43de9c18947977990acee5fb41e7d9a76562aed960a51">approval</a> was made for the exploiter wallet.</li>
+<li>The attacker used several anti-detection techniques in their attack. They applied and removed the script periodically over the month of November, often for very short periods of time. The attacker also only targeted wallets over a certain balance, and explicitly avoided targeting listed signers of the Dev Multisig. Finally, the attacker accessed the API from multiple proxy and VPN IP addresses and changed the script on each deployment so they each had a unique hash, rendering static indicators of limited value.</li>
+<li>The Badger community raised an alert via Discord about a large, suspicious <a target="_blank" rel="noredirect" href="https://etherscan.io/tx/0x951babdddbfbbba81bbbb7991a959d9815e80cc5d9418d10e692f41541029869">transaction</a> on December 2</li>
+<li>Badger immediately paused most vault activity within 30 minutes of the alert. A handful of older contracts with a single, inaccessible guardian were paused approximately 15 hours later.</li>
+<li>After this incident, Cloudflare API keys have been rotated, passwords changed, and the MFA was transferred following discovery of the incident.</li>
+</ul>
+<p>As this exploit involved Web 2 vectors which are unusual to DeFi attacks, we will provide a short post-mortem of the Web 2 events that occurred, and a full Web 3 post mortem that follows standards of reporting in DeFi.</p>
+<h2>Web2 Event Log</h2>
+<p>Badger is providing the following details in order to help other people identify a similar Web2 compromise.</p>
+<p>Here’s what our Cloudflare audit logs look like for one of the exploited accounts:</p>
+<p><img src="https://lh4.googleusercontent.com/iBhzq3emf6gW0G_kacwwy9p_00aFt-vdM7HBXbnqVa0r4Ksv2Im955gUFm82c9W0StfdUbWXxySgmbo4IKshK_E94eEjx0O2NHZLEL02dr9Qki9EA1x4RimfEhUJPB28LvxmNMIL" alt=""></p>
+<p><br>
+The earliest evidence we currently have of the attacker trying to take over an account is August 20, 2021.</p>
+<div><p>Per the responses on the Cloudflare forum, the vulnerability appears to have been mitigated around September 29.</p><p>
+
+Here’s what Badger’s app looked like with the injected code:</p></div>
+<p><a target="_blank" rel="noredirect" href="https://web.archive.org/web/20211129101319/https://app.badger.com/">Archived version of the Badger App with code injected</a></p>
+<p>Badger is redacting the malicious scripts from the summary below at this time while the investigation is ongoing.</p>
+<p>On November 10, 2021 here’s the first example of malicious activity:</p>
+<p><img src="https://lh5.googleusercontent.com/HaOUvm2r_qEuuNQllTIfQ6p-uePYrJI4e-LCaVnnvYN8XqYxDZjHaGrZ0PZeHyqXX109u5VPKVzyfjMI4dBMfB7fShVaI10l8VjLqv11yOcLIZQ9iFzlDc1lELJ3UIA0KHnloPdE" alt=""></p>
+<p>The following table shows the times when malicious scripts were running on the site:</p>
+<p><img src="https://lh4.googleusercontent.com/IJk7PorpHMla8YPWkqzQYO2WitOAxs-967ZLa7gVGBE7bewkgux34u-rrBUoBMklQrUOmESGyk6qbrvk18jqSIqrnUALfZ601rggC_JoZXish2oMLT7XJL3XdGMwJjV6Z6UOIqsX" alt=""></p>
+<h2>Web3: On-chain events</h2>
+<h3>Mitigation Steps</h3>
+<p>At around 2:05 AM UTC, on 2 Dec, 2021, Badger was alerted of suspicious activity on the platform. The attack was noticed by a Community member when approximately <a target="_blank" rel="noredirect" href="https://etherscan.io/tx/0x951babdddbfbbba81bbbb7991a959d9815e80cc5d9418d10e692f41541029869">900 BTC were removed</a> from the Yearn wBTC vault.</p>
+<p>After a quick investigation, the issue was marked a high priority and urgent. At 3:14 AM UTC, Badger began pausing all vault and strategy contracts.</p>
+<p>Per <a target="_blank" rel="noredirect" href="https://forum.badger.finance/t/bip-33-phase-1-of-decentralizing-badger-dao/2607">BIP-33</a>, addresses approved on the <a target="_blank" rel="noredirect" href="https://etherscan.io/address/0x6615e67b8B6b6375D38A0A3f937cd8c1a1e96386#writeProxyContract">guardian contract</a> have the ability to pause contracts. The pausing functionality of these contracts operates in a manner that blocks any deposit, withdrawal, transfer for ERC20 vaults, withdrawals from strategies, and any minting/redeeming of ibBTC until the unpause function is called on them. Unpausing is restricted to the Dev Multisig, which requires governance approval. Eight older strategies and one vault also require a timelock to unpause.</p>
+<p>Most contracts were paused by 3:30 AM UTC. Some older vaults, (namely bcrvRenBTC, bcrvSBTC, bcrvTBTC, bBADGER, bharvestcrvRenBTC and buniWbtcBadger) do not have pause functionality on the vault contract. Their strategies were nevertheless paused to prevent withdrawals. At the time Badger engineers were unable to access the guardian account of the bBADGER, bharvestcrvRenBTC and buniWbtcBadger strategies. Further investigation revealed the strategist who helped come up with this smart contract idea also had pausing capabilities, and pausers were eventually able to pause the strategies with the strategist account.</p>
+<p>A list of all of the pausing txs can be found <a target="_blank" rel="noredirect" href="https://docs.google.com/spreadsheets/d/1jEyKhad85RFUXr0PshnlGyQu_IJHjhLrAoNWbzD3WWQ/edit#gid=0">here</a>. As soon as the vaults were paused, the <a target="_blank" rel="noredirect" href="https://etherscan.io/txs?a=0x1fcdb04d0c5364fbd92c73ca8af9baa72c269107&amp;p=1">exploiter’s</a> transferFrom calls began to fail.</p>
+<p><img src="https://lh5.googleusercontent.com/OKFzUrcGZOzZQpuew4D4vf6tgaBn_f26-NoWaLbPWCDOp75whEY8XaLVkIzzBkt9H5lWNH6vatPyQar41uaeR6uFezCYldkEev5Gx5bVRsibQ2lGAGBtycTYCYGoDkvpkrl1a0nG" alt=""></p>
+<p>The graphs below show the movement of Badger Sett tokens stopping after pausing. (Note: The y axis shows the raw number of Badger Sett tokens)</p>
+<p>All Setts except bBADGER, bharvestcrvRenBTC, and buniWbtcBadger:<img src="https://lh6.googleusercontent.com/avu9ubuJP1DTBIVf1cKeys0tbd_SA_8ugOlQs2P1VdKQVJ0qq3OWXaHVmiyfiMhqPEwUYEAlfK1-4sMBDgFQUGlx9pqkQJb1s2VxacRXkqNxJGEgFzLvVPx1fjvR_0oBCSifvH6x" alt=""></p>
+<p>Below is the graph demonstrating the movement of all Badger Sett tokens, including those that were late to pause</p>
+<p><img src="https://lh3.googleusercontent.com/Uo-3blV_2ze9zrGKDRl_6jDGyYpJFX_c4Hct0d82wOm60DPDWbWoDk6lzKbkqNWN5Bb730DOehYkhX5vMyPCicqD3Is60IZXmuDuRW6FsUrRfMzzS9m9V6nduuM409NkJhHAqLmH" alt=""></p>
+<p>It is worth mentioning that the <a target="_blank" rel="noredirect" href="https://etherscan.io/tx/0xbf83cd37a8bb82a2c6b4ffb60048a27dda454e0bac83fd4bde73fe8e846f864c">last malicious withdrawal</a> from the unpaused vaults occurred at 4:57 AM UTC. All withdrawals that took place after this and until the pausing of the last strategy were conducted by regular users.</p>
+<p>It is also worth mentioning that the attacker was able to compromise non-Sett tokens, such as BADGER, wBTC, CVX and cvxCRV, and was able to liquidate them after Badger had enacted the pauses.</p>
+<h3>Attack Execution</h3>
+<p>Through the Web2 intrusion, the attacker was able to phish for ERC20 token approvals from Badger users through the user interface. The hacker tricked users into signing token approve or increaseAllowance calls allowing the main exploiter EOA account (0x1fcdb04d0c5364fbd92c73ca8af9baa72c269107) to spend funds.</p>
+<p>After phishing a number of approvals, a <a target="_blank" rel="noredirect" href="https://etherscan.io/address/0xa0d34572fb3be1bca9f36b5d41e86c135e580553">funding account</a> sent 8 ETH to the exploiter’s account to fuel a series of transferFrom calls on the users’ approved tokens. This allowed the attacker to move funds on behalf of the users to other accounts, which then liquidated the funds and exited via the Badger Bridge to BTC.</p>
+<h3>Involved Parties</h3>
+<p>Badger is actively tracking all funds associated with the incident and relevant information is available below:</p>
+<p>Destination Addresses:</p>
+<p><img src="https://badger.com/images/uploads/screen-shot-2021-12-08-at-8.56.50-pm.png" alt=""></p>
+<h3>Protocol Impact (Stolen Funds)</h3>
+<p>Impact by underlying assets:</p>
+<p><img src="https://lh3.googleusercontent.com/ff6LgQYPIzxfxVO_ntyC9CubtHl4IPTAoy4DKxMvpAkBT2GYe_C3PyOEhdYrculI_h0a7iIGDth07i6ShU5cAY1RH3l2DjwagOU3KG5S2tLdayraUtzb1s-jt_Qxg6aiTkCU3X-8" alt=""></p>
+<p><strong>Note: Estimated USD prices are based on fixed pricing taken from the time when the collection script was run (2 Dec, 2021).&nbsp; They should be taken as an indication and not absolute. A detailed token breakdown can be found <a target="_blank" rel="noredirect" href="https://docs.google.com/spreadsheets/d/1IPwk-_ZtZ3aIxaJgYm8wZ7W6biB65Ou46lkYnniAHzQ/edit?usp=sharing">here</a>.</strong></p>
+<h2>Post Incident Plan</h2>
+<p>The Badger Cloudflare account has had the password updated, MFA changed and all API keys either deleted or refreshed where possible.</p>
+<p>Badger has verified that the exploit has been patched on the Cloudflare side.&nbsp; New accounts are no longer allowed to view API keys until the email address has been verified.</p>
+<div><p>As <a target="_blank" rel="noredirect" href="https://badger.com/exploit/updates">previously advised</a>, some funds were transferred by the exploiter but not yet withdrawn from the Badger vaults.&nbsp; We are working on a plan to recover these funds.</p><p>
+
+Badger is working with Chainalaysis, Mandiant, and the crypto exchanges as well as authorities in the US and Canada to recover any funds possible</p><p>
+
+Badger is continuing to work with Cloudflare to collect more relevant data, fully scope this incident and assist in their own post-mortem.</p></div>
+<h3>The Path Forward</h3>
+<p>Badger is currently assessing and working on a plan towards implementing the following potential improvement ideas:</p>
+<ul>
+<li>To review the emergency functionality on all smart contracts, in order to ensure that it is universal, and automates a “pause everything” feature with the goal of bringing Badger’s emergency break time from 15 minutes down to 2 - 3 minutes.</li>
+<li>Before re-launching the protocol, completing 3rd party audits of all web2 and web3 infrastructure</li>
+<li>Badger could potentially fund a hack-a-thon that is focused on building detection technology in order to watch all smart contracts for unexpected approvals or to automatically issue an alert when there are heuristic changes to how calls are made</li>
+<li>Add a trust minimized, IPFS deployed version of the Badger App</li>
+<li>Create public repositories for people to build from source</li>
+<li>Badger could educate the Community about the importance of vigilance and set up new channels to make sure that changes in usage behaviors by Community members are quickly heard, and analyzed</li>
+<li>Badger could build monitoring tools …</li></ul></div></div></div></div></div></div>
+<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://badger.com/technical-post-mortem">https://badger.com/technical-post-mortem</a></em></p>]]>
             </description>
             <link>https://badger.com/technical-post-mortem</link>
             <guid isPermaLink="false">hacker-news-small-sites-29526102</guid>
@@ -437,7 +907,49 @@ December 11, 2021 | https://badger.com/technical-post-mortem | <a href="https://
 Score 64 | Comments 39 (<a href="https://news.ycombinator.com/item?id=29525487">thread link</a>) | @YeGoblynQueenne
 <br/>
 December 11, 2021 | https://www.science.org/content/article/ancient-greeks-didn-t-kill-weak-babies-new-study-argues | <a href="https://web.archive.org/web/*/https://www.science.org/content/article/ancient-greeks-didn-t-kill-weak-babies-new-study-argues">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
+										
+										
+										
+
+
+
+											
+												
+											
+
+											
+
+												
+
+
+
+        
+        
+
+
+												<div data-interstitial="3">
+													
+													
+													<p>In his biography <em>Life of Lycurgus</em>, written around 100 C.E., Greek philosopher Plutarch recounted how the ancient Spartans submitted newborns to a council of elders for inspection. “Fit and strong” babies survived, but those found to be “lowborn or deformed” were left outside to die, Plutarch wrote, “on the grounds that it is neither better for themselves nor for the city to live [their] natural life poorly equipped.”</p>
+<p>In the nearly 2000 years since, Plutarch’s tale has become a commonly accepted notion about ancient Greek society. Even modern scholars have taken the philosopher’s words at face value, repeating the idea to generations of students to emphasize the differences between today’s society and the ancients. “Scholars have simply assumed disabled children would have been exposed,” or abandoned outdoors or in a public place, University of Sydney archaeologist Lesley Beaumont says.</p>
+<p>The belief has also been used to justify modern atrocities. Nazi eugenicists made their case for killing disabled people by citing ancient Greek precedent, for example. “It’s gotten used for some pretty nefarious ends,” says California State University, Long Beach, classicist Debby Sneed.</p>
+<p>But archaeological evidence and a closer look at literary sources suggests the legend may be pure myth. In a study published today in the journal <em>Hesperia</em>, Sneed argues that <a href="https://www.jstor.org/stable/10.2972/hesperia.90.4.0747">abandoning disabled infants wasn’t an accepted part of ancient Greek culture</a>, even if it happened occasionally.</p>
+<p>Although infanticide happens occasionally in most societies—including in modern times—many cultures shun or disparage it. Sneed says there’s little to show the Greeks were any different.</p>
+<p>But Plutarch was writing about events that took place 700 years before he was born, Sneed notes. And the ancient historian’s own account mentions another Spartan king who was unusually short and “impaired in his legs” but still a good leader. An anonymous Greek doctor writing around 400 B.C.E. advised contemporary physicians on how to help adults “who are weasel-armed from birth.” All these textual clues suggest babies born visibly different lived to adulthood as productive members of society.</p>
+<p>Sneed says archaeological evidence supports that view, showing babies with profound health problems at birth were cared for well beyond their first weeks of life. In 1931, for example, excavators uncovered the remains of more than 400 infants in a well in Athens. In a 2018 analysis, archaeologists showed the remains were mostly just a few days old at most, <a href="https://www.jstor.org/stable/26800133">consistent with typical patterns of high infant mortality</a> in the ancient world, not selective infanticide.</p>
+<p>One of the skeletons belonged to a 6- to 8-month-old with severe hydrocephaly, in which spinal fluid is trapped in the skull and puts pressure on the brain. The condition results in a visibly anomalous skull shape and is often fatal, even today. “That infant needed to be cared for to a significant degree,” Sneed says. “People were still giving that care until it died.”</p>
+<p>Meanwhile, in graves all over Greece, excavators have uncovered small, globular ceramic bottles with spouts, some with baby tooth marks on the spouts, Sneed reports in the paper. She argues the bottles could have been used to feed infants with cleft palate or other disability—particularly because they are rare and primarily found in the graves of infants and children under age 1, and almost never in the graves of older children closer to weaning age. Figurines also depict adults with deformities, including adults with severe cleft palates.</p>
+<p>Together, the evidence suggests babies born with anomalous limbs or disabilities were regularly nurtured and often survived until adulthood. “We have plenty of evidence of people actively not killing infants,” Sneed says, “and no evidence that they did.”</p>
+<p>Other scholars are more reluctant to make that claim. “Could you define all of ancient Greek and Roman society as getting rid of weak babies? Absolutely not,” says Christian Laes, a classicist at the University of Manchester. “But absence of evidence does not mean the phenomenon itself was absent.” He argues that based on ethnographic examples from other societies babies were abandoned or killed regularly if families couldn’t afford to raise them. Societal discomfort or shame, he suggests, might help explain why a common practice might not be mentioned in more ancient sources.</p>
+<p>Beaumont draws a line between infanticide and the more passive exposure, suggesting that although there’s no evidence for actively killing infants, unwanted babies might nonetheless have been left in a public place or outdoors in the hopes they’d be picked up and raised by others. “Getting us to question our assumptions is really important, and [Sneed has] brought a lot of evidence to bear,” Beaumont says. “But I’m not sure I can agree it was common practice to raise disabled … children.”</p>
+<p>Sneed says critics have a responsibility to bring more than modern assumptions about the disabled to the table. Because people today tend to devalue those with disabilities, we assume that humans in the past did the same. But, she says, “There are a lot of different strands of evidence that show people investing time and resources into care for infants who are sick or disabled.”</p>
+													
+												</div>
+
+											
+
+											</article></div>]]>
             </description>
             <link>https://www.science.org/content/article/ancient-greeks-didn-t-kill-weak-babies-new-study-argues</link>
             <guid isPermaLink="false">hacker-news-small-sites-29525487</guid>
@@ -1357,7 +1869,145 @@ December 10, 2021 | https://www.neelc.org/posts/fiber-ont-pppoe/ | <a href="http
 Score 27 | Comments 13 (<a href="https://news.ycombinator.com/item?id=29517663">thread link</a>) | @andrewstuart
 <br/>
 December 10, 2021 | https://openforeveryone.net/articles/kde-fixing-every-ltt-complaint-plasma-ark/ | <a href="https://web.archive.org/web/*/https://openforeveryone.net/articles/kde-fixing-every-ltt-complaint-plasma-ark/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-id="9d56eab" data-element_type="widget" data-settings="{&quot;_animation&quot;:&quot;fadeIn&quot;}" data-widget_type="theme-post-content.default">
+				<div>
+			
+<figure><img width="800" height="450" src="https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/12/kde-plasma-nate-graham.jpg?resize=800%2C450&amp;ssl=1" alt="" srcset="https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/12/kde-plasma-nate-graham.jpg?w=1920&amp;ssl=1 1920w, https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/12/kde-plasma-nate-graham.jpg?resize=300%2C169&amp;ssl=1 300w, https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/12/kde-plasma-nate-graham.jpg?resize=1024%2C576&amp;ssl=1 1024w, https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/12/kde-plasma-nate-graham.jpg?resize=768%2C432&amp;ssl=1 768w, https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/12/kde-plasma-nate-graham.jpg?resize=1536%2C864&amp;ssl=1 1536w, https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/12/kde-plasma-nate-graham.jpg?w=1600&amp;ssl=1 1600w" sizes="(max-width: 800px) 100vw, 800px" data-recalc-dims="1" data-lazy-srcset="https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/12/kde-plasma-nate-graham.jpg?w=1920&amp;ssl=1 1920w, https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/12/kde-plasma-nate-graham.jpg?resize=300%2C169&amp;ssl=1 300w, https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/12/kde-plasma-nate-graham.jpg?resize=1024%2C576&amp;ssl=1 1024w, https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/12/kde-plasma-nate-graham.jpg?resize=768%2C432&amp;ssl=1 768w, https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/12/kde-plasma-nate-graham.jpg?resize=1536%2C864&amp;ssl=1 1536w, https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/12/kde-plasma-nate-graham.jpg?w=1600&amp;ssl=1 1600w" data-lazy-src="https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/12/kde-plasma-nate-graham.jpg?resize=800%2C450&amp;is-pending-load=1#038;ssl=1" data-old-srcset="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"><figcaption>KDE Plasma desktop and a photo of engineer Nate Graham (top left)</figcaption></figure>
+
+
+
+<p>The Linux community seems divided on their feelings about Linus Tech Tips’ (LTT) <a href="https://www.youtube.com/watch?v=0506yDSgU7M" target="_blank" rel="noreferrer noopener">Linux Gaming Challenge</a> series. Maybe you believe the hosts are deliberately creating scenarios that will end in disaster or disappointment. Perhaps you see a genuine desire to expose usability problems with desktop Linux with the hope of them being improved. I’m in the latter camp, which is why I was thrilled to stumble across this <a href="https://invent.kde.org/teams/usability/issue-board/-/boards/7723" target="_blank" rel="noreferrer noopener">issue board</a> started by my favorite KDE engineer, Nate Graham. </p>
+
+
+
+<p>Let me give you a bit of context in case you’re not following the video series. LTT’s Linux Gaming Challenge recently put the games on pause and veered into more mainstream user territory. </p>
+
+
+
+<p>The team attempted to carry out 12 “basic usage” tasks on their distributions of choice, with largely successful results. </p>
+
+
+
+<p>Were there a few hiccups along the way? Yes. </p>
+
+
+<p><iframe id="_ytid_85183" width="800" height="450" data-origwidth="800" data-origheight="450" src="https://www.youtube.com/embed/TtsglXhbxno?enablejsapi=1&amp;autoplay=0&amp;cc_load_policy=0&amp;cc_lang_pref=&amp;iv_load_policy=1&amp;loop=0&amp;modestbranding=0&amp;rel=0&amp;fs=1&amp;playsinline=0&amp;autohide=2&amp;theme=dark&amp;color=red&amp;controls=1&amp;" title="YouTube player" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen="" data-no-lazy="1" data-skipgform_ajax_framebjll=""></iframe></p>
+
+
+<p>KDE’s Nate Graham took it upon himself to document <a href="https://invent.kde.org/teams/usability/issue-board/-/boards/7723" target="_blank" rel="noreferrer noopener"><em>every single one</em></a>. </p>
+
+
+
+<h2>KDE Is On The Case</h2>
+
+
+
+<p>Some of them were legitimate usability issues. Things like Okular not having an intuitive way to embed a handwritten signature into a PDF. Or KDE Plasma notifications getting missed on physically large screens. </p>
+
+
+
+<p>However, the majority of the complaints revolved around KDE’s Ark application. Ark is a graphical tool for compressing and decompressing files and archives. That’s probably an activity most of us take for granted because we have our own comfortable way of doing it. </p>
+
+
+
+<p>Here are a few examples:</p>
+
+
+
+<ul><li>If the file manager isn’t called Dolphin, Ark can’t drag-and-drop to it.</li><li>Ark’s “compress here” menu actions don’t prompt the user for a filenames when compressing multiple files. </li><li>The selection highlight effect on Ark isn’t visually accuruate. </li></ul>
+
+
+
+<figure><blockquote><p>“Anything can be difficult or impossible if you lack the requisite skills, resources, or knowledge.” </p><cite>Linus Sebastian</cite></blockquote></figure>
+
+
+
+<p>So, Nate Graham isn’t just documenting the nitpicks. He, along with the KDE team, is doing something about them. </p>
+
+
+
+<p>“I want to let you know that we’re working on fixing the issues Linus brought up, and you can track our progress&nbsp;<a href="https://invent.kde.org/teams/usability/issue-board/-/boards/7723">here</a>,” Graham writes on <a href="https://pointieststick.com/">his excellent blog</a>. “Thankfully most of the issues are fairly minor and should be easy to fix.”</p>
+
+
+
+<h2>The Ripple Effect Expands</h2>
+
+
+
+<p>This is admirable! And it’s yet another result of the ripple effect Linus Tech Tips is having on the entire desktop Linux world right now. </p>
+
+
+
+<p>Graham’s actions are the latest in a string of improvements being made. </p>
+
+
+
+<figure></figure>
+
+
+
+<p><a href="https://openforeveryone.net/articles/fedora-partnerships-to-make-streaming-better-for-linux/" target="_blank" rel="noreferrer noopener">Fedora is chasing down partnerships</a> with hardware and software companies involved in live streaming. Pop OS and KDE Plasma have both patched their distributions to prevent the accidental removal of the desktop environment. </p>
+
+
+
+<p>It also bears repeating that a young Ubuntu developer (he’s 12!) designed an app <a href="https://openforeveryone.net/articles/7th-grader-develops-linus-proof-ubuntu-gaming-app/" target="_blank" rel="noreferrer noopener">called Gamebuntu</a>, an installer and overlay intended to make gaming on Ubuntu easier for newcomers. </p>
+
+
+
+<p>So thanks to Nate and the entire KDE team for taking genuine criticism seriously. And thank you for so passionately pursuing improvements on KDE Plasma.</p>
+
+
+
+<p>If you haven’t yet, I highly recommend Nate’s “<a href="https://pointieststick.com/" target="_blank" rel="noreferrer noopener">Adventures in Linux and KDE</a>” blog. He publishes a lot of great insights and strong opinions, and they’re always an enjoyable, educational read.</p>
+
+
+
+<p>You can track the “LTT Usability Issues” board <a href="https://invent.kde.org/teams/usability/issue-board/-/boards/7723" target="_blank" rel="noreferrer noopener">here</a>.  </p>
+
+
+
+<p><strong>UDPATE | Saturday Dec 11</strong>: It looks like the work has begun, as indicated by a couple closed issues on the aforementioned board, and this <a href="https://pointieststick.com/2021/12/10/this-week-in-kde-polishing-up-ark-and-dolphin/" target="_blank" rel="noreferrer noopener">dedicated blog post</a> at Nate’s Blog.</p>
+
+
+
+<hr>
+
+
+
+<div>
+<div>
+<h3>Support Jason With A Coffee:</h3>
+
+
+
+<figure><a href="https://ko-fi.com/openforeveryone"><img src="https://i1.wp.com/openforeveryone.net/wp-content/uploads/2021/11/Kofi_pixel_logo_with_text_light.png?resize=215%2C61&amp;ssl=1" alt="Buy Jason a Ko-Fi" width="215" height="61" srcset="https://i1.wp.com/openforeveryone.net/wp-content/uploads/2021/11/Kofi_pixel_logo_with_text_light.png?resize=1024%2C293&amp;ssl=1 1024w, https://i1.wp.com/openforeveryone.net/wp-content/uploads/2021/11/Kofi_pixel_logo_with_text_light.png?resize=300%2C86&amp;ssl=1 300w, https://i1.wp.com/openforeveryone.net/wp-content/uploads/2021/11/Kofi_pixel_logo_with_text_light.png?resize=768%2C220&amp;ssl=1 768w, https://i1.wp.com/openforeveryone.net/wp-content/uploads/2021/11/Kofi_pixel_logo_with_text_light.png?resize=1536%2C440&amp;ssl=1 1536w, https://i1.wp.com/openforeveryone.net/wp-content/uploads/2021/11/Kofi_pixel_logo_with_text_light.png?resize=2048%2C587&amp;ssl=1 2048w, https://i1.wp.com/openforeveryone.net/wp-content/uploads/2021/11/Kofi_pixel_logo_with_text_light.png?w=1600&amp;ssl=1 1600w, https://i1.wp.com/openforeveryone.net/wp-content/uploads/2021/11/Kofi_pixel_logo_with_text_light.png?w=2400&amp;ssl=1 2400w" sizes="(max-width: 215px) 100vw, 215px" data-recalc-dims="1" data-lazy-srcset="https://i1.wp.com/openforeveryone.net/wp-content/uploads/2021/11/Kofi_pixel_logo_with_text_light.png?resize=1024%2C293&amp;ssl=1 1024w, https://i1.wp.com/openforeveryone.net/wp-content/uploads/2021/11/Kofi_pixel_logo_with_text_light.png?resize=300%2C86&amp;ssl=1 300w, https://i1.wp.com/openforeveryone.net/wp-content/uploads/2021/11/Kofi_pixel_logo_with_text_light.png?resize=768%2C220&amp;ssl=1 768w, https://i1.wp.com/openforeveryone.net/wp-content/uploads/2021/11/Kofi_pixel_logo_with_text_light.png?resize=1536%2C440&amp;ssl=1 1536w, https://i1.wp.com/openforeveryone.net/wp-content/uploads/2021/11/Kofi_pixel_logo_with_text_light.png?resize=2048%2C587&amp;ssl=1 2048w, https://i1.wp.com/openforeveryone.net/wp-content/uploads/2021/11/Kofi_pixel_logo_with_text_light.png?w=1600&amp;ssl=1 1600w, https://i1.wp.com/openforeveryone.net/wp-content/uploads/2021/11/Kofi_pixel_logo_with_text_light.png?w=2400&amp;ssl=1 2400w" data-lazy-src="https://i1.wp.com/openforeveryone.net/wp-content/uploads/2021/11/Kofi_pixel_logo_with_text_light.png?resize=215%2C61&amp;is-pending-load=1#038;ssl=1" data-old-srcset="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"></a></figure>
+</div>
+
+
+
+
+
+
+
+<div>
+<h3>Get Our Newsletter:</h3>
+
+
+
+<div><figure><a href="https://www.getrevue.co/profile/techforeveryone"><img src="https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/10/LOGO-MAIN-e1634998951137-300x198.png?resize=104%2C68&amp;ssl=1" alt="Subscribe to my newsletter! Get fun, conversational Linux + tech news delivered to your inbox. " width="104" height="68" srcset="https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/10/LOGO-MAIN-e1634998951137.png?resize=300%2C198&amp;ssl=1 300w, https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/10/LOGO-MAIN-e1634998951137.png?resize=1024%2C676&amp;ssl=1 1024w, https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/10/LOGO-MAIN-e1634998951137.png?resize=768%2C507&amp;ssl=1 768w, https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/10/LOGO-MAIN-e1634998951137.png?resize=1536%2C1014&amp;ssl=1 1536w, https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/10/LOGO-MAIN-e1634998951137.png?resize=2048%2C1352&amp;ssl=1 2048w, https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/10/LOGO-MAIN-e1634998951137.png?w=1600&amp;ssl=1 1600w, https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/10/LOGO-MAIN-e1634998951137.png?w=2400&amp;ssl=1 2400w" sizes="(max-width: 104px) 100vw, 104px" data-recalc-dims="1" data-lazy-srcset="https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/10/LOGO-MAIN-e1634998951137.png?resize=300%2C198&amp;ssl=1 300w, https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/10/LOGO-MAIN-e1634998951137.png?resize=1024%2C676&amp;ssl=1 1024w, https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/10/LOGO-MAIN-e1634998951137.png?resize=768%2C507&amp;ssl=1 768w, https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/10/LOGO-MAIN-e1634998951137.png?resize=1536%2C1014&amp;ssl=1 1536w, https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/10/LOGO-MAIN-e1634998951137.png?resize=2048%2C1352&amp;ssl=1 2048w, https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/10/LOGO-MAIN-e1634998951137.png?w=1600&amp;ssl=1 1600w, https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/10/LOGO-MAIN-e1634998951137.png?w=2400&amp;ssl=1 2400w" data-lazy-src="https://i2.wp.com/openforeveryone.net/wp-content/uploads/2021/10/LOGO-MAIN-e1634998951137-300x198.png?resize=104%2C68&amp;is-pending-load=1#038;ssl=1" data-old-srcset="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"></a></figure></div>
+
+
+
+<p><a href="https://www.getrevue.co/profile/techforeveryone" data-type="URL" data-id="https://www.getrevue.co/profile/techforeveryone" target="_blank" rel="noreferrer noopener">Subscribe</a> to our newsletter! Get fun, conversational Linux + tech + gaming news delivered to your inbox.</p>
+</div>
+</div>
+
+
+
+
+
+		</div>
+				</div></div>]]>
             </description>
             <link>https://openforeveryone.net/articles/kde-fixing-every-ltt-complaint-plasma-ark/</link>
             <guid isPermaLink="false">hacker-news-small-sites-29517663</guid>
