@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Sun, 24 Apr 2022 08:34:50 GMT</lastBuildDate>
+        <lastBuildDate>Sun, 24 Apr 2022 12:49:10 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-1.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Sun, 24 Apr 2022 08:34:50 GMT</pubDate>
+        <pubDate>Sun, 24 Apr 2022 12:49:10 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -3282,232 +3282,7 @@ on the Internet. Not ideal post apocalypse.</p>
 Score 2 | Comments 1 (<a href="https://news.ycombinator.com/item?id=31126402">thread link</a>) | @henkie_b
 <br/>
 April 22, 2022 | https://jacco.ompf2.com/2022/04/13/how-to-build-a-bvh-part-1-basics/ | <a href="https://web.archive.org/web/*/https://jacco.ompf2.com/2022/04/13/how-to-build-a-bvh-part-1-basics/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
-            
-<p>In this series we explore the wonderful world of the <em>bounding volume hierarchy:</em> the mysterious data structure that enables real-time ray tracing on recent GPUs, in complex, animated scenes. Despite the broad adoption of ray tracing in games, in-depth understanding of the underlying technology seems to be reserved to a select few. In this article we show how a proper BVH is implemented without support from DXR / RTX / OptiX / Vulkan, in easy-to-read ‘sane C++’. Whether this is actually useful for you, or just interesting as background information, depends on your needs, obviously.</p>
-
-
-
-<p>This series will grow in a few stages. The final version will consist of five articles:</p>
-
-
-
-<ol><li><strong>Basics: data structure, simple construction and ray traversal (this article).</strong></li><li><a href="https://jacco.ompf2.com/2022/04/18/how-to-build-a-bvh-part-2-faster-rays/">Faster rays: the Surface Area Heuristic and ordered traversal.</a></li><li><a href="https://jacco.ompf2.com/2022/04/21/how-to-build-a-bvh-part-3-quick-builds/">Faster construction: binned BVH building</a>.</li><li>BVHs for animated scenes: refitting, rebuilding and top-level BVHs.</li><li>Even faster rays: spatial splits and tree rotations.</li></ol>
-
-
-
-<p>In this first article we discuss the bare basics: what the BVH is used for, and how a basic BVH is constructed and traversed with a ray. The end product is a simple but reasonably efficient CPU ray tracer, which we will further improve upon in subsequent articles.</p>
-
-
-
-<h2>Background</h2>
-
-
-
-<p>The BVH is an <em>acceleration structure</em>. It serves to reduce a pretty fundamental problem in ray tracing: the sheer cost of finding the nearest intersection of a ray and a scene consisting of (potentially) millions of polygons. The basic principle is easy to understand: if we have 64 polygons, we could split them into two groups of 32 polygons, each group enclosed by a <em>bounding volume</em> such as a box or a sphere. When intersecting the scene, we can skip 32 polygons if the ray does not intersect the enclosing volume, nearly halving the processing time. Next, we do the same to each of the two groups: split in two halves, encapsulate, recurse. The resulting bounding volume <em>hierarchy</em> brings down processing time to manageable levels: with each level, we halve the number of polygons. Starting with 64 polygons, we traverse a tree in six steps to arrive at a single polygon.</p>
-
-
-
-<figure><img loading="lazy" width="1024" height="548" src="https://jacco.ompf2.com/wp-content/uploads/2022/04/whittedbvh-1024x548.jpg" alt="" srcset="https://jacco.ompf2.com/wp-content/uploads/2022/04/whittedbvh-1024x548.jpg 1024w, https://jacco.ompf2.com/wp-content/uploads/2022/04/whittedbvh-300x160.jpg 300w, https://jacco.ompf2.com/wp-content/uploads/2022/04/whittedbvh-768x411.jpg 768w, https://jacco.ompf2.com/wp-content/uploads/2022/04/whittedbvh-897x480.jpg 897w, https://jacco.ompf2.com/wp-content/uploads/2022/04/whittedbvh-360x193.jpg 360w, https://jacco.ompf2.com/wp-content/uploads/2022/04/whittedbvh.jpg 1208w" sizes="(max-width: 1024px) 100vw, 1024px"><figcaption>BVH: a hierarchy of bounding volumes. We can skip any volume that the ray doesn’t intersect. Image based on <em>A 3-Dimensional Representation for Fast Rendering of Complex Scenes</em>, by Rubin and Whitted.</figcaption></figure>
-
-
-
-<p>That’s the global idea, but let’s make things practical. I will be using a <a href="https://github.com/jbikker/advgrtmpl8">minimalistic template</a> from one of my courses for these experiments, but the code is designed to be generic. Feel free to use something else.</p>
-
-
-
-<p>We start with the definition of a triangle:</p>
-
-
-
-<pre><code>struct Tri { float3 vertex0, vertex1, vertex2; float3 centroid; };
-</code></pre>
-
-
-
-<p>Your triangle may need more properties for rendering, but for building a BVH and intersecting the triangle with a ray, this is all we need. Speaking of rays:</p>
-
-
-
-<pre><code>struct Ray { float3 O, D; float t = 1e30f; };</code></pre>
-
-
-
-<p>Here, <code>O</code> is the ray origin, <code>D</code> is the (typically normalized) ray direction. Scalar <code>t</code> is the distance at which we found an intersection, which gets initialized to ‘infinity’ (well, almost) here.</p>
-
-
-
-<p>Let’s construct some random triangles to play with:</p>
-
-
-
-<pre><code>// triangle count
-#define N 64
-Tri tri[N];
-// application init; gets called once at startup
-void BasicBVHApp::Init()
-{
-    for (int i = 0; i &lt; N; i++)
-    {
-        float3 r0( RandomFloat(), RandomFloat(), RandomFloat() );
-        float3 r1( RandomFloat(), RandomFloat(), RandomFloat() );
-        float3 r2( RandomFloat(), RandomFloat(), RandomFloat() );
-        tri[i].vertex0 = r0 * 9 - float3( 5 );
-        tri[i].vertex1 = tri[i].vertex0 + r1;
-        tri[i].vertex2 = tri[i].vertex0 + r2;
-    }
-}</code></pre>
-
-
-
-<p>Here, <code>RandomFloat()</code> yields a uniform random number in the range 0..1. I used <a href="https://www.researchgate.net/publication/5142825_Xorshift_RNGs">Marsaglia’s Xor32 RNG</a>, but anything will do. Given three vectors with random components, a triangle is then produced within a 10x10x10 cube centered around the origin. Not pretty, but good enough for now. Feel free to replace this with a proper model, e.g. imported using <a href="https://github.com/assimp/assimp">assimp</a> or <a href="https://github.com/tinyobjloader/tinyobjloader">TinyOBJ</a>.</p>
-
-
-
-<p>Next, we need a way to intersect a triangle with a ray:</p>
-
-
-
-<pre><code>void IntersectTri( Ray&amp; ray, const Tri&amp; tri )
-{
-    const float3 edge1 = tri.vertex1 - tri.vertex0;
-    const float3 edge2 = tri.vertex2 - tri.vertex0;
-    const float3 h = cross( ray.D, edge2 );
-    const float a = dot( edge1, h );
-    if (a &gt; -0.0001f &amp;&amp; a &lt; 0.0001f) return; // ray parallel to triangle
-    const float f = 1 / a;
-    const float3 s = ray.O - tri.vertex0;
-    const float u = f * dot( s, h );
-    if (u &lt; 0 || u &gt; 1) return;
-    const float3 q = cross( s, edge1 );
-    const float v = f * dot( ray.D, q );
-    if (v &lt; 0 || u + v &gt; 1) return;
-    const float t = f * dot( edge2, q );
-    if (t &gt; 0.0001f) ray.t = min( ray.t, t );
-}</code></pre>
-
-
-
-<p>This is the famous <a href="https://en.wikipedia.org/wiki/M%C3%B6ller%E2%80%93Trumbore_intersection_algorithm">Möller–Trumbore intersection algorithm</a>, which is still pretty close to ‘as fast as possible’. There exist <a href="http://www.sven-woop.de/papers/2004-Diplom-Sven-Woop.pdf">slightly faster approaches</a> (see Chapter 5 of Sven’s thesis), but these need more (or rather, different) data than just the three vertices. </p>
-
-
-
-<p>The <code>IntersectTri</code> function determines if there is an intersection between the ray and the triangle. If this is the case, we check if the found intersection distance is closer than what the ray encountered before. If so, the <code>t</code> value for the ray is updated. For a given ray, we can now simply check all triangles; after doing so, the ray ‘knows’ the shortest distance to a surface in the scene.</p>
-
-
-
-<p>So, let’s generate some rays. For e.g. a 640 x 640 image, we do this by firing rays from a camera position to a virtual screen plane:</p>
-
-
-
-<pre><code>float3 camPos( 0, 0, -18 );
-float3 p0( -1, 1, -15 ), p1( 1, 1, -15 ), p2( -1, -1, -15 );
-Ray ray;
-for (int y = 0; y &lt; 640; y++) for (int x = 0; x &lt; 640; x++)
-{
-    float3 pixelPos = p0 + (p1 - p0) * (x / 640.0f) + (p2 - p0) * (y / 640.0f);
-    ray.O = camPos;
-    ray.D = normalize( pixelPos - ray.O );
-    ray.t = 1e30f;</code></pre>
-
-
-
-<p>Here, the camera is placed at position (0,0,-18), so: well outside the cube that contains the triangles. Virtual screen corners are located at (-1, 1, -15), (1,1,-15) and (-1,-1,-15), so 3 units in front of the camera. For each of the pixels we can now calculate a position on this square. The ray is then initialized with the camera position as origin, and a normalized vector from the ray origin to the pixel position as a direction.</p>
-
-
-
-<div><figure><img loading="lazy" src="https://jacco.ompf2.com/wp-content/uploads/2022/04/primrays-1024x568.jpg" alt="" width="634" height="351" srcset="https://jacco.ompf2.com/wp-content/uploads/2022/04/primrays-1024x568.jpg 1024w, https://jacco.ompf2.com/wp-content/uploads/2022/04/primrays-300x167.jpg 300w, https://jacco.ompf2.com/wp-content/uploads/2022/04/primrays-768x426.jpg 768w, https://jacco.ompf2.com/wp-content/uploads/2022/04/primrays-1222x678.jpg 1222w, https://jacco.ompf2.com/wp-content/uploads/2022/04/primrays-897x498.jpg 897w, https://jacco.ompf2.com/wp-content/uploads/2022/04/primrays-360x200.jpg 360w, https://jacco.ompf2.com/wp-content/uploads/2022/04/primrays.jpg 1344w" sizes="(max-width: 634px) 100vw, 634px"><figcaption>Generating primary rays: pixelPos is obtained by interpolating over the rectangle defined by p0, p1 and p2.</figcaption></figure></div>
-
-
-
-<p>With a properly initialized primary ray we can now get our first ray traced view of the test scene, by ‘brute force’ checking the ray against every triangle. The result is a <code>t</code> value in the ray for each pixel. This value is 1e30f if we hit nothing, or the actual distance to a triangle otherwise.</p>
-
-
-
-<pre><code>for( int i = 0; i &lt; N; i++ ) IntersectTri( ray, tri[i] );</code></pre>
-
-
-
-<div><figure><img loading="lazy" width="620" height="308" src="https://jacco.ompf2.com/wp-content/uploads/2022/04/result.png" alt="" srcset="https://jacco.ompf2.com/wp-content/uploads/2022/04/result.png 620w, https://jacco.ompf2.com/wp-content/uploads/2022/04/result-300x149.png 300w, https://jacco.ompf2.com/wp-content/uploads/2022/04/result-360x179.png 360w" sizes="(max-width: 620px) 100vw, 620px"><figcaption>Result of ray tracing 64 triangles.</figcaption></figure></div>
-
-
-
-<p>The result is underwhelming, but hey, it shows that the basic setup works. I’ll leave the explanation of proper Whitted-style ray tracing to <a href="https://raytracing.github.io/books/RayTracingInOneWeekend.html">Peter Shirley</a>‘s amazing book and focus on the efficiency of those rays instead.</p>
-
-
-
-<h2>Concepts and Ingredients</h2>
-
-
-
-<p>On my machine, it takes about 140 milliseconds to construct the 640 x 640 rays and intersect them with the 64 triangles. That’s not bad by the way: we trace almost 3 million rays per second, and that’s not even using multithreading or the GPU. Thing is, however: computation scales linearly in the number of triangles… Tracing 256 triangles takes 540 milliseconds; 1024 triangles bring this to 2250 milliseconds.</p>
-
-
-
-<p>Time to introduce the BVH.</p>
-
-
-
-<p>When Rubin &amp; Whitted first described the bounding volume hierarchy, they assumed the bounding volumes would be placed manually. This is not something artists will enjoy, so let’s see how a BVH can be constructed automatically.</p>
-
-
-
-<div><figure><img loading="lazy" src="https://jacco.ompf2.com/wp-content/uploads/2022/04/bvhroot-1024x805.jpg" alt="" width="512" height="403" srcset="https://jacco.ompf2.com/wp-content/uploads/2022/04/bvhroot-1024x805.jpg 1024w, https://jacco.ompf2.com/wp-content/uploads/2022/04/bvhroot-300x236.jpg 300w, https://jacco.ompf2.com/wp-content/uploads/2022/04/bvhroot-768x603.jpg 768w, https://jacco.ompf2.com/wp-content/uploads/2022/04/bvhroot-897x705.jpg 897w, https://jacco.ompf2.com/wp-content/uploads/2022/04/bvhroot-360x283.jpg 360w, https://jacco.ompf2.com/wp-content/uploads/2022/04/bvhroot.jpg 1176w" sizes="(max-width: 512px) 100vw, 512px"></figure></div>
-
-
-
-<p>We start with the scene and it’s bounding box. This is going to be the root node for the hierarchy. We then recursively subdivide this node. A <em>split plane</em> partitions the primitives in two sets. Note that we do not split <em>space</em>: this might lead to primitives being split and/or assigned to both sides. In a BVH this never happens. The partitioning is what we need the primitive <em>centroids</em> for: each triangle (or disc, in the figure above) is either to the left of the split plane, or <em>not</em> to the left (which includes the situation where the primitive is <em>on</em> the split plane – we need to be precise!).</p>
-
-
-
-<p>After the split we have two (now independent) groups of objects, with their updated group bounds:</p>
-
-
-
-<div><figure><img loading="lazy" src="https://jacco.ompf2.com/wp-content/uploads/2022/04/childs-1024x835.jpg" alt="" width="512" height="418" srcset="https://jacco.ompf2.com/wp-content/uploads/2022/04/childs-1024x835.jpg 1024w, https://jacco.ompf2.com/wp-content/uploads/2022/04/childs-300x245.jpg 300w, https://jacco.ompf2.com/wp-content/uploads/2022/04/childs-768x626.jpg 768w, https://jacco.ompf2.com/wp-content/uploads/2022/04/childs-897x732.jpg 897w, https://jacco.ompf2.com/wp-content/uploads/2022/04/childs-360x294.jpg 360w, https://jacco.ompf2.com/wp-content/uploads/2022/04/childs.jpg 1128w" sizes="(max-width: 512px) 100vw, 512px"></figure></div>
-
-
-
-<p>Note that the bounding volumes of the two groups may overlap. This actually happens when we split the right group vertically:</p>
-
-
-
-<div><figure><img loading="lazy" src="https://jacco.ompf2.com/wp-content/uploads/2022/04/overlap-1024x822.jpg" alt="" width="512" height="411" srcset="https://jacco.ompf2.com/wp-content/uploads/2022/04/overlap-1024x822.jpg 1024w, https://jacco.ompf2.com/wp-content/uploads/2022/04/overlap-300x241.jpg 300w, https://jacco.ompf2.com/wp-content/uploads/2022/04/overlap-768x617.jpg 768w, https://jacco.ompf2.com/wp-content/uploads/2022/04/overlap-897x720.jpg 897w, https://jacco.ompf2.com/wp-content/uploads/2022/04/overlap-360x289.jpg 360w, https://jacco.ompf2.com/wp-content/uploads/2022/04/overlap.jpg 1138w" sizes="(max-width: 512px) 100vw, 512px"></figure></div>
-
-
-
-<p>Splitting the left group also leads to an interesting situation: the group of discs at the top and the single disc at the bottom have bounds that are pretty far apart. A ray that does intersect the left group may thus miss both of its child nodes, avoiding intersection tests with seven discs.</p>
-
-
-
-<p>For a BVH node we need the following data:</p>
-
-
-
-<ol><li>The bounds. In our case: an <em>axis-aligned bounding box</em> (AABB), which is easy to calculate and cheap to store: just 6 floats define the AABB in 3D space. Note: a sphere would be even cheaper to store, but it is not as convenient to work with in practice.</li><li>References to the two child nodes, if the node is not a leaf node.</li><li>References to primitives, if the node is a leaf node.</li></ol>
-
-
-
-<p>A naïve BVH node layout would look something like:</p>
-
-
-
-<pre><code>struct BVHNode
-{
-    aabb nodeBounds;
-    BVHNode* left, *right;
-    bool isLeaf;
-    vector&lt;Tri*&gt; primitives;
-};</code></pre>
-
-
-
-<p>However, this struct has many problems. It’s rather large, but also somewhat unpredictable in size due to the vector and the pointers, which take up 4 bytes on a 32-bit OS, but 8 on a 64-bit OS. </p>
-
-
-
-<p>The first improvement is switching from pointers to <em>indices</em>. For triangles we use their indices in the triangle array; for child node pointers we can do something similar if we pre-allocate all nodes that we ever need in a <code>BVHNode</code> pool. We can do this, because the size of the BVH for <em>N</em> triangles has an upper …</p></div></div>
-<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://jacco.ompf2.com/2022/04/13/how-to-build-a-bvh-part-1-basics/">https://jacco.ompf2.com/2022/04/13/how-to-build-a-bvh-part-1-basics/</a></em></p>]]>
+<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
             </description>
             <link>https://jacco.ompf2.com/2022/04/13/how-to-build-a-bvh-part-1-basics/</link>
             <guid isPermaLink="false">hacker-news-small-sites-31126402</guid>
@@ -3865,7 +3640,7 @@ April 22, 2022 | https://therecord.media/mariupol-computer-museum-creator-finds-
 <p><strong>CH: Before the fighting started, you created a computer museum, can you talk about that?&nbsp;</strong></p>
 <p><strong>DC: </strong>It’s a long story! But in short, I got acquainted with computers in the late eighties, when I was eleven years old. I have a nostalgia for computers of my childhood. Since then, I realized that my whole life will be connected with them, and in 2003, I decided to start collecting. That eventually grew into a whole museum.</p>
 <figure><div>
-<p><iframe loading="lazy" id="_ytid_29028" width="800" height="450" data-origwidth="800" data-origheight="450" data-relstop="1" src="https://www.youtube.com/embed/Lhl4YS3TQkA?enablejsapi=1&amp;autoplay=0&amp;cc_load_policy=0&amp;cc_lang_pref=&amp;iv_load_policy=1&amp;loop=0&amp;modestbranding=1&amp;rel=0&amp;fs=1&amp;playsinline=0&amp;autohide=2&amp;theme=dark&amp;color=red&amp;controls=1&amp;" title="YouTube player" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen="" data-no-lazy="1" data-skipgform_ajax_framebjll=""></iframe></p>
+<p><iframe loading="lazy" id="_ytid_31726" width="800" height="450" data-origwidth="800" data-origheight="450" data-relstop="1" src="https://www.youtube.com/embed/Lhl4YS3TQkA?enablejsapi=1&amp;autoplay=0&amp;cc_load_policy=0&amp;cc_lang_pref=&amp;iv_load_policy=1&amp;loop=0&amp;modestbranding=1&amp;rel=0&amp;fs=1&amp;playsinline=0&amp;autohide=2&amp;theme=dark&amp;color=red&amp;controls=1&amp;" title="YouTube player" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen="" data-no-lazy="1" data-skipgform_ajax_framebjll=""></iframe></p>
 </div><figcaption>Dmitry Cherepanov gives a tour of his museum in 2019.</figcaption></figure>
 <p><strong>CH: What do you love about computers?</strong></p>
 <p><strong>DC: </strong>Computers are another world in which I can express myself, create. It’s like a parallel universe without borders. I have always been inspired by what computers give us.</p>
@@ -3888,7 +3663,7 @@ April 22, 2022 | https://therecord.media/mariupol-computer-museum-creator-finds-
 <p><strong>DC: </strong>It’s hard for me to say some message to the world&nbsp;except that war is always destruction and death.</p>
 
 
- 
+
 </div></div>]]>
             </description>
             <link>https://therecord.media/mariupol-computer-museum-creator-finds-a-new-war-time-calling/</link>
@@ -5405,178 +5180,7 @@ April 22, 2022 | https://www.thediff.co/p/what-happens-when-most-media-is-produc
 Score 2 | Comments 0 (<a href="https://news.ycombinator.com/item?id=31121425">thread link</a>) | @davidwguymon
 <br/>
 April 22, 2022 | https://davesblog.dev/building-a-reading-log-app-with-the-google-books-api-and-ruby-on-rails-part-2 | <a href="https://web.archive.org/web/*/https://davesblog.dev/building-a-reading-log-app-with-the-google-books-api-and-ruby-on-rails-part-2">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="post-content-wrapper"><p>In <a target="_blank" href="https://davesblog.dev/building-a-reading-log-app-with-the-google-books-api-and-ruby-on-rails-part-1">my previous post</a>, we made our way through the process of successfully making an API call to Google's Books API from a new Rails app and verifying that a successful response is returned. âœ… If you're like me, simply understanding how to fetch data from an external API is astounding! But we're not stopping there. The next challenge in the development of our reading log is twofold: â˜�ï¸� correctly configure a deployment-ready database system, and âœŒï¸� ensure that we can create and persist records for Books and Shelves, including shelves for: </p>
-<ul>
-<li>ðŸ“š we want to read, </li>
-<li>ðŸ“š we are currently reading, </li>
-<li>ðŸ“š we have read, and </li>
-<li>ðŸ“š that hold a special place among our absolute favorites!</li>
-</ul>
-<p>Though it might be tempting to assume that our next step should be building out a user-interface, life will be a lot easier if we prioritize architecting our database and table schemas first.</p>
-<p>By default, newly generated Rails apps (like this one) come with built-in support for a SQLite database. While SQLite is fine for development, in a later article in this series we will walk through deploying our reading log app with Heroku. As a prerequisite, we need to uninstall SQLite and configure our app to use <a target="_blank" href="https://www.postgresql.org/">Postgresql</a>, which is another type of relational database system similar to SQLite.</p>
-<h2 id="heading-replacing-sqlite-with-postgresql">Replacing SQLite with Postgresql</h2>
-<p>Let's begin in our app's <code>Gemfile</code>. ðŸ’Ž </p>
-<p>Here, all we need to do is delete: </p>
-<pre><code>
-gem <span>"sqlite3"</span>
-</code></pre>
-<p>and replace it with:</p>
-<pre><code>
-gem <span>"pg"</span>
-</code></pre>
-<p>Once that's done, run <code>bundle install</code> in your command line to uninstall <code>sqlite3</code> and install <code>pg</code>. You should see output similar to the following (though your gems' version numbers might be different than mine appear here):</p>
-<pre><code>Installing pg <span>1.3</span>.<span>5</span> with native extensions
-Updating files <span>in</span> vendor/cache
-  * pg-<span>1.3</span>.<span>5</span>.gem
-Removing outdated .gem files from vendor/cache
-  * sqlite3-<span>1.4</span>.<span>2</span>.gem
-Bundle complete! <span>17</span> Gemfile dependencies, <span>77</span> gems now installed.
-Bundled gems are installed into <span>`./vendor/cache`</span>
-</code></pre>
-<p>You can additionally verify this change by looking at your <code>Gemfile.lock</code> after the bundle update completes.</p>
-<p>Next, we need to replace the contents of our <code>config/database.yml</code> file with the following configuration (note: replace <code>reading_log_tutorial_*</code> with the name of your own app):</p>
-<pre><code><span>development:</span>
-  <span>adapter:</span> postgresql
-  <span>database:</span> reading_log_tutorial_development
-  <span>pool:</span> <span>5</span>
-  <span>timeout:</span> <span>5000</span>
-<span>test:</span>
-  <span>adapter:</span> postgresql
-  <span>database:</span> reading_log_tutorial_test
-  <span>pool:</span> <span>5</span>
-  <span>timeout:</span> <span>5000</span>
-
-<span>production:</span>
-  <span>adapter:</span> postgresql
-  <span>database:</span> reading_log_tutorial_production
-  <span>pool:</span> <span>5</span>
-  <span>timeout:</span> <span>5000</span>
-</code></pre>
-<p>Lastly, let's setup our new Postgresql database by running the following command in the command line:</p>
-<pre><code>% rake <span>db:</span>setup
-</code></pre>
-<p>If successful, you should see a message similar to the following towards the end of the output:</p>
-<pre><code>Created database <span>'reading_log_tutorial_development'</span>
-Created database <span>'reading_log_tutorial_test'</span>
-</code></pre>
-<h2 id="heading-defining-table-schemas-andamp-scaffolding-resources">Defining Table Schemas &amp; Scaffolding Resources</h2>
-<p>ðŸ˜… Now that we have setup our app with a production-ready database system, we can define and create the tables we need for storing records in that database. Since we intend to have books that can be organized by shelves, we will need a table for books and a separate table for shelves. </p>
-<p>As we've seen, the response we receive from the Books API provides a lot of data for any given book (identified by the <code>"volumeInfo"</code> key). In addition to viewing the returned book fields in our Rails console, we can also see them in the <a target="_blank" href="https://developers.google.com/books/docs/v1/using#response_1">API's documentation</a>. For our app, let's have each book we store include the book's:</p>
-<ul>
-<li>title (as a string),</li>
-<li>authors (as a hash of strings),</li>
-<li>description (as text),</li>
-<li>page count (as an integer), </li>
-<li>categories (as a hash of strings), and</li>
-<li>image links (as a hash of strings)</li>
-</ul>
-<p>And for each shelf we store, let's include the shelf's:</p>
-<ul>
-<li>name (as a string)</li>
-</ul>
-<p>One of the things I â�¤ï¸� most about the Ruby on Rails framework is how easy it makes seemingly difficult tasks, like creating the migration files we need for migrating our database tables, as well as automatically generating our needed routes, controllers, and views associated with the resources we mapped out above.</p>
-<p>We can do this by executing the following Rails scaffold commands:</p>
-<pre><code>rails generate scaffold Book <span>title:</span>string <span>authors:</span>jsonb <span>description:</span>text <span>page_count:</span>integer <span>categories:</span>jsonb <span>image_links:</span>jsonb
-</code></pre>
-<p>and</p>
-<pre><code>rails generate scaffold Shelf <span>name:</span>string
-</code></pre>
-<p>ðŸ’¥ We now have all the files we need for our Books and Shelves. . .</p>
-<p>But if you look at our <code>db/schema.rb</code> file, you'll notice that we don't yet have a books table or a shelves table. ðŸ¤·â€�â™‚ï¸� To create these, we need to tell Rails to build them based on the contents of our <code>db/migrate</code> directory. This is done by executing the following in our command line:</p>
-<pre><code>rake <span>db:</span>migrate
-</code></pre>
-<p>If done successfully, you should see output similar to:</p>
-<pre><code>== <span>20220422041449</span> <span>CreateBooks:</span> migrating ======================================
--- create_table(<span>:books</span>)
-   -&gt; <span>0</span>.<span>015</span>9s
-== <span>20220422041449</span> <span>CreateBooks:</span> migrated (<span>0</span>.<span>0160</span>s) =============================
-
-== <span>20220422041601</span> <span>CreateShelves:</span> migrating ====================================
--- create_table(<span>:shelves</span>)
-   -&gt; <span>0</span>.<span>0052</span>s
-== <span>20220422041601</span> <span>CreateShelves:</span> migrated (<span>0</span>.<span>0053</span>s) ===========================
-</code></pre>
-<p>ðŸ’� Note: If you are not yet familiar with Rails' scaffolding process, take a moment to look at the  auto-generated contents of your app's <code>config/routes.rb</code> file along with the <code>app/controllers</code>, <code>app/helpers</code>, <code>app/models</code>, and <code>app/views</code> directories. ðŸ¤¯</p>
-<h2 id="heading-persisting-books-andamp-shelves-in-our-database">Persisting Books &amp; Shelves in Our Database</h2>
-<p>Our reading log app is now to the point where we can create new records for both books and shelves and persist them in our database through a Rails console. Let's do it!</p>
-<p>After starting a new Rails console in the command line, create a book record by executing the following:</p>
-<pre><code>Book.create!(<span>:title</span> =&gt; <span>"Hello Book World"</span>, <span>:authors</span> =&gt; [<span>"Seymour Butts"</span>])
-</code></pre>
-<p>ðŸŽ‰ We created our first book!</p>
-<pre><code> =&gt;
-
- <span>id:</span> <span>1</span>,
- <span>title:</span> <span>"Hello Book World"</span>,
- <span>authors:</span> <span>"Seymour Butts"</span>,
- <span>description:</span> <span>nil</span>,
- <span>page_count:</span> <span>nil</span>,
- <span>categories:</span> <span>nil</span>,
- <span>image_links:</span> <span>nil</span>,
- <span>created_at:</span> Fri, <span>22</span> Apr <span>2022</span> <span>04</span><span>:</span><span>50</span><span>:</span><span>57.295025000</span> UTC +<span>00</span><span>:</span><span>00</span>,
- <span>updated_at:</span> Fri, <span>22</span> Apr <span>2022</span> <span>04</span><span>:</span><span>50</span><span>:</span><span>57.295025000</span> UTC +<span>00</span><span>:</span><span>00</span>&gt;
-</code></pre>
-<p>What do you notice about our books attribute values? ðŸ¤” </p>
-<p>We have values for a <code>title</code> and an <code>author</code>. But we have <code>nil</code> for <code>description</code>, <code>page_count</code>, <code>categories</code>, and <code>image_links</code>.</p>
-<p>Let's make sure that whenever we create a new book record in our database that it validates that a value is present for each of our book's attributes by adding validations to our <code>/models/book.rb</code> file, like so:</p>
-<pre><code><span><span>class</span> <span>Book</span> &lt; ApplicationRecord</span>
-  validates_presence_of <span>:title</span>, <span>:authors</span>, <span>:description</span>, <span>:page_count</span>, <span>:categories</span>, <span>:image_links</span>
-<span>end</span>
-</code></pre>
-<p>Now, after restarting our Rails console, if we attempt to create a new book record with incomplete data, the action will fail and the output will contain a validation error message that looks something like this:</p>
-<pre><code>Validation <span>failed:</span> Description can<span>'t be blank, Page count can'</span>t be blank, Categories can<span>'t be blank, Image links can'</span>t be blank (ActiveRecord::RecordInvalid)
-</code></pre>
-<p>If we attempt to create a new book and provide values for all of the fields we now validate to be present, our database transaction succeeds. Check it out!</p>
-<pre><code>&gt; Book.create!(<span>:title</span> =&gt; <span>"Hello Book World, the Sequel"</span>, <span>:authors</span> =&gt; [<span>"Harry Butts"</span>], <span>:description</span> =&gt; <span>"A better story than the last"</span>, <span>:page_count</span> =&gt; <span>123</span>,
- <span>:categories</span> =&gt; [<span>"Programming"</span>], <span>:image_links</span> =&gt; { <span>:thumbnail</span> =&gt; <span>"www.notathumbnail.com"</span> })
-</code></pre>
-<p>The output verifies a successful database transaction.</p>
-<pre><code>  TRANSACTION (<span>0</span>.<span>1</span>ms)  <span>BEGIN</span>
-  Book Create (<span>1.4</span>ms)  INSERT INTO <span>"books"</span> (<span>"title"</span>, <span>"authors"</span>, <span>"description"</span>, <span>"page_count"</span>, <span>"categories"</span>, <span>"image_links"</span>, <span>"created_at"</span>, <span>"updated_at"</span>) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING <span>"id"</span>  [[<span>"title"</span>, <span>"Hello Book World, the Sequel"</span>], [<span>"authors"</span>, <span>"[\"Harry Butts\"]"</span>], [<span>"description"</span>, <span>"A better story than the last"</span>], [<span>"page_count"</span>, <span>123</span>], [<span>"categories"</span>, <span>"[\"Programming\"]"</span>], [<span>"image_links"</span>, <span>"{\"thumbnail\":\"www.notathumbnail.com\"}"</span>], [<span>"created_at"</span>, <span>"2022-04-23 04:59:55.634131"</span>], [<span>"updated_at"</span>, <span>"2022-04-23 04:59:55.634131"</span>]]
-  TRANSACTION (<span>0</span>.<span>5</span>ms)  COMMIT
- =&gt; 
-
- <span>id:</span> <span>1</span>,
- <span>title:</span> <span>"Hello Book World, the Sequel"</span>,
- <span>authors:</span> [<span>"Harry Butts"</span>],
- <span>description:</span> <span>"A better story than the last"</span>,
- <span>page_count:</span> <span>123</span>,
- <span>categories:</span> [<span>"Programming"</span>],
- <span>image_links:</span> {<span>"thumbnail"</span>=&gt;<span>"www.notathumbnail.com"</span>},
- <span>created_at:</span> Sat, <span>23</span> Apr <span>2022</span> <span>04</span><span>:</span><span>59</span><span>:</span><span>55.634131000</span> UTC +<span>00</span><span>:</span><span>00</span>,
- <span>updated_at:</span> Sat, <span>23</span> Apr <span>2022</span> <span>04</span><span>:</span><span>59</span><span>:</span><span>55.634131000</span> UTC +<span>00</span><span>:</span><span>00</span>&gt;
-</code></pre>
-<p>Woot! ðŸ™Œ</p>
-<p>Before we forget, let's go add validation to <code>models/shelf.rb</code> to make sure a value for the <code>name</code> attribute is present on newly created shelf records, just like we do with our book attributes.</p>
-<pre><code><span><span>class</span> <span>Shelf</span> &lt; ApplicationRecord</span>
-  validates_presence_of <span>:name</span>
-<span>end</span>
-</code></pre>
-<p>After testing in a restarted Rails console, we see that we can now create and persist shelves too!</p>
-<pre><code>&gt; Shelf.create!(<span>:name</span> =&gt; <span>"To Be Read"</span>)
-  TRANSACTION (<span>0</span>.<span>2</span>ms)  <span>BEGIN</span>
-  Shelf Create (<span>1.1</span>ms)  INSERT INTO <span>"shelves"</span> (<span>"name"</span>, <span>"created_at"</span>, <span>"updated_at"</span>) VALUES ($1, $2, $3) RETURNING <span>"id"</span>  [[<span>"name"</span>, <span>"To Be Read"</span>], [<span>"created_at"</span>, <span>"2022-04-23 05:01:14.768796"</span>], [<span>"updated_at"</span>, <span>"2022-04-23 05:01:14.768796"</span>]]
-  TRANSACTION (<span>0</span>.<span>3</span>ms)  COMMIT
- =&gt; 
-
- <span>id:</span> <span>1</span>,
- <span>name:</span> <span>"To Be Read"</span>,
- <span>created_at:</span> Sat, <span>23</span> Apr <span>2022</span> <span>05</span><span>:</span><span>01</span><span>:</span><span>14.768796000</span> UTC +<span>00</span><span>:</span><span>00</span>,
- <span>updated_at:</span> Sat, <span>23</span> Apr <span>2022</span> <span>05</span><span>:</span><span>01</span><span>:</span><span>14.768796000</span> UTC +<span>00</span><span>:</span><span>00</span>&gt;
-</code></pre>
-<p>Hotdog! We've made a lot of progress. Together, we learned how to:</p>
-<ol>
-<li><p>Replace SQLite with Postgres as our database system for production-ready deploys,</p>
-</li>
-<li><p>Define table schemas,</p>
-</li>
-<li><p>Create scaffolded resources, including files for migrations, models, controllers, and views, and</p>
-</li>
-<li><p>Add validations to our model classes to ensure that we only persist records to our database that have values present for each attribute.</p>
-</li>
-</ol>
-<p>In part 3ï¸�âƒ£ of this series, we'll learn how to organize books by shelves through creating model associations and a third unique database table commonly known as a <em>bridge table</em>. </p>
-<p>In part 4ï¸�âƒ£, we'll dive into our views and controllers to create book records from our fetched API data with the click of a button. Stay tuned!</p>
-</div></div>]]>
+<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
             </description>
             <link>https://davesblog.dev/building-a-reading-log-app-with-the-google-books-api-and-ruby-on-rails-part-2</link>
             <guid isPermaLink="false">hacker-news-small-sites-31121425</guid>
@@ -7941,7 +7545,7 @@ April 22, 2022 | https://moontowermeta.com/if-you-make-money-every-day-youre-not
 Score 3 | Comments 0 (<a href="https://news.ycombinator.com/item?id=31119321">thread link</a>) | @arraypad
 <br/>
 April 22, 2022 | https://repography.com/blog/github-dashboards-v2 | <a href="https://web.archive.org/web/*/https://repography.com/blog/github-dashboards-v2">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>A few weeks ago I deployed a pretty significant change in how our GitHub dashboards are rendered. Instead of a single SVG image to embed, we now generate templated Markdown / reST which may include smaller SVG components.</p><p>I haven't had the time to write about it until now, but I think it's worth explaining the rationale and the implications.</p><p>I'd received a fair amount of feedback (thanks!) about the dashboards. Lots of positive feedback but among the more critical, there were a few common themes:</p><ul><li>They took up too much space in a README</li><li>Didn't scale well on mobile</li><li>Didn't work very well in dark mode</li><li>Included information which wasn't always relevant to the repo</li></ul><p>The main hurdle in addressing these points was that we were generating a single SVG per dashboard. During the generation of this SVG we can make some guesses about what you'd like to see, but it's fundamentally a one-size-fits-all approach.</p><p>Right now the "Recent Activity" dashboard is the main beneficiary. Being composed of several components it's a great opportunity to put more power in the hands of the user. You can now select which components you'd like to have included. For example many repos don't accept issues, so that component you can ignore completely.</p><figure><p><img src="https://assets.repography.com/file/repography-assets/blog/github-dashboards-v2/dashboard-recent-activity.png" alt="Selecting individual components to appear on the Recent Activity dashboard"></p><figcaption>Selecting individual components to appear on the Recent Activity dashboard</figcaption></figure><p>More generally, this change has some great benefits:</p><ul><li>Responsive: Smaller components can become single-column on mobile, rather than the whole image scaling down.</li><li>Improved accessibility, and legibility in dark mode: By generating appropriate semantic markup the dashboards fit more naturally into your README regardless of the context.</li><li>Meaningful links for individual components, e.g. the issue status diagram links to the Issues page.</li></ul><p>I'm continuing to work on the dashboards - both improving the output of the existing designs and also developing some new ideas - so it's worth checking back regularly to see what's new.</p><h3>If you've already embedded the dashboards</h3><p>This change is fully backwards compatible so there's no need to do anything if you're happy with what you have now, your dashboard will continue to be updated. I think there is still merit in a single-SVG version which can be more opiniated, so that won't be going away any time soon.</p><h3>More feedback, please!</h3><p>Thanks to everyone who's already using our GitHub dashboards, and especially those who've taken the time to feed back on how they could be improved. It's hugely appreciated!</p><p>Whether you're tickled or irritated by something we're doing now, or you have a great idea of something else we could be doing, I'd love it hear it. Please send me an email directly at <a href="https://repography.com/cdn-cgi/l/email-protection#127360627376526077627d756073627a6b3c717d7f"><span data-cfemail="e08192908184a09285908f879281908899ce838f8d">[email&nbsp;protected]</span></a>.</p></div></div>]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>A few weeks ago I deployed a pretty significant change in how our GitHub dashboards are rendered. Instead of a single SVG image to embed, we now generate templated Markdown / reST which may include smaller SVG components.</p><p>I haven't had the time to write about it until now, but I think it's worth explaining the rationale and the implications.</p><p>I'd received a fair amount of feedback (thanks!) about the dashboards. Lots of positive feedback but among the more critical, there were a few common themes:</p><ul><li>They took up too much space in a README</li><li>Didn't scale well on mobile</li><li>Didn't work very well in dark mode</li><li>Included information which wasn't always relevant to the repo</li></ul><p>The main hurdle in addressing these points was that we were generating a single SVG per dashboard. During the generation of this SVG we can make some guesses about what you'd like to see, but it's fundamentally a one-size-fits-all approach.</p><p>Right now the "Recent Activity" dashboard is the main beneficiary. Being composed of several components it's a great opportunity to put more power in the hands of the user. You can now select which components you'd like to have included. For example many repos don't accept issues, so that component you can ignore completely.</p><figure><p><img src="https://assets.repography.com/file/repography-assets/blog/github-dashboards-v2/dashboard-recent-activity.png" alt="Selecting individual components to appear on the Recent Activity dashboard"></p><figcaption>Selecting individual components to appear on the Recent Activity dashboard</figcaption></figure><p>More generally, this change has some great benefits:</p><ul><li>Responsive: Smaller components can become single-column on mobile, rather than the whole image scaling down.</li><li>Improved accessibility, and legibility in dark mode: By generating appropriate semantic markup the dashboards fit more naturally into your README regardless of the context.</li><li>Meaningful links for individual components, e.g. the issue status diagram links to the Issues page.</li></ul><p>I'm continuing to work on the dashboards - both improving the output of the existing designs and also developing some new ideas - so it's worth checking back regularly to see what's new.</p><h3>If you've already embedded the dashboards</h3><p>This change is fully backwards compatible so there's no need to do anything if you're happy with what you have now, your dashboard will continue to be updated. I think there is still merit in a single-SVG version which can be more opiniated, so that won't be going away any time soon.</p><h3>More feedback, please!</h3><p>Thanks to everyone who's already using our GitHub dashboards, and especially those who've taken the time to feed back on how they could be improved. It's hugely appreciated!</p><p>Whether you're tickled or irritated by something we're doing now, or you have a great idea of something else we could be doing, I'd love it hear it. Please send me an email directly at <a href="https://repography.com/cdn-cgi/l/email-protection#68091a18090c281a0d18070f1a09180011460b0705"><span data-cfemail="0c6d7e7c6d684c7e697c636b7e6d7c6475226f6361">[email&nbsp;protected]</span></a>.</p></div></div>]]>
             </description>
             <link>https://repography.com/blog/github-dashboards-v2</link>
             <guid isPermaLink="false">hacker-news-small-sites-31119321</guid>
@@ -18938,8 +18542,6 @@ April 20, 2022 | http://letterlocking.org/about | <a href="https://web.archive.o
 
 
 
-
-
 <div>
 
   <div>
@@ -19816,7 +19418,7 @@ April 20, 2022 | http://letterlocking.org/about | <a href="https://web.archive.o
 
             
               
-  …</div></div></div></div></div></div></div></div></div></div>
+    …</div></div></div></div></div></div></div></div></div></div>
 <br/><p><em>Article truncated for RSS feed. Read the full article at <a href="http://letterlocking.org/about">http://letterlocking.org/about</a></em></p>]]>
             </description>
             <link>http://letterlocking.org/about</link>
