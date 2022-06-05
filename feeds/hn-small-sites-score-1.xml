@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Sun, 05 Jun 2022 12:48:34 GMT</lastBuildDate>
+        <lastBuildDate>Sun, 05 Jun 2022 16:42:16 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-1.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Sun, 05 Jun 2022 12:48:34 GMT</pubDate>
+        <pubDate>Sun, 05 Jun 2022 16:42:16 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -671,7 +671,174 @@ June 3, 2022 | https://matt3o.com/about-mt3-profile-and-devtty-set/ | <a href="h
 Score 2 | Comments 0 (<a href="https://news.ycombinator.com/item?id=31617467">thread link</a>) | @pizza
 <br/>
 June 3, 2022 | https://www.thegoodpenguin.co.uk/blog/pcie-dma-attack-against-a-secured-jetson-nano-cve-2022-21819/ | <a href="https://web.archive.org/web/*/https://www.thegoodpenguin.co.uk/blog/pcie-dma-attack-against-a-secured-jetson-nano-cve-2022-21819/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div itemprop="text">
+		
+<p>Congratulations! Your <a rel="noreferrer noopener" href="https://developer.nvidia.com/embedded/jetson-nano" target="_blank">Jetson Nano</a> (T210) product is finished and ready to ship worldwide. Secure boot is enabled, Linux and it’s bootloaders are locked down and the file system holding your precious IP is encrypted. Even JTAG is disabled with an OTP (One-Time-Programmable) security fuse. Yet, lurking in the Jetson Nano’s Linux kernel is a PCIe IOMMU vulnerability allowing an attacker to circumvent all that security. An off-the-shelf $500 tool, the <a rel="noreferrer noopener" href="https://shop.lambdaconcept.com/home/43-screamer-m2.html" target="_blank">PCI Screamer</a>, and open source software, <a rel="noreferrer noopener" href="https://github.com/ufrisk/pcileech" target="_blank">PCI Leech</a>, gives total RAM and kernel access at over 20MB/s. Yes – faster than the expensive JTAG probes you just locked out. How is this possible?</p>
+
+
+
+<p>This blog post aims to answer that question and show how we investigated and fixed the problem. To begin, we need to look at the architecture and peripheral interconnect of a modern SoC (System-On-Chip).</p>
+
+
+
+<h3>Background</h3>
+
+
+
+<p>Central to every SoC is a bus fabric connecting the CPU(s), RAM and peripherals together. For the Jetson Nano this is ARM’s AXI (Advanced eXtensible Interface) with lower performance AHB buses attached for low-speed peripherals. To enhance performance, work is off-loaded from the CPU to various accelerators. The most fundamental accelerator is the DMA (Direct Memory Access) controller, a  co-processor dedicated to moving data between peripherals and memory. The CPU programs the DMA controller to perform a transfer and notify it when completed. Dedicated flow control signals from the bus and peripherals allow the DMA controller to operate autonomously. The AXI bus lets multiple ‘bus-masters’ perform transfers simultaneously and independently, including the CPU(s), DMA and GPU.</p>
+
+
+
+<p>DMA is a key element of all high performance systems, but there is a security catch. The DMA controller has full access to all RAM and peripherals in the system. If incorrectly programmed it can <strong>write</strong> to application or kernel process memory, causing an immediate segfault or mysterious untraceable bugs.&nbsp; It can also <strong>read</strong> from all RAM, including the kernel areas holding passwords, encryption keys and your super-secret application IP. This is the same situation as a CPU without an MMU (Memory Management Unit) where software tasks can trample over each other.</p>
+
+
+
+<p>A single central DMA controller can be a bottleneck in high-performance systems, so the highest bandwidth peripherals are usually equipped with their own independent bus-mastering DMA controllers. Each has full access to the system bus. This gets interesting when the peripheral itself is an expansion bus controller such as Firewire, Thunderbolt or PCIe. Devices attached to these expansion buses can themselves operate as DMA bus masters and initiate transfer requests to their bus (e.g. PCIe). If the addresses are right then the read/write requests pass through to the host bus (e.g. AXI). This is obviously great if your NVMe drive can independently be asked to DMA data into host memory, but is terrible if a rogue PCIe device were to read your kernel memory…</p>
+
+
+
+<p>Obviously bus masters need to be limited to only the address ranges required to to their job e.g. an NVMe drive only actually needs to access the buffer it’s supposed to be reading / writing, not all of RAM! Enter the IOMMU (Input Output Memory Management Unit) to provide a private virtual address space for each bus-master, with a translation table mapping virtual addresses to physical bus addresses. A properly configured IOMMU will prevent memory corruption caused by bad drivers and also prevent an attacker using DMA. Except the IOMMU isn’t always enabled correctly.</p>
+
+
+
+<p>Note: the IOMMU only maps accesses originating <strong>from the peripheral </strong>(e.g. PCI bus). It does not map requests in the other direction from the host AXI bus to the peripheral. In PCI the BARs (Base Address Registers) perform the mapping and protection of accesses <strong>from the AXI bus </strong>to the PCI bus’s address space. For T210 the BARs live in the AFI bridge between AXI and Root Complexes.</p>
+
+
+
+<p><a href="https://en.wikipedia.org/wiki/DMA_attack" target="_blank" rel="noreferrer noopener">DMA attacks</a> have been well described on x86 platforms, and comprehensive hardware and software tools exist to exploit the holes. The PCI Leech software is a great example – see this <a href="https://media.ccc.de/v/34c3-9111-public_fpga_based_dma_attacking#t=1208">presentation by the author Ulf Frisk</a>. Dedicated PCIe hardware hacking tools are also available off-the-shelf, such as the PCI Screamer devices from <a href="https://shop.lambdaconcept.com/">Lambda Concepts</a> – an M.2 PCIe card with FPGA and USB bridge allowing DMA attacks to be performed. These tools are used by PC gamers seeking to gain advantage in online tournaments by modifying game parameters in real-time.</p>
+
+
+
+<h3>Test for PCIe vulnerability</h3>
+
+
+
+<p>This brings us to NVIDIA’s Jetson Nano SoM (System on Module) fitted with the Tegra T210. We recently implemented a Yocto BSP with <a href="https://www.thegoodpenguin.co.uk/blog/filesystem-encryption-on-a-jetson-nano/">secure file system encryption</a> for a customer, alongside a security review and hardening. Our review highlighted the potential for a PCIe DMA attack. Ideally we’d simply disable PCIe, but our customer requires PCIe for bulk data storage to an M.2 NVMe SSD. We could not find examples of PCIe attacks against ARM platforms, so we investigated to see if the theoretical attack was possible in practice.</p>
+
+
+
+<p>In embedded systems it’s often helpful to investigations by checking how the hardware is actually configured, and then compare against what the OS thinks. We begin by looking at the IOMMU registers, which show that the IOMMU (also called the SMMU) is enabled. However the PCIe controller (called AFI in the T210) has a value of 0x00000000 meaning it is not assigned to an ASID (Address Space ID) and is unmapped.</p>
+
+
+
+<pre><code><span>0x70019010 = 0xFFFFFFFF  MC_SMMU_CONFIG_0   = IOMMU Enabled</span>
+<span><strong>0x70019238 = 0x00000000  MC_SMMU_AFI_ASID_0 = Translation disabled!</strong></span>
+<span>0x70019228 = 0xFFFFFFFF  MC_SMMU_TRANSLATION_ENABLE_0_0 = All mapped
+0x7001922C = 0xFFFFFFFF  MC_SMMU_TRANSLATION_ENABLE_1_0 = All mapped
+0x70019230 = 0xFFFFFFFF  MC_SMMU_TRANSLATION_ENABLE_2_0 = All mapped
+0x70019234 = 0xFFFFFFFF  MC_SMMU_TRANSLATION_ENABLE_3_0 = All mapped</span></code></pre>
+
+
+
+<p>If a peripheral is not mapped by the Tegra IOMMU then all requests are routed through to the AXI bus with a 1:1 mapping. So, from the hardware configuration, we’d expect a PCIe device should have full DMA access to the system RAM.</p>
+
+
+
+<p>Next we check the Linux kernel’s view of IOMMU configuration.  DebugFS shows us all the assigned ASIDs:</p>
+
+
+
+<pre><code lang="">$ ls /sys/kernel/debug/70019000.iommu/
+     
+    <span>as000    as002    as004    as006    as008    as010    masters</span>
+    <span>as001    as003  </span>  <span>as005    as007    as009    as011</span></code></pre>
+
+
+
+<p>DebugFS also shows the bus-masters mapped by the IOMMU that use these ASIDs. Note that there are more bus-masters than ASIDs because one ASID can be shared by multiple masters using the same address range:</p>
+
+
+
+<pre><code lang="">$ ls /sys/kernel/debug/70019000.iommu/masters/
+
+    50000000.host1x                  7000d100.i2c
+    54080000.vi                      7000d400.spi
+    54100000.tsecb                   7000d600.spi
+    54340000.vic                     70012000.se
+    54380000.nvjpg                   70090000.xusb
+    54480000.nvdec                   700d0000.xudc
+    544c0000.nvenc                   702ef000.adsp
+    54500000.tsec                    aconnect@702c0000:adsp_audio
+    54600000.isp                     flush_all_threshold_map_pages
+    54680000.isp                     flush_all_threshold_unmap_pages
+    546c0000.i2c                     mc
+    57000000.gpu                     sdhci-tegra.2
+    70006000.serial                  sdhci-tegra.3
+    70006040.serial                  serial8250
+    70006200.serial                  smmu_test
+    7000c000.i2c                     snd-soc-dummy
+    7000c400.i2c                     tegra-carveouts
+    7000c500.i2c                     tegradc.0
+    7000c700.i2c                     tegradc.1
+    7000d000.i2c</code></pre>
+
+
+
+<p>AFI is not listed, which confirms what we saw from the IOMMU registers; that the PCIe controller is not mapped by the IOMMU.</p>
+
+
+
+<p>Before we can use the PCI Screamer to attack the PCIe we need to know which addresses to dump. The Nano SOM (System on Module) has 4GB of RAM located as 2x 2GB banks at these physical addresses:</p>
+
+
+
+<pre><code>1st 2GB of RAM   base=0x0000000080000000 size=0x80000000 (2GB)
+2nd 2GB of RAM   base=0x0000000100000000 size=0x80000000 (2GB)</code></pre>
+
+
+
+<p>Tegra Linux reports it is using RAM in 3 regions:</p>
+
+
+
+<pre><code lang="">$ cat /sys/kernel/debug/memblock/memory
+
+    0: 0x0000000080000000..0x00000000afffffff
+    1: 0x00000000b0200000..0x00000000fedfffff
+    2: 0x0000000100000000..0x000000017f1fffff</code></pre>
+
+
+
+<p>The gaps are because the Tegra Memory Controller also supports independent Carve-Outs and Protection Regions that operate independently of the IOMMU. They protect critical systems such as the TSEC Security Processor.</p>
+
+
+
+<pre><code>iram              base=0x0000000040001000 size=0x0003f000
+ramoops           base=0x00000000b0000000 size=0x00200000
+VPR               base=0x00000000d7000000 size=0x19000000
+Nck Carveout      base=0x00000000ff080000 Size=0x00200000
+RamDump Carveout  base=0x00000000ff280000 Size=0x00080000
+GSC5 Carveout     base=0x00000000ff300000 Size=0x00100000
+GSC4 Carveout     base=0x00000000ff400000 Size=0x00100000
+GSC2 Carveout     base=0x00000000ff500000 Size=0x00100000
+GSC1 Carveout     base=0x00000000ff600000 Size=0x00100000
+BpmpFw Carveout   base=0x00000000ff700000 Size=0x00080000
+Lp0 Carveout      base=0x00000000ff780000 Size=0x00001000
+SecureOs Carveout base=0x00000000ff800000 Size=0x00800000
+GSC3 Carveout     base=0x000000017f300000 Size=0x00d00000</code></pre>
+
+
+
+<p>Now we have all the information we need, we can fit the PCI Screamer into the M.2 socket and dump memory using PCI Leech:</p>
+
+
+
+<pre><code lang=""># sudo pcileech dump -min  0x80000000 -max  0xd7000000 -device fpga
+$ sudo pcileech dump -min  0xf0000000 -max  0xff280000 -device fpga
+$ sudo pcileech dump -min 0x100000000 -max 0x17f300000 -device fpga</code></pre>
+
+
+
+<p>The PCI Leech software reads all the regions perfectly at 20MB/s:</p>
+
+
+
+<pre><code>[+] using FTDI device: 0403:601f (bus 1, device 25)
+ [+] FTDIFTDI SuperSpeed-FIFO Bridge000000000001
+  Current Action: Dumping Memory                             
+  Access Mode:    Normal                                                       
+  Progress:   …</code></pre></div></div>
+<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://www.thegoodpenguin.co.uk/blog/pcie-dma-attack-against-a-secured-jetson-nano-cve-2022-21819/">https://www.thegoodpenguin.co.uk/blog/pcie-dma-attack-against-a-secured-jetson-nano-cve-2022-21819/</a></em></p>]]>
             </description>
             <link>https://www.thegoodpenguin.co.uk/blog/pcie-dma-attack-against-a-secured-jetson-nano-cve-2022-21819/</link>
             <guid isPermaLink="false">hacker-news-small-sites-31617467</guid>
@@ -4946,7 +5113,7 @@ June 3, 2022 | https://www.brycewray.com/posts/2022/06/static-mastodon-toots-hug
 </span></span><span><span>      <span>},</span>
 </span></span><span><span>      <span>{</span>
 </span></span><span><span>        <span>"name"</span><span>:</span> <span>"Birdsite"</span><span>,</span>
-</span></span><span><span>        <span>"value"</span><span>:</span> <span>"\\u003cspan class=\"h-card\"\\u003e\\u003ca href=\"https://mastodon.technology/@BryceWrayTX\" class=\"u-url mention\"\\<a href="https://www.brycewray.com/cdn-cgi/l/email-protection" data-cfemail="bdc88d8d8ed8fd">[email&nbsp;protected]</a>\\u003cspan\\u003eBryceWrayTX\\u003c/span\\u003e\\u003c/a\\u003e\\u003c/span\\u003e"</span><span>,</span>
+</span></span><span><span>        <span>"value"</span><span>:</span> <span>"\\u003cspan class=\"h-card\"\\u003e\\u003ca href=\"https://mastodon.technology/@BryceWrayTX\" class=\"u-url mention\"\\<a href="https://www.brycewray.com/cdn-cgi/l/email-protection" data-cfemail="21541111124461">[email&nbsp;protected]</a>\\u003cspan\\u003eBryceWrayTX\\u003c/span\\u003e\\u003c/a\\u003e\\u003c/span\\u003e"</span><span>,</span>
 </span></span><span><span>        <span>"verified_at"</span><span>:</span> <span>null</span>
 </span></span><span><span>      <span>}</span>
 </span></span><span><span>    <span>],</span>
@@ -5381,7 +5548,7 @@ June 3, 2022 | https://courses.dibya.online/p/fastdeeprl | <a href="https://web.
 
 </div>
 <div>
-<p><a href="https://www.linkedin.com/in/dmatrix/" target="_blank" rel="noopener">
+ <p><a href="https://www.linkedin.com/in/dmatrix/" target="_blank" rel="noopener">
 <img alt="" src="https://cdn.fs.teachablecdn.com/2jWziRANSG68T69uSvB3">
 </a></p><div><h5>"Brilliant introduction to RL concepts and how they map to RLlib."<br></h5><p><strong>Jules S. Damji</strong> - Lead Developer Advocate, Anyscale<br></p></div>
 
@@ -5477,7 +5644,7 @@ June 3, 2022 | https://courses.dibya.online/p/fastdeeprl | <a href="https://web.
 </section>
 </div>
 
-
+ 
 <div id="block-101400598">
 
 <section>
@@ -5491,7 +5658,6 @@ June 3, 2022 | https://courses.dibya.online/p/fastdeeprl | <a href="https://web.
 </div>
 </section>
 </div>
-
 
 
 <div id="block-101400599">
@@ -5526,7 +5692,6 @@ June 3, 2022 | https://courses.dibya.online/p/fastdeeprl | <a href="https://web.
 </div>
 </div>
 </div>
-
 
 
 
@@ -5577,6 +5742,7 @@ June 3, 2022 | https://courses.dibya.online/p/fastdeeprl | <a href="https://web.
 </div>
 
 
+
 <div id="block-101400605">
 
 <section>
@@ -5617,7 +5783,6 @@ June 3, 2022 | https://courses.dibya.online/p/fastdeeprl | <a href="https://web.
 </p>
 </section>
 </div>
-
 
 
 <div id="block-101400608">
@@ -9063,7 +9228,219 @@ BTW, creating an OpenBSD port is out of this post's scope.
 Score 3 | Comments 1 (<a href="https://news.ycombinator.com/item?id=31605146">thread link</a>) | @forrestthewoods
 <br/>
 June 3, 2022 | https://www.forrestthewoods.com/blog/benchmarking-malloc-with-doom3/ | <a href="https://web.archive.org/web/*/https://www.forrestthewoods.com/blog/benchmarking-malloc-with-doom3/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+            <p>This blog post began the same way as many of my posts. I nerd sniped myself.</p>
+
+            <p>I recently read about a new audio library for games. It repeated a claim that is conventional wisdom in the audio programming world – "you can't allocate or deallocate memory on the audio thread". That's a very strong statement, and I'm not sure it's correct.</p>
+            
+            <p>Lately I've been doing quite a bit of audio and audio-like programming. My code is efficient and does pre-allocate quite a bit. However it uses both <code>malloc</code> and <code>mutex</code>. It also happens to run great and glitch free!</p>
+            
+            <p>Here's my question: what is the worst-case performance for <code>malloc</code> on a modern machine in practice?</p>
+            
+            <p><img src="https://www.forrestthewoods.com/blog/benchmarking-malloc-with-doom3/assets/img/01.png" alt="Tim Sweeney quote on malloc"></p><p>Source: <a href="https://twitter.com/TimSweeneyEpic/status/1526439480873328640">Twitter</a></p>
+
+            
+
+            
+
+            <p>Answering performance questions is hard. The boring answer is always the same – it depends!</p>
+            
+            <p>How big is your allocation? What is your program's allocation pattern? Is it heavily multi-threaded? Are you a long lived server or medium lived game? It always depends.</p>
+
+            <p>Allocating memory isn't free. Time spent on complex systems full of error prone lockless programming isn't free either. My spidey sense suggests <code>malloc</code> is cheaper than people realize.</p>
+
+            <p>For today I'm focused on games. Modern games run between 60 and 144 frames per second. One frame at 144Hz is about 7 milliseconds. That's not very many milliseconds! Except I know most games hit the allocator hard. Worst case in theory sets my computer on fire. What is it in practice?</p>
+
+            <p>My goal isn't to come up with a singular, definitive answer. I'm a big fan of napkin math. I want a ballpark guideline of when <code>malloc</code> may cause me to miss my target framerate.</p>
+
+            
+
+            
+
+            <p>My first attempt at a benchmark involved allocating and freeing blocks of random size. Twitter friends correctly scolded me and said that's not good enough. I need real data with real allocation patterns and sizes.</p>
+
+            <p>The goal is to create a "journal" of memory operations. It should record <code>malloc</code> and <code>free</code> operations with their inputs and outputs. Then the journal can be replayed with different allocators to compare performance.</p>
+
+            <p>Unfortunately I don't have a suitable personal project for generating this journal. I did a quick search for open source games and the choice was obvious – Doom 3!</p>
+
+            <p>It took some time to find a Doom 3 project that had a "just works" Visual Studio project. Eventually I found <a href="https://github.com/RobertBeckebans/RBDOOM-3-BFG">RBDOOM-3-BFG</a> which only took a little effort to get running.</p>
+
+            <p>All memory allocations go through <code>Mem_Alloc16</code> and <code>Mem_Free16</code> functions defined in <a href="https://github.com/RobertBeckebans/RBDOOM-3-BFG/blob/master/neo/idlib/Heap.cpp">Heap.cpp</a>. Modifying this was trivial. I started with the simplest possible thing and wrote every allocation to disk via <code>std::fwrite</code>. It runs a solid 60fps even in debug mode. Ship it!</p>
+
+<pre><span>void</span><span>*</span> fts_allocator<span>::</span>allocInternal(<span>const</span> <span>size_t</span> size) {
+  <span>auto</span> allocRelativeTime <span>=</span> (Clock<span>::</span>now() <span>-</span> _timeBegin);
+
+  <span>// Perform actual malloc</span>
+  <span>auto</span> ptr <span>=</span> _aligned_malloc(size, <span>16</span>);
+
+  <span>// AllocEntry = a allocSize ptr threadId timestamp</span>
+  std<span>::</span>array<span>&lt;</span><span>char</span>, <span>256</span><span>&gt;</span> buf;
+  <span>int</span> len <span>=</span> std<span>::</span>snprintf(
+    buf.data(),
+    buf.size(), 
+    <span>"a %lld %p %lu %lld</span><span>\n</span><span>"</span>,
+    size, ptr, GetCurrentThreadId(), allocRelTime.count());
+  std<span>::</span>fwrite(buf.data(), <span>1</span>, len, _file);
+
+  <span>return</span> ptr;
+}
+</pre>
+
+            <p>Running <code>Doom3BFG.exe</code> now produces a file called <code>doom3_journal.txt</code>. This journal records every single <code>malloc</code> and <code>free</code> from startup to shut down. It looks like this:</p>
+
+            <pre>a 2048 0000023101F264A0 15888 542200
+a 1280 0000023101F28020 15888 1098100
+a 2560 0000023101F298A0 15888 1130500
+f 0000023101F28020 15888 1142000
+a 3840 0000023101F2A300 15888 1146900
+f 0000023101F298A0 15888 1154900
+a 1280 0000023101F28020 15888 1171200
+a 2560 0000023101F298A0 15888 1189500
+f 0000023101F28020 15888 1191900
+a 3840 0000023101F2B260 15888 1202200
+f 0000023101F298A0 15888 1207900</pre>
+
+            <p>All content for the rest of this post is derived from the same journal. It's a 420 megabyte file containing over 11,000,000 lines. Roughly 5.5 million <code>mallocs</code> and 5.5 million <code>frees</code>. It leaks 7 megabytes from 8473 <code>mallocs</code>, tsk tsk.</p>
+
+            <p>The journal covers 7 minutes of game time. I entered the main menu, selected a level, played, died, reloaded, died again, quit to main menu, and quit to desktop. I did this a few times and each run produced very similar journals. </p>
+
+            
+
+            
+
+            <p>Next, we need to write code to load and replay the journal. To do this I created a new C++ project called <code>MallocMicrobench</code>. The code can be summarized as:</p>
+
+<pre>std<span>::</span>vector<span>&lt;</span>Entry<span>&gt;</span> journal <span>=</span> ParseJournal(<span>"doom3_journal.txt"</span>);
+<span>for</span> (<span>auto</span><span>&amp;</span> entry <span>:</span> journal) {
+  <span>// Spin until journal time</span>
+  <span>while</span> (ReplayClock<span>::</span>now() <span>&lt;</span> entry.timepoint) {}
+
+  <span>if</span> (entry.op <span>==</span> Alloc) {
+    <span>// Measure malloc</span>
+    <span>auto</span> allocStart <span>=</span> RdtscClock<span>::</span>now();
+    <span>void</span><span>*</span> ptr <span>=</span> <span>::</span>malloc(entry.size);
+    <span>auto</span> allocTime <span>=</span> RdtscClock<span>::</span>now() <span>-</span> allocStart;
+  } <span>else</span> {
+    <span>// Measure free</span>
+    <span>auto</span> freeStart <span>=</span> RdtscClock<span>::</span>now();
+    <span>::</span>free(entry.ptr);
+    <span>auto</span> freeTime <span>=</span> RdtscClock<span>::</span>now() <span>-</span> freeStart;
+  }
+}</pre>
+
+            <p>This snippet excludes configuration and bookkeeping. The basic idea is very simple.</p>
+
+            <p>Running my journal through the new replay system produces the following output:</p>
+
+<pre>Parsing log file: c:/temp/doom3_journal.txt
+Running Replay
+
+== Replay Results ==
+Number of Mallocs:    5531709
+Number of Frees:      5523236
+Total Allocation:     2.47 gigabytes
+Max Live Bytes:       330 megabytes
+Average Allocation:   480 bytes
+Median Allocation:    64 bytes
+Average Malloc Time:  57 nanoseconds
+Num Leaked Bytes:     7 megabytes
+
+Alloc Time
+Best:    21 nanoseconds
+p1:      22 nanoseconds
+p10:     22 nanoseconds
+p25:     23 nanoseconds
+p50:     31 nanoseconds
+p75:     45 nanoseconds
+p90:     58 nanoseconds
+p95:     86 nanoseconds
+p98:     192 nanoseconds
+p99:     316 nanoseconds
+p99.9:   3.07 microseconds
+p99.99:  25.75 microseconds
+p99.999: 95.01 microseconds
+Worst:   200.74 microseconds</pre>
+
+            <p>Interesting! Average <code>malloc</code> time is 57 nanoseconds. That's decent. However <code>p99.9</code> time (1 in 1000) is 2.67 microseconds. That's not great. Worst case is a whopping 200 microseconds, ouch!</p>
+
+            <p>What does this mean for hitting 144Hz? Honestly, I don't know. There's a ton of variance. Are the slow allocations because of infrequent but large allocations? Do slow allocs occur only during a loading screen or also in the middle of gameplay? Are outliers due to OS context switches? We don't have enough information.</p>
+
+            <p>Note: <a href="https://www.forrestthewoods.com/blog/benchmarking-malloc-with-doom3/assets/img/percentile_heapalloc_large.png">Evidence</a> <a href="https://www.forrestthewoods.com/blog/benchmarking-malloc-with-doom3/assets/img/percentile_heapalloc_zoomed_large.png">indicates</a> that on Windows the C Runtime (CRT) <code>malloc</code> is a thin wrapper around <a href="https://docs.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heapalloc">HeapAlloc</a>. This post will stick with the terminology <code>malloc</code>. All replays were run in <code>Release</code> mode from a Windows console.</p>
+
+            
+
+            
+
+            <p>We need to graph our replay data to make better sense of it.</p>
+
+            <p>First, I took <code>doom3_journal.txt</code>, ran a replay, and produced a new <code>doom3_replayreport.csv</code>. This replay report contains replay timestamps and profiler time for <code>malloc</code> and <code>free</code>. It looks like this:</p>
+
+<pre><span>replayAllocTimestamp</span>,<span>allocTime</span>,<span>allocSize</span>,<span>replayFreeTimestamp</span>,<span>freeTime</span>
+<span>661500</span>,<span>375</span>,<span>2048</span>,<span>0</span>,<span>0</span>
+<span>881700</span>,<span>531</span>,<span>1280</span>,<span>912000</span>,<span>254</span>
+<span>911600</span>,<span>268</span>,<span>2560</span>,<span>935400</span>,<span>343</span>
+<span>917500</span>,<span>261</span>,<span>3840</span>,<span>0</span>,<span>0</span>
+<span>935800</span>,<span>153</span>,<span>1280</span>,<span>961800</span>,<span>101</span>
+<span>961600</span>,<span>206</span>,<span>2560</span>,<span>962700</span>,<span>146</span>
+<span>962000</span>,<span>248</span>,<span>3840</span>,<span>0</span>,<span>0</span>
+<span>984500</span>,<span>447</span>,<span>3760</span>,<span>432968726000</span>,<span>397</span>
+<span>993400</span>,<span>18980</span>,<span>3760</span>,<span>432968728400</span>,<span>758</span>
+<span>1012500</span>,<span>1354</span>,<span>3760</span>,<span>432968729200</span>,<span>133</span>
+<span>1013900</span>,<span>1365</span>,<span>3760</span>,<span>432968842900</span>,<span>161</span>
+</pre>
+
+            <p>To graph this data I used Python's <a href="https://matplotlib.org/">matplotlib</a>.</p>
+
+            <p>After several failed experiments I landed on scatterplots. This looked great. Unfortunately, Python is a miserably slow language so rendering 11 million points took over 45 seconds. Yikes!</p>
+
+            <p>A kind Twitter user pointed me towards a <code>matplotlib</code> extension called <a href="https://github.com/astrofrog/mpl-scatter-density">mpl-scatter-density</a>. This worked phenomenally well and turned 45 seconds into 3 seconds. My biggest bottleneck is now csv parsing.</p>
+
+            <p>New tools in hand I produced this:</p>
+        </div><div>
+
+            <p>Data visualization is story telling. This story has a lot going on. Let's break it down.</p>
+
+            <ul>
+                <li>each pixel is one <code>malloc</code> or <code>free</code></li>
+                <li>x-axis is replay time</li>
+                <li>y-axis is <code>malloc</code>/<code>free</code> time, in <b>logarithmic scale</b></li>
+                <li>pixel color is alloc size</li>
+            </ul>
+
+            <p>There are expensive <code>mallocs</code> at the very start when the game first boots. At ~30 seconds there are large and expensive  <code>mallocs</code> as the level loads. There are similar allocations when I die and reload at 2 minutes.</p>
+
+            <p>During actual gameplay the vast majority of allocations take between 21 nanoseconds and 700 nanoseconds. Not amazing. Unfortunately there are numerous <code>mallocs</code> sprinkled between 1 and 20 microseconds. Even worse, those expensive <code>mallocs</code> are as small as just 16 bytes!</p>
+
+            <p>Here's a zoom shot that covers the first gameplay segment.</p>
+        </div><div>
+
+            <p>All images in this post are clickable if you'd like to view full-res.</p>
+
+            
+
+            
+
+            <p>What can we take away from this? A few things.</p>
+
+            <ol>
+                <li>C Runtime (CRT) <code>malloc</code> is highly variable</li>
+                <li><code>p90</code> <code>malloc</code> is ~60 nanoseconds</li>
+                <li><code>p99.99</code> <code>malloc</code> is ~25 microseconds</li>
+                <li>Worst case for gameplay is ~100 microseconds</li>
+            </ol>
+
+            <p>Is this good or bad? It sure <i>feels</i> bad. The inconsistency is frustrating. However it's important to note that my gameplay ran a rock solid 60fps!</p>
+
+            <p>Worst degenerate case is my computer catches fire. Thus far my computer has not caught fire. Nor has <code>malloc</code> frozen my computer for seconds. Worst case for gamplay seems to be on the order of a few hundred microseconds.</p>
+
+            <p>I'm going to make a bold claim:</p>
+
+            <p><b>You can call <code>malloc</code> and still hit real-time framerates.</b></p>
+
+            <p>I believe this is true even if you're writing audio code that needs to compute a buffer every 4 milliseconds.</p>
+
+            <p>The problem isn't <code>malloc</code> per se. The problem is if you call <code>malloc</code> once then you probably call it more than once. It's death by a thousand cuts. It adds up …</p></div></div>
+<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://www.forrestthewoods.com/blog/benchmarking-malloc-with-doom3/">https://www.forrestthewoods.com/blog/benchmarking-malloc-with-doom3/</a></em></p>]]>
             </description>
             <link>https://www.forrestthewoods.com/blog/benchmarking-malloc-with-doom3/</link>
             <guid isPermaLink="false">hacker-news-small-sites-31605146</guid>
@@ -9199,7 +9576,7 @@ June 2, 2022 | https://www.productive-cpp.com/using-the-mold-linker-for-fun-and-
 
 <!-- Crayon Syntax Highlighter v_2.7.2_beta -->
 
-		<div id="crayon-629ca64173065165399513" data-settings=" minimize scroll-mouseover">
+		<div id="crayon-629cdd04e44b0435250707" data-settings=" minimize scroll-mouseover">
 		
 			
 			
@@ -9215,7 +9592,7 @@ June 2, 2022 | https://www.productive-cpp.com/using-the-mold-linker-for-fun-and-
 				</tbody></table>
 			</div>
 		</div>
-<!-- [Format Time: 0.0002 seconds] -->
+<!-- [Format Time: 0.0003 seconds] -->
 
 
 
@@ -9234,7 +9611,7 @@ June 2, 2022 | https://www.productive-cpp.com/using-the-mold-linker-for-fun-and-
 
 <!-- Crayon Syntax Highlighter v_2.7.2_beta -->
 
-		<div id="crayon-629ca64173072177175056" data-settings=" minimize scroll-mouseover">
+		<div id="crayon-629cdd04e44c5008538298" data-settings=" minimize scroll-mouseover">
 		
 			
 			
@@ -9269,7 +9646,7 @@ June 2, 2022 | https://www.productive-cpp.com/using-the-mold-linker-for-fun-and-
 
 <!-- Crayon Syntax Highlighter v_2.7.2_beta -->
 
-		<div id="crayon-629ca64173075730894807" data-settings=" minimize scroll-mouseover">
+		<div id="crayon-629cdd04e44c8426473941" data-settings=" minimize scroll-mouseover">
 		
 			
 			
@@ -9285,7 +9662,7 @@ June 2, 2022 | https://www.productive-cpp.com/using-the-mold-linker-for-fun-and-
 				</tbody></table>
 			</div>
 		</div>
-<!-- [Format Time: 0.0001 seconds] -->
+<!-- [Format Time: 0.0002 seconds] -->
 
 
 
@@ -9296,7 +9673,7 @@ June 2, 2022 | https://www.productive-cpp.com/using-the-mold-linker-for-fun-and-
 
 <!-- Crayon Syntax Highlighter v_2.7.2_beta -->
 
-		<div id="crayon-629ca64173076966199215" data-settings=" minimize scroll-mouseover">
+		<div id="crayon-629cdd04e44cb859665442" data-settings=" minimize scroll-mouseover">
 		
 			
 			
@@ -10608,36 +10985,36 @@ June 2, 2022 | https://seermedical.com/health/ | <a href="https://web.archive.or
 <div id="content" role="main">
 
 		
-				<section id="section_1719961459">
+				<section id="section_1191525332">
 		
 
 		<div>
 			
-<div id="row-1831066975">
+<div id="row-594715199">
 
-	<div id="col-2012487608">
+	<div id="col-1600855147">
 		<div>
 			
 			
 	
 	
 
-<div id="row-1336529973">
+<div id="row-1232451002">
 
-	<div id="col-787737153">
+	<div id="col-2007116945">
 		<div>
 			
 			
 <h6>Backed by decades of research, the Seer app uses your recorded events to indicate when you might be more or less likely to have a seizure.</h6>
 	
 	
-<div id="row-989434213">
+<div id="row-397626484">
 
-	<div id="col-598487356">
+	<div id="col-1232121941">
 		<div>
 			
 			
-	<div id="image_1301078802">
+	<div id="image_1347575684">
 		<a href="https://apps.apple.com/au/app/seer-epilepsy-management/id1535417653" target="_blank" rel="noopener noreferrer">						<p><img width="312" height="104" src="https://seermedical.com/wp-content/uploads/Download_on_the_App_Store_Badge_US-UK_RGB_blk_092917-1.png" data-src="https://seermedical.com/wp-content/uploads/Download_on_the_App_Store_Badge_US-UK_RGB_blk_092917-1.png" alt="" loading="lazy">						
 					</p>
 						</a>		
@@ -10649,11 +11026,11 @@ June 2, 2022 | https://seermedical.com/health/ | <a href="https://web.archive.or
 
 	
 
-	<div id="col-519504560">
+	<div id="col-1882597835">
 		<div>
 			
 			
-	<div id="image_1754300790">
+	<div id="image_1926452016">
 		<a href="https://play.google.com/store/apps/details?id=com.seermedical.seer" target="_blank" rel="noopener noreferrer">						<p><img width="344" height="102" src="https://seermedical.com/wp-content/uploads/GooglePlay-1.png" data-src="https://seermedical.com/wp-content/uploads/GooglePlay-1.png" alt="" loading="lazy">						
 					</p>
 						</a>		
@@ -10693,9 +11070,9 @@ June 2, 2022 | https://seermedical.com/health/ | <a href="https://web.archive.or
 
 	
 	
-<div id="row-930316519">
+<div id="row-779209437">
 
-	<div id="col-1125324037">
+	<div id="col-262879871">
 		<p>
 			
 			
@@ -10710,22 +11087,22 @@ June 2, 2022 | https://seermedical.com/health/ | <a href="https://web.archive.or
 
 	
 	
-	<section id="section_1732374599">
+	<section id="section_1744604093">
 		
 
 		<div>
 			
-<div id="row-845945260">
+<div id="row-556470131">
 
 	
 
 	
 
-	<div id="col-1022023375">
+	<div id="col-441833255">
 		<div>
 			
 			
-	<p id="text-3787560405">
+	<p id="text-1282228609">
 		
 <h2>Like a weather forecast, but for seizures</h2>
 		
@@ -10748,14 +11125,14 @@ Still, a seizure forecast is a powerful tool for planning activities and managin
 
 	</section>
 	
-	<section id="section_497493030">
+	<section id="section_1659414760">
 		
 
 		<div>
 			
-<div id="row-155800313">
+<div id="row-526970725">
 
-	<div id="col-590555289">
+	<div id="col-155073075">
 		<div>
 			
 			
@@ -10779,20 +11156,20 @@ Still, a seizure forecast is a powerful tool for planning activities and managin
 
 	</section>
 	
-	<section id="section_71711539">
+	<section id="section_1854062326">
 		
 
 		<div>
 			
 	
 	
-<div id="row-281844300">
+<div id="row-1486197506">
 
-	<div id="col-930094492">
+	<div id="col-1444414336">
 		<div>
 			
 			
-	<p id="text-566930324">
+	<p id="text-2454060842">
 		
 <h2>How does the world’s first non-invasive seizure risk forecaster work?</h2>
 		
@@ -10806,7 +11183,7 @@ Still, a seizure forecast is a powerful tool for planning activities and managin
 
 	
 </div>
-<div id="slider-1803000498">
+<div id="slider-951248469">
     <div data-flickity-options="{
             &quot;cellAlign&quot;: &quot;center&quot;,
             &quot;imagesLoaded&quot;: true,
@@ -10827,25 +11204,25 @@ Still, a seizure forecast is a powerful tool for planning activities and managin
             &quot;parallax&quot; : 0,
             &quot;friction&quot;: 0.6        }">
         
-<div id="row-358442257">
+<div id="row-1602956950">
 
-	<div id="col-968718556">
+	<div id="col-1226556875">
 		<div>
 			
 			
-<div id="row-1640554020">
+<div id="row-898981334">
 
-	<div id="col-2056917904">
+	<div id="col-828322574">
 		<div>
 			
 			
-<div id="row-269605419">
+<div id="row-959545257">
 
-	<div id="col-878391694">
+	<div id="col-673876341">
 		<div>
 			
 			
-	<div id="image_21607205">
+	<div id="image_360516302">
 								<p><img width="676" height="1206" src="https://seermedical.com/wp-content/uploads/App_1.png" data-src="https://seermedical.com/wp-content/uploads/App_1.png" alt="" loading="lazy" srcset="https://seermedical.com/wp-content/uploads/App_1.png 676w, https://seermedical.com/wp-content/uploads/App_1-448x800.png 448w" data-srcset="https://seermedical.com/wp-content/uploads/App_1.png 676w, https://seermedical.com/wp-content/uploads/App_1-448x800.png 448w" sizes="(max-width: 676px) 100vw, 676px">						
 					</p>
 								
@@ -10859,7 +11236,7 @@ Still, a seizure forecast is a powerful tool for planning activities and managin
 
 	
 </div>
-	<div id="text-2720650482">
+	<div id="text-1420112482">
 		
 <h5>1</h5>
 <p>Log your events, include details to help identify your triggers<br>
@@ -10883,25 +11260,25 @@ Still, a seizure forecast is a powerful tool for planning activities and managin
 
 	
 </div>
-<div id="row-346785227">
+<div id="row-193060420">
 
-	<div id="col-58249450">
+	<div id="col-660016394">
 		<div>
 			
 			
-<div id="row-344178867">
+<div id="row-304345684">
 
-	<div id="col-913739438">
+	<div id="col-58168673">
 		<div>
 			
 			
-<div id="row-890447166">
+<div id="row-1352232337">
 
-	<div id="col-852480798">
+	<div id="col-1186913671">
 		<div>
 			
 			
-	<div id="image_1544514938">
+	<div id="image_1262257565">
 								<p><img width="837" height="1206" src="https://seermedical.com/wp-content/uploads/App_2_1.png" data-src="https://seermedical.com/wp-content/uploads/App_2_1.png" alt="" loading="lazy" srcset="https://seermedical.com/wp-content/uploads/App_2_1.png 837w, https://seermedical.com/wp-content/uploads/App_2_1-555x800.png 555w, https://seermedical.com/wp-content/uploads/App_2_1-768x1107.png 768w" data-srcset="https://seermedical.com/wp-content/uploads/App_2_1.png 837w, https://seermedical.com/wp-content/uploads/App_2_1-555x800.png 555w, https://seermedical.com/wp-content/uploads/App_2_1-768x1107.png 768w" sizes="(max-width: 837px) 100vw, 837px">						
 					</p>
 								
@@ -10915,7 +11292,7 @@ Still, a seizure forecast is a powerful tool for planning activities and managin
 
 	
 </div>
-	<div id="text-79519953">
+	<div id="text-2464216095">
 		
 <h5>2</h5>
 <p>Over time, the app will deliver insights about your seizure cycles*<br>
@@ -10939,25 +11316,25 @@ Still, a seizure forecast is a powerful tool for planning activities and managin
 
 	
 </div>
-<div id="row-2008827055">
+<div id="row-176171049">
 
-	<div id="col-1011691946">
+	<div id="col-2027473153">
 		<div>
 			
 			
-<div id="row-235863741">
+<div id="row-1466349523">
 
-	<div id="col-1229836344">
+	<div id="col-1848584020">
 		<div>
 			
 			
-<div id="row-1303490464">
+<div id="row-1334123492">
 
-	<div id="col-48223323">
+	<div id="col-1829410238">
 		<div>
 			
 			
-	<div id="image_598295738">
+	<div id="image_1691660562">
 								<p><img width="676" height="1206" src="https://seermedical.com/wp-content/uploads/App_3.png" data-src="https://seermedical.com/wp-content/uploads/App_3.png" alt="" loading="lazy" srcset="https://seermedical.com/wp-content/uploads/App_3.png 676w, https://seermedical.com/wp-content/uploads/App_3-448x800.png 448w" data-srcset="https://seermedical.com/wp-content/uploads/App_3.png 676w, https://seermedical.com/wp-content/uploads/App_3-448x800.png 448w" sizes="(max-width: 676px) 100vw, 676px">						
 					</p>
 								
@@ -10971,7 +11348,7 @@ Still, a seizure forecast is a powerful tool for planning activities and managin
 
 	
 </div>
-	<div id="text-929862626">
+	<div id="text-2660248874">
 		
 <h5>3</h5>
 <p>See when you are high or low risk for seizure activity – Plan accordingly<br>
@@ -11002,9 +11379,9 @@ Still, a seizure forecast is a powerful tool for planning activities and managin
      </div>
 
 
-<div id="row-1380599696">
+<div id="row-1979840584">
 
-	<div id="col-257977229">
+	<div id="col-1935946537">
 		<p>*Individual seizure cycles are determined after at least 10 events have been logged in the Seer app. The frequency of seizures is a factor in establishing seizure cycles. Seizure risk forecasts become available once the app has identified strong seizure cycles.</p>
 		
 
@@ -11020,18 +11397,18 @@ Still, a seizure forecast is a powerful tool for planning activities and managin
 
 	</section>
 	
-	<section id="section_1853744549">
+	<section id="section_607628216">
 		
 
 		<div>
 			
-<div id="row-1176843992">
+<div id="row-810102372">
 
-	<div id="col-43413616">
+	<div id="col-1638716906">
 		<div>
 			
 			
-	<p id="text-1261171029">
+	<p id="text-522490546">
 		
 <h2>A modern solution to an age-old question</h2>
 		
@@ -11058,30 +11435,30 @@ Still, a seizure forecast is a powerful tool for planning activities and managin
 	</section>
 	
 
-	<section id="section_1072914625">
+	<section id="section_1873343721">
 		
 
 		<div>
 			
 	
 	
-<div id="row-625804046">
+<div id="row-843907952">
 
 	
 
 	
 
-	<div id="col-1824633050">
+	<div id="col-1991213380">
 		<div>
 			
 			
-<div id="row-729291475">
+<div id="row-2099541202">
 
-	<div id="col-370781005">
+	<div id="col-1184099057">
 		<div>
 			
 			
-	<div id="image_910009215">
+	<div id="image_1387203270">
 		<a href="https://apps.apple.com/au/app/seer-epilepsy-management/id1535417653" target="_blank" rel="noopener noreferrer">						<p><img width="312" height="104" src="https://seermedical.com/wp-content/uploads/Download_on_the_App_Store_Badge_US-UK_RGB_blk_092917-1.png" data-src="https://seermedical.com/wp-content/uploads/Download_on_the_App_Store_Badge_US-UK_RGB_blk_092917-1.png" alt="" loading="lazy">						
 					</p>
 						</a>		
@@ -11095,11 +11472,11 @@ Still, a seizure forecast is a powerful tool for planning activities and managin
 
 	
 
-	<div id="col-1208913590">
+	<div id="col-2129886829">
 		<div>
 			
 			
-	<div id="image_1298331823">
+	<div id="image_2095486451">
 		<a href="https://play.google.com/store/apps/details?id=com.seermedical.seer" target="_blank" rel="noopener noreferrer">						<p><img width="344" height="102" src="https://seermedical.com/wp-content/uploads/GooglePlay-1.png" data-src="https://seermedical.com/wp-content/uploads/GooglePlay-1.png" alt="" loading="lazy">						
 					</p>
 						</a>		
@@ -11130,20 +11507,20 @@ Still, a seizure forecast is a powerful tool for planning activities and managin
 
 	</section>
 	
-	<section id="section_1794386046">
+	<section id="section_1154822794">
 		
 
 		<div>
 			
 	
 	
-<div id="row-1735571387">
+<div id="row-1894972766">
 
-	<div id="col-947427959">
+	<div id="col-1653557169">
 		<div>
 			
 			
-	<p id="text-117128751">
+	<p id="text-924526236">
 		
 <h2>The underpinning of seizure forecasting technology</h2>
 		
@@ -11157,19 +11534,19 @@ Still, a seizure forecast is a powerful tool for planning activities and managin
 
 	
 </div>
-<div id="row-1581702697">
+<div id="row-962725718">
 
-	<div id="col-942244181">
+	<div id="col-655621818">
 		<div>
 			
 			
-<div id="row-966372961">
+<div id="row-1288218760">
 
-	<div id="col-1639314315">
+	<div id="col-51762999">
 		<div>
 			
 			
-	<p id="text-1742227819">
+	<p id="text-2481528759">
 		
 <h6>In collaboration with some of the world’s leading epilepsy researchers, the Seer Research Team has published several papers on the topic of seizure forecasting and seizure cycles in peer-reviewed journals.</h6>
 		
@@ -11190,7 +11567,7 @@ Still, a seizure forecast is a powerful tool for planning activities and managin
 
 	
 </div>
-<div id="slider-694146300">
+<div id="slider-1399711989">
     <div data-flickity-options="{
             &quot;cellAlign&quot;: &quot;center&quot;,
             &quot;imagesLoaded&quot;: true,
@@ -11211,21 +11588,21 @@ Still, a seizure forecast is a powerful tool for planning activities and managin
             &quot;parallax&quot; : 0,
             &quot;friction&quot;: 0.6        }">
         
-<div id="row-623003643">
+<div id="row-587314908">
 
-	<div id="col-1910709928">
+	<div id="col-416415257">
 		<div>
 			
 			
-<div id="row-330427381">
+<div id="row-1210728499">
 
-	<div id="col-1751525257">
+	<div id="col-699178595">
 		<div>
 			
 			
 	
 	
-	<div id="image_747451402">
+	<div id="image_716577081">
 								<p><img width="93" height="29" src="data:image/svg+xml,%3Csvg%20viewBox%3D%220%200%2093%2029%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%3C%2Fsvg%3E" data-src="https://seermedical.com/wp-content/uploads/TLN-1.svg" alt="" loading="lazy">						
 					</p>
 								
@@ -11252,21 +11629,21 @@ Still, a seizure forecast is a powerful tool for planning activities and managin
 
 	
 </div>
-<div id="row-309488388">
+<div id="row-1366786493">
 
-	<div id="col-808134083">
+	<div id="col-1160072692">
 		<div>
 			
 			
-<div id="row-71164663">
+<div id="row-1994641746">
 
-	<div id="col-1936649482">
+	<div id="col-1435868369">
 		<div>
 			
 			
 	
 	
-	<div id="image_648050010">
+	<div id="image_1627497841">
 								<p><img width="663" height="166" src="https://seermedical.com/wp-content/uploads/Epilepsia.png" data-src="https://seermedical.com/wp-content/uploads/Epilepsia.png" alt="" loading="lazy">						
 					</p>
 								
@@ -11291,21 +11668,21 @@ Still, a seizure forecast is a powerful tool for planning activities and managin
 
 	
 </div>
-<div id="row-848430927">
+<div id="row-661101075">
 
-	<div id="col-242684973">
+	<div id="col-433002864">
 		<div>
 			
 			
-<div id="row-15896506">
+<div id="row-1584525907">
 
-	<div id="col-876879552">
+	<div id="col-605062421">
 		<div>
 			
 			
 	
 	
-	<div id="image_174550763">
+	<div id="image_545055155">
 								<p><img width="347" height="32" src="data:image/svg+xml,%3Csvg%20viewBox%3D%220%200%20347%2032%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%3C%2Fsvg%3E" data-src="https://seermedical.com/wp-content/uploads/NRN.svg" alt="" loading="lazy">						
 					</p>
 								
@@ -11339,9 +11716,9 @@ Still, a seizure forecast is a powerful tool for planning activities and managin
      </div>
 
 
-<div id="row-1395995875">
+<div id="row-460069200">
 
-	<div id="col-1830847039">
+	<div id="col-1680510421">
 		<p>
 			
 			
@@ -11371,21 +11748,21 @@ Still, a seizure forecast is a powerful tool for planning activities and managin
 
 
 </div><div id="test">
-			<section id="section_335260539">
+			<section id="section_1298878893">
 		
 
 		<div>
 			
 
-<div id="row-531513916">
+<div id="row-121971149">
 
 
-	<div id="col-392720597">
+	<div id="col-498511799">
 		<div>
 			
 			
 
-	<div id="image_68248782">
+	<div id="image_610814298">
 								<p><img width="190" height="28" src="https://seermedical.com/wp-content/uploads/seer-logo-1.svg" alt="Seer Medical logo" loading="lazy">						
 					</p>
 								
@@ -11401,7 +11778,7 @@ Still, a seizure forecast is a powerful tool for planning activities and managin
 
 	
 
-	<div id="col-1934078942">
+	<div id="col-239882560">
 		<div>
 			
 			
@@ -11663,7 +12040,7 @@ June 2, 2022 | https://benedikt-bitterli.me/tantalum/tantalum.html | <a href="ht
 Score 98 | Comments 160 (<a href="https://news.ycombinator.com/item?id=31601926">thread link</a>) | @drodio
 <br/>
 June 2, 2022 | https://graphcdn.io/blog/one-job-one-pay | <a href="https://web.archive.org/web/*/https://graphcdn.io/blog/one-job-one-pay">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p><b>As a fully distributed company, we’ve made a bold decision not to anchor pay to employees’ physical location, no matter where they are in the world</b>. This means that an employee who works as an Engineer 2 in a rural town in India will be in the exact same salary band as an Engineer 2 who is working from San Francisco, CA. We’re calling this “One Job, One Pay” (OJOP).</p><p>We are anchoring our salary to the 60th percentile of San Francisco, CA. This allows us to offer highly competitive salaries to top talent across the world.</p><p>OJOP is representative of how we value, care for, and reinvest in our people without compromising our company values. It’s the idea that the value of the work is inherent in the work, in and of the work itself. It moves beyond the arcane practice of pricing a job based on location. OJOP is not determined by the personal details, life choices, location, employee’s gender, race, background, or any other factor external to the value that the work provides.</p><blockquote><p><b>This approach is one of the most straightforward ways to make work and pay as globally inclusive as possible.</b></p><p>It is not about who you are, what you are, what your background is, or where you live. It's about the work that you produce. It’s about your contribution and participation. We value your impact.</p></blockquote><h2>It's what's best for our company</h2><p>OJOP is our way of ensuring success by prioritizing the company’s most valuable assets, its people and proprietary technology. It is a form of de-risking the business by ensuring that we can attract and retain top talent best suited to build our product.</p><p>The work-life revolution, which I refer to as&nbsp;The Great Realignment, is causing companies to rethink how they compensate and treat employees. This has presented&nbsp;<a href="https://graphcdn.io/">our startup</a> with&nbsp;an opportunity to&nbsp;think through how we can provide equal and fair pay&nbsp;and create a culture that&nbsp;<a href="https://www.sueodio.com/pay-transparency/">defaults to transparency</a>&nbsp;to optimize for better outcomes.</p><blockquote><p>Compensation. It's a surprisingly controversial topic, but it doesn't have to be. &nbsp;</p></blockquote><h2>Leveraging our culture of "default to open"</h2><p>GraphCDN adheres to this value: Default to open. Usually, opacity is the starting point, and you have to justify transparency. In our case, our starting point is transparency and we have to justify opacity. It doesn't mean that everything's open, but that openness is where we begin.</p><p>Living up to this value and showing up to the world entails pushing forward radical inclusion within our company. This includes paying equal compensation. When compensation is hidden behind some level of opacity, the company has the power to hire people at different rates even though they're doing the same job. We are neutralizing that by choosing to reveal our bands.</p><p>We don't just release publicly available bands. The transparency continues internally; every employee knows how much everyone is getting paid, including equity.</p><p>While some would argue that publishing compensation data erodes privacy, we default to the broadest definition of “open” by only publishing the band but not the level and stage of salary of our employees.</p><blockquote><p>We are committed to ensuring fair pay while protecting everyone's privacy.</p></blockquote><p>We have been advised that it’s risky, we have been advised that it's costly, and we have been advised that it's a distraction–but we believe that one job one pay goes hand in hand with<a href="https://www.sueodio.com/pay-transparency/">&nbsp;pay transparency</a>. So, we’re tackling both in one fell swoop.</p><p>We’re very comfortable with pay transparency because, we will be ensuring global pay parity through one job one pay. These two initiatives naturally go hand-in-hand as a low friction means of ensuring that we are adhering to the policy.</p><h2>Implementation of One Job, One Pay</h2><p>As elegant as “One Job, One Pay” sounds, its implementation is complicated and far from perfect. We’re not pursuing perfection but rather rapid learning and iteration.</p><p>As part of our One Job, One Pay, rollout, we’ll publish the pay range for each job. Every applicant will see what their salary would be based on the job to be done. We'll publish internally the more granular levels and sub-levels for each job. This creates an environment where we can remove the pressure of negotiating salary, which has historically been&nbsp;<a href="https://www.pon.harvard.edu/daily/leadership-skills-daily/counteracting-racial-and-gender-bias-in-job-negotiations-nb/">wrought with bias and discrimination</a>.</p><p>We will conduct an annual salary review to ensure that our comp strategy is following market guidance from reliable data sources, which we will publish each year.</p></div></div>]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p><b>As a fully distributed company, we’ve made a bold decision not to anchor pay to employees’ physical location, no matter where they are in the world</b>. This means that an employee who works as an Engineer 2 in a rural town in India will be in the exact same salary band as an Engineer 2 who is working from San Francisco, CA. We’re calling this “One Job, One Pay” (OJOP).</p><p>We are anchoring our salary to the 60th percentile of San Francisco, CA. This allows us to offer highly competitive salaries to top talent across the world.</p><p>OJOP is representative of how we value, care for, and reinvest in our people without compromising our company values. It’s the idea that the value of the work is inherent in the work, in and of the work itself. It moves beyond the arcane practice of pricing a job based on location. OJOP is not determined by the personal details, life choices, location, employee’s gender, race, background, or any other factor external to the value that the work provides.</p><blockquote><p><b>This approach is one of the most straightforward ways to make work and pay as globally inclusive as possible.</b></p><p>It is not about who you are, what you are, what your background is, or where you live. It's about the work that you produce. It’s about your contribution and participation. We value your impact.</p></blockquote><h2>It's what's best for our company</h2><p>OJOP is our way of ensuring success by prioritizing the company’s most valuable assets, its people and proprietary technology. It is a form of de-risking the business by ensuring that we can attract and retain top talent best suited to build our product.</p><p>The work-life revolution, which I refer to as&nbsp;The Great Realignment, is causing companies to rethink how they compensate and treat employees. This has presented&nbsp;<a href="https://graphcdn.io/">our startup</a> with&nbsp;an opportunity to&nbsp;think through how we can provide equal and fair pay&nbsp;and create a culture that&nbsp;<a href="https://www.sueodio.com/pay-transparency/">defaults to transparency</a>&nbsp;to optimize for better outcomes.</p><blockquote><p>Compensation. It's a surprisingly controversial topic, but it doesn't have to be. &nbsp;</p></blockquote><h2>Leveraging our culture of "default to open"</h2><p>Stellate adheres to this value: Default to open. Usually, opacity is the starting point, and you have to justify transparency. In our case, our starting point is transparency and we have to justify opacity. It doesn't mean that everything's open, but that openness is where we begin.</p><p>Living up to this value and showing up to the world entails pushing forward radical inclusion within our company. This includes paying equal compensation. When compensation is hidden behind some level of opacity, the company has the power to hire people at different rates even though they're doing the same job. We are neutralizing that by choosing to reveal our bands.</p><p>We don't just release publicly available bands. The transparency continues internally; every employee knows how much everyone is getting paid, including equity.</p><p>While some would argue that publishing compensation data erodes privacy, we default to the broadest definition of “open” by only publishing the band but not the level and stage of salary of our employees.</p><blockquote><p>We are committed to ensuring fair pay while protecting everyone's privacy.</p></blockquote><p>We have been advised that it’s risky, we have been advised that it's costly, and we have been advised that it's a distraction–but we believe that one job one pay goes hand in hand with<a href="https://www.sueodio.com/pay-transparency/">&nbsp;pay transparency</a>. So, we’re tackling both in one fell swoop.</p><p>We’re very comfortable with pay transparency because, we will be ensuring global pay parity through one job one pay. These two initiatives naturally go hand-in-hand as a low friction means of ensuring that we are adhering to the policy.</p><h2>Implementation of One Job, One Pay</h2><p>As elegant as “One Job, One Pay” sounds, its implementation is complicated and far from perfect. We’re not pursuing perfection but rather rapid learning and iteration.</p><p>As part of our One Job, One Pay, rollout, we’ll publish the pay range for each job. Every applicant will see what their salary would be based on the job to be done. We'll publish internally the more granular levels and sub-levels for each job. This creates an environment where we can remove the pressure of negotiating salary, which has historically been&nbsp;<a href="https://www.pon.harvard.edu/daily/leadership-skills-daily/counteracting-racial-and-gender-bias-in-job-negotiations-nb/">wrought with bias and discrimination</a>.</p><p>We will conduct an annual salary review to ensure that our comp strategy is following market guidance from reliable data sources, which we will publish each year.</p></div></div>]]>
             </description>
             <link>https://graphcdn.io/blog/one-job-one-pay</link>
             <guid isPermaLink="false">hacker-news-small-sites-31601926</guid>
@@ -13185,7 +13562,7 @@ functions such as our <code>dbg_…</code></p></div>
 Score 2 | Comments 0 (<a href="https://news.ycombinator.com/item?id=31601030">thread link</a>) | @donbrae
 <br/>
 June 2, 2022 | https://www.jamieonkeys.dev/posts/calendar-and-weather-in-terminal/ | <a href="https://web.archive.org/web/*/https://www.jamieonkeys.dev/posts/calendar-and-weather-in-terminal/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><p>I learned a couple of cool terminal tricks on Hacker News yesterday.</p><h2 id="heading-calendar">Calendar <a href="#heading-calendar"><span>permalink</span> </a></h2><p>The <a href="https://news.ycombinator.com/item?id=31575076">first</a> is the <a href="https://en.wikipedia.org/wiki/Cal_(command)"><code>cal</code> program</a>, which prints an ASCII calendar.</p><p><code>cal</code> by itself returns the current month with today’s date highlighted.</p><p><code>cal 2022</code> returns a calendar for the whole of 2022.</p><p><code>cal -3</code> returns the current and surrounding months. This may be the most useful default view for me:</p><figure><img width="714" height="221" alt="Running 'cal -3' returns a calendar comprising the previous month, current month and next month." loading="lazy" data-src="/img/cal-3.jpg" src="https://www.jamieonkeys.dev/img/cal-3.jpg"><figcaption>Running <code>cal -3</code> returns a calendar comprising the previous month, current month and next month.</figcaption></figure><p>It also works for the past: <code>cal 1981</code> returns a calendar for 1981. You can also capture just a month: <code>cal may 1981</code>.</p><h2 id="heading-the-weather">The weather <a href="#heading-the-weather"><span>permalink</span> </a></h2><p><a href="https://news.ycombinator.com/item?id=31576344">Another user brought up <code>wttr.in</code></a>, a service which provides a <a href="https://github.com/chubin/wttr.in">weather report in ASCII format</a>.</p><p>You can run a simple <code>curl wttr.in</code> to retrieve a forecast based on your location:</p><figure><img width="714" height="507" alt="A three-day weather forecast for Edinburgh." loading="lazy" data-src="/img/terminal-weather.jpg" src="https://www.jamieonkeys.dev/img/terminal-weather.jpg"><figcaption>A three-day weather forecast for Edinburgh.</figcaption></figure><h3 id="heading-assigning-alias-weather-to-curl-wttr.in">Assigning alias <code>weather</code> to <code>curl wttr.in</code> <a href="#heading-assigning-alias-weather-to-curl-wttr.in"><span>permalink</span> </a></h3><p>To make the <code>curl wttr.in</code> command more memorable, I decided to assign the alias <code>weather</code> to it. Adding aliases can be useful in general, so I thought I’d document the process:<sup><a href="#fn1" id="fnref1">1</a></sup></p><ol><li><code>cd</code> to your home directory: <code>cd ~/</code></li><li>Open the file .bashrc in your preferred text editor (which is <a href="https://www.nano-editor.org/">nano</a> for me): <code>sudo nano .bashrc</code></li><li>Add a new line with an alias: <code>alias weather='curl wttr.in'</code></li><li>Save the change (<kbd>Control</kbd>-<kbd>O</kbd> in nano), then exit (<kbd>Control</kbd>+<kbd>X</kbd>)</li><li>Run <code>source .bashrc</code> to add the function to the current terminal session<sup><a href="#fn2" id="fnref2">2</a></sup></li><li>You can now run <code>weather</code> to get a weather forecast for your current location</li></ol><h3 id="heading-passing-an-argument-for-location">Passing an argument for location <a href="#heading-passing-an-argument-for-location"><span>permalink</span> </a></h3><p><a href="http://wttr.in/">wttr.in</a> also lets you query the weather in a <a href="https://github.com/chubin/wttr.in#usage">specific location</a>. I updated my <code>weather</code> command to allow for this:</p><ol><li>In your home folder, run <code>unalias weather</code> to remove the alias we just set</li><li>Open .bashrc in your text editor</li><li>Delete the line with <code>alias weather='curl wttr.in'</code></li><li>Add a <code>weather()</code> function (you don’t need the <code>alias</code> keyword):</li></ol><pre><code><span>weather</span><span>(</span><span>)</span> <span>{</span><br>  <span>if</span> <span>[</span> <span>$#</span> -eq <span>0</span> <span>]</span> <br>    <span>then</span><br>      <span>curl</span> wttr.in<br>    <span>else</span><br>      <span>curl</span> wttr.in/<span>"<span>$1</span>"</span> <br>  <span>fi</span><br><span>}</span></code></pre><ol start="5"><li>Save and exit</li><li>Run <code>source .bashrc</code></li><li>Now, by adding a location argument to <code>weather</code> you can see what the weather is like in, say, Glasgow (<code>weather glasgow+scotland</code>) or New York (<code>weather new+york</code>).<sup><a href="#fn3" id="fnref3">3</a></sup> <code>weather</code> with no argument returns a forecast based on your location.</li></ol><hr><section><ol><li id="fn1"><p>I’m running macOS Big Sur, but this process, or something similar, should work on Linux too. <a href="#fnref1">↩︎</a></p></li><li id="fn2"><p><a href="https://askubuntu.com/questions/1266196/why-do-i-need-to-run-source-command-for-bashrc-alias-to-get-applied">More details on <code>source .bashrc</code> here</a>. If it’s not there already, you’ll need to add something along the lines of <code>if [ -f .bashrc ]; then source .bashrc; fi</code> to .zshrc or .bash_profile so that aliases are available to you in the terminal automatically whenever you log into the OS. In my case I also had to create the .zshrc file. <a href="#fnref2">↩︎</a></p></li><li id="fn3"><p><code>weather "glasgow scotland"</code> and <code>weather "new york"</code> will also work. <a href="#fnref3">↩︎</a></p></li></ol></section></div></div></div>]]>
+<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
             </description>
             <link>https://www.jamieonkeys.dev/posts/calendar-and-weather-in-terminal/</link>
             <guid isPermaLink="false">hacker-news-small-sites-31601030</guid>
@@ -14328,8 +14705,7 @@ June 2, 2022 | https://iamunknowing.com/what-are-you-good-at/ | <a href="https:/
 Score 3 | Comments 0 (<a href="https://news.ycombinator.com/item?id=31599136">thread link</a>) | @bokenator
 <br/>
 June 2, 2022 | https://www.cantorsparadise.com/a-gentle-introduction-to-chaos-theory-93b9c821903b | <a href="https://web.archive.org/web/*/https://www.cantorsparadise.com/a-gentle-introduction-to-chaos-theory-93b9c821903b">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section><div><div><figure><div role="button" tabindex="0"><p><img alt="" src="https://miro.medium.com/max/1400/0*NDnDRjmIAKWakCmD" width="700" height="468" loading="lazy" role="presentation"></p></div><figcaption>Photo by <a href="https://unsplash.com/@danielklein?utm_source=medium&amp;utm_medium=referral" rel="noopener ugc nofollow" target="_blank">Daniel Klein</a> on <a href="https://unsplash.com/?utm_source=medium&amp;utm_medium=referral" rel="noopener ugc nofollow" target="_blank">Unsplash</a></figcaption></figure><p><h2 id="8296">Why the Butterfly Effect is not the whole story</h2></p><p id="cc6d">Chaos theory is potentially one of the most controversial fields in mathematics. Not because of the choice of axioms or some of the results, but due to the fact that no-one can agree what chaos actually means.</p><p id="e17a">In Gleick’s book <em>Chaos, </em>the author interviewed a whole bunch of chaos scientists (chaosists?) and not one of them could agree on a definition of chaos.</p><p id="42cc">The definition given in most pop culture media is the butterfly effect:</p><blockquote><p id="d26f">The flap of a butterfly’s wings in Brazil can set off a tornado in Texas</p></blockquote><p id="1ed7">This means that given a very small change to a system, we can achieve wildly different outcomes.</p><p id="7bc8">Unfortunately, as with most things in mathematics, it is never quite that simple. The butterfly effect is used to demonstrate <em>sensitive dependence on initial conditions </em>and is one of three requirements for a system to be called <strong>chaotic </strong>under Devany’s definition of chaos — one of the most widely accepted definitions. The three components are:</p><ol><li id="ecee">Sensitive dependence on initial conditions</li><li id="5f79">Topological transitivity</li><li id="fdf8">Dense periodic orbits</li></ol><p id="1bb3">In this article we will explore all three of these requirements and get to the root of what chaos truly means. But first I present:</p><p id="9e8a">If you have already met dynamical systems, feel free to skip this section and start reading again at <strong>Sensitive Dependence on Initial Conditions</strong>.</p><p id="b279">When we talk about a system, in this context we mean a dynamical system which (for our purpose) comes in two flavours: continuous time systems and discrete time systems.</p><p id="efa7">Continuous time systems are defined via an ordinary differential equation (ode)</p><figure><p><img alt="" src="https://miro.medium.com/max/1084/1*IuFIeG0gNsDD2p0HE4o-QQ.png" width="542" height="292" loading="lazy" role="presentation"></p></figure><p id="1f5c">Where <em>f </em>is a sufficiently nice function (we usually require something like (uniformly) Lipschitz continuous) and is possibly allowed to depend on some parameter mu.</p><p id="7cab">The space <em>f </em>maps from and to is called the phase space. For simplicity, we will assume the phase space can be equipped with a metric <em>d </em>(i.e. a way of measuring distances between points), this can then induce a topology (more generally, it is sufficient to require X to be a manifold that is locally diffeomorphic to a Banach space but that is far beyond the scope of this article). In most cases, our phase space will be a subset of Euclidean space and equipped with the induced Euclidean metric.</p><p id="567a">Given some value x₀ in our phase space, we can consider the <em>flow </em>of that point at a time t denoted 𝜙ₜ(x₀). If we give the ode an initial condition for x to start at then we obtain the initial value problem:</p><figure><p><img alt="" src="https://miro.medium.com/max/1016/1*rO5NNUgK2nBNqayfKMJpAw.png" width="508" height="300" loading="lazy" role="presentation"></p></figure><p id="b41f">This has solution x(t), then we define the flow to be 𝜙ₜ(x₀) = x(t). We will not bother with details of conditions for the flow to exist, I will simply state that if the system is in this article then the flow will exist. (The interested reader can read about <a href="https://en.wikipedia.org/wiki/Picard%E2%80%93Lindel%C3%B6f_theorem" rel="noopener ugc nofollow" target="_blank">Picard’s Theorem of existence and uniqueness</a> which states that if f is Lipschitz then locally there is a unique flow.)</p><p id="b344">We will need the definition of periodic orbit later on so might as well define it here. The orbit of a point x is the set {𝜙ₜ(x), for all time t} and so a periodic orbit is when that orbit is periodic. That is to say, for some value of t, the flow will come back to the starting condition in a loop fashion and will repeat this loop forever. You can think of, for example, the Earth orbiting around the Sun. Ignoring pesky details, the earth will loop back around and go through the point it started at.</p></div><div><p id="4c10">A similar discussion can be had vis-a-vis discrete time systems. In this case we consider the governing equation</p><figure><p><img alt="" src="https://miro.medium.com/max/1000/1*4_CwXXYbsWv3ZIX6BHslww.png" width="500" height="208" loading="lazy" role="presentation"></p></figure><p id="fc0a">The flow of x₀ at iterate n is simply fⁿ(x₀) (i.e. f applied to x₀ n times) and it is a periodic orbit if for some n, fⁿ(x₀) = x₀.</p><p id="cf94">This has been an abusively short introduction to dynamical systems with (hopefully) just the bare-bones to understand this story.</p><p id="ea82">Now on to the fun stuff.</p><p id="c062">This is probably the most intuitive of the three conditions and makes the most sense when trying to relate to chaos. SDIC was also the first part of chaos theory to be discovered.</p><p id="3273">In the 1950s and 60s, the commercialisation of computers allowed for larger and heavier computations. One field that benefited was numerical weather prediction. Edward Lorenz was heavily involved in that area and was equipped with a Royal McBee LGP-30 which he used to simulate weather patterns via a complicated set of ODEs. The resulting sequence was printed out line by line as a row of twelve numbers.</p><p id="d685">So that he could see sequences of results again, he would write down the row of numbers that occurred before the interesting part, and then the next time, he would start it off with those initial conditions from mid way through.</p><p id="e20c">Though something bizarre would happen: He wouldn’t see the same sequence again. The readout would start off the same and then all of a sudden would no longer resemble the intended sequence.</p><figure><p><img alt="" src="https://miro.medium.com/max/754/1*IV6v92C31jvu4rz4Dga1cA.png" width="377" height="248" loading="lazy" role="presentation"></p><figcaption>This is the x value of the solution to the Lorenz equation with <em>ρ</em> = 28, <em>σ</em> = 10, <em>β</em> = 8/3. Even though the points start very close together, they end up behaving completely differently.</figcaption></figure><p id="de58">What was actually happening was that the computer had an internal 6 digit precision but the printout was only to 3 digits. This rounding error meant that the starting conditions were slightly different but these differences created large long-term changes in the behaviour of the system.</p><p id="4553">What he had discovered was SDIC and the birth of chaos theory.</p><p id="d260">Very formally, the definition of SDIC is that there exists a positive delta such that for all <em>x </em>in the phase space and neighbourhood N of x, we can find a y in N and a time T such that:</p><figure><div role="button" tabindex="0"><p><img alt="" src="https://miro.medium.com/max/1400/1*egvfarRUsaj-iDXSaDOUig.png" width="700" height="82" loading="lazy" role="presentation"></p></div></figure><p id="d80c">This equation holds whether we talk about discrete or continuous systems.</p><p id="7374">Less formally, this means that if you give me an initial starting condition, I can find a starting point arbitrarily close to yours whose trajectory differs by some amount.</p><p id="1177">This is sometimes referred to in literature as <em>weak </em>sensitive dependence on initial conditions since it just says that the flows must differ at some point. There is a stronger notion that requires the flows to at some point diverge exponentially fast.</p><p id="1d02">This definition isn’t quite enough. Take for example the iterated doubling map:</p><figure><p><img alt="" src="https://miro.medium.com/max/1116/1*DPgIf3fuUNPVVHZ03Fkvkw.png" width="558" height="183" loading="lazy" role="presentation"></p></figure><p id="802c">Here the n-th term is n iterates of D applied to the initial condition. It is easy to see that simply for an initial condition x₀, the n-th term is xₙ = 2ⁿx₀. Therefore given any two initial conditions x₀ and y₀, the resulting trajectory will diverge exponentially.</p><p id="e0cb">So whilst the doubling map is (strongly) sensitive to initial conditions, it does not behave very chaotically on the positive real line. We need some stronger conditions!</p></div><div><p id="35ed">For a nice example of SDIC, look no further than a double pendulum. I am not going to prove rigorously that it exhibits SDIC because I want this story to have a sensible length also I remember going through the proof once and decided never again.</p><p id="c9d3">Instead I will show you this fabulous animation courtesy of Dirk Brockmann.</p><figure><div></div></figure><p id="9872">As you can see, the two bobs (yes that is the technical term for the mass on the end of a pendulum) start at nearly exactly the same place but after a small amount of time behave completely differently.</p><p id="a927">We have established that simply being sensitive to initial conditions is not sufficient to be chaotic. We need some stronger conditions.</p><p id="54ad">We want to encapsulate the idea that the motion is ‘all over the place’. It would be sensible to require that a point cannot stay local to its starting place and that it gets flung out to explore the whole phase space.</p><p id="e93e">This is where the concept of topological transitivity comes into play. It states that given an open set, it will eventually intersect all other open sets. Written in notation, this reads:</p><figure><div role="button" tabindex="0"><p><img alt="" src="https://miro.medium.com/max/1400/1*vzLwrRlKHwZnzHJepnfjLw.png" width="700" height="35" loading="lazy" role="presentation"></p></div></figure><p id="60c6">Now whilst I haven’t defined what I mean by the flow of a set, I’m sure you can understand by using the definition of the flow for a point.</p><p id="35be">Again, the definition does not make reference to whether it is the flow of a continuous or discrete map so can be applied to both.</p><p id="411f">What this means is that given a region of our phase space and enough time, it will pass through any other region. Equivalently, the orbit of U is dense in X.</p><p id="be90">A very visual example of a topological transitivity is the Baker’s transformation. It is inspired by the process of a baker kneading their dough.</p><p id="a5c0">We consider an iteration to be stretching the unit square and then cutting it in half and placing one half on top of the other like so:</p><figure><p><img alt="" src="https://miro.medium.com/max/550/0*gt8Mr7WoKb9T6amr.gif" width="275" height="183" loading="lazy" role="presentation"></p><figcaption>Animation of Baker transformation courtesy of <a href="https://en.wikipedia.org/wiki/Baker%27s_map#/media/File:Baker's_map_mixing.gif" rel="noopener ugc nofollow" target="_blank">Eviator Bach</a></figcaption></figure><p id="96bd">If you stare at this for long enough, you can convince yourself that every set should eventually be spread everywhere and therefore exhibits topological transitivity.</p><p id="0906">Arguably this is the easiest to understand. If there is a periodic orbit, then it is dense in the phase space.</p><p id="75b7">Dense means that given any point in the phase space, there is a periodic point (a point in a periodic orbit) arbitrarily close to it.</p><p id="2c19">In a round about way, this ensures that there is a lot of <strong>aperiodic</strong> behaviour. Since in any subset of X, there is a dense set of unstable periodic points (instability is guaranteed by SDIC and topological transitivity) which gives rise to an abundance of aperiodic behaviour which is what we expect from a chaotic system.</p><p id="6610">NB 1: Aperiodic simply means not periodic.</p><p id="5f62">NB 2: Many people disagree with this requirement. I will discuss this in the next section.</p><p id="53c8">The definition of a chaotic system given here is one due to R. L. Devaney, it is one of the most widely and commonly accepted.</p><figure><div role="button" tabindex="0"><p><img alt="" src="https://miro.medium.com/max/1400/0*fMHkYJkDTpbxce1w" width="700" height="467" loading="lazy" role="presentation"></p></div><figcaption>Photo by <a href="https://unsplash.com/@dariusbashar?utm_source=medium&amp;utm_medium=referral" rel="noopener ugc nofollow" target="_blank">Darius Bashar</a> on <a href="https://unsplash.com/?utm_source=medium&amp;utm_medium=referral" rel="noopener ugc nofollow" target="_blank">Unsplash</a></figcaption></figure><p id="50e0">It has been shown (Banks <em>et al., </em>1992) that in the discrete time case, provided the phase space is a non-finite metric space then in fact being topologically transitive and density of periodic orbits implies SDIC. In an even more extreme case Michel Vellekoop and Raoul Berglund proved that if we restrict even further to (possibly infinite) intervals, then being topologically transitive implies the rest (Vellekoop and Berglund, 1994).</p><p id="6f4c">As I alluded to at the start of the section, there are many definitions of chaos. Peter Smith suggested that Devaney’s definition is a consequence of chaos and not a true definition itself. …</p></div></div></section></div>
-<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://www.cantorsparadise.com/a-gentle-introduction-to-chaos-theory-93b9c821903b">https://www.cantorsparadise.com/a-gentle-introduction-to-chaos-theory-93b9c821903b</a></em></p>]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article><div><div><section><div><div><figure><div role="button" tabindex="0"><p><img alt="" src="https://miro.medium.com/max/1400/0*NDnDRjmIAKWakCmD" width="700" height="468" loading="lazy" role="presentation"></p></div><figcaption>Photo by <a href="https://unsplash.com/@danielklein?utm_source=medium&amp;utm_medium=referral" rel="noopener ugc nofollow" target="_blank">Daniel Klein</a> on <a href="https://unsplash.com/?utm_source=medium&amp;utm_medium=referral" rel="noopener ugc nofollow" target="_blank">Unsplash</a></figcaption></figure><p><h2 id="8296">Why the Butterfly Effect is not the whole story</h2></p><p id="cc6d">Chaos theory is potentially one of the most controversial fields in mathematics. Not because of the choice of axioms or some of the results, but due to the fact that no-one can agree what chaos actually means.</p><p id="e17a">In Gleick’s book <em>Chaos, </em>the author interviewed a whole bunch of chaos scientists…</p></div></div></section></div></div></article></div>]]>
             </description>
             <link>https://www.cantorsparadise.com/a-gentle-introduction-to-chaos-theory-93b9c821903b</link>
             <guid isPermaLink="false">hacker-news-small-sites-31599136</guid>
@@ -17336,51 +17712,7 @@ June 2, 2022 | https://knock.app/blog/building-a-batched-notification-engine | <
 Score 2 | Comments 0 (<a href="https://news.ycombinator.com/item?id=31595927">thread link</a>) | @da-x
 <br/>
 June 2, 2022 | https://blog.aloni.org/posts/tests-in-seperate-git-repo/ | <a href="https://web.archive.org/web/*/https://blog.aloni.org/posts/tests-in-seperate-git-repo/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div role="document">
-  <div>
-    <div>
-      <div>
-        <article>
-          
-          
-          <p>In the debate on whether to put everything in the so-called mono-repo, system
-tests are usually not considered a separate codebase.  My take on the mono-repo
-vs multiple-repo debate is "split histories on a stable API boundary", and I
-think that for system tests this split becomes valid too.</p>
-<p>With the emerging CI/CD standard stacks that encourage us to put the tests with
-the code being tested, it seems to me that the tendency to split the tests from
-the main code gets even weaker, where it promotes a defaulted mono-repo design
-that unites main code and test code together to the same repository.</p>
-<p>In this post I present arguments mostly against putting system tests in the
-same Git repository.</p>
-<h2 id="api-compatibility">API compatibility</h2>
-<p>If a system presents APIs to external entities (i.e. your customers), it means
-that your system tests should be able to do feature testing using these APIs in
-a way that would allow new tests to work on old code. Tests relying on features
-not supported by the old code can be auto-disabled.</p>
-<p>The system tests are just another customer that insists on not upgrading across
-this stable API boundary. The high-level tests are aware of this API layer, and
-therefore can be versioned separately.</p>
-<h2 id="git-bisect">Git Bisect</h2>
-<p>If you are using Git bisect to pinpoint the change that introduced a bug, then
-the test code that reproduces it may be quite new, and the Git history in the
-older versions where the bug was introduces does not include that test code at
-all. Therefore, it is only natural that the test lives in a separate repo,
-otherwise you would need to do weird <code>git checkout</code> maneuvers to get the testee
-and tester working on the same run.</p>
-<h2 id="exception-tightly-integrated-unit-tests">Exception: tightly integrated unit tests</h2>
-<p>One may go too far saying let's put all tests in a separate repo. However, I
-think that line should be drawn carefully and checked for whether it works in
-practice.  For the tests that are tightly bound to the code being tested, for
-instance unit tests that depend on internal interfaces or symbols, it may be
-harder to apply this principle.</p>
-
-        </article>
-	
-      </div>
-    </div>
-  </div>
-</div></div>]]>
+<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
             </description>
             <link>https://blog.aloni.org/posts/tests-in-seperate-git-repo/</link>
             <guid isPermaLink="false">hacker-news-small-sites-31595927</guid>
@@ -17966,7 +18298,7 @@ June 2, 2022 | https://neilthanedar.com/yc-for-mittelstands/ | <a href="https://
 <p><mark><em><strong><mark>This is a follow-up to my most popular post <a href="https://neilthanedar.com/we-need-a-middle-class-for-startups/">We Need a Middle Class for Startups</a>.</mark></strong></em></mark></p>
 <ul><li><strong><em>Both of these ideas are on my list of solutions to <a href="https://neilthanedar.com/worlds-biggest-problems/" target="_blank" rel="noreferrer noopener"><span>The World’s Biggest Problems</span></a>.</em></strong></li></ul>
 <p><mark><strong><em>I want to raise a $1M+ per year rolling fund to build this accelerator.</em></strong></mark></p>
-<ul><li><em><strong><a href="https://twitter.com/NeilThanedar" target="_blank" rel="noreferrer noopener"><span>DM</span></a> or <a href="https://neilthanedar.com/cdn-cgi/l/email-protection#402e25292c3428212e2524213200272d21292c6e232f2d" target="_blank" rel="noreferrer noopener"><span>email</span></a> me if you want to invest!</strong></em></li></ul>
+<ul><li><em><strong><a href="https://twitter.com/NeilThanedar" target="_blank" rel="noreferrer noopener"><span>DM</span></a> or <a href="https://neilthanedar.com/cdn-cgi/l/email-protection#620c070b0e160a030c0706031022050f030b0e4c010d0f" target="_blank" rel="noreferrer noopener"><span>email</span></a> me if you want to invest!</strong></em></li></ul>
 <h4><strong>Summary:</strong></h4>
 <p><mark><strong><mark>Idea: Raise two funds to help founders launch and scale </mark></strong><a href="https://neilthanedar.com/we-need-a-middle-class-for-startups/"><mark><strong>middle class startups</strong></mark></a><strong><mark>:</mark></strong></mark></p>
 <ol><li><strong>Accelerator</strong>: Invest the first $100K+ to help new pre-Mittelstands launch and grow.</li><li><strong>Ventures</strong>: Invest $1M+ to help pre-Mittelstands go from $1M to $10M+ revenue.</li></ol>
@@ -18400,9 +18732,9 @@ Score 63 | Comments 9 (<a href="https://news.ycombinator.com/item?id=31594873">t
 <br/>
 June 2, 2022 | https://axile.itch.io/folia | <a href="https://web.archive.org/web/*/https://axile.itch.io/folia">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p><strong>Folia </strong>is a minimalistic authoring tool for narrative games. <br></p>
-<p>With Folia, you can write interactive, branching stories using a simple syntax based on <a href="https://lua.org/" target="_blank" rel="nofollow noopener" referrerpolicy="origin">Lua</a>. Folia presents your game in a two-page 'storybook' format, with one leaf dedicated to a scrolling log of text, and the other displaying images. You can make your story as simple or complex as you like, with the full power of Lua available whenever you need it. When you're done, you can upload your finished game to itch.io or wherever you like.<br></p>
+<p>With Folia, you can write interactive, branching stories using a simple syntax based on <a href="https://lua.org/" target="_blank" referrerpolicy="origin" rel="nofollow noopener">Lua</a>. Folia presents your game in a two-page 'storybook' format, with one leaf dedicated to a scrolling log of text, and the other displaying images. You can make your story as simple or complex as you like, with the full power of Lua available whenever you need it. When you're done, you can upload your finished game to itch.io or wherever you like.<br></p>
 <p>To get started, just download the engine and edit the <strong>story.lua</strong> file. Instructions and examples are available in <strong>docs/</strong><strong>readme.html</strong>.&nbsp;Have fun!<br></p>
-<p><em>Made with <a href="https://love2d.org/" target="_blank" rel="nofollow noopener" referrerpolicy="origin">Löve</a>. 'Leiff' illustration by <a href="https://hollyboson.xyz/" target="_blank" rel="nofollow noopener" referrerpolicy="origin">Holly Boson</a>. Folia is free to use for commercial and non-commercial products; more detailed licensing information can be found in&nbsp;<strong>docs/license.txt</strong>.</em><br></p>
+<p><em>Made with <a href="https://love2d.org/" target="_blank" referrerpolicy="origin" rel="nofollow noopener">Löve</a>. 'Leiff' illustration by <a href="https://hollyboson.xyz/" target="_blank" referrerpolicy="origin" rel="nofollow noopener">Holly Boson</a>. Folia is free to use for commercial and non-commercial products; more detailed licensing information can be found in&nbsp;<strong>docs/license.txt</strong>.</em><br></p>
 
 <p><small><em>Our mascot Leiff is a falconet, a sparrow-sized bird of prey. Falconets love leaves and give them to each other as gifts. 🍂</em></small></p></div></div>]]>
             </description>
@@ -19468,84 +19800,7 @@ June 2, 2022 | https://martinheinz.dev/blog/24 | <a href="https://web.archive.or
 Score 160 | Comments 152 (<a href="https://news.ycombinator.com/item?id=31593995">thread link</a>) | @fronterablog
 <br/>
 June 2, 2022 | https://fronterablog.com/thinking-in-bets/ | <a href="https://web.archive.org/web/*/https://fronterablog.com/thinking-in-bets/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="site-content">
-<article id="post-1168">
-<!-- .entry-header -->
-<div>
-<div>
-<p>Thinking in bets is a decision-making framework developed by former professional poker player <a href="https://www.youtube.com/watch?v=uYNsSeYjkp4" target="_blank" rel="noreferrer noopener">Annie Duke</a>. </p>
-<p>In this article, you’ll find two real-life examples of how people —mistakenly— evaluate decisions based on their <a href="https://fronterablog.com/input-goals-vs-output-goals/" target="_blank" rel="noreferrer noopener">outcomes</a>. Then, you’ll see why it’s wrong and how to take luck into consideration by thinking like a poker player. </p>
-
-
-<h2>Bad decision, good luck</h2>
-<p>Mike was excited when he heard about a new cryptocurrency from his close friend.</p>
-<p>Everybody was talking about its growth potential on Reddit.</p>
-<p>He thought he was finally early enough to get huge returns in a short time.</p>
-<p>And he was so convinced; that he invested&nbsp;<strong>all his savings</strong>&nbsp;in it.</p>
-<p>After two weeks, his dreams came true.</p>
-<p>His investment got 10x higher and he cashed out.</p>
-<p>Mike told himself: “<em>That was the best decision of my life.</em>“</p>
-<h2>Good decision, bad luck</h2>
-<p>Jane was working in the Marketing department of a consumer goods company.</p>
-<p>One day, she received a job offer from the tech industry.</p>
-<p>The offer was good: a promotion, stock options, and leading a team…</p>
-<p>After thinking about it for a week, she decided to take the offer.</p>
-<p>It was&nbsp;<strong>a great opportunity</strong>&nbsp;and the tech industry was better for her future.</p>
-<p>But 5 months later, a recession started.</p>
-<p>The tech industry was hit hard, and stocks plummeted. Her new company decided to go through a restructuring and let her go.</p>
-<p>As she was new, she got almost no severance. And finding a new job was impossible during a recession.</p>
-<p>Jane told herself: “<em>That was the worst decision of my life.</em>“</p>
-<h2>Thinking like a poker player</h2>
-<p>Life is a&nbsp;<strong>decision-making game</strong>.</p>
-<p>Investments, what projects to work on, career changes…</p>
-<p>The <a href="https://fronterablog.com/second-order-thinking/" target="_blank" rel="noreferrer noopener">better decisions you make</a> over the long term, the more <a href="https://fronterablog.com/how-to-define-your-own-success/" target="_blank" rel="noreferrer noopener">successful</a> you get.</p>
-<p>But people make one common mistake while assessing their decisions.</p>
-<p>They judge the quality of the decisions&nbsp;<strong>based on the outcomes</strong>. And this is a flaw that creates a dangerous illusion for future decisions.</p>
-<p>Because life is not chess. It’s poker.</p>
-<p>Luck plays a bigger role than you think.</p>
-<figure><img src="https://fronterablog.com/wp-content/uploads/2022/05/Thinking-in-bets-1024x1024.jpg" alt="" width="700" height="700" srcset="https://fronterablog.com/wp-content/uploads/2022/05/Thinking-in-bets-1024x1024.jpg 1024w, https://fronterablog.com/wp-content/uploads/2022/05/Thinking-in-bets-300x300.jpg 300w, https://fronterablog.com/wp-content/uploads/2022/05/Thinking-in-bets-150x150.jpg 150w, https://fronterablog.com/wp-content/uploads/2022/05/Thinking-in-bets-768x768.jpg 768w, https://fronterablog.com/wp-content/uploads/2022/05/Thinking-in-bets.jpg 1088w" sizes="(max-width: 700px) 100vw, 700px" data-srcset="https://fronterablog.com/wp-content/uploads/2022/05/Thinking-in-bets-1024x1024.jpg 1024w, https://fronterablog.com/wp-content/uploads/2022/05/Thinking-in-bets-300x300.jpg 300w, https://fronterablog.com/wp-content/uploads/2022/05/Thinking-in-bets-150x150.jpg 150w, https://fronterablog.com/wp-content/uploads/2022/05/Thinking-in-bets-768x768.jpg 768w, https://fronterablog.com/wp-content/uploads/2022/05/Thinking-in-bets.jpg 1088w" data-src="https://fronterablog.com/wp-content/uploads/2022/05/Thinking-in-bets-1024x1024.jpg" data-old-src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw=="><figcaption>Thinking in Bets: Skill, Luck &amp; Outcome (by Annie Duke)</figcaption></figure>
-<p>Mike made a&nbsp;<em>terrible</em>&nbsp;decision by risking all his savings, but he got lucky.</p>
-<p>Jane made a good decision by taking an opportunity with better conditions, but luck was not on her side.</p>
-<p>Thinking in bets allows you to take luck (and probabilities) into consideration and makes you a better decision-maker in the game of life.</p>
-<h2>How to think in bets in three steps:</h2>
-<h3>1. Imagine a bet with a friend</h3>
-<p>Let’s say you want to buy real estate. You expect to get a good return in three years.</p>
-<p>Imagine a friend betting against your prediction: “<strong>Wanna bet?</strong>“</p>
-<p>This will make you think about what your friend might know that you’re missing.</p>
-<p>So you can find the <a href="https://fronterablog.com/hindsight-bias-meaning-and-examples/" target="_blank" rel="noreferrer noopener">blind spots in your thinking</a> before you make the decision.</p>
-<h3>2. Calculate the expected value</h3>
-<p>Professional poker players decide to bet (or not) on a hand by calculating the&nbsp;<strong>expected value</strong>&nbsp;of the bet.</p>
-<p>Let’s say there is $300 in the pot — that’s the total money you can earn.</p>
-<p>You need $50 to call your opponent’s bet and you estimate a 25% chance of having the winning hand.</p>
-<p>So the expected value of that bet would be 25% of the $300, which is&nbsp;<strong>$75</strong>.</p>
-<p>Since the expected value ($75) is higher than the bet ($50), it makes sense to bet 50 bucks for that hand.</p>
-<p>Do the same for your life decisions.</p>
-<p>Compare the expected value and your “bet” by estimating:</p>
-<ul><li><strong>The potential reward of the decision</strong>&nbsp;— not only monetary but also joy, freedom, or time<br>​</li><li><strong>Probability of getting it</strong>&nbsp;— you cannot know the exact probability, but estimate it the best way you can (remember the bet with a friend)<br>​</li><li><strong>The resources (time/effort/money) to bet to get the reward</strong>&nbsp;— also consider the opportunity cost</li></ul>
-<p>If the expected value is higher than your bet, it’s a good decision.</p>
-<h3>3. Analyze your past decisions</h3>
-<p>Another way to make better decisions is to examine your past choices.</p>
-<p>But remember,&nbsp;<strong>regardless of the outcome</strong>.</p>
-<p>What made you win big in that investment? Your good decision or luck?</p>
-<p>Was starting that business a good decision despite the failure?</p>
-<p>If you don’t find your mistakes, you run the risk of <strong>repeating them</strong>.<br></p>
-<blockquote><p>There are exactly two things that determine how our lives turn out: the quality of our decisions and luck. Learning to recognize the difference between the two is what thinking in bets is all about.</p><cite><em>Annie Duke</em></cite></blockquote>
-
-
-
-<p>This article is taken from Frontera’s free <strong><a href="https://fronterablog.com/life-changing-concepts-newsletter/">Life-Changing Concepts</a></strong> Newsletter. </p>
-<p>If you’d like to get ideas that’ll make you more successful in life, join by leaving your email below. </p>
-
-
-<hr>
-<p><strong>References:</strong> Thinking in Bets, <a href="https://www.goodreads.com/book/show/35957157-thinking-in-bets" target="_blank" rel="noreferrer noopener">Annie Duke</a>.</p>
-
-</div><!-- .entry-content -->
-</div><!-- .post-inner -->
-<!-- .section-inner -->
-<!-- .pagination-single -->
-</article><!-- .post -->
-</div><p><span><div><div><p>This website uses cookies. By clicking “Accept”, you consent to the use of the cookies.</p><p><a></a>.</p></div></div></span></p></div>]]>
+<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
             </description>
             <link>https://fronterablog.com/thinking-in-bets/</link>
             <guid isPermaLink="false">hacker-news-small-sites-31593995</guid>
@@ -21078,7 +21333,7 @@ June 2, 2022 | https://www.productive-cpp.com/using-the-mold-linker-for-fun-and-
 
 <!-- Crayon Syntax Highlighter v_2.7.2_beta -->
 
-		<div id="crayon-629ca64173065165399513" data-settings=" minimize scroll-mouseover">
+		<div id="crayon-629cdd04e44b0435250707" data-settings=" minimize scroll-mouseover">
 		
 			
 			
@@ -21094,7 +21349,7 @@ June 2, 2022 | https://www.productive-cpp.com/using-the-mold-linker-for-fun-and-
 				</tbody></table>
 			</div>
 		</div>
-<!-- [Format Time: 0.0002 seconds] -->
+<!-- [Format Time: 0.0003 seconds] -->
 
 
 
@@ -21113,7 +21368,7 @@ June 2, 2022 | https://www.productive-cpp.com/using-the-mold-linker-for-fun-and-
 
 <!-- Crayon Syntax Highlighter v_2.7.2_beta -->
 
-		<div id="crayon-629ca64173072177175056" data-settings=" minimize scroll-mouseover">
+		<div id="crayon-629cdd04e44c5008538298" data-settings=" minimize scroll-mouseover">
 		
 			
 			
@@ -21148,7 +21403,7 @@ June 2, 2022 | https://www.productive-cpp.com/using-the-mold-linker-for-fun-and-
 
 <!-- Crayon Syntax Highlighter v_2.7.2_beta -->
 
-		<div id="crayon-629ca64173075730894807" data-settings=" minimize scroll-mouseover">
+		<div id="crayon-629cdd04e44c8426473941" data-settings=" minimize scroll-mouseover">
 		
 			
 			
@@ -21164,7 +21419,7 @@ June 2, 2022 | https://www.productive-cpp.com/using-the-mold-linker-for-fun-and-
 				</tbody></table>
 			</div>
 		</div>
-<!-- [Format Time: 0.0001 seconds] -->
+<!-- [Format Time: 0.0002 seconds] -->
 
 
 
@@ -21175,7 +21430,7 @@ June 2, 2022 | https://www.productive-cpp.com/using-the-mold-linker-for-fun-and-
 
 <!-- Crayon Syntax Highlighter v_2.7.2_beta -->
 
-		<div id="crayon-629ca64173076966199215" data-settings=" minimize scroll-mouseover">
+		<div id="crayon-629cdd04e44cb859665442" data-settings=" minimize scroll-mouseover">
 		
 			
 			
