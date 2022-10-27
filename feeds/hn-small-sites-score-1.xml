@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Thu, 27 Oct 2022 02:37:10 GMT</lastBuildDate>
+        <lastBuildDate>Thu, 27 Oct 2022 05:00:25 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-1.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Thu, 27 Oct 2022 02:37:10 GMT</pubDate>
+        <pubDate>Thu, 27 Oct 2022 05:00:25 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -995,7 +995,7 @@ October 25, 2022 | https://teslanorth.com/2022/10/25/spacex-launches-starlink-fl
 <p>Flat High Performance Starlink (designed for in-motion use) pricing is $2,500 USD, which is more than four-times the cost of the $599 USD Standard dish. Starlink RV costs $135 USD per month for service.</p>
 <p>Here’s what the new flat dish looks like below:</p>
 <p><img loading="lazy" title="starlink flat high performance dish.jpg" src="https://cdn.teslanorth.com/wp-content/uploads/2022/10/starlink-flat-high-performance-dish.jpg" alt="starlink flat high performance dish" width="799" height="334"></p>
-<p><span data-ez-name="teslanorth_com-box-4"></span>Flat High Performance is designed for in-motion use and those looking for a permanent installation on their vehicle, says SpaceX. The dish offers better visibility and enhanced GPS capabilities for use with in-motion connectivity.</p>
+<p>Flat High Performance is designed for in-motion use and those looking for a permanent installation on their vehicle, says SpaceX. The dish offers better visibility and enhanced GPS capabilities for use with in-motion connectivity.</p>
 <p>Included is a Wedge Mount kit to install the dish at an 8 degree angle for water run-off. The dish also has improved weather resistance and has 1.7x better snow melt capability versus the Standard Dish.</p>
 <p>For hardcore Starlink RV customers, this high performance flat dish looks to be the one you’ve been waiting for, if you have the cash to buy it.</p>
 <p>SpaceX CEO Elon Musk said this “works on any moving land object.”</p>
@@ -1750,7 +1750,235 @@ October 25, 2022 | https://willfennel.com/posts/2022/10/26/cheap-ergonomic-keybo
 Score 3 | Comments 0 (<a href="https://news.ycombinator.com/item?id=33337609">thread link</a>) | @bcl
 <br/>
 October 25, 2022 | https://www.scrivano.org/posts/2022-10-21-the-journey-to-speed-up-oci-containers/ | <a href="https://web.archive.org/web/*/https://www.scrivano.org/posts/2022-10-21-the-journey-to-speed-up-oci-containers/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div role="main">
+<div>
+<div>
+<article role="main">
+<p>When I've started working on crun, I was looking at a faster way to
+start up and stop containers by improving the OCI runtime, the
+component in the OCI stack that is responsible to ultimately talk to
+the kernel and setting the environment where the container runs.</p>
+<p>The OCI runtime runs for a very limited time, and its job consists
+mostly in executing a series of syscalls that map directly to the
+OCI configuration file.</p>
+<p>I was surprised to find out that such trivial task could relatively
+take such a long time.</p>
+<p><em><strong>DISCLAIMER</strong></em>: for my tests I've used the default kernels available in
+the Fedora installation as well as all the libraries. In addition to
+the fixes described in this blog post, there could have been other
+ones during these years that might have affected the overall
+performance.</p>
+<p>The version of crun used for all the tests below is the same.</p>
+<p>For all the tests, I've used <a href="https://github.com/sharkdp/hyperfine">hyperfine</a>,
+it was installed through cargo.</p>
+
+<p>To check how far we went from what we had in the past, we'd need to time
+travel back to 2017, or just install an old Fedora image. For the
+tests below I've used Fedora 24, that is based on the Linux kernel 4.5.5.</p>
+<p>On a freshly installed Fedora 24 with crun built from the main branch:</p>
+<div><pre><code data-lang="shell"><span># hyperfine 'crun run foo'</span>
+Benchmark 1: <span>'crun run foo'</span>
+  Time <span>(</span>mean ± σ<span>)</span>:     159.2 ms ±  21.8 ms    <span>[</span>User: 43.0 ms, System: 16.3 ms<span>]</span>
+  Range <span>(</span>min … max<span>)</span>:    73.9 ms … 194.9 ms    <span>39</span> runs
+</code></pre></div><p>160ms is a lot, and to the best of my memory, that is similar to what
+I was observing five years ago.</p>
+<p>Profiling the OCI runtime immediately showed that most of the user time
+was spent by libseccomp to compile the seccomp filter.</p>
+<p>To verify that, let's try running a container with the same
+configuration but without the seccomp profile:</p>
+<div><pre><code data-lang="shell"><span># hyperfine 'crun run foo'</span>
+Benchmark 1: <span>'crun run foo'</span>
+  Time <span>(</span>mean ± σ<span>)</span>:     139.6 ms ±  20.8 ms    <span>[</span>User: 4.1 ms, System: 22.0 ms<span>]</span>
+  Range <span>(</span>min … max<span>)</span>:    61.8 ms … 177.0 ms    <span>47</span> runs
+</code></pre></div><p>We use 1/10th of the user time we needed before, and the overall time
+also improved!</p>
+<p>So there are mainly two different problems: 1) system time is
+quite high, 2) and user time is dominated by libseccomp. We need to
+tackle both of them.</p>
+<p>Let's concentrate on the system time for now, we will get back to
+seccomp later.</p>
+<p>There very few culprits responsible for most of the time wasted in the
+kernel.</p>
+
+<h2 id="create-and-destroy-a-network-namespace">Create and destroy a network namespace</h2>
+<p>Creating and destroying a network namespace used to be very expensive,
+the issue can be reproduced just by using the <code>unshare</code> tool, and on
+Fedora 24 I get:</p>
+<div><pre><code data-lang="shell"><span># hyperfine 'unshare -n true'</span>
+Benchmark 1: <span>'unshare -n true'</span>
+  Time <span>(</span>mean ± σ<span>)</span>:      47.7 ms ±  51.4 ms    <span>[</span>User: 0.6 ms, System: 3.2 ms<span>]</span>
+  Range <span>(</span>min … max<span>)</span>:     0.0 ms … 190.5 ms    <span>365</span> runs
+</code></pre></div><p>That is a lot of time!</p>
+<p>I've attempted to fix it in the kernel and suggest a
+<a href="https://www.spinics.net/lists/netfilter-devel/msg50394.html">patch</a>.
+Florian Westphal rewrote it as a series in a much better way and it
+was merged in the Linux kernel:</p>
+<div><pre><code data-lang="text">commit 8c873e2199700c2de7dbd5eedb9d90d5f109462b
+Author: Florian Westphal &lt;<a href="https://www.scrivano.org/cdn-cgi/l/email-protection" data-cfemail="ee8899ae9d9a9c828b80c08a8b">[email&nbsp;protected]</a>&gt;
+Date:   Fri Dec 1 00:21:04 2017 +0100
+
+    netfilter: core: free hooks with call_rcu
+    
+    Giuseppe Scrivano says:
+      "SELinux, if enabled, registers for each new network namespace 6
+        netfilter hooks."
+    
+    Cost for this is high.  With synchronize_net() removed:
+       "The net benefit on an SMP machine with two cores is that creating a
+       new network namespace takes -40% of the original time."
+    
+    This patch replaces synchronize_net+kvfree with call_rcu().
+    We store rcu_head at the tail of a structure that has no fixed layout,
+    i.e. we cannot use offsetof() to compute the start of the original
+    allocation.  Thus store this information right after the rcu head.
+    
+    We could simplify this by just placing the rcu_head at the start
+    of struct nf_hook_entries.  However, this structure is used in
+    packet processing hotpath, so only place what is needed for that
+    at the beginning of the struct.
+    
+    Reported-by: Giuseppe Scrivano &lt;<a href="https://www.scrivano.org/cdn-cgi/l/email-protection" data-cfemail="ccabbfafbea5baada28cbea9a8a4adb8e2afa3a1">[email&nbsp;protected]</a>&gt;
+    Signed-off-by: Florian Westphal &lt;<a href="https://www.scrivano.org/cdn-cgi/l/email-protection" data-cfemail="b9dfcef9cacdcbd5dcd797dddc">[email&nbsp;protected]</a>&gt;
+    Signed-off-by: Pablo Neira Ayuso &lt;<a href="https://www.scrivano.org/cdn-cgi/l/email-protection" data-cfemail="a6d6c7c4cac9e6c8c3d2c0cfcad2c3d488c9d4c1">[email&nbsp;protected]</a>&gt;
+
+commit 26888dfd7e7454686b8d3ea9ba5045d5f236e4d7
+Author: Florian Westphal &lt;<a href="https://www.scrivano.org/cdn-cgi/l/email-protection" data-cfemail="6b0d1c2b181f19070e05450f0e">[email&nbsp;protected]</a>&gt;
+Date:   Fri Dec 1 00:21:03 2017 +0100
+
+    netfilter: core: remove synchronize_net call if nfqueue is used
+    
+    since commit 960632ece6949b ("netfilter: convert hook list to an array")
+    nfqueue no longer stores a pointer to the hook that caused the packet
+    to be queued.  Therefore no extra synchronize_net() call is needed after
+    dropping the packets enqueued by the old rule blob.
+    
+    Signed-off-by: Florian Westphal &lt;<a href="https://www.scrivano.org/cdn-cgi/l/email-protection" data-cfemail="5533221526212739303b7b3130">[email&nbsp;protected]</a>&gt;
+    Signed-off-by: Pablo Neira Ayuso &lt;<a href="https://www.scrivano.org/cdn-cgi/l/email-protection" data-cfemail="126273707e7d527c7766747b7e6677603c7d6075">[email&nbsp;protected]</a>&gt;
+
+commit 4e645b47c4f000a503b9c90163ad905786b9bc1d
+Author: Florian Westphal &lt;<a href="https://www.scrivano.org/cdn-cgi/l/email-protection" data-cfemail="a3c5d4e3d0d7d1cfc6cd8dc7c6">[email&nbsp;protected]</a>&gt;
+Date:   Fri Dec 1 00:21:02 2017 +0100
+
+    netfilter: core: make nf_unregister_net_hooks simple wrapper again
+    
+    This reverts commit d3ad2c17b4047
+    ("netfilter: core: batch nf_unregister_net_hooks synchronize_net calls").
+    
+    Nothing wrong with it.  However, followup patch will delay freeing of hooks
+    with call_rcu, so all synchronize_net() calls become obsolete and there
+    is no need anymore for this batching.
+    
+    This revert causes a temporary performance degradation when destroying
+    network namespace, but its resolved with the upcoming call_rcu conversion.
+    
+    Signed-off-by: Florian Westphal &lt;<a href="https://www.scrivano.org/cdn-cgi/l/email-protection" data-cfemail="bfd9c8ffcccbcdd3dad191dbda">[email&nbsp;protected]</a>&gt;
+    Signed-off-by: Pablo Neira Ayuso &lt;<a href="https://www.scrivano.org/cdn-cgi/l/email-protection" data-cfemail="0878696a646748666d7c6e61647c6d7a26677a6f">[email&nbsp;protected]</a>&gt;
+</code></pre></div><p>These patches make a huge difference, the time to create and destroy a
+network namespace now is the following one a modern 5.19.15 kernel
+dropped to a ridiculous amount:</p>
+<div><pre><code data-lang="shell"><span># hyperfine 'unshare -n true'</span>
+Benchmark 1: <span>'unshare -n true'</span>
+  Time <span>(</span>mean ± σ<span>)</span>:       1.5 ms ±   0.5 ms    <span>[</span>User: 0.3 ms, System: 1.3 ms<span>]</span>
+  Range <span>(</span>min … max<span>)</span>:     0.8 ms …   6.7 ms    <span>1907</span> runs
+</code></pre></div><h2 id="mounting-mqueue">Mounting mqueue</h2>
+<p>Mounting mqueue was also a relatively expensive operation.</p>
+<p>On Fedora 24, it used to be like:</p>
+<div><pre><code data-lang="shell"><span># mkdir /tmp/mqueue; hyperfine 'unshare --propagation=private -m mount -t mqueue mqueue /tmp/mqueue'; rmdir /tmp/mqueue</span>
+Benchmark 1: <span>'unshare --propagation=private -m mount -t mqueue mqueue /tmp/mqueue'</span>
+  Time <span>(</span>mean ± σ<span>)</span>:      16.8 ms ±   3.1 ms    <span>[</span>User: 2.6 ms, System: 5.0 ms<span>]</span>
+  Range <span>(</span>min … max<span>)</span>:     9.3 ms …  26.8 ms    <span>261</span> runs
+</code></pre></div><p>In this case as well I've tried to fix it and propose a
+<a href="https://www.mail-archive.com/linux-kernel@vger.kernel.org/msg1545810.html">patch</a>.
+It was not accepted, but Al Viro came up with a better version to fix
+the issue:</p>
+<div><pre><code data-lang="text">commit 36735a6a2b5e042db1af956ce4bcc13f3ff99e21
+Author: Al Viro &lt;<a href="https://www.scrivano.org/cdn-cgi/l/email-protection" data-cfemail="fa8c938895ba809f94938cd49693948f82d495889dd48f91">[email&nbsp;protected]</a>&gt;
+Date:   Mon Dec 25 19:43:35 2017 -0500
+
+    mqueue: switch to on-demand creation of internal mount
+    
+    Instead of doing that upon each ipcns creation, we do that the first
+    time mq_open(2) or mqueue mount is done in an ipcns.  What's more,
+    doing that allows to get rid of mount_ns() use - we can go with
+    considerably cheaper mount_nodev(), avoiding the loop over all
+    mqueue superblock instances; ipcns-&gt;mq_mnt is used to locate preexisting
+    instance in O(1) time instead of O(instances) mount_ns() would've
+    cost us.
+    
+    Based upon the version by Giuseppe Scrivano &lt;<a href="https://www.scrivano.org/cdn-cgi/l/email-protection" data-cfemail="e0879383928996818ea0928584888194ce838f8d">[email&nbsp;protected]</a>&gt;; I've
+    added handling of userland mqueue mounts (original had been broken in
+    that area) and added a switch to mount_nodev().
+    
+    Signed-off-by: Al Viro &lt;<a href="https://www.scrivano.org/cdn-cgi/l/email-protection" data-cfemail="c9bfa0bba689b3aca7a0bfe7a5a0a7bcb1e7a6bbaee7bca2">[email&nbsp;protected]</a>&gt;
+</code></pre></div><p>after this patch, the cost to create a mqueue mount dropped as well:</p>
+<div><pre><code data-lang="shell"><span># mkdir /tmp/mqueue; hyperfine 'unshare --propagation=private -m mount -t mqueue mqueue /tmp/mqueue'; rmdir /tmp/mqueue</span>
+Benchmark 1: <span>'unshare --propagation=private -m mount -t mqueue mqueue /tmp/mqueue'</span>
+  Time <span>(</span>mean ± σ<span>)</span>:       0.7 ms ±   0.5 ms    <span>[</span>User: 0.5 ms, System: 0.6 ms<span>]</span>
+  Range <span>(</span>min … max<span>)</span>:     0.0 ms …   3.1 ms    <span>772</span> runs
+</code></pre></div><h2 id="create-and-destroy-an-ipc-namespace">Create and destroy an IPC namespace</h2>
+<p>I've procrastined the containers startup time for a couple of years,
+and got back at it in the beginning of 2020. Another issue I was
+aware of was the time to create and destroy an IPC namespace.</p>
+<p>As for the network namespace, the issue can be reproduced using only
+the <code>unshare</code> tool:</p>
+<div><pre><code data-lang="shell"><span># hyperfine 'unshare -i true'</span>
+Benchmark 1: <span>'unshare -i true'</span>
+  Time <span>(</span>mean ± σ<span>)</span>:      10.9 ms ±   2.1 ms    <span>[</span>User: 0.5 ms, System: 1.0 ms<span>]</span>
+  Range <span>(</span>min … max<span>)</span>:     4.2 ms …  17.2 ms    <span>310</span> runs
+</code></pre></div><p>Differently that the previous two attempts, this time the version I've
+sent was accepted upstream:</p>
+<div><pre><code data-lang="text">commit e1eb26fa62d04ec0955432be1aa8722a97cb52e7
+Author: Giuseppe Scrivano &lt;<a href="https://www.scrivano.org/cdn-cgi/l/email-protection" data-cfemail="c7a0b4a4b5aeb1a6a987b5a2a3afa6b3e9a4a8aa">[email&nbsp;protected]</a>&gt;
+Date:   Sun Jun 7 21:40:10 2020 -0700
+
+    ipc/namespace.c: use a work queue to free_ipc
+    
+    the reason is to avoid a delay caused by the synchronize_rcu() call in
+    kern_umount() when the mqueue mount is freed.
+    
+    the code:
+    
+        #define _GNU_SOURCE
+        #include &lt;sched.h&gt;
+        #include &lt;error.h&gt;
+        #include &lt;errno.h&gt;
+        #include &lt;stdlib.h&gt;
+    
+        int main()
+        {
+            int i;
+    
+            for (i = 0; i &lt; 1000; i++)
+                if (unshare(CLONE_NEWIPC) &lt; 0)
+                    error(EXIT_FAILURE, errno, "unshare");
+        }
+    
+    goes from
+    
+            Command being timed: "./ipc-namespace"
+            User time (seconds): 0.00
+            System time (seconds): 0.06
+            Percent of CPU this job got: 0%
+            Elapsed (wall clock) time (h:mm:ss or m:ss): 0:08.05
+    
+    to
+    
+            Command being timed: "./ipc-namespace"
+            User time (seconds): 0.00
+            System time (seconds): 0.02
+            Percent of CPU this job got: 96%
+            Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.03
+    
+    Signed-off-by: Giuseppe Scrivano &lt;<a href="https://www.scrivano.org/cdn-cgi/l/email-protection" data-cfemail="a3c4d0c0d1cad5c2cde3d1c6c7cbc2d78dc0ccce">[email&nbsp;protected]</a>&gt;
+    Signed-off-by: Andrew Morton &lt;<a href="https://www.scrivano.org/cdn-cgi/l/email-protection" data-cfemail="b1d0dac1dcf1ddd8dfc4c99cd7dec4dfd5d0c5d8dedf9fdec3d6">[email&nbsp;protected]</a>&gt;
+    Reviewed-by: Paul E. McKenney &lt;<a href="https://www.scrivano.org/cdn-cgi/l/email-protection" data-cfemail="e69687938a8b858da68d839488838ac8899481">[email&nbsp;protected]</a>&gt;
+    Reviewed-by: Waiman Long &lt;<a href="https://www.scrivano.org/cdn-cgi/l/email-protection" data-cfemail="74181b1a1319151a340611101c15005a171b19">[email&nbsp;protected]</a>&gt;
+    Cc: Davidlohr Bueso &lt;<a href="https://www.scrivano.org/cdn-cgi/l/email-protection" data-cfemail="94f0f5e2f1d4e7e0f3fbf8f5f6e7bafaf1e0">[email&nbsp;protected]</a>&gt;
+    Cc: Manfred Spraul &lt;<a href="https://www.scrivano.org/cdn-cgi/l/email-protection" data-cfemail="b1dcd0dfd7c3d4d5f1d2dedddec3d7c4ddddd8d7d49fd2dedc">[email&nbsp;protected]</a>&gt;
+    Link: http://lkml.kernel.org/r/<a href="https://www.scrivano.org/cdn-cgi/l/email-protection" data-cfemail="3a080a080a0a08080f0b0e0f0e0b03140f080d03030e170b175d495948534c5b547a485f5e525b4e14595557">[email&nbsp;protected]</a>
+    Signed-off-by: Linus Torvalds &lt;<a href="https://www.scrivano.org/cdn-cgi/l/email-protection" data-cfemail="95e1fae7e3f4f9f1e6d5f9fcfbe0edb8f3fae0fbf1f4e1fcfafbbbfae7f2">[email&nbsp;protected]</a>&gt;
+</code></pre></div><p>with …</p></article></div></div></div></div>
+<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://www.scrivano.org/posts/2022-10-21-the-journey-to-speed-up-oci-containers/">https://www.scrivano.org/posts/2022-10-21-the-journey-to-speed-up-oci-containers/</a></em></p>]]>
             </description>
             <link>https://www.scrivano.org/posts/2022-10-21-the-journey-to-speed-up-oci-containers/</link>
             <guid isPermaLink="false">hacker-news-small-sites-33337609</guid>
@@ -1907,7 +2135,226 @@ October 25, 2022 | https://rwamigabo.com/caddy/ | <a href="https://web.archive.o
 Score 87 | Comments 32 (<a href="https://news.ycombinator.com/item?id=33337086">thread link</a>) | @zdw
 <br/>
 October 25, 2022 | https://luqman.ca/blog/multi-kernel-drifting/ | <a href="https://web.archive.org/web/*/https://luqman.ca/blog/multi-kernel-drifting/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+            <p>I was setting up some automation to build Windows images pre-loaded with some drivers and software
+(a story for another day). I had already gotten it working with QEMU under KVM on Linux but wanted
+to port it to <a href="https://github.com/oxidecomputer/propolis">propolis</a> on our illumos distro, Helios.
+I figured it should be mostly straightforward; maybe a couple different flags or utilities to futz
+around with the disk images and mount them. Which was the case. Mostly. That is except for the one
+minor detail of not being able to mount an NTFS image.</p>
+<pre data-lang="console"><code data-lang="console"><span>$ pfexec mount -F ntfs-3g $LOOPBACK_DEV /mnt/test
+</span><span>fuse: mount failed: Not a directory
+</span></code></pre>
+<h2 id="the-setup">the setup</h2>
+<p>Ok, let's step back a second. To give some context, I was trying to create a raw image that
+contained an NTFS partition. Maybe it didn't like the way I created the GPT? Ok, let's try
+something simpler and forget partitions for a moment and just try solely creating an NTFS file
+system:</p>
+<ol>
+<li>Create an empty disk image:</li>
+</ol>
+<pre data-lang="console"><code data-lang="console"><span>$ qemu-img create -f raw test.img 8G
+</span><span>Formatting 'test.img', fmt=raw size=8589934592
+</span></code></pre>
+<ol start="2">
+<li>Create loopback device:</li>
+</ol>
+<pre data-lang="console"><code data-lang="console"><span>$ pfexec lofiadm -l -a test.img
+</span><span>/dev/dsk/c2t1d0p0
+</span></code></pre>
+<ol start="3">
+<li>Create an NTFS file system:</li>
+</ol>
+<pre data-lang="console"><code data-lang="console"><span>$ mkntfs -Q /dev/dsk/c2t1d0p0
+</span><span>The sector size was not specified for /dev/dsk/c2t1d0p0 and it could not be obtained automatically.  It has been set to 512 bytes.
+</span><span>The partition start sector was not specified for /dev/dsk/c2t1d0p0 and it could not be obtained automatically.  It has been set to 0.
+</span><span>The number of sectors per track was not specified for /dev/dsk/c2t1d0p0 and it could not be obtained automatically.  It has been set to 0.
+</span><span>The number of heads was not specified for /dev/dsk/c2t1d0p0 and it could not be obtained automatically.  It has been set to 0.
+</span><span>Cluster size has been automatically set to 4096 bytes.
+</span><span>To boot from a device, Windows needs the 'partition start sector', the 'sectors per track' and the 'number of heads' to be set.
+</span><span>Windows will not be able to boot from this device.
+</span><span>Creating NTFS volume structures.
+</span><span>mkntfs completed successfully. Have a nice day.
+</span></code></pre>
+<p>Ok, that's a lot of warnings (that I did handle properly in the real scenario!) but shouldn't be
+relevant right now. We don't care if Windows can't boot off of this image.</p>
+<ol start="4">
+<li>Mount the file system:</li>
+</ol>
+<pre data-lang="console"><code data-lang="console"><span>$ pfexec mount -F ntfs-3g /dev/dsk/c2t1d0p0 /mnt/test
+</span><span>fuse: mount failed: Not a directory
+</span></code></pre>
+<p>Something's clearly wrong.</p>
+<h3 id="linux">linux</h3>
+<p>Mind you this same scenario using the fuse-based ntfs-3g driver works in linux:</p>
+<pre data-lang="console"><code data-lang="console"><span>➜  ~ qemu-img create -f raw test.img 8G
+</span><span>Formatting 'test.img', fmt=raw size=8589934592
+</span><span>➜  ~ sudo losetup -f --show test.img   
+</span><span>/dev/loop1
+</span><span>➜  ~ sudo mkntfs -Q /dev/loop1
+</span><span>The partition start sector was not specified for /dev/loop1 and it could not be obtained automatically.  It has been set to 0.
+</span><span>The number of sectors per track was not specified for /dev/loop1 and it could not be obtained automatically.  It has been set to 0.
+</span><span>The number of heads was not specified for /dev/loop1 and it could not be obtained automatically.  It has been set to 0.
+</span><span>Cluster size has been automatically set to 4096 bytes.
+</span><span>To boot from a device, Windows needs the 'partition start sector', the 'sectors per track' and the 'number of heads' to be set.
+</span><span>Windows will not be able to boot from this device.
+</span><span>Creating NTFS volume structures.
+</span><span>mkntfs completed successfully. Have a nice day.
+</span><span>➜  ~ mkdir test
+</span><span>➜  ~ sudo mount -t ntfs-3g /dev/loop1 test
+</span><span>➜  ~ echo hello &gt; test/world
+</span><span>➜  ~ cat test/world 
+</span><span>hello
+</span></code></pre>
+<h2 id="ntfs-3g">ntfs-3g</h2>
+<p>If you're using NTFS on non-Windows chances are you're using some <a href="https://github.com/tuxera/ntfs-3g">ntfs-3g</a>
+based driver. It is used along with Filesystem in USErspace (FUSE) to provide access to NTFS volumes.
+This arrangement consists of two parts: the FUSE kernel driver and the userspace application that
+links against <code>libfuse</code>. In this case, that is <code>ntfs-3g</code>.</p>
+<p>Let's skip the <code>mount</code> wrapper and just ask <code>ntfs-3g</code> directly to mount our image:</p>
+<pre data-lang="console"><code data-lang="console"><span>$ pfexec ntfs-3g /dev/dsk/c2t1d0p0 /mnt/test
+</span><span>fuse: mount failed: Not a directory
+</span></code></pre>
+<p>Alas, still no good. I guess we gotta dig.</p>
+<h3 id="truss">truss</h3>
+<p>On Linux you have <code>strace</code> to trace system calls. On Illumos there's <code>truss</code>:</p>
+<pre data-lang="console"><code data-lang="console"><span>$ pfexec truss ntfs-3g /dev/dsk/c2t1d0p0 /mnt/test                                                                                                                                                          
+</span><span>execve("/opt/ooce/ntfs-3g/bin/ntfs-3g", 0xFFFFFC7FFFDFDE48, 0xFFFFFC7FFFDFDE68)  argc = 3                                                                                                                   
+</span><span>sysinfo(SI_MACHINE, "i86pc", 257)               = 6
+</span><span>[...snip...]
+</span><span>mount("/devices/pseudo/lofi@1:q", "/mnt/test", MS_NOSUID|MS_OPTIONSTR, "fuse", 0x00000000, 0, 0x00E63E60, 1024) Err#20 ENOTDIR
+</span><span>open("/usr/lib/locale/en_US.UTF-8/LC_MESSAGES/SUNW_OST_OSLIB.mo", O_RDONLY) Err#2 ENOENT
+</span><span>fstat(2, 0xFFFFFC7FFFDFC720)                    = 0
+</span><span>fuse: mount failed: write(2, " f u s e :   m o u n t  ".., 20)  = 20
+</span><span>Not a directorywrite(2, " N o t   a   d i r e c t".., 15)       = 15
+</span><span>
+</span><span>write(2, "\n", 1)                               = 1
+</span><span>close(5)                                        = 0
+</span><span>fdsync(4, FSYNC)                                = 0
+</span><span>fcntl(4, F_SETLK, 0xFFFFFC7FFFDFDBD0)           = 0
+</span><span>close(4)                                        = 0
+</span><span>_exit(21)
+</span><span>
+</span></code></pre>
+<p>Hmmm, <code>mount("/devices/pseudo/lofi@1:q", "/mnt/test", MS_NOSUID|MS_OPTIONSTR, "fuse", 0x00000000, 0, 0x00E63E60, 1024) Err#20 ENOTDIR</code>.</p>
+<p>That <code>ENOTDIR</code> error is not from <code>ntfs-3g</code>, in fact we see it returns an exit code of <code>21</code> and the
+manual page tells us that's an "Unclassified FUSE error".</p>
+<p>The <code>mount</code> syscall here is what returned that <code>ENOTDIR</code> and its manual page says:</p>
+<pre><code><span>       ENOTDIR
+</span><span>                       The dir argument is not a directory, or a component of
+</span><span>                       a path prefix is not a directory.
+</span></code></pre>
+<p>Not a directory you say?</p>
+<pre data-lang="console"><code data-lang="console"><span>$ file /mnt/test
+</span><span>/mnt/test:      directory
+</span></code></pre>
+<p>Presumably it is the fuse kernel driver which is handling the <code>mount</code> syscall in this case. One
+quick way to check: <a href="http://dtrace.org/blogs/about/">DTrace</a>.</p>
+<h3 id="dtrace">dtrace</h3>
+<p><a href="https://illumos.org/books/dtrace/chp-intro.html#chp-intro">DTrace on illumos</a> offers a wealth of
+information on a live system. With a lot of introspection capabilities, it makes for a great
+debugging tool. I'm still learning to reach for it, but it works perfectly here:</p>
+<pre><code><span>$ pfexec dtrace -n 'fuse::return /arg1 == ENOTDIR &amp;&amp; pid == $target/ { stack(); }' -c "ntfs-3g /dev/dsk/c2t1d0p0 /mnt/test"
+</span><span>dtrace: description 'fuse::return ' matched 98 probes
+</span><span>fuse: mount failed: Not a directory
+</span><span>dtrace: pid 11852 has exited
+</span><span>CPU     ID                    FUNCTION:NAME
+</span><span>  1  17911                fuse_mount:return 
+</span><span>              genunix`fsop_mount+0x14
+</span><span>              genunix`domount+0x948
+</span><span>              genunix`mount+0xfe
+</span><span>              genunix`syscall_ap+0x98
+</span><span>              unix`sys_syscall+0x17d
+</span></code></pre>
+<p>So what did we do there? We ran dtrace (<code>pfexec dtrace</code>) and:</p>
+<ol>
+<li>
+<p>told it what probes to match (<code>fuse::return</code>)</p>
+<p>Probes are specified as <code>[[[provider:] module:] function:] name</code>, where any unspecified field
+acts as a wildcard.</p>
+<p>We want to match the exit (<code>return</code>) probe of any function in the <code>fuse</code> kernel module.</p>
+</li>
+<li>
+<p>for any such probes, a predicate to further filter them (<code>/arg1 == ENOTDIR &amp;&amp; pid == $target/</code>)</p>
+<p><code>arg1</code> for a <code>return</code> probe corresponds to its return value. Here we compare to the error we're
+looking for: <code>ENOTDIR</code>.</p>
+<p><code>pid == $target</code> is to further constrain it by using the provided <code>$target</code> macro which refers
+to:</p>
+</li>
+<li>
+<p>the command we want to trace (<code>-c "ntfs-3g /dev/dsk/c2t1d0p0 /mnt/test"</code>)</p>
+</li>
+<li>
+<p>and what actions to take for any matches (<code>{ stack(); }</code>)</p>
+<p>DTrace has a number of actions to inspect the system, here we use the <code>stack()</code> to record and
+print out the kernel stack trace for our matched probes.</p>
+</li>
+</ol>
+<h2 id="fuse">FUSE</h2>
+<p>FUSE seems to be the one stumbling over our supposedly "not a directory" directory. Now that
+<code>dtrace</code> was helpful enough to point out where the error comes from, let's take a look at the
+<a href="https://github.com/jurikm/illumos-fusefs/blob/ef9a33d4a18131a8c0e50002b138b0431e5db616/kernel/fuse_vfsops.c#L367">code</a>.</p>
+<p>It certainly doesn't take long to find the spot:</p>
+<pre data-lang="c"><code data-lang="c"><span>static int
+</span><span>fuse_mount</span><span>(</span><span>struct</span><span> vfs *</span><span>vfsp</span><span>, </span><span>struct</span><span> vnode *</span><span>mvp</span><span>, </span><span>struct</span><span> mounta *</span><span>uap</span><span>,
+</span><span>    </span><span>struct</span><span> cred *</span><span>cr</span><span>)
+</span><span>{
+</span><span>	fuse_vfs_data_t	 *vfsdata;
+</span><span>	fuse_session_t	 *se;
+</span><span>	dev_t dev;
+</span><span>	</span><span>char </span><span>*fdstr;
+</span><span>	</span><span>int</span><span> err;
+</span><span>
+</span><span>	</span><span>if </span><span>(</span><span>secpolicy_fs_mount</span><span>(cr, mvp, vfsp) != </span><span>0</span><span>)
+</span><span>		</span><span>return </span><span>(EPERM);
+</span><span>
+</span><span>	</span><span>if </span><span>(mvp-&gt;v_type != VDIR)
+</span><span>		</span><span>return </span><span>(ENOTDIR);
+</span></code></pre>
+<p>Every file is allocated a <code>vnode</code> and <code>mvp</code> here should represent the one for our mountpoint
+(<code>/mnt/test</code>). <code>mount</code> understandably requires you only mount things at a directory and so every
+file system driver should verify that is the case, just as FUSE does here. But if <code>/mnt/test</code>
+isn't a directory (<code>VDIR</code>), what is it?</p>
+<p>Back to dtrace!</p>
+<pre data-lang="console"><code data-lang="console"><span>$ pfexec dtrace -n 'fuse_mount:entry /pid == $target/ { printf("v_type = %d", args[1]-&gt;v_type); }' -c "ntfs-3g /dev/dsk/c2t1d0p0 /mnt/test"
+</span><span>dtrace: description 'fuse_mount:entry ' matched 1 probe
+</span><span>fuse: mount failed: Not a directory
+</span><span>dtrace: pid 11921 has exited
+</span><span>CPU     ID                    FUNCTION:NAME
+</span><span>  6  17910                 fuse_mount:entry v_type = 2
+</span></code></pre>
+<p>This time we match just on entry to <code>fuse_mount</code> and for an entry probe we have access to <code>args</code>,
+which allows typed access to the function arguments. In this case we print out the <code>v_type</code> field
+of the second arg (<code>mvp = args[1]</code>). Let's take a look at the <a href="https://github.com/illumos/illumos-gate/blob/1a613b61205f4ee9a9fb00184dbe6cae17a6ede7/usr/src/uts/common/sys/vnode.h#L161-L174">enum definition</a>:</p>
+<pre data-lang="c"><code data-lang="c"><span>typedef enum</span><span> vtype {
+</span><span>	VNON	= </span><span>0</span><span>,
+</span><span>	VREG	= </span><span>1</span><span>,
+</span><span>	VDIR	= </span><span>2</span><span>,
+</span><span>	VBLK	= </span><span>3</span><span>,
+</span><span>	VCHR	= </span><span>4</span><span>,
+</span><span>	VLNK	= </span><span>5</span><span>,
+</span><span>	VFIFO	= </span><span>6</span><span>,
+</span><span>	VDOOR	= </span><span>7</span><span>,
+</span><span>	VPROC	= </span><span>8</span><span>,
+</span><span>	VSOCK	= </span><span>9</span><span>,
+</span><span>	VPORT	= </span><span>10</span><span>,
+</span><span>	VBAD	= </span><span>11
+</span><span>} </span><span>vtype_t</span><span>;
+</span></code></pre>
+<p>...it's <code>VDIR</code>?</p>
+<p>This is when I started questioning my sanity a little. Theories of weird corruption happening
+between function entry and the condition check. Was <code>secpolicy_fs_mount</code> secretly modifying it?
+(No.)</p>
+<p>Eventually I decide to look at the actual code running on my machine and use the kernel debugger
+to disassemble the <code>fuse</code> module in-memory:</p>
+<pre data-lang="asm"><code data-lang="asm"><span>$ pfexec mdb </span><span>-</span><span>k                                                                                       
+</span><span>Loading modules: </span><span>[ </span><span>unix genunix specfs dtrace mac </span><span>cpu</span><span>.generic uppc apix scsi_vhci zfs sata </span><span>ip </span><span>hook neti sockfs arp usba xhci mm smbios stmf stmf_sbd lofs crypto random cpc ufs logindmux nsmb ptm smbsrv nf
+</span><span>s </span><span>]                                                
+</span><span>&gt; fuse`fuse_mount::dis                            
+</span><span>[...snip...]
+</span><span>fuse_mount</span><span>+0x28</span><span>:                </span><span>call   </span><span>+0x3a21ec3       </span><span>&lt;secpolicy_fs_mount&gt;
+</span><span>fuse_moun…</span></code></pre></div></div>
+<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://luqman.ca/blog/multi-kernel-drifting/">https://luqman.ca/blog/multi-kernel-drifting/</a></em></p>]]>
             </description>
             <link>https://luqman.ca/blog/multi-kernel-drifting/</link>
             <guid isPermaLink="false">hacker-news-small-sites-33337086</guid>
@@ -1937,7 +2384,113 @@ October 25, 2022 | https://iapps.courts.state.ny.us/fbem/DocumentDisplayServlet?
 Score 2 | Comments 0 (<a href="https://news.ycombinator.com/item?id=33336954">thread link</a>) | @metadat
 <br/>
 October 25, 2022 | https://adl.io/essays/why-software-development-requires-servant-leaders/ | <a href="https://web.archive.org/web/*/https://adl.io/essays/why-software-development-requires-servant-leaders/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
+  <p>The idea of “servant” leaders has been on the rise in the agile community of
+late. Robert K. Greenleaf coined the term in a <a href="https://amzn.to/2KHPIB6">1970 essay</a>,
+but the idea is timeless. Virtually every religion describes the concept. This
+one from the <em>Tao Te Ching</em> is particularly poignant:</p>
+<blockquote>
+<p>The highest type of ruler is one of whose existence the people are barely aware.</p>
+<p>Next comes one whom they love and praise.
+Next comes one whom they fear.
+Next comes one whom they despise and defy.</p>
+<p>When you are lacking in faith,
+Others will be unfaithful to you.</p>
+<p>The Sage is self-effacing and scanty of words.
+When his task is accomplished and things have been completed, All the people say, “<strong>We ourselves have achieved it!</strong>”</p>
+<p>— Lao Tzu</p>
+</blockquote>
+<p>The idea applies to any kind of leader, but I think it’s especially applicable
+to leaders of software projects, where the unique dynamics of
+<a href="https://chrismm.com/blog/project-delays-why-software-estimates/">unpredictability</a>
+and <a href="https://www.extremetech.com/computing/259977-software-increasingly-complex-thats-dangerous">complexity</a> collide.</p>
+<p>Ever wonder why software people invent all kinds of alternative labels for
+“project” (e.g. “Scrum”, “Sprint”, “engagement”, “iteration”, “MVP”, etc)
+and “project nager” (“Scrum Master”, “Product Owner”, “Product Manager”,
+“engagement manager”, etc), and everyone else just uses the regular names?
+It’s not because we’re narcissists who need special labels. It’s because
+people keep running into difficulty trying to square the very definition of a
+project (something with “<a href="https://www.pmi.org/about/learn-about-pmi/what-is-project-management">defined scope, schedule and resources</a>") with our real world experiences. In software it’s <strong>common</strong> to have something estimated at a
+day take a week instead. Sure, you can call your work a project; you can write
+down a scope and make a schedule, but it’ll probably be wrong.</p>
+<p>The inherent inaccuracy of software estimates creates extra tension that you
+don’t find in other industries. If you’re the CEO of a startup, and you’ve got
+a fixed technology budget, you don’t want to hear that your software will take
+<a href="http://www.construx.com/Thought_Leadership/Books/The_Cone_of_Uncertainty/">up to <strong>4X</strong> longer</a>
+than your team initially estimated.</p>
+<p>Because engineering managers inhabit the border between the business and the
+technical, they are the ones who need to resolve the tension between estimate
+and reality. It’s a bit like being the wishbone being pulled at both ends; either
+side can snap. When the business side “wins”, the developers end up in a death
+march. When development concerns outweigh business ones, you end up blowing the
+budget and deadline. Either way you’re broken. Successful software managers find
+ways to be <em>flexible</em>; to bend without breaking and to resolve the tension
+gradually. Servant leadership can be a guide to finding this flexibility.</p>
+<h2 id="what-servant-leadership-means-for-software">What Servant Leadership Means for Software</h2>
+<p>At its core, servant leadership is about inverting the pyramid of power.
+Instead of exerting power from the top, servant leaders empower others and
+enable them from below. Here’s how that looks in software.</p>
+<h3 id="prioritize-growth">Prioritize Growth</h3>
+<p>Servant leadership works because it motivates people to bring their very best.
+By being aligned with their innate needs for autonomy, mastery and purpose
+(see Daniel Pink’s book <a href="https://amzn.to/2I3ALri">Drive</a> for more on that), you
+unlock a completely different kind of engagement in your team. Command and
+Control may work on some battlefields, but in creative endeavors, blindly
+following directions is the last thing you want your people to do.</p>
+<p>Ask yourself:</p>
+<blockquote>
+<p>Do those served grow as persons? Do they, while being served, become
+healthier, wiser, freer, more autonomous, more likely themselves to
+become servants?
+— <a href="https://www.greenleaf.org/what-is-servant-leadership/">Robert K. Greenleaf</a></p>
+</blockquote>
+<p>When considering a project, consider the growth opportunity it represents for
+each member of your team. Always have an ear trained toward learning what
+challenges they are ready to take on.</p>
+<h3 id="establish-trust">Establish Trust</h3>
+<p>Establish trust with your team by showing you care and looking out for their best
+interests. Protect them from unreasonable deadlines or unnecessary off-project
+work. Immediately recognize their achievements. Give them every available tool
+and advantage to achieve their goals, but do not protect them from the
+consequences of their own behavior.</p>
+<h3 id="give-developers-control-over-estimation">Give Developers Control Over Estimation</h3>
+<p>Developers should estimate their own work, and should be encouraged to be as
+honest and realistic as possible. Managers shouldn’t “negotiate” with the
+estimate; that reduces its accuracy and disrespects its creator. Instead,
+managers should probe for thoroughness in a curious, conversational style that
+encourages “thinking out loud” about the risks that need to be incorporated into
+the estimates.</p>
+<h3 id="drive-uncertainty-out-of-requirements">Drive Uncertainty Out of Requirements</h3>
+<p>Vague or contradictory requirements are the bane of a developer’s existence.
+Computers are unyielding in their need for precise instructions, and developers
+spend most of their day talking with them.</p>
+<p>To be of service in the early stages of a project, managers need to play an
+active role in vetting, testing and refining requirements. In the same way a
+good QA team stretches the software to its limit to ensure it’s not broken, a
+good manager stretches the requirements to their limit to ensure they’re not
+broken.</p>
+<h3 id="be-chief-unblocker">Be “Chief Unblocker”</h3>
+<p>The best referees are the ones nobody notices because they make the right calls
+and stay aware of the emotional state of the game to prevent controversial
+calls from spiraling out of their control. It’s the same for managers and
+blockers. The best managers see blockers coming and act early to prevent them
+from ever surfacing. When prevention fails, they act quickly to resolve it,
+knowing that nothing outranks a blocker.</p>
+<p>This requires <strong>active listening</strong> during stand ups and other meetings. Great
+managers hone their “blocker radar” by noticing patterns in status reports.
+When a developer’s standup is nearly identical today as it was yesterday, they
+notice; the developer might not be blocked yet, but they definitely didn’t
+achieve yesterday what they expected, and might be at risk of being blocked soon.</p>
+<h3 id="have-empathy-for-the-customer">Have Empathy for the Customer</h3>
+<p>Things often take a meandering path between the customer and the programming
+task. When developers don’t understand the <strong>Why</strong> behind a request, they can
+struggle with motivation or even misinterpret the request and build the wrong
+thing. As the liaison between the team and the customer, the manager needs to
+excel at understanding the customer better than anyone else. If you don’t
+understand why a requirement exists… find out. Put yourself in the customers
+shoes to understand the underlying needs behind their requests.</p>
+
+</article></div>]]>
             </description>
             <link>https://adl.io/essays/why-software-development-requires-servant-leaders/</link>
             <guid isPermaLink="false">hacker-news-small-sites-33336954</guid>
@@ -1952,7 +2505,7 @@ October 25, 2022 | https://adl.io/essays/why-software-development-requires-serva
 Score 2 | Comments 0 (<a href="https://news.ycombinator.com/item?id=33336672">thread link</a>) | @gmays
 <br/>
 October 25, 2022 | https://tips.ariyh.com/p/graspable-objects | <a href="https://web.archive.org/web/*/https://tips.ariyh.com/p/graspable-objects">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><article><div><div><div dir="auto"><p><em><strong><span>New to </span><a href="https://ariyh.com/?utm_source=tips" rel="">Ariyh</a><span>? </span></strong><span>Join </span><strong>14,241</strong><span> evidence-based marketers for 3min practical insights</span></em><span> 💡 </span><em>from the latest scientific research</em><span> 🎓 </span><em>to get better marketing results</em><span> 📈</span></p><p><strong><span>Today’s insight is brought to you by… </span><a href="https://www.storyblok.com/lp/ecommerce-marketing-atlas?utm_source=Ariyh&amp;utm_medium=email&amp;utm_campaign=DGM_DEM_ARN_TRA&amp;utm_content=ariyh-marketing-atlas" rel="">Storyblok</a></strong></p><div><figure><a target="_blank" href="https://www.storyblok.com/lp/ecommerce-marketing-atlas?utm_source=Ariyh&amp;utm_medium=email&amp;utm_campaign=DGM_DEM_ARN_TRA&amp;utm_content=ariyh-marketing-atlas" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fbucketeer-e05bbc84-baa3-437e-9518-adb32be77984.s3.amazonaws.com%2Fpublic%2Fimages%2F95c74670-a93f-4b92-be97-b93ea107d83d_1600x369.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fbucketeer-e05bbc84-baa3-437e-9518-adb32be77984.s3.amazonaws.com%2Fpublic%2Fimages%2F95c74670-a93f-4b92-be97-b93ea107d83d_1600x369.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fbucketeer-e05bbc84-baa3-437e-9518-adb32be77984.s3.amazonaws.com%2Fpublic%2Fimages%2F95c74670-a93f-4b92-be97-b93ea107d83d_1600x369.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fbucketeer-e05bbc84-baa3-437e-9518-adb32be77984.s3.amazonaws.com%2Fpublic%2Fimages%2F95c74670-a93f-4b92-be97-b93ea107d83d_1600x369.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fbucketeer-e05bbc84-baa3-437e-9518-adb32be77984.s3.amazonaws.com%2Fpublic%2Fimages%2F95c74670-a93f-4b92-be97-b93ea107d83d_1600x369.jpeg" width="1456" height="336" data-attrs="{&quot;src&quot;:&quot;https://bucketeer-e05bbc84-baa3-437e-9518-adb32be77984.s3.amazonaws.com/public/images/95c74670-a93f-4b92-be97-b93ea107d83d_1600x369.jpeg&quot;,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:336,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:&quot;https://www.storyblok.com/lp/ecommerce-marketing-atlas?utm_source=Ariyh&amp;utm_medium=email&amp;utm_campaign=DGM_DEM_ARN_TRA&amp;utm_content=ariyh-marketing-atlas&quot;,&quot;belowTheFold&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fbucketeer-e05bbc84-baa3-437e-9518-adb32be77984.s3.amazonaws.com%2Fpublic%2Fimages%2F95c74670-a93f-4b92-be97-b93ea107d83d_1600x369.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fbucketeer-e05bbc84-baa3-437e-9518-adb32be77984.s3.amazonaws.com%2Fpublic%2Fimages%2F95c74670-a93f-4b92-be97-b93ea107d83d_1600x369.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fbucketeer-e05bbc84-baa3-437e-9518-adb32be77984.s3.amazonaws.com%2Fpublic%2Fimages%2F95c74670-a93f-4b92-be97-b93ea107d83d_1600x369.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fbucketeer-e05bbc84-baa3-437e-9518-adb32be77984.s3.amazonaws.com%2Fpublic%2Fimages%2F95c74670-a93f-4b92-be97-b93ea107d83d_1600x369.jpeg 1456w" sizes="100vw"></picture></div></a></figure></div><p>Get your free copy of the eCommerce Marketing Atlas, a 70-page blueprint on how to run a modern ecommerce business.</p><p>A practical handbook of everything you need to have covered, from customer journeys to SEO to conversions to content automation. All filled with real-life examples and quick tips.</p><p data-attrs="{&quot;url&quot;:&quot;https://www.storyblok.com/lp/ecommerce-marketing-atlas?utm_source=Ariyh&amp;utm_medium=email&amp;utm_campaign=DGM_DEM_ARN_TRA&amp;utm_content=ariyh-marketing-atlas&quot;,&quot;text&quot;:&quot;Download the PDF&quot;,&quot;action&quot;:null,&quot;class&quot;:null}"><a href="https://www.storyblok.com/lp/ecommerce-marketing-atlas?utm_source=Ariyh&amp;utm_medium=email&amp;utm_campaign=DGM_DEM_ARN_TRA&amp;utm_content=ariyh-marketing-atlas" rel=""><span>Download the PDF</span></a></p><p><em><span>Want to sponsor Ariyh? </span><a href="https://advertise.ariyh.com/" rel="">Here’s all you need to know</a></em><span>.</span></p><p>Hold tight. This study is going to blow your mind.</p><p><span>In one of the experiments, scientists </span><strong>tripled</strong><span> signups for a loyalty program by strategically positioning a vegetable peeler in an image advert of the program.</span></p><p>How?</p><p>Let’s take a look.</p><p><em>P.S.: In this study I talk about positioning objects in a way that’s convenient for right-handers. The more correct way would be to say ‘position objects for each person’s dominant hand’.</em></p><p><em><span>But </span><a href="https://doi.org/10.1007/BF01067189" rel="">90% of the world’s population is right-handed</a><span>, so you are better off simply catering to them.</span></em></p><p><em><span>I know, left-handed people </span><a href="https://www.buzzfeed.com/katherinepickhardt/left-handed-frustrations" rel="">always get ignored</a><span>. I’m left-handed myself.</span></em></p><p><em><span>Here’s some consolation though. Turns out the research that found that </span><a href="https://doi.org/10.1037/0033-2909.109.1.90" rel="">left-handed people die younger</a><span> is </span><a href="https://doi.org/10.1037/0033-2909.114.2.203" rel="">probably (and hopefully) wrong</a><span>.</span></em></p><p><span>Previous insight: </span><a href="https://tips.ariyh.com/p/use-you-in-copy" rel="">Use ‘you’ in your copy to boost results</a><span> (100+ more insights </span><a href="https://tips.ariyh.com/archive?utm_source=prevtip" rel="">here</a><span>)</span></p><p><strong>Channels</strong><span>: Ads | Image Ads | Website | Marketing communications</span><br><strong>For</strong><span>: Both B2C and B2B</span><br><strong>Research date</strong><span>: October 2019</span></p><p>Products can be either:</p><ul><li><p>Graspable objects: that people can easily grab and hold in their hand (e.g. mug, baseball bat)</p></li><li><p>Non-graspable objects: anything else - physical or non-physical (e.g. car, newsletter, SaaS software)</p></li></ul><p>You can increase sales of any product by strategically positioning graspable objects in your marketing creatives (e.g. ads, website, email banners).</p><p>If your product is a graspable object, position it in a way that people can easily imagine grabbing it with their right hand (e.g. to the right side of an image, with the handle facing right).</p><p>If your product is not graspable, position a graspable object (even if unrelated to your product) in the field of vision of the product you are selling (e.g. image of a car, logo of your SaaS). It will make your product feel graspable.</p><ul><li><p><a href="https://doi.org/10.1016/j.jcps.2013.04.004" rel="">Previous research</a><span> found that people like products that they can take and hold (“graspable” objects) more when they are on the right side of their body or when the handle is pointed toward the right. For example:</span></p><ul><li><p>Mugs, wine glasses, and yogurt cups are graspable objects</p></li><li><p>A bottle of detergent on a store shelf would sell more when placed with the handle on the right, rather than the left</p></li></ul></li><li><p>This study found that graspable objects can be placed strategically to increase preferences for non-graspable products in the same field of view (e.g. a painting, an ad for accounting software). For example:</p><ul><li><p>A mug with a handle facing to the right, placed in an ad for a wall-mounted clock</p></li><li><p>A pen on the right side of an ad for accounting services</p></li></ul></li><li><p>For example, as part of 8 experiments:</p><ul><li><p>7,962 visitors to a shopping center walked by different versions of a poster advertising its loyalty program. The ad also contained a vegetable peeler, with the handle pointing toward the viewer</p><ul><li><p>0.6% of people signed up when the peeler was on the right side of the image</p></li><li><p>0.2% signed up when the peeler was on the left</p></li></ul></li><li><p>A painting was shown with a glass of wine next to it. People were asked how likely they were to buy the painting</p><ul><li><p>13.9% more said they would buy it when the glass was to the right of the painting, compared to the left of it</p></li><li><p>16.2% more said they would buy it when there was a glass on the right, compared to no glass</p></li></ul></li></ul></li><li><p>On average, across 5 of the controlled experiments, the effect increased purchase intentions by about 7.5% to 8.75%.</p></li></ul><p><em>In one of the experiments, people were 13.9% more likely to say they would buy a painting when it had a wine glass placed to its right, compared to when the glass was placed to its left</em></p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fbucketeer-e05bbc84-baa3-437e-9518-adb32be77984.s3.amazonaws.com%2Fpublic%2Fimages%2F8d0b7fff-02a8-4906-be97-255c9a232cf3_869x457.png" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fbucketeer-e05bbc84-baa3-437e-9518-adb32be77984.s3.amazonaws.com%2Fpublic%2Fimages%2F8d0b7fff-02a8-4906-be97-255c9a232cf3_869x457.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fbucketeer-e05bbc84-baa3-437e-9518-adb32be77984.s3.amazonaws.com%2Fpublic%2Fimages%2F8d0b7fff-02a8-4906-be97-255c9a232cf3_869x457.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fbucketeer-e05bbc84-baa3-437e-9518-adb32be77984.s3.amazonaws.com%2Fpublic%2Fimages%2F8d0b7fff-02a8-4906-be97-255c9a232cf3_869x457.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fbucketeer-e05bbc84-baa3-437e-9518-adb32be77984.s3.amazonaws.com%2Fpublic%2Fimages%2F8d0b7fff-02a8-4906-be97-255c9a232cf3_869x457.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fbucketeer-e05bbc84-baa3-437e-9518-adb32be77984.s3.amazonaws.com%2Fpublic%2Fimages%2F8d0b7fff-02a8-4906-be97-255c9a232cf3_869x457.png" width="869" height="457" data-attrs="{&quot;src&quot;:&quot;https://bucketeer-e05bbc84-baa3-437e-9518-adb32be77984.s3.amazonaws.com/public/images/8d0b7fff-02a8-4906-be97-255c9a232cf3_869x457.png&quot;,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:457,&quot;width&quot;:869,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fbucketeer-e05bbc84-baa3-437e-9518-adb32be77984.s3.amazonaws.com%2Fpublic%2Fimages%2F8d0b7fff-02a8-4906-be97-255c9a232cf3_869x457.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fbucketeer-e05bbc84-baa3-437e-9518-adb32be77984.s3.amazonaws.com%2Fpublic%2Fimages%2F8d0b7fff-02a8-4906-be97-255c9a232cf3_869x457.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fbucketeer-e05bbc84-baa3-437e-9518-adb32be77984.s3.amazonaws.com%2Fpublic%2Fimages%2F8d0b7fff-02a8-4906-be97-255c9a232cf3_869x457.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fbucketeer-e05bbc84-baa3-437e-9518-adb32be77984.s3.amazonaws.com%2Fpublic%2Fimages%2F8d0b7fff-02a8-4906-be97-255c9a232cf3_869x457.png 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><ul><li><p>When we see an object that we could easily grasp with our dominant hand, we have a stronger feeling that we own it.</p></li><li><p><span>Once we feel stronger ownership of a product, we like it more, are more likely to buy it, and are willing to pay more for it. We would not want to lose it, largely due to our </span><a href="https://en.wikipedia.org/wiki/Loss_aversion" rel="">loss aversion</a><span>.</span></p></li><li><p>This feeling of ownership of a graspable object spills over to a non-graspable product if they are in the same field of vision.</p></li></ul><p><span>I’m proud to have Ahrefs sponsor Ariyh, by far my favorite company for SEO tools (and probably the </span><a href="https://ahrefs.com/blog/" rel="">best source of SEO tips and resources</a><span>).</span></p><p>If you want to track and improve your SEO, they have a great tool to do that - at no cost. I use it myself. You can try it out below.</p><p data-attrs="{&quot;url&quot;:&quot;https://ahrefs.com/webmaster-tools&quot;,&quot;text&quot;:&quot;Audit your website at no cost&quot;,&quot;action&quot;:null,&quot;class&quot;:null}"><a href="https://ahrefs.com/webmaster-tools" rel=""><span>Audit your website at no cost</span></a></p><p><em><span>This announcement was sponsored. Want your brand here? </span><a href="https://advertise.ariyh.com/" rel="">Click here</a></em><span>.</span></p><ul><li><p>In most of the experiments, people were asked to not use or move their hands when looking at the ads and images. It’s possible that when people have their right hand occupied (e.g. using their phone) the effect changes or disappears, because they can’t grasp the object they see with an occupied hand.</p></li><li><p>The study focused on psychological ownership as the driver of this effect, but it is likely that there are other unexplored reasons that drive it.</p></li><li><p>It’s unclear where the line is that defines when an object is ‘graspable’. Is a smartphone in itself graspable? If it’s attached to a selfie stick, does it become more graspable?</p></li></ul><ul><li><p>No companies or advertising agencies appear to be using this technique yet.</p></li></ul><ul><li><p>If your product is graspable, make sure to position it in a way that makes it easy for right-handed viewers to imagine grabbing it.</p></li><li><p>If your product is not graspable, think of graspable objects that would fit well in the scenario you are depicting. For example, you can set an advertisement of a luxury car on a golf course and include a graspable golf club on the right side of the image.</p></li><li><p>Apply this effect whenever you are displaying your product, and in some cases even your brand. For example in ads, on your website, or in email banners.</p></li><li><p><span>You can also drive a similar effect by </span><a href="https://tips.ariyh.com/p/-the-virtual-touch-effect" rel="">showing a hand touching your product</a><span>.</span></p></li></ul><p>Lab and online experiments and field experiment (with two versions of a poster used to advertise a loyalty program at the entrance of a hypermarket)</p><p><a href="https://doi.org/10.1177/0022243719878390" rel="">On the other hand…: Enhancing promotional effectiveness with haptic cues</a><span>. Journal of Marketing Research (October 2019).</span></p><ul><li><p><a href="https://scholar.google.com/citations?user=8czIu4AAAAAJ" rel="">Virginie Maille</a><span>. KEDGE Business School</span></p></li><li><p><a href="https://www.linkedin.com/in/maureen-morrin-3141734/" rel="">Maureen Morrin</a><span>. Rutgers University–Camden</span></p></li><li><p><a href="https://scholar.google.com/citations?user=xznkoVkAAAAJ" rel="">Ryann Reynolds-McIlnay</a><span>. Oregon State University</span></p></li></ul><p><em><span>Remember: This is a scientific discovery. In the future it will probably be better understood and could even be proven wrong (that’s </span><a href="https://en.wikipedia.org/wiki/Scientific_method" rel="">how science works</a><span>). It may also not be generalizable to your situation. If it’s a risky change, always test it on a small scale before rolling it out widely.</span></em></p><p>Rate today’s insight to help me make Ariyh's next insights 🎓 even more useful 📈</p><p><span>How was today’s insight?</span><br><a href="https://docs.google.com/forms/d/e/1FAIpQLSfO9eWblE6OZf2iqor_RvEInBVbIlWjGhGfYLN7DCBqd_kAyA/viewform?usp=pp_url&amp;entry.1057479649=Loved+it" rel="">Loved it</a><span> | </span><a href="https://docs.google.com/forms/d/e/1FAIpQLSfO9eWblE6OZf2iqor_RvEInBVbIlWjGhGfYLN7DCBqd_kAyA/viewform?usp=pp_url&amp;entry.1057479649=Great" rel="">Great</a><span> | </span><a href="https://docs.google.com/forms/d/e/1FAIpQLSfO9eWblE6OZf2iqor_RvEInBVbIlWjGhGfYLN7DCBqd_kAyA/viewform?usp=pp_url&amp;entry.1057479649=Good" rel="">Good</a><span> | </span><a href="https://docs.google.com/forms/d/e/1FAIpQLSfO9eWblE6OZf2iqor_RvEInBVbIlWjGhGfYLN7DCBqd_kAyA/viewform?usp=pp_url&amp;entry.1057479649=Meh" rel="">Meh</a><span> | </span><a href="https://docs.google.com/forms/d/e/1FAIpQLSfO9eWblE6OZf2iqor_RvEInBVbIlWjGhGfYLN7DCBqd_kAyA/viewform?usp=pp_url&amp;entry.1057479649=Bad" rel="">Bad</a></p><ul><li><p><span>📘 </span><strong>Want to optimize your pricing?</strong><span> Get </span><a href="https://ariyh.gumroad.com/l/pricing" rel="">Ariyh’s Science-based Playbook of Pricing &amp; Promotions</a></p></li><li><p><span>📣 </span><strong>Want to advertise on Ariyh?</strong><span> </span><a href="https://advertise.ariyh.com/" rel="">Here’s all you need to know</a></p></li><li><p><span>🎓 </span><strong>New to Ariyh?</strong><span> -&gt; Subscribe below or read 100+ other </span><a href="https://tips.ariyh.com/archive?utm_source=email_footer" rel="">3-min marketing insights</a></p></li></ul></div></div></div></article></div></div></div>]]>
             </description>
             <link>https://tips.ariyh.com/p/graspable-objects</link>
             <guid isPermaLink="false">hacker-news-small-sites-33336672</guid>
@@ -2291,6 +2844,9 @@ October 25, 2022 | https://www.matuzo.at/blog/2022/twitter-ban/ | <a href="https
     </p>
 
   
+    <p><a href="#update_2610">Update 26.10</a></p>
+
+  
 
   
 
@@ -2359,12 +2915,27 @@ Twitter</p></blockquote></div>
   <p><strong>24.10. Submitted an appeal</strong>  </p>
   <p>I've submitted an appeal and asked them again to look into the matter and tell me what happened.</p>
   </li>
-<li><p><strong>25.10 you ❤️</strong>
+<li><p><strong>25.10 You ❤️</strong>
   </p><p>Today I had multiple mails in my inbox from people offering their help and asking if I was okay. You're amazing, thank you! ❤️ I'm fine, it's just annoying.</p>
   <p>Thank you everyone for @-ing Twitter Support (<a href="https://twitter.com/spuz78/status/1584470084231516161">Bernhard</a> and <a href="https://twitter.com/m_ott/status/1584648614282133504">Matthias</a>) and retweeting, and especially thank you Bernhard, Matthias, Mike, David, Jenn, Jens, and Sara for getting in touch via e-mail.</p>
   </li>
+  <p>What's next? I don't know. I'll just wait for their reply. I'll keep you updated in this blog post.</p>
+<li id="update_2610">
+  <p><strong>26.10 Support and reply from Twitter Support</strong></p>
+  <p>
+    I'm blown away by the amount of support I've received. Literally 100s of tweets @-ing Twitter-Support. Thank you! Thank you!  Thank you!
+  </p>
+  <p>
+  <img src="https://www.matuzo.at/images/twitter_ban5.jpg" alt="Twitter search for 'Bring back @mmatuzo, @TwitterSupport' showing dozens of results by all kinds of people.">
+  </p>
+  <p>  Some of you even put the message in their Twitter name. 😁</p>
+  <img src="https://www.matuzo.at/images/twitter_ban3.jpg" alt="Zack Leathermans profil showing his portrait, bio and twitter name 'Zack Leatherman–bring back @mmatuzo'">
+  <p>And others created memes. 😁</p>
+  <img src="https://www.matuzo.at/images/twitter_ban4.jpg" alt="Bring back @mmatuzo paid for by the Manuel Hates Lobester Foundation written in Lobster font">
+  <img src="https://www.matuzo.at/images/twitter_ban6.jpg" alt="Crowd from the TV show Southpark protesting and holding up signs that say Freedom for @mmatuzo, free @mmatuzo or @mmatuzo didn't do it.">
+  <p>Other than that, nothing much happened except that I've filed another appeal and someone from Twitter Support replied to one of the tweets asking for a case number, which Max provided for me. Let's see what happens next.</p>
+</li>
 </ol>
-<p>What's next? I don't know. I'll just wait for their reply. I'll keep you updated in this blog post.</p>
 <p>Yours truly,<br>
 Manuel</p>
 <p>PS: A div is still not a button.</p>
@@ -4018,7 +4589,7 @@ unidiomatic and unimpressive version:</p>
 Score 59 | Comments 5 (<a href="https://news.ycombinator.com/item?id=33333285">thread link</a>) | @alwillis
 <br/>
 October 25, 2022 | https://vimtricks.com/p/50-useful-vim-commands/ | <a href="https://web.archive.org/web/*/https://vimtricks.com/p/50-useful-vim-commands/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="bwp-post-240"><div> <div>   <h3> <a href="https://vimtricks.com/p/vim-spell-check/" data-wpel-link="internal">Vim Spell Check</a></h3>  <p>Vim spell check is a native feature that can check your spelling as you type and give you suggested spelling corrections right in Vim.</p>  <div> <div><figure> <a href="https://vimtricks.com/p/author/cbartlett/" title="Posted by Colin Bartlett" data-wpel-link="internal"> <img alt="Colin Bartlett" src="https://secure.gravatar.com/avatar/e88405313419b8cda03966224a92235f?s=72&amp;d=mm&amp;r=g" srcset="https://secure.gravatar.com/avatar/e88405313419b8cda03966224a92235f?s=144&amp;d=mm&amp;r=g 2x" height="72" width="72" loading="lazy"> </a></figure></div> </div> </div> </div></article><article id="bwp-post-1390"><div> <div>   <h3> <a href="https://vimtricks.com/p/vim-line-length-marker/" data-wpel-link="internal">Vim Line Length Marker</a></h3>  <p>Vim’s line length marker capability, called colorcolumn, allows you to visually highlight a certain text width.</p>  <div> <div><figure> <a href="https://vimtricks.com/p/author/cbartlett/" title="Posted by Colin Bartlett" data-wpel-link="internal"> <img alt="Colin Bartlett" src="https://secure.gravatar.com/avatar/e88405313419b8cda03966224a92235f?s=72&amp;d=mm&amp;r=g" srcset="https://secure.gravatar.com/avatar/e88405313419b8cda03966224a92235f?s=144&amp;d=mm&amp;r=g 2x" height="72" width="72" loading="lazy"> </a></figure></div> </div> </div> </div></article></div>]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="bwp-post-1461"><div> <div>   <h3> <a href="https://vimtricks.com/p/vim-code-folding/" data-wpel-link="internal">Vim Code Folding</a></h3>  <p>Show and hide code with Vim code folding options. This tutorial covers enabling and disabling folding and gives helpful hints for fold usage.</p>  <div> <div><figure> <a href="https://vimtricks.com/p/author/cbartlett/" title="Posted by Colin Bartlett" data-wpel-link="internal"> <img alt="Colin Bartlett" src="https://secure.gravatar.com/avatar/e88405313419b8cda03966224a92235f?s=72&amp;d=mm&amp;r=g" srcset="https://secure.gravatar.com/avatar/e88405313419b8cda03966224a92235f?s=144&amp;d=mm&amp;r=g 2x" height="72" width="72" loading="lazy"> </a></figure></div> </div> </div> </div></article><article id="bwp-post-195"><div> <div>   <h3> <a href="https://vimtricks.com/p/vim-jump-list/" data-wpel-link="internal">Vim Jump List</a></h3>  <p>The Vim jump list is a convenient list of navigation points, akin to a browser history. Read on to improve your use of the Vim jumplist.</p>  <div> <div><figure> <a href="https://vimtricks.com/p/author/alibby/" title="Posted by Andy Libby" data-wpel-link="internal"> <img alt="Andy Libby" src="https://secure.gravatar.com/avatar/644a0b83c008560259d41cb11999c5df?s=72&amp;d=mm&amp;r=g" srcset="https://secure.gravatar.com/avatar/644a0b83c008560259d41cb11999c5df?s=144&amp;d=mm&amp;r=g 2x" height="72" width="72" loading="lazy"> </a></figure></div> </div> </div> </div></article></div>]]>
             </description>
             <link>https://vimtricks.com/p/50-useful-vim-commands/</link>
             <guid isPermaLink="false">hacker-news-small-sites-33333285</guid>
@@ -5951,7 +6522,226 @@ October 25, 2022 | https://readyset.io/blog/helm-chart-launch | <a href="https:/
 Score 2 | Comments 0 (<a href="https://news.ycombinator.com/item?id=33330128">thread link</a>) | @todsacerdoti
 <br/>
 October 25, 2022 | https://luqman.ca/blog/multi-kernel-drifting/ | <a href="https://web.archive.org/web/*/https://luqman.ca/blog/multi-kernel-drifting/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+            <p>I was setting up some automation to build Windows images pre-loaded with some drivers and software
+(a story for another day). I had already gotten it working with QEMU under KVM on Linux but wanted
+to port it to <a href="https://github.com/oxidecomputer/propolis">propolis</a> on our illumos distro, Helios.
+I figured it should be mostly straightforward; maybe a couple different flags or utilities to futz
+around with the disk images and mount them. Which was the case. Mostly. That is except for the one
+minor detail of not being able to mount an NTFS image.</p>
+<pre data-lang="console"><code data-lang="console"><span>$ pfexec mount -F ntfs-3g $LOOPBACK_DEV /mnt/test
+</span><span>fuse: mount failed: Not a directory
+</span></code></pre>
+<h2 id="the-setup">the setup</h2>
+<p>Ok, let's step back a second. To give some context, I was trying to create a raw image that
+contained an NTFS partition. Maybe it didn't like the way I created the GPT? Ok, let's try
+something simpler and forget partitions for a moment and just try solely creating an NTFS file
+system:</p>
+<ol>
+<li>Create an empty disk image:</li>
+</ol>
+<pre data-lang="console"><code data-lang="console"><span>$ qemu-img create -f raw test.img 8G
+</span><span>Formatting 'test.img', fmt=raw size=8589934592
+</span></code></pre>
+<ol start="2">
+<li>Create loopback device:</li>
+</ol>
+<pre data-lang="console"><code data-lang="console"><span>$ pfexec lofiadm -l -a test.img
+</span><span>/dev/dsk/c2t1d0p0
+</span></code></pre>
+<ol start="3">
+<li>Create an NTFS file system:</li>
+</ol>
+<pre data-lang="console"><code data-lang="console"><span>$ mkntfs -Q /dev/dsk/c2t1d0p0
+</span><span>The sector size was not specified for /dev/dsk/c2t1d0p0 and it could not be obtained automatically.  It has been set to 512 bytes.
+</span><span>The partition start sector was not specified for /dev/dsk/c2t1d0p0 and it could not be obtained automatically.  It has been set to 0.
+</span><span>The number of sectors per track was not specified for /dev/dsk/c2t1d0p0 and it could not be obtained automatically.  It has been set to 0.
+</span><span>The number of heads was not specified for /dev/dsk/c2t1d0p0 and it could not be obtained automatically.  It has been set to 0.
+</span><span>Cluster size has been automatically set to 4096 bytes.
+</span><span>To boot from a device, Windows needs the 'partition start sector', the 'sectors per track' and the 'number of heads' to be set.
+</span><span>Windows will not be able to boot from this device.
+</span><span>Creating NTFS volume structures.
+</span><span>mkntfs completed successfully. Have a nice day.
+</span></code></pre>
+<p>Ok, that's a lot of warnings (that I did handle properly in the real scenario!) but shouldn't be
+relevant right now. We don't care if Windows can't boot off of this image.</p>
+<ol start="4">
+<li>Mount the file system:</li>
+</ol>
+<pre data-lang="console"><code data-lang="console"><span>$ pfexec mount -F ntfs-3g /dev/dsk/c2t1d0p0 /mnt/test
+</span><span>fuse: mount failed: Not a directory
+</span></code></pre>
+<p>Something's clearly wrong.</p>
+<h3 id="linux">linux</h3>
+<p>Mind you this same scenario using the fuse-based ntfs-3g driver works in linux:</p>
+<pre data-lang="console"><code data-lang="console"><span>➜  ~ qemu-img create -f raw test.img 8G
+</span><span>Formatting 'test.img', fmt=raw size=8589934592
+</span><span>➜  ~ sudo losetup -f --show test.img   
+</span><span>/dev/loop1
+</span><span>➜  ~ sudo mkntfs -Q /dev/loop1
+</span><span>The partition start sector was not specified for /dev/loop1 and it could not be obtained automatically.  It has been set to 0.
+</span><span>The number of sectors per track was not specified for /dev/loop1 and it could not be obtained automatically.  It has been set to 0.
+</span><span>The number of heads was not specified for /dev/loop1 and it could not be obtained automatically.  It has been set to 0.
+</span><span>Cluster size has been automatically set to 4096 bytes.
+</span><span>To boot from a device, Windows needs the 'partition start sector', the 'sectors per track' and the 'number of heads' to be set.
+</span><span>Windows will not be able to boot from this device.
+</span><span>Creating NTFS volume structures.
+</span><span>mkntfs completed successfully. Have a nice day.
+</span><span>➜  ~ mkdir test
+</span><span>➜  ~ sudo mount -t ntfs-3g /dev/loop1 test
+</span><span>➜  ~ echo hello &gt; test/world
+</span><span>➜  ~ cat test/world 
+</span><span>hello
+</span></code></pre>
+<h2 id="ntfs-3g">ntfs-3g</h2>
+<p>If you're using NTFS on non-Windows chances are you're using some <a href="https://github.com/tuxera/ntfs-3g">ntfs-3g</a>
+based driver. It is used along with Filesystem in USErspace (FUSE) to provide access to NTFS volumes.
+This arrangement consists of two parts: the FUSE kernel driver and the userspace application that
+links against <code>libfuse</code>. In this case, that is <code>ntfs-3g</code>.</p>
+<p>Let's skip the <code>mount</code> wrapper and just ask <code>ntfs-3g</code> directly to mount our image:</p>
+<pre data-lang="console"><code data-lang="console"><span>$ pfexec ntfs-3g /dev/dsk/c2t1d0p0 /mnt/test
+</span><span>fuse: mount failed: Not a directory
+</span></code></pre>
+<p>Alas, still no good. I guess we gotta dig.</p>
+<h3 id="truss">truss</h3>
+<p>On Linux you have <code>strace</code> to trace system calls. On Illumos there's <code>truss</code>:</p>
+<pre data-lang="console"><code data-lang="console"><span>$ pfexec truss ntfs-3g /dev/dsk/c2t1d0p0 /mnt/test                                                                                                                                                          
+</span><span>execve("/opt/ooce/ntfs-3g/bin/ntfs-3g", 0xFFFFFC7FFFDFDE48, 0xFFFFFC7FFFDFDE68)  argc = 3                                                                                                                   
+</span><span>sysinfo(SI_MACHINE, "i86pc", 257)               = 6
+</span><span>[...snip...]
+</span><span>mount("/devices/pseudo/lofi@1:q", "/mnt/test", MS_NOSUID|MS_OPTIONSTR, "fuse", 0x00000000, 0, 0x00E63E60, 1024) Err#20 ENOTDIR
+</span><span>open("/usr/lib/locale/en_US.UTF-8/LC_MESSAGES/SUNW_OST_OSLIB.mo", O_RDONLY) Err#2 ENOENT
+</span><span>fstat(2, 0xFFFFFC7FFFDFC720)                    = 0
+</span><span>fuse: mount failed: write(2, " f u s e :   m o u n t  ".., 20)  = 20
+</span><span>Not a directorywrite(2, " N o t   a   d i r e c t".., 15)       = 15
+</span><span>
+</span><span>write(2, "\n", 1)                               = 1
+</span><span>close(5)                                        = 0
+</span><span>fdsync(4, FSYNC)                                = 0
+</span><span>fcntl(4, F_SETLK, 0xFFFFFC7FFFDFDBD0)           = 0
+</span><span>close(4)                                        = 0
+</span><span>_exit(21)
+</span><span>
+</span></code></pre>
+<p>Hmmm, <code>mount("/devices/pseudo/lofi@1:q", "/mnt/test", MS_NOSUID|MS_OPTIONSTR, "fuse", 0x00000000, 0, 0x00E63E60, 1024) Err#20 ENOTDIR</code>.</p>
+<p>That <code>ENOTDIR</code> error is not from <code>ntfs-3g</code>, in fact we see it returns an exit code of <code>21</code> and the
+manual page tells us that's an "Unclassified FUSE error".</p>
+<p>The <code>mount</code> syscall here is what returned that <code>ENOTDIR</code> and its manual page says:</p>
+<pre><code><span>       ENOTDIR
+</span><span>                       The dir argument is not a directory, or a component of
+</span><span>                       a path prefix is not a directory.
+</span></code></pre>
+<p>Not a directory you say?</p>
+<pre data-lang="console"><code data-lang="console"><span>$ file /mnt/test
+</span><span>/mnt/test:      directory
+</span></code></pre>
+<p>Presumably it is the fuse kernel driver which is handling the <code>mount</code> syscall in this case. One
+quick way to check: <a href="http://dtrace.org/blogs/about/">DTrace</a>.</p>
+<h3 id="dtrace">dtrace</h3>
+<p><a href="https://illumos.org/books/dtrace/chp-intro.html#chp-intro">DTrace on illumos</a> offers a wealth of
+information on a live system. With a lot of introspection capabilities, it makes for a great
+debugging tool. I'm still learning to reach for it, but it works perfectly here:</p>
+<pre><code><span>$ pfexec dtrace -n 'fuse::return /arg1 == ENOTDIR &amp;&amp; pid == $target/ { stack(); }' -c "ntfs-3g /dev/dsk/c2t1d0p0 /mnt/test"
+</span><span>dtrace: description 'fuse::return ' matched 98 probes
+</span><span>fuse: mount failed: Not a directory
+</span><span>dtrace: pid 11852 has exited
+</span><span>CPU     ID                    FUNCTION:NAME
+</span><span>  1  17911                fuse_mount:return 
+</span><span>              genunix`fsop_mount+0x14
+</span><span>              genunix`domount+0x948
+</span><span>              genunix`mount+0xfe
+</span><span>              genunix`syscall_ap+0x98
+</span><span>              unix`sys_syscall+0x17d
+</span></code></pre>
+<p>So what did we do there? We ran dtrace (<code>pfexec dtrace</code>) and:</p>
+<ol>
+<li>
+<p>told it what probes to match (<code>fuse::return</code>)</p>
+<p>Probes are specified as <code>[[[provider:] module:] function:] name</code>, where any unspecified field
+acts as a wildcard.</p>
+<p>We want to match the exit (<code>return</code>) probe of any function in the <code>fuse</code> kernel module.</p>
+</li>
+<li>
+<p>for any such probes, a predicate to further filter them (<code>/arg1 == ENOTDIR &amp;&amp; pid == $target/</code>)</p>
+<p><code>arg1</code> for a <code>return</code> probe corresponds to its return value. Here we compare to the error we're
+looking for: <code>ENOTDIR</code>.</p>
+<p><code>pid == $target</code> is to further constrain it by using the provided <code>$target</code> macro which refers
+to:</p>
+</li>
+<li>
+<p>the command we want to trace (<code>-c "ntfs-3g /dev/dsk/c2t1d0p0 /mnt/test"</code>)</p>
+</li>
+<li>
+<p>and what actions to take for any matches (<code>{ stack(); }</code>)</p>
+<p>DTrace has a number of actions to inspect the system, here we use the <code>stack()</code> to record and
+print out the kernel stack trace for our matched probes.</p>
+</li>
+</ol>
+<h2 id="fuse">FUSE</h2>
+<p>FUSE seems to be the one stumbling over our supposedly "not a directory" directory. Now that
+<code>dtrace</code> was helpful enough to point out where the error comes from, let's take a look at the
+<a href="https://github.com/jurikm/illumos-fusefs/blob/ef9a33d4a18131a8c0e50002b138b0431e5db616/kernel/fuse_vfsops.c#L367">code</a>.</p>
+<p>It certainly doesn't take long to find the spot:</p>
+<pre data-lang="c"><code data-lang="c"><span>static int
+</span><span>fuse_mount</span><span>(</span><span>struct</span><span> vfs *</span><span>vfsp</span><span>, </span><span>struct</span><span> vnode *</span><span>mvp</span><span>, </span><span>struct</span><span> mounta *</span><span>uap</span><span>,
+</span><span>    </span><span>struct</span><span> cred *</span><span>cr</span><span>)
+</span><span>{
+</span><span>	fuse_vfs_data_t	 *vfsdata;
+</span><span>	fuse_session_t	 *se;
+</span><span>	dev_t dev;
+</span><span>	</span><span>char </span><span>*fdstr;
+</span><span>	</span><span>int</span><span> err;
+</span><span>
+</span><span>	</span><span>if </span><span>(</span><span>secpolicy_fs_mount</span><span>(cr, mvp, vfsp) != </span><span>0</span><span>)
+</span><span>		</span><span>return </span><span>(EPERM);
+</span><span>
+</span><span>	</span><span>if </span><span>(mvp-&gt;v_type != VDIR)
+</span><span>		</span><span>return </span><span>(ENOTDIR);
+</span></code></pre>
+<p>Every file is allocated a <code>vnode</code> and <code>mvp</code> here should represent the one for our mountpoint
+(<code>/mnt/test</code>). <code>mount</code> understandably requires you only mount things at a directory and so every
+file system driver should verify that is the case, just as FUSE does here. But if <code>/mnt/test</code>
+isn't a directory (<code>VDIR</code>), what is it?</p>
+<p>Back to dtrace!</p>
+<pre data-lang="console"><code data-lang="console"><span>$ pfexec dtrace -n 'fuse_mount:entry /pid == $target/ { printf("v_type = %d", args[1]-&gt;v_type); }' -c "ntfs-3g /dev/dsk/c2t1d0p0 /mnt/test"
+</span><span>dtrace: description 'fuse_mount:entry ' matched 1 probe
+</span><span>fuse: mount failed: Not a directory
+</span><span>dtrace: pid 11921 has exited
+</span><span>CPU     ID                    FUNCTION:NAME
+</span><span>  6  17910                 fuse_mount:entry v_type = 2
+</span></code></pre>
+<p>This time we match just on entry to <code>fuse_mount</code> and for an entry probe we have access to <code>args</code>,
+which allows typed access to the function arguments. In this case we print out the <code>v_type</code> field
+of the second arg (<code>mvp = args[1]</code>). Let's take a look at the <a href="https://github.com/illumos/illumos-gate/blob/1a613b61205f4ee9a9fb00184dbe6cae17a6ede7/usr/src/uts/common/sys/vnode.h#L161-L174">enum definition</a>:</p>
+<pre data-lang="c"><code data-lang="c"><span>typedef enum</span><span> vtype {
+</span><span>	VNON	= </span><span>0</span><span>,
+</span><span>	VREG	= </span><span>1</span><span>,
+</span><span>	VDIR	= </span><span>2</span><span>,
+</span><span>	VBLK	= </span><span>3</span><span>,
+</span><span>	VCHR	= </span><span>4</span><span>,
+</span><span>	VLNK	= </span><span>5</span><span>,
+</span><span>	VFIFO	= </span><span>6</span><span>,
+</span><span>	VDOOR	= </span><span>7</span><span>,
+</span><span>	VPROC	= </span><span>8</span><span>,
+</span><span>	VSOCK	= </span><span>9</span><span>,
+</span><span>	VPORT	= </span><span>10</span><span>,
+</span><span>	VBAD	= </span><span>11
+</span><span>} </span><span>vtype_t</span><span>;
+</span></code></pre>
+<p>...it's <code>VDIR</code>?</p>
+<p>This is when I started questioning my sanity a little. Theories of weird corruption happening
+between function entry and the condition check. Was <code>secpolicy_fs_mount</code> secretly modifying it?
+(No.)</p>
+<p>Eventually I decide to look at the actual code running on my machine and use the kernel debugger
+to disassemble the <code>fuse</code> module in-memory:</p>
+<pre data-lang="asm"><code data-lang="asm"><span>$ pfexec mdb </span><span>-</span><span>k                                                                                       
+</span><span>Loading modules: </span><span>[ </span><span>unix genunix specfs dtrace mac </span><span>cpu</span><span>.generic uppc apix scsi_vhci zfs sata </span><span>ip </span><span>hook neti sockfs arp usba xhci mm smbios stmf stmf_sbd lofs crypto random cpc ufs logindmux nsmb ptm smbsrv nf
+</span><span>s </span><span>]                                                
+</span><span>&gt; fuse`fuse_mount::dis                            
+</span><span>[...snip...]
+</span><span>fuse_mount</span><span>+0x28</span><span>:                </span><span>call   </span><span>+0x3a21ec3       </span><span>&lt;secpolicy_fs_mount&gt;
+</span><span>fuse_moun…</span></code></pre></div></div>
+<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://luqman.ca/blog/multi-kernel-drifting/">https://luqman.ca/blog/multi-kernel-drifting/</a></em></p>]]>
             </description>
             <link>https://luqman.ca/blog/multi-kernel-drifting/</link>
             <guid isPermaLink="false">hacker-news-small-sites-33330128</guid>
@@ -6404,13 +7194,13 @@ adding an extra dependency such as WASIX.</p>
 <p>We want to make it easier for users to test our work. We have created
 a container image that you can use to run a simple PHP script, or even
 your own custom PHP programs!</p>
-<pre><code><span>docker</span> run -p8080:8080 projects.registry.vmware.com/wasmlabs/containers/php-mod-wasm:<a href="https://wasmlabs.dev/cdn-cgi/l/email-protection" data-cfemail="90f8f5fcfcffbde7ffe2fcf4d0e3f8f1a2a5a6">[email&nbsp;protected]</a>:716518f5a264b63b3f00ce717b83af9a2c407df49b482dc36ce0d2882c731449</code></pre>
+<pre><code><span>docker</span> run -p8080:8080 projects.registry.vmware.com/wasmlabs/containers/php-mod-wasm:<a href="https://wasmlabs.dev/cdn-cgi/l/email-protection" data-cfemail="e78f828b8b88ca9088958b83a7948f86d5d2d1">[email&nbsp;protected]</a>:716518f5a264b63b3f00ce717b83af9a2c407df49b482dc36ce0d2882c731449</code></pre>
 <p>And now, we can perform a request to it:</p>
 <pre><code>❯ <span>curl</span> -vvv http://localhost:8080/<br>*   Trying <span>127.0</span>.0.1:8080<span>..</span>.<br>* Connected to localhost <span>(</span><span>127.0</span>.0.1<span>)</span> port <span>8080</span> <span>(</span><br><span>&gt;</span> GET / HTTP/1.1<br><span>&gt;</span> Host: localhost:8080<br><span>&gt;</span> User-Agent: curl/7.83.1<br><span>&gt;</span> Accept: */*<br><span>&gt;</span><br>* Mark bundle as not supporting multiuse<br><span>&lt;</span> HTTP/1.1 <span>200</span> OK<br><span>&lt;</span> Date: Fri, <span>21</span> Oct <span>2022</span> 06:13:03 GMT<br><span>&lt;</span> Server: Apache/2.4.54 <span>(</span>Unix<span>)</span><br><span>&lt;</span> X-Powered-By: PHP/7.3.33<br><span>&lt;</span> Content-Length: <span>13</span><br><span>&lt;</span> Content-Type: text/html<span>;</span> <span>charset</span><span>=</span>UTF-8<br><span>&lt;</span><br>* Connection <br>Hello, world</code></pre>
 <h3>Running your own PHP programs in Apache</h3>
 <p>In order to run your own PHP application you only have to mount the
 PHP project directory in the expected location:</p>
-<pre><code><span>docker</span> run -p8080:8080 -v /path/to/php/project:/usr/local/apache2/htdocs projects.registry.vmware.com/wasmlabs/containers/php-mod-wasm:<a href="https://wasmlabs.dev/cdn-cgi/l/email-protection" data-cfemail="e78f828b8b88ca9088958b83a7948f86d5d2d1">[email&nbsp;protected]</a>:716518f5a264b63b3f00ce717b83af9a2c407df49b482dc36ce0d2882c731449</code></pre>
+<pre><code><span>docker</span> run -p8080:8080 -v /path/to/php/project:/usr/local/apache2/htdocs projects.registry.vmware.com/wasmlabs/containers/php-mod-wasm:<a href="https://wasmlabs.dev/cdn-cgi/l/email-protection" data-cfemail="2c4449404043015b435e40486c5f444d1e191a">[email&nbsp;protected]</a>:716518f5a264b63b3f00ce717b83af9a2c407df49b482dc36ce0d2882c731449</code></pre>
 <p>Now you can visit your PHP project at <code>http://localhost:8080</code>!</p>
 <p>As an example, you can find how to run <a href="https://wasmlabs.dev/articles/running-wordpress-with-mod-wasm/">WordPress on Wasm with
 Apache</a></p>
@@ -7102,6 +7892,9 @@ October 25, 2022 | https://www.matuzo.at/blog/2022/twitter-ban/ | <a href="https
     </p>
 
   
+    <p><a href="#update_2610">Update 26.10</a></p>
+
+  
 
   
 
@@ -7170,12 +7963,27 @@ Twitter</p></blockquote></div>
   <p><strong>24.10. Submitted an appeal</strong>  </p>
   <p>I've submitted an appeal and asked them again to look into the matter and tell me what happened.</p>
   </li>
-<li><p><strong>25.10 you ❤️</strong>
+<li><p><strong>25.10 You ❤️</strong>
   </p><p>Today I had multiple mails in my inbox from people offering their help and asking if I was okay. You're amazing, thank you! ❤️ I'm fine, it's just annoying.</p>
   <p>Thank you everyone for @-ing Twitter Support (<a href="https://twitter.com/spuz78/status/1584470084231516161">Bernhard</a> and <a href="https://twitter.com/m_ott/status/1584648614282133504">Matthias</a>) and retweeting, and especially thank you Bernhard, Matthias, Mike, David, Jenn, Jens, and Sara for getting in touch via e-mail.</p>
   </li>
+  <p>What's next? I don't know. I'll just wait for their reply. I'll keep you updated in this blog post.</p>
+<li id="update_2610">
+  <p><strong>26.10 Support and reply from Twitter Support</strong></p>
+  <p>
+    I'm blown away by the amount of support I've received. Literally 100s of tweets @-ing Twitter-Support. Thank you! Thank you!  Thank you!
+  </p>
+  <p>
+  <img src="https://www.matuzo.at/images/twitter_ban5.jpg" alt="Twitter search for 'Bring back @mmatuzo, @TwitterSupport' showing dozens of results by all kinds of people.">
+  </p>
+  <p>  Some of you even put the message in their Twitter name. 😁</p>
+  <img src="https://www.matuzo.at/images/twitter_ban3.jpg" alt="Zack Leathermans profil showing his portrait, bio and twitter name 'Zack Leatherman–bring back @mmatuzo'">
+  <p>And others created memes. 😁</p>
+  <img src="https://www.matuzo.at/images/twitter_ban4.jpg" alt="Bring back @mmatuzo paid for by the Manuel Hates Lobester Foundation written in Lobster font">
+  <img src="https://www.matuzo.at/images/twitter_ban6.jpg" alt="Crowd from the TV show Southpark protesting and holding up signs that say Freedom for @mmatuzo, free @mmatuzo or @mmatuzo didn't do it.">
+  <p>Other than that, nothing much happened except that I've filed another appeal and someone from Twitter Support replied to one of the tweets asking for a case number, which Max provided for me. Let's see what happens next.</p>
+</li>
 </ol>
-<p>What's next? I don't know. I'll just wait for their reply. I'll keep you updated in this blog post.</p>
 <p>Yours truly,<br>
 Manuel</p>
 <p>PS: A div is still not a button.</p>
@@ -7927,7 +8735,7 @@ Nil
 Score 2 | Comments 0 (<a href="https://news.ycombinator.com/item?id=33327695">thread link</a>) | @nixcraft
 <br/>
 October 25, 2022 | https://vimtricks.com/p/50-useful-vim-commands/ | <a href="https://web.archive.org/web/*/https://vimtricks.com/p/50-useful-vim-commands/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="bwp-post-240"><div> <div>   <h3> <a href="https://vimtricks.com/p/vim-spell-check/" data-wpel-link="internal">Vim Spell Check</a></h3>  <p>Vim spell check is a native feature that can check your spelling as you type and give you suggested spelling corrections right in Vim.</p>  <div> <div><figure> <a href="https://vimtricks.com/p/author/cbartlett/" title="Posted by Colin Bartlett" data-wpel-link="internal"> <img alt="Colin Bartlett" src="https://secure.gravatar.com/avatar/e88405313419b8cda03966224a92235f?s=72&amp;d=mm&amp;r=g" srcset="https://secure.gravatar.com/avatar/e88405313419b8cda03966224a92235f?s=144&amp;d=mm&amp;r=g 2x" height="72" width="72" loading="lazy"> </a></figure></div> </div> </div> </div></article><article id="bwp-post-1390"><div> <div>   <h3> <a href="https://vimtricks.com/p/vim-line-length-marker/" data-wpel-link="internal">Vim Line Length Marker</a></h3>  <p>Vim’s line length marker capability, called colorcolumn, allows you to visually highlight a certain text width.</p>  <div> <div><figure> <a href="https://vimtricks.com/p/author/cbartlett/" title="Posted by Colin Bartlett" data-wpel-link="internal"> <img alt="Colin Bartlett" src="https://secure.gravatar.com/avatar/e88405313419b8cda03966224a92235f?s=72&amp;d=mm&amp;r=g" srcset="https://secure.gravatar.com/avatar/e88405313419b8cda03966224a92235f?s=144&amp;d=mm&amp;r=g 2x" height="72" width="72" loading="lazy"> </a></figure></div> </div> </div> </div></article></div>]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="bwp-post-1461"><div> <div>   <h3> <a href="https://vimtricks.com/p/vim-code-folding/" data-wpel-link="internal">Vim Code Folding</a></h3>  <p>Show and hide code with Vim code folding options. This tutorial covers enabling and disabling folding and gives helpful hints for fold usage.</p>  <div> <div><figure> <a href="https://vimtricks.com/p/author/cbartlett/" title="Posted by Colin Bartlett" data-wpel-link="internal"> <img alt="Colin Bartlett" src="https://secure.gravatar.com/avatar/e88405313419b8cda03966224a92235f?s=72&amp;d=mm&amp;r=g" srcset="https://secure.gravatar.com/avatar/e88405313419b8cda03966224a92235f?s=144&amp;d=mm&amp;r=g 2x" height="72" width="72" loading="lazy"> </a></figure></div> </div> </div> </div></article><article id="bwp-post-195"><div> <div>   <h3> <a href="https://vimtricks.com/p/vim-jump-list/" data-wpel-link="internal">Vim Jump List</a></h3>  <p>The Vim jump list is a convenient list of navigation points, akin to a browser history. Read on to improve your use of the Vim jumplist.</p>  <div> <div><figure> <a href="https://vimtricks.com/p/author/alibby/" title="Posted by Andy Libby" data-wpel-link="internal"> <img alt="Andy Libby" src="https://secure.gravatar.com/avatar/644a0b83c008560259d41cb11999c5df?s=72&amp;d=mm&amp;r=g" srcset="https://secure.gravatar.com/avatar/644a0b83c008560259d41cb11999c5df?s=144&amp;d=mm&amp;r=g 2x" height="72" width="72" loading="lazy"> </a></figure></div> </div> </div> </div></article></div>]]>
             </description>
             <link>https://vimtricks.com/p/50-useful-vim-commands/</link>
             <guid isPermaLink="false">hacker-news-small-sites-33327695</guid>
@@ -11337,7 +12145,7 @@ October 24, 2022 | https://www.gamedeveloper.com/design/how-to-make-a-roguelike 
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div>
 <p>I’ve always wanted to put together a comprehensive primer on how to make a roguelike, something that could hopefully be inspiring while including both general and specific advice. <a href="https://www.gridsagegames.com/blog/2018/10/roguelike-celebration-2018-experience/" title="Roguelike Celebration 2018, the Experience">This year’s Roguelike Celebration</a> seemed like the perfect opportunity to force myself to do that after having put it off for so long, so I gave a 30-minute talk on the subject.</p>
 
-<p>I’ve got a fair bit of experience to draw from, having exclusively worked with the genre for the past seven years (<a href="http://www.gridsagegames.com/cogmind/" title="Cogmind">Cogmind</a>, <a href="http://cogmindrl.blogspot.com/" title="Cogmind 7DRL (2012)">Cogmind 7DRL</a>, <a href="https://kyzrati.itch.io/polybot-7" title="POLYBOT-7 (2018 7DRL)">POLYBOT-7</a>, <a href="http://www.gridsagegames.com/rexpaint/" title="REXPaint">REXPaint</a>, <a href="http://xcomrl.blogspot.com/" title="X@COM"><span data-cfemail="fda5bdbeb2b0">[email&nbsp;protected]</span></a>), made it my full-time job for the past five, and over these years also helped build <a href="https://www.reddit.com/r/roguelikedev/" title="r/RoguelikeDev">r/RoguelikeDev</a> into the largest community of roguelike developers on the net.</p>
+<p>I’ve got a fair bit of experience to draw from, having exclusively worked with the genre for the past seven years (<a href="http://www.gridsagegames.com/cogmind/" title="Cogmind">Cogmind</a>, <a href="http://cogmindrl.blogspot.com/" title="Cogmind 7DRL (2012)">Cogmind 7DRL</a>, <a href="https://kyzrati.itch.io/polybot-7" title="POLYBOT-7 (2018 7DRL)">POLYBOT-7</a>, <a href="http://www.gridsagegames.com/rexpaint/" title="REXPaint">REXPaint</a>, <a href="http://xcomrl.blogspot.com/" title="X@COM"><span data-cfemail="85ddc5c6cac8">[email&nbsp;protected]</span></a>), made it my full-time job for the past five, and over these years also helped build <a href="https://www.reddit.com/r/roguelikedev/" title="r/RoguelikeDev">r/RoguelikeDev</a> into the largest community of roguelike developers on the net.</p>
 
 <p>The “How to Make a Roguelike” talk is available in video form below, but this article serves as a text version of that same talk for those who’d prefer a readable format, or to just take a closer look at the many images ;)</p>
 
@@ -12049,7 +12857,7 @@ October 24, 2022 | https://www.science.org/content/article/u-s-weighs-crackdown-
 
 
         
-        <div><div><div><p><img src="https://www.science.org/cms/asset/869e37a1-bbdc-48dd-9009-992f57bfb3e8/science.2022.378.issue-6617.cover.gif" alt="issue cover image"></p></div><div><p><span>A version of this story appeared in Science, Vol 378, Issue 6617.</span><a href="https://www.science.org/doi/epdf/10.1126/science.adf3764" title="" data-toggle="tooltip" data-offset="0,14px" data-original-title="DOWNLOAD PDF"><i aria-hidden="aria-hidden"></i><span>Download PDF</span></a></p></div></div></div>
+        <div><div><div><p><img src="https://www.science.org/cms/asset/869e37a1-bbdc-48dd-9009-992f57bfb3e8/science.2022.378.issue-6617.cover.gif" alt="issue cover image"></p></div><div><p><span>A version of this story appeared in Science, Vol 378, Issue 6617.</span></p></div></div></div>
 
 											
 											
@@ -12113,7 +12921,7 @@ December 2022 to January 2023: NSABB final report due."></p></div>
 <figcaption><span>V. Altounian/<cite>Science</cite></span></figcaption>
 </figure>
 <p>In 2017, the debate culminated with the <a href="https://www.science.org/content/article/nih-lifts-3-year-ban-funding-risky-virus-studies">release of the current HHS policy</a>, dubbed Potential Pandemic Pathogen Care and Oversight (P3CO). It requires that an HHS panel review any NIH-funded study “reasonably anticipated” to generate an enhanced version of a pathogen that is highly virulent, highly transmissible, and might cause a pandemic. But it exempts natural, unmodified viruses and GOF work done to develop vaccines or as part of surveillance efforts, such as tweaking a circulating flu virus to assess the risks of a newly observed variant.</p>
-<p>The …</p></div></article></div>
+<p>The HHS committee …</p></div></article></div>
 <br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://www.science.org/content/article/u-s-weighs-crackdown-experiments-could-make-viruses-more-dangerous">https://www.science.org/content/article/u-s-weighs-crackdown-experiments-could-make-viruses-more-dangerous</a></em></p>]]>
             </description>
             <link>https://www.science.org/content/article/u-s-weighs-crackdown-experiments-could-make-viruses-more-dangerous</link>
@@ -15073,7 +15881,48 @@ October 24, 2022 | https://www.vibilagare.se/english/chinese-ev-mg-sending-data-
 Score 2 | Comments 2 (<a href="https://news.ycombinator.com/item?id=33317236">thread link</a>) | @suavsu
 <br/>
 October 24, 2022 | https://juicefs.com/en/blog/engineering/posix-compatibility-comparison-among-four-file-system-on-the-cloud | <a href="https://web.archive.org/web/*/https://juicefs.com/en/blog/engineering/posix-compatibility-comparison-among-four-file-system-on-the-cloud">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+                    
+                        
+                            <p data-block-key="hhi59">POSIX compatibility is an indispensable criterion when choosing file system. Recently, we conducted a test on POSIX compatibility among GCP Filestore, Amazon EFS, Azure Files and JuiceFS.</p><h2 data-block-key="cg64s">About POSIX</h2><p data-block-key="ctkpt">POSIX ( Portable Operating System Interface) is the most widely used interface standards for operating systems, including file systems. If you want to learn more about POSIX, please refer to the Quora question and answer "<a href="https://www.quora.com/What-does-POSIX-conformance-compliance-mean-in-the-distributed-systems-world">What does POSIX conformance/compliance mean in the distributed systems world</a>?"</p><h2 data-block-key="2c9v0">Test Method</h2><p data-block-key="6h1al">One popular POSIX compatibility test suites is <a href="https://github.com/pjd/pjdfstest">pjdfstest</a>, derived from FreeBSD and also applicable to systems such as Linux.</p><h2 data-block-key="37hk4">Test Results</h2><p data-block-key="dmocj">The test results are shown below, JuiceFS failed with 0 cases, showing the best compatibility. GCP Filestore is the second best, with two failures. Amazon EFS failed with several orders of magnitude larger test cases compared to other products.</p><p data-block-key="3g1qf">Note that, for the sake of comparison, logarithmic coordinates are used for the horizontal coordinates of the result figure.</p><p><img alt="11" height="494" src="https://static1.juicefs.com/images/11_tXxW1Ws.width-800.png" width="800"></p><h2 data-block-key="1va95">Failure Use Case Analysis</h2><h3 data-block-key="3eus4">GCP Filestore</h3><p data-block-key="bmhl0">The GCP Filestore failed2 tests in total, one in each of the unlink and utimensat categories.</p><p data-block-key="t7r">The first one is in the unlink test set <a href="https://github.com/pjd/pjdfstest/blob/master/tests/unlink/14.t">unlink/14.t</a>, and the corresponding log is as follows.</p>
+                        
+                    
+                        
+                        <pre><code>/root/pjdfstest/tests/unlink/14.t ...........
+not ok 4 - tried 'open pjdfstest_b03f52249a0c653a3f382dfe1237caa1 O_RDONLY : unlink pjdfstest_b03f52249a0c653a3f382dfe1237caa1 : fstat 0 nlink', expected 0, got 1</code></pre>
+                        
+                    
+                        
+                            <p data-block-key="hhi59"><b>This test set （</b><a href="https://github.com/pjd/pjdfstest/blob/master/tests/unlink/14.t"><b>unlink/14.t</b></a><b>） is used to verify the behavior of a file when it is deleted in the open state.</b></p>
+                        
+                    
+                        
+                        <pre><code>desc="An open file will not be immediately freed by unlink"</code></pre>
+                        
+                    
+                        
+                            <p data-block-key="hhi59">The operation of deleting a file actually corresponds to unlink at the system level, which removes the link from filename to inode, and then minus the corresponding nlink by 1. This test is to verify this.</p>
+                        
+                    
+                        
+                        <pre><code># A deleted file's link count should be 0
+expect 0 open ${n0} O_RDONLY : unlink ${n0} : fstat 0 nlink</code></pre>
+                        
+                    
+                        
+                            <p data-block-key="hhi59">The contents of a file are only really deleted when the number of links (nlink) is reduced to 0 and there are no open file descriptors (fd) pointing to the file. If nlink is not updated correctly, it may result in files that should be deleted remaining on the system.</p><p data-block-key="b9o1n"><b>The other one is in the utimensat test set</b> <a href="https://github.com/pjd/pjdfstest/blob/master/tests/utimensat/09.t"><b>utimensat/09.t</b></a><b>, which corresponds to the following log.</b></p>
+                        
+                    
+                        
+                        <pre><code>/root/pjdfstest/tests/utimensat/09.t ........
+not ok 5 - tried 'lstat pjdfstest_909f188e5492d41a12208f02402f8df6 mtime', expected 4294967296, got 4294967295</code></pre>
+                        
+                    
+                        
+                            <p data-block-key="hhi59">This test case requires 64-bit timestamp support. <b>GCP Filestore supports 64-bit timestamp, but it will be reduced by 1 on top of that. So it should not affect the use of this test case even though it fails.</b></p><h3 data-block-key="eo514">Amazon EFS</h3><p data-block-key="1krm0">Amazon Elastic File System (EFS) failed 21.49% of the pjdfstest tests, with failure use cases covering almost all categories.</p><p><img alt="2" height="616" src="https://static1.juicefs.com/images/2_dYezoy3.width-800.png" width="800"></p><p data-block-key="e8r4s">Amazon EFS supports mounting via NFS, but the support for NFS features is not complete. For example, EFS does not support block and character devices, which directly led to the failure of a large number of test cases in pjdfstest. After excluding these two types of files, there are still hundreds of different categories of failure.</p><h3 data-block-key="4dbfh">Azure Files</h3><p><img alt="9090" height="604" src="https://static1.juicefs.com/images/9090.width-800.png" width="800"></p><p data-block-key="abbj4">Azure Files has a failure rate of 62%, indicating that some basic POSIX scenarios may have incompatibility issues. For example, Azure Files files and folders have default permissions of 0777, with root as owner, and it does not support modification, i.e. there are no permissions restrictions. Also, Azure Files does not support hard and symbolic links.</p><ul><li data-block-key="57shs">JuiceFS passed all test items, performed the best in terms of compatibility.</li><li data-block-key="8log9">Google Filestore was the next, only failing in two categories, one of which did not affect actual usage.</li><li data-block-key="58kkp">Amazon EFS has the worst compatibility with Azure Files, with a large number of compatibility tests failing, including several test cases with serious security risks, so it is recommended to do a security assessment before use.</li></ul><blockquote data-block-key="b1fjq">About Author<br>Zhijian, full-stack engineer in Juicedata, responsible for the development and maintenance of JuiceFS.</blockquote>
+                        
+                    
+                    </div></div>]]>
             </description>
             <link>https://juicefs.com/en/blog/engineering/posix-compatibility-comparison-among-four-file-system-on-the-cloud</link>
             <guid isPermaLink="false">hacker-news-small-sites-33317236</guid>
@@ -17901,9 +18750,8 @@ Run-loop <a href="#run-loop">#</a>
 <span>}</span>
 </code></pre></div></div>
 <h2 id="creating-the-table">
-
 Creating the table <a href="#creating-the-table">#</a>
-</h2>
+ </h2>
 <p>The RDBMS table might look like the following — note we are using MySQL/MariaDB as our chosen dialect:</p>
 <div><div><pre><code><span>CREATE</span> <span>TABLE</span> <span>DelayedQueue</span>
 <span>(</span>
@@ -26703,6 +27551,7 @@ Phone: +49-8142-66989-53 Fax: +49-8142-66989-80 Email: <a href="https://lists.de
 
 
 
+
 <!--endarticle-->
     <hr>
     <ul>
@@ -28775,7 +29624,73 @@ October 22, 2022 | https://larsdu.github.io/StarRust/ | <a href="https://web.arc
 Score 2 | Comments 0 (<a href="https://news.ycombinator.com/item?id=33305038">thread link</a>) | @pabs3
 <br/>
 October 22, 2022 | https://www.volkerkrause.eu/2022/10/22/osm-indoor-workshop-october-2022.html | <a href="https://web.archive.org/web/*/https://www.volkerkrause.eu/2022/10/22/osm-indoor-workshop-october-2022.html">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div itemprop="articleBody">
+    <p>Last weekend I attended an <a href="https://wiki.openstreetmap.org/wiki/Arbeitstreffen_Indoor_OSM_2022">OpenStreetMap workshop about indoor mapping</a>
+hosted by the German Federal Agency for Cartography and Geodesy in Frankfurt. After having started to use OSM indoor data in 2020 for
+<a href="https://apps.kde.org/itinerary">KDE Itinerary</a> this was my first opportunity to actually meet other people working on that subject in person.</p>
+
+<h3 id="osm-indoor-data-in-kde-itinerary">OSM Indoor Data in KDE Itinerary</h3>
+
+<p>Indoor data here refers to mapping information about the inside of a building, which compared to outdoor
+map data tends to have an even higher need on precision (centimeter-level rather than meter-level), and
+much more often involves a third dimension (the floor level). In KDE Itinerary we use this to display
+detailed maps for train stations and airports.</p>
+
+<figure>
+  
+  <img src="https://www.volkerkrause.eu/assets/posts/129/kde-itinerary-train-station-map.jpg" alt="Screenshot of KDE Itinerary's train station map showing parts of Frankfurt central station." loading="lazy">
+  
+  <figcaption>Parts of Frankfurt central station displayed in KDE Itineary.</figcaption>
+</figure>
+
+<p>The OSM data model for this has been designed under the assumption of having a single self-contained building.
+Large train stations can however cover several city blocks, overstretching this model quite bit. That’s one of
+the topics I hoped to get input on during the workshop, and it turns out we are indeed not the only ones
+running into that problem.</p>
+
+<p>Another issue we encountered is modeling of underground structures. While many elements (say a train track)
+can exist on their own above ground, they only really make sense underground with a corresponding “cut-out”
+around them (say a tunnel).</p>
+
+<h3 id="different-use-cases-very-similar-challenges">Different use-cases, very similar challenges</h3>
+
+<p>Displaying train station maps is just one possible thing to do with OSM indoor data, many other use-cases
+were represented at the workshop as well.</p>
+
+<ul>
+  <li>Mapping of university buildings or libraries.</li>
+  <li>Mapping of accessibility relevant features, for informational use or for routing, in any kind of building.</li>
+  <li>Indoor positioning, and if that wouldn’t be hard enough already also
+<a href="https://www.bkg.bund.de/DE/Forschung/Projekte/DeniedAreas-IndoorPositionierung/DeniedAreas-IndoorPositionierung.html">positioning in emergency situations</a>
+with possible unavailability of (digital) infrastructure.</li>
+  <li><a href="https://accessiblemaps.de/">Presenting maps in accessible ways</a>, including e.g. tactile maps.</li>
+  <li><a href="https://github.com/tordanik/OSM2World">3D rendering</a> of buildings.</li>
+  <li><a href="https://indoorequal.org/">General purpose indoor map rendering</a>.</li>
+</ul>
+
+<figure>
+  
+  <img src="https://www.volkerkrause.eu/assets/posts/129/osm-indoor-workshop-2022.jpg" alt="Photo of attendees of the OSM indoor data workshop." loading="lazy">
+  
+  <figcaption></figcaption>
+</figure>
+
+<p>While that is a very diverse set of perspectives, a lot of this is relevant for features we sooner or later want in KDE Itinerary
+as well. Positioning, routing and 2.5D or 3D views are on the wishlist for our train station maps, and accessibility is something
+we want to focus on more as KDE as a whole as well.</p>
+
+<p>And in any case, pretty much everyone is facing the same challenges regarding data modelling, data quality,
+data level of detail, processing algorithms, you name it. It’s certainly extremely valuable to have a forum to
+exchange on those topics.</p>
+
+<h3 id="outlook">Outlook</h3>
+
+<p>One and half a day workshop wasn’t even remotely enough to cover all topics, so there
+are now <a href="https://community.openstreetmap.org/t/indoor-mapping-online-meeting/4442">online meetings</a>
+planned to continue the discussion, as well as another in-person meeting
+at the <a href="https://fossgis-konferenz.de/2023/">FOSSGISS conference</a> in March in Berlin.</p>
+
+  </div></div>]]>
             </description>
             <link>https://www.volkerkrause.eu/2022/10/22/osm-indoor-workshop-october-2022.html</link>
             <guid isPermaLink="false">hacker-news-small-sites-33305038</guid>
@@ -28790,7 +29705,7 @@ October 22, 2022 | https://www.volkerkrause.eu/2022/10/22/osm-indoor-workshop-oc
 Score 3 | Comments 0 (<a href="https://news.ycombinator.com/item?id=33305011">thread link</a>) | @howon92
 <br/>
 October 22, 2022 | https://pesto.app/blog/discontinuing-pesto | <a href="https://web.archive.org/web/*/https://pesto.app/blog/discontinuing-pesto">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>Vivek and I have made the hard decision to discontinue Pesto and move in a different direction. We’ll follow up at some point with details about what happened and what the new direction is, but for now, we want to focus on the immediate impact of this decision.</p><h2 id="for-users-customers">For users &amp; customers</h2><p>We plan to operate Pesto until Saturday November 12, 2022. On that day, we will refund any remaining days on subscriptions to the original form of payment and discontinue the product.</p><p>On a more personal note, you trusted us to be your digital workplace, and we’ve failed you by not producing a business that can continue to serve you. Vivek and I deeply apologize.</p><p>Please let us know via the Pesto support chat if there’s anything we can do to make this as painless as possible.</p><p>We’ve been honored to work with such an incredible community, and we deeply appreciate the support you gave us.</p><h2 id="for-prospective-employers">For prospective employers</h2><p>As part of this announcement, we are parting ways with many of our talented teammates.</p><p>I’m incredibly proud of the team that we’ve built, and every single Pesto employee would still be contributing in a strong way if not for decisions that Vivek and I made about our direction and the market.</p><p>If you’re hiring for engineers, designers, artists, and/or marketers, please reach out to me at <a href="https://pesto.app/cdn-cgi/l/email-protection" data-cfemail="fb9f948e9cbb8b9e888f94d59a8b8bd5">[email&nbsp;protected]</a> We’d love to connect you with some excellent people.</p><hr><p>We’re disappointed in the outcome and sad to let you down, and it’s been an incredible privilege to work with you. Please keep in touch as we continue to our next adventure, and look out for more news from us over the next several months. </p> <hr></div></div>]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>Vivek and I have made the hard decision to discontinue Pesto and move in a different direction. We’ll follow up at some point with details about what happened and what the new direction is, but for now, we want to focus on the immediate impact of this decision.</p><h2 id="for-users-customers">For users &amp; customers</h2><p>We plan to operate Pesto until Saturday November 12, 2022. On that day, we will refund any remaining days on subscriptions to the original form of payment and discontinue the product.</p><p>On a more personal note, you trusted us to be your digital workplace, and we’ve failed you by not producing a business that can continue to serve you. Vivek and I deeply apologize.</p><p>Please let us know via the Pesto support chat if there’s anything we can do to make this as painless as possible.</p><p>We’ve been honored to work with such an incredible community, and we deeply appreciate the support you gave us.</p><h2 id="for-prospective-employers">For prospective employers</h2><p>As part of this announcement, we are parting ways with many of our talented teammates.</p><p>I’m incredibly proud of the team that we’ve built, and every single Pesto employee would still be contributing in a strong way if not for decisions that Vivek and I made about our direction and the market.</p><p>If you’re hiring for engineers, designers, artists, and/or marketers, please reach out to me at <a href="https://pesto.app/cdn-cgi/l/email-protection" data-cfemail="c7a3a8b2a087b7a2b4b3a8e9a6b7b7e9">[email&nbsp;protected]</a> We’d love to connect you with some excellent people.</p><hr><p>We’re disappointed in the outcome and sad to let you down, and it’s been an incredible privilege to work with you. Please keep in touch as we continue to our next adventure, and look out for more news from us over the next several months. </p> <hr></div></div>]]>
             </description>
             <link>https://pesto.app/blog/discontinuing-pesto</link>
             <guid isPermaLink="false">hacker-news-small-sites-33305011</guid>
@@ -29705,7 +30620,120 @@ October 22, 2022 | https://thedebrief.org/any-idea-what-they-are-american-pilots
 Score 2 | Comments 0 (<a href="https://news.ycombinator.com/item?id=33304132">thread link</a>) | @memorable
 <br/>
 October 22, 2022 | https://cybertron.cg.tu-berlin.de/eitz/pdf/2012_siggraph_classifysketch.pdf | <a href="https://web.archive.org/web/*/https://cybertron.cg.tu-berlin.de/eitz/pdf/2012_siggraph_classifysketch.pdf">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>4\×B•Ä›$qî¼cÕ&amp;²ª65…”sD€¿†qÚ`¨6lRGšøÎX~n8ânÈ.ÌTu­ŒwO2È&lt;è’ùHY¼q9ÿ~È<g·1­© Ÿt{aÔŽf¨¶í‘¤p–'yÈo="" òÈi»v¯,•Ã$cëgË,™’qÏöb§+{ÍÆˆ©°«“��r~™jÓwÓ—bêh³Äù¥0Ã—xË2³oitvÐˆ"�ý.ljaƒ:oºƒüw¡¡»ôá.:nç^rÇh$lj§nà½„ƒ¦vâœ­Î�~-4]="" ‹•˜fÉéa�õÒd*u}hìicÞicr+î+v�="" �!:¸»j"yx±uÏ^äÌdÆr2;hüâ¼Ÿº¡‘Ž‘‰ e?±o="" ò8��Á="" rúkay#<ò3~="">ŸµQh¸c¶Ó,&amp;(Õ¡l§êé"E‰ÑÐwÖÕëCâÑ'Yl¤»R‚û£KÃ/Àsˆ6$Ö­€@^‹œV´Ò7�‹®éÍ&nbsp;5FZ§²2ìiÌ°VTí8ÉZxÞo	…­œå™&amp;ôö¢˜šaš:M9�ºûÏlÅ
+F+õ©»^Öùy4Ç}÷´*ÍtØFÓôI(C	g&gt;BÜêt‚0Ñ
+cŠ#BiÎõTí‹ÚŒ£ÆsßwìBËK1±ÑÒlCn¼É½‡8¿ò(·,ˆ½œJø¡ÆÚr©¯úù’N6Ï*ó¡êÞúÃ('']Ê^�8çÐÇ]–òæqˆËõ#•&lt;µcqì&nbsp;it@Kxˆ®T‚jß·3ä¤á£å#›µâäYeŠbS5€H¢¦r˜Uì'Ñ°0õ4ØäŽçF_`ÌÇ;û!¤þÚpÔ§!~•ÄZ¬…‹ÆÑ6Mw(k,äË¿?œCÙt-Á‘‰6	)²ÈoÕN%�”•ç”�«Óýk¥æ	—q*
+ZpnsÐÂÀPÖ%Øßôï}~…ºœ¸{T„Ø�Pž‚á&amp;-þ,’ØIso¢F8PD¾ÝœÍ»�Ïž•¸Š¾üô…l*P¸ÿÍ?Iˆ¹ó
+„#ŽöÕdK¦ã»ÈdÙOßðy°SG÷/ƒéOU1þü
+’I2çGÖÀ®îŽ™`ãÏ^w\èÝÓ¢œ06ýÁžOgáø&lt;ü§Ï¼š¢þ¿‘\Ë‹‚¿Ãæ‹!5ó²À¾Ø"ß—
+Í—sW
+Nwha†Ú½9=…n7|íõ){?s½\ßöïUû^Xš�õ*Êb7ÌÓ]èÅnE’&amp;a„ž°jJån,Kç–dR�Í¤æJ·Þ¯ö–,j-—�Þóñ|¤®È¦˜ãoq¦žó÷Íœ`ÅºïGnæÅ·¼§^hyŸ›·¼#']8ï8·;žu?ˆ\/È¯yÿ?æ]ÞàÍÕÜe3ÐLZkr³D“iž	�iá4°égÑÊßËnÞ^g-AI6�†è"Xë”^Âhä(nIÆ‚¢–]°ïãhê;o%“¡a¿9kÙ
+
+
+G±0$ÔõÒÛŒËO5aÿ‹ž"–tI§Ð^§SèV­ü.Ö³¯+iË@_NC·…Ø�õ¥?‘8�hpÈÅoqÅQÀé	ü4ÄÇ"ÁKü¦¤}Ý‘|Žn!ØËSG‘Pê˜¾‡ÕrÜÙÀç¶ÀkmÚãÙp6ƒÞãE~§R@ž7ÏƒC;�pc7äž&nbsp;$&lt;•³C]¥›Çª&amp;ï¬6:F+gËf^n]Ñ'Ýg
+tÂœÐ0‡VÏ�ð–Õ–	Pd96hà‰–Ãµ2 ‰iw&nbsp;€[oôa]Ï	|øÖÄ'£ûégow¬Ã—d»�&lt;«Ùå‰ëù	šõî-—m3Lw0Ö4åBR"¦	Œíq¾Q‘K1~‡&lt;³Õ�-¹™¯‚)÷
+ÒÛWò‚�[VÓ§?Oçý#&nbsp;ÜC)›\=oº9ÙróöoKoË³t=+ØxÖÉ\Æ?£ûh‹qny8ÿ±§}úüÓ6ßÌ…klÍîî
+Ÿ­ËÞø¡€J{Ü`š¸q¨Ñ¾-ÏC7U),¬-¿§èùx,GV"Œi¶ƒÖXd!]I3¨°”v$·îÒÂ�ôj3C—Û'ö‘R
+�«¥iñÀŠ
+û™G*­òÐ¤µä¡_‰Éðnçº’ÎOWBÂC�™ZÒ[šÁ¨ŠÞ£v¥x¾»êgwÃ4¿-Ç¾÷D_æÀ8,‰æìë¨Hz”�à4M$ém	‹fTã’µÝ—$}„á,N,&lt;áBÑ}ÄñSDEßNj‘Œh@-N¯Î&nbsp;­ÆF
+O¶4Ñtœãeñ¨mk„f£µ‹è¬�¸¤‘P¹?àÄ{‰e”©¿”ú	_ë'3nH¶½Zˆ0•:�eÉ`;ã&lt;NOkikÖN£ì�A:	Ò™c&amp;\ƒùtå(ÑÿŠYvù=oK®ŸIAõ¤­�÷´åà[³Ã&gt;HŸCÊª.Ú0¯V=ºf3çÌ\ef·Ð D+¹-YF/ª'ÂšÇ¥a+yB�–¦ÈÙu–Ä#}_n&lt;—créK«Py|›˜ÑÐUõ*§ZiœðDè?éM”J¡=Ol%ÙB;ˆ\Ç¡…ŸK¨&nbsp;]%c%´~Yù¥ŽuòÛ”\è@ËÈÏuU�ë·ÉìÚdÊ/t%‹Š×NÇÄ�ÂY’¯¼Ø¿¦¿rƒ0LUq·†~Sª³Vô)5.]
+…€þ¹ªo®	X.’&amp;ë³ýÄ
+ß¾“š½T¥^§PAéð¡¡“”Üú¡êµ.JËt­¥NHÙ$¥äZÕéž�ñÂ­"çã&lt;Ñw5•çë!ÝT9ß×*ÆÌ8ž›^Ól¥®‘
+v¬Ud¹Äu��`ãÆ‘ˆ{õ8’½”²G�ÆŽ- ñØ¾÷e{„I	ð%¢žtnoŠò¥xêkàE£KQ6!«ß²—±l¸îxl�i€—pÛ¯Ð4
+Ý™²^R©y&amp;Îëó$óm¹æ
+[2
+»j!ˆäž¯Ñí„ÜCÄâTª1üZuµ™¤èÛ«#´4$D«²4D2nŒ¬¦ÓÓ¹
+)ùNy’BœãTš­¢ÙmãÕÄo`„L*\Òó“‘»²�E†T
+1HÒ�›�‡.®]w]ÔZ¢¤UÙêôÒtm†tIs}o¼à¨Q5ˆÍó+S‰’LSò¶?c¥Õ/P³Î‰€ò°SÈLÆWj¤Êã²Ñìô�Í†e8[¸½?ô~èZ(—“"˜‡³j‘2Ðï`«iÔº[š…°Â³Î!OF¿‹Ã–þÜX’‘ûS½�‘çs¹�kª0M§FºÍ™t,ò´¨"Ä§¡Óa#?\se'D½¹,F:Búe$x¯&lt;7&amp;xu[ŽZ1Ç3�b´ŠªS½?uS7J›¿áA~Åå‘7ó"ç5€!×›y•"Q¶è¡tó¦És¯¸5
+/J–«‚ˆªØâ�A&gt;TOäžŸäº�Gr�0”ì¥#	Í4@òaÔGD�4!¢jeëdÎ:·`»<!--Œ`—š7G›”o,Ké¼©Žî
+‚fú¬&u#ÁÆwš¯{�–‘ŸõÅb¸ºÙ¡Ž€½»ª4(»·®€Ñ?œáâlH†dûº\îÂG½
+—Üd¨ÄÀ-->c&nbsp;S��´ÖÑ–úZ©‰Éðƒ]‰À¡'J¯qO\_™€ ïÂÍI/ö£ô¦Z`Ïf®Þ“›¢úGÉ·WìÒA™K,©&gt;?MœÖƒË|Ó5tÏsï\«Á^ÖTP¨_nE|(fa/€Æ¢So¸qåSi0à™kÞ×w›´‰Ôxè&gt;ÈRôZA�½?r§ÍzNmo,¨–«¤ÀÎ±ŒZŒ%áfüQ) Ÿø:–`…¥ ætÁãlØíš,åª�ÊGè%[Nµ?ÚÊ#(€&gt;�[QLù€ ôl`Íå¶nâk.ñuä¬+
+�¯k*GO2ù±ã{QLB¤ì·„£ùFHñ�n½4–ÄjX1W%©{S^ŠÃÅa´á²ˆ’ëX6!Š'²- „º}4û¼k	Ac&nbsp;2}Ç‰� qÍîghº@p4&amp;ùÕ$ Q�IDs›(¹»/I,‚IÉÕna¦~}_]�õ‚`ÉƒàUAº&nbsp;%ú~�ŸE�Æ|Â‹±¢nQœ5Ë¢ÞÖÕ7_La{¹ðæÔ3¸I=¯ÜT˜_§‹a,IU‹­k�!#?“ù
+P¡¹È&gt;'Påv�ùØ1x}!¯»°FQ£øp&amp;g±¡tTb¼vëA¸rë�jˆóÇ!wƒœÒÒ�~Ý3„Y6FÒð|9³Éí}
+¦&amp;ìõÞ–Å}Ãúp+ˆÑÕ&nbsp;¨½ª4w
+ì§3X·zCIe‰XR±J."A]jÔÝÙÂÉúC”HJq¢A1
+t”h•™·‚!‹/Šs`AR%"­õŸ“�EÛR¸ì¬~&gt;ieŸÒ6ò3tòi+%úËÅ‚¿$]º¶ª~ìëñûwõF={z‹ÿ(ßüxÍ/ÒT“ŽU¾Ù’óñŒ9x
+¹3‰ä»¥Ñn&amp;ViýE-îÏù¹×ð‘&amp;Ï )Êýô[›ž(ÐÄÏµòC¤›Ò‘® ‡¯e?¿u™Dyž«ÔIÿ°Rœ*BÁ‘/_OFÈéÓŠr}ñNƒF~NÅ4jÝð-7!Â;/b‡j¿4ˆäVæžþZ�Røõw\Ð"¬ý�3ýDëÓ·ŸaŠ¿„ÜÿÂ»©ç2®Ñ¯eæ@Àë+ª_èW6tX[([oüâìºb#¸5C¨�&amp;ù•2_hiÝ�¾:…ÂðœJ)„i\É3£§ÌÎ‡{ò:[ž¸¦¶å°@LjB¾-Î8Â[hdÊí±~°!Íg-+³-åzµ`¨X"ßØôÑ2ÒæG4ãú£Ž&lt;×|ò®¸K{LcY?A/"øü�ºžuá÷¾6É3‹‚òè‹Ã–!�sóX®em¬1Ò½*bÓ‚îÌ÷¯h&gt;a††‘
+/Wð¤¶»*ðqÞS»‚K—R3UÄû¹ÆÌZf¶šœÙª´ŽrUeÌBäQ†Œü¨§ßB;=y/úÜªaô~”î„{¹~Mð¼^H¢N"@ºã¥Bì÷%ó'¯re@7.7–tZ3*¤æƒ÷Ò•.©¨¹Mé·Iz–oú´F®Au¼§Pí‡µ¹øž(?.ã:SÙ?÷UÅ’Œ?Â
+endstream
+endobj
+4 0 obj &lt;&lt;
+/Type /XObject
+/Subtype /Form
+/FormType 1
+/PTEX.FileName (./figures/teaser_siggraph.pdf)
+/PTEX.PageNumber 1
+/PTEX.InfoDict 31 0 R
+/BBox [0 0 504 64.5]
+/Resources &lt;&lt;
+/ExtGState &lt;&lt;
+/GS0 32 0 R
+&gt;&gt;/Properties &lt;&lt;
+/MC0 &lt;&lt;
+/Color [ 20224 32768 65535]
+/Dimmed false
+/Editable true
+/Preview true
+/Printed true
+/Title (Layer 1)
+/Visible true
+&gt;&gt;
+&gt;&gt;&gt;&gt;
+/Length 24868
+/Filter /FlateDecode
+&gt;&gt;
+stream
+H‰”WÛª$Ç|Ÿ¯è˜ÞÊºf½Z�±l=øÙ,Â`$ƒd8fÿÞ‘Õ==gF`³ì™©©[Vfddä—?ÿýÛO¿m_~ø.møãwÛí×[ÚzÝÛÖRÝîúöÛO·¿mÿÂïü÷×ïo	¿ýg«Û›mÿÄÿ?m·/ßÿ˜¶üûö+†\e[¶ÝËô­ÍÝÍÚöõðËÍlŸcniÏÍ7Ë{/¬ø¸qÔ4ªƒS©�ížöYò†]î¶Ý±¹á0ž2RÙîyŸ&gt;8ÛÌ-{.ó\[÷lÆµy7qo{v]9Ÿ¶×R5‚õk»uŽGÆI0Å1{Ë›þà«g¬«{©s»ûncle/É95sƒõ3=Ö¥}¸¦Ü8Õc
+}»ýxûË³¿ºÏFÍnóá/8&nbsp;Â�ü°Â��sqÈgGéô‹¹
+ç&nbsp;Ã
+ÇÒÃeø.«#oÈÍ|‹Óà&gt;CLà½
+Cfp)]™_�\ñ–¢U�'´Ýá	ƒ‘r*w®…cO=Ž+¦g8ütÜýâ8²`¦î}Ò}'fp}&lt;–Ç{N´Ýzå+S®[ƒk�s&gt;úæø[Ž…_o!Ö~œ{ïqPŽ(',§‡›ð‚/]3ˆ‘gºˆ“Ÿ-.wÀ©­Á×©_¢{�VåeKí‚7U]àE¾X×�¯ã¾–Ç±aÃ½ÊðF,{ÍôÖ&nbsp;Ü	£¼�Z..¤ßu‰F²Å€oBÞíá\XKÃ1Þð=ÓÑ@@b¼‘µò-ôÒ¦
+1&lt;•?u"Á,¶98ìÎh5D”(™ð(&lt;¿ÛPr0+øþ64çÌ(µ@2ÓIÔ5¤ŸàÒÂúf¾ÏÜá¹…K‰zÑ°“åôçpyv¯LbðEJz¨ìæp4å	_…¡�
+°ÀgœðCž¢“â±¼
+[Y}Y
+ô1	®&amp;ã­,[,¢X†žQ‡’“§2K°�Áæ°vûŒ;Ei‹Uî&nbsp;©®Kä'Ó¿#*1.?[ïkùtEH‰iNŽLf�å_ò‡‚�¤Ó¶Ì.ªíS–“¿¦Ÿ¦‰½ÐÔÚ=Bø’áàÍ	€UòëhWx*ªð0¶`¤NxŽ&amp;ÞJð7þ¡^Ìpíà÷Üº89gÙYà‹º�©¹ê¤ïía2ð—E“BŠ¸E¶½dnëðÌÍŸB’##�~~}¤W»|Œ+•‡¥ˆ/ÛÜ†„«ÎÄéO Ð{™ö*IAIÏU�$¡ÂMd''GVPþš²!+#×C¬=˜:Eò"M¼D1nÀÓ‹¥±'ÎüžG/FÐ?ï*]†³*ªGžv�@RÌå¥$€©”J¤ÆPrx„•z©ýõö.Â&nbsp;9ÄÕÞ	ŸÞ/hª‘¸šˆ<pða�…# 8çd&‘{‘m,+xŽ;Û="">˜°Ð ÄªÖŽt×1Ø%ü]DÅ“Xä�R°ª„tDpáö&nbsp;&gt;Ð&amp;—1³q
+GÄ sWxåÕØ8˜õàY/
+|èˆ|lœ³ÊA’/Fy„I÷uGt—–‘q©žîà{féÈ’=Ô,+:àêÙ4‘s�œ«×!3DçZæ$Ô›ê"Ë“JÌ<s ,íoÞ†hšxÈ“´`móº•¹¶„Ýq˜.ÐµvpÎgvæ�kÓ †ù´)rñÍ¦="">aH¼Y	.›÷•›/»ÀQ¯/´³}Î,½­½nBD*6¥Róÿxç$GWø‘Bçš�­Sñ¤|*Íû’è&lt;+äA0òËˆCV½&lt;ØøN½&nbsp;tò(¦H$„ÌŽ—rZ¶¨F,ïmÌd?&nbsp;"ˆ�ðÉ:ÃÔÉL“<b@÷üx7Á$Âj 1èškezž¥ÿi«.¢v]mëØspmu9d,5Óz:ycƒ�="" cÚ¢‘s="">#‹ª&lt;ÁÊ�Ùégñy¡ÒLaÔ÷¦bý‰	®P{+’äõ�ÛcŒç¤¸ê�ž†í.«äõ+šÍªbBÓÒ¡ñ&gt;ng)?Y90÷r6(¢{=›�…Škõèxâí&lt;¾·€Hòãø@Ã›Öt�ÂûTbV«’pÄKµ ·tn²^ìYüæ¨/›@äì%+‹ý5Qiu=ŒS˜ú¨ÎÜ*ªÖ“ÙSÆ¶K±f"Rö‹Åj¦ÖI¹”†�5ñ¡‡f':A©ŒU„ƒìäæèË²Dø;|•Um‘ä3çùÜ&nbsp;ØV?ˆï�/ž¦Ÿ)d8š�¶dï½™üÔÊC6G€^ÌA™("ïP£æ°¥£}óTä
+°AG!ý�wJ_;ùÝµ«°D•Kê÷âuÊÊ:Yœ,ù–W1âü›£ÃWòâÔ¬ïÅí&nbsp;æ,Oú„Ä¶&gt;¼3kÆAAá¼÷š'ö,3Û3ÙgÊ66‡�þ®U¢°•©^�F¿¾w–rˆÞL#/ïL±©'Œí*ì1i¦ÕS‹¿×‹�]Á)Ô�ã™äzÂSp�Ò4rAµf�ÐBògI=æ†¬€äË¤B66Qq.ÑÑt?°È‚`u–¶Ž�dàyv¾ÇéÁy‡ªaù+«é-’Ö£éóí aBÔÔø¦c—Gª:BÊ¥rÊ%Z*lZˆ©Û�¥#Öªd°Û»¬åÏ=5*	ÔËÑæ°
+q–¦��–C­•øaà¶ZWß[9ìl_Ï'R®N55Ç:¼:Ó7¼&lt;™……ôŸí]½*—zu ð1ö&amp;ê#e2¾¥Gù¡B$§%WIHÂ•giõT|;&lt;Z†å�uJä’~T•È.´h—òì‚mVc“Â�4Þkº�ä�Mý‹ÎSÑåªæ3ÚŠù(Ž-1•(A…ÔÙ¶5u¬m‘Eq$ßñí!ÐÞö&gt;¬}&nbsp;¥­JóæŒW•‹B;}íÑÕø(‘5cn¹5äìÈñTÐÔ6döÄGdê˜ÇFj4Õ†zé4ÃGô€Ç­Œ£-‡‰|uÖtyáMRéågÇyÆDáˆî–~¥}¥ŸòÿXxÊã[\kK�F'—,Ga�Îpð9PxÞ}?
+0†5¶u2t‘)i&gt;l´pJ¸I·&amp;�*A+¦õÊTÔËvú�Ç¿äÔâÙé˜úT£KQ€©´–Y‡|�ò(p©ýŠ
+ns1eÓR¸ø˜]ï¦l­jHcÏj8;ø}uœŽ€ÈŸX$PXhv´cBøw”sµñÄ8yò�Æ~NBÛlõ“õ•&gt;&nbsp;–f…E€v+þ$ë¦+´‰}`�²ÌÔP”†‹ùZùpDYI3‰l½&amp;öµ¤sô™ßåŒ�Üžê#›”uä8ì˜©ØÔÒ_|kõ¢#]ÔÉ²Â#ƒ•©ö£515¤_o`ñ\Â	tw—4²…©²XÛ4b¨Áðt±92oU}˜C,'ºÂUÄVÍZ“ŸýêDaaá(,Ã§[Aân„[Ä_ÎN´¤ŠÍÔà¨+_œ�#¸þH›Ì^VÕNÍìÍ~_á1ÃàI:”Âó*Ü•sŒ¥-„Õv©²¯kCœ‚ÜE¥Ém-R«ÖmG§)ÏP "­ÔCÃªÿêK¸sæ†`0
+¸Ö‡veí´xXWiÌõÂÎ/ØµI'~¼$&amp;£¹W!ùq+EdþºEÞW¿
+44`ÌåùÄô©*HˆJ’?S3Ñgô	½–íÑ7ª†Û¹/ñöYÿKwu7²ÁEÁ¤‚¸x”ƒª.û×X’Z½Ÿ;�ÀÂŒi³6¯9`­•Éo§*mäý„*x&gt;àŽ–�3ƒ�ùû5
+úd "è¢QQq¯"ŸÚ±�£€�1B:%„+mŒ©€©T��†[@U7ãò=Ž�z²òäB�ü&lt;ùˆËßK�ë¸ë@¿Óbôæ¤[æó(õ-q²äd²Z2gºp.QJMªF‰¢P&amp;á3‰¸B”¬°
+»µ%=öï_ZµðLhDdâSaøþ˜ð•Úm‚§m6Ð`íF&nbsp;ùFÓÓÒ��à%Â«Â�…‹u¯ÛæÎnÈ^óYwž�íwóŽnKcfeA¿ETívµ‹P¹)y”¹£²9Mªüù±z&nbsp;Ž ¢½óx€wN”%^_"ë`‡V%¤Vh¥¼ú_ÚG²¹¨¾ð…¥�úU’Æøö-÷4d)ú”gSÈæ1�W8oG·‘à¾š�Ç¨JvyI¶LMÕ5�Ó´¹;”F­cÏ9ì{È…*…"~Úm¹¸°ÌbDýò1·Îl\Óï&lt;±£JM—Ð8AÅË­[Ò}–iÈ`µ|éÄü™Âº|Q¼PG¼ûæÖ.ŽssÕvíTå5ÄÛ©ë“’³Ý]¥oÀ¢®† WSãÔu°|+ËAÞ!@®;Á1ÖÃñi/ÆŒß`¡gåâêN@“;�Î
+@O-zSGµÛQJ€t-l~/U ½[]¶³ðði“Ì}õ�±[©Þ´!E^(s=¥þ–±Ë-vqßQ[‡+WD]%^$qßR7{ƒyZQ-r'©´=uœkÃ­–•V¶O˜Nn?úL5ÆÕc1zŠvÐÊ•sAeayÎMãX-ùá¶½¶d…é»RM·nÞg÷z`§¸<l�wb«ÝÉÉ2{:?çjÕãºtÙ–™Þgº¢rÇÁƒµÀ[£9däÔºì™iÍÚ=*×…£´Õ•;Àž ù<î¢h:.’)‰zcy�ó²™þ�yÜnqÎa¹y="">×_ÕŠ¼®ë…šþÑª3.«TQÆ×Üö˜ie7ÌGÃ©¾¯|_‡oÇÊO_–,C·Ý—áÔ­€xX€È&amp;zó­ÚU—¿y} ê˜
+TÞD–_´ÚX21ìG&nbsp;ŒÈ,\(1ÄÈ0:6Ñsáï¤F$·LW1âÓê!·íU$÷-Œº,ÃP’ŒÎütÁluÊ¦ª³2Ua‘òLÿH&lt;\P‚!U2xMÒ¢&amp;®ÊÚ—ÈdnT,»�³“Ý]‹ˆ‘Ž…]^C'i1ÅëgÅSPàxI^ì'(îöÐ»–F1—%ôõý@Ì¸:îvë
+ ¶bxIQ„yÀ|•ò’ÕJÀ[@úEÞóË¢ÈbÕQ‚×Ð7Ý]Ü'mÖþTîâ�DM†bIs˜1$T»5Ôå&lt;‰£WÄ‡üƒ¸ÈÁÃÕºi�Ëèeáæ¶«”
+¶¼U¢
+0¥×UÑ;Žðc—ÈãµÖ,4M.Tê¡œ2¥K�w¸„•ÓÔ‡Hš˜¦I«´}ñ\�¢×a¬›aÌÊÝ…aw3µ*úšßý‹Í^&nbsp;@~7ÒsN´&gt;ÜÏÈ½þ’Ô	»}qª¹HñÉ4TŠ¿m§&amp;~,¸�vóoÈ$/#cQÊG˜M6Iâ*ÖËšhš&amp;òpbYrUý„�˜K“ÕËëRä§f«õ.„hf¢&amp;¼XEu‘êrÜ¥&gt;¹{eVò’©Î¯§ºô.Æª5è²PE©Huê^½=öÚR5–’d²G4S'õK¤èÔ³22M•7VóXÎr(d–yÐK?Œ¬åâO¢Õè´üå°vW¡¼(œîÕ«{Óí[L¯ÊìVSÃa‰ò\næÑò&gt;»¯ÎŽY[¦'yPç¸`Ë—S‹8�Ó€~|ÍËµê8Šw^C'6¬vÀ[æz¥1¼VãqmÁ/Ñ¬¬”½o“õ¦õhÕûFl°ÎáB&nbsp;åµ=[LÅHq§L›{�6µoÛ.Èo
+5GÚR›#É‡¨�¨X5QQ1
+
+Ÿ¾¼Î�âi›FJAÐ‰ŠÏã›âÉµ°ˆ8
+?9»c‘ÍªS9Q¶.#.ÅÁPj8³°ni—&nbsp;í`Ä®�Bó:
+w¼A­l¼’d0*îØ	K…&gt;Û‚ºñž\­†ÔuÙo"5xƒ±$7,¶˜$KéUF@­5-z	7Y"Íþ1É˜V«�B“^;±
+RòÐvz¬}ƒVÄ�65PÃíóè(tN¿ip×­B¤„XëMÛ—‡-–¯cŒgRN��–ØˆUÇ�R;0
+ Ò�(PXÁèÆr`*³0æT,*`�–’þ/`¥Pü¥ïXn†4jBç³E±îŸÃ´W:]ÖýÕÜ$ÚàpP_hñ÷,Ó!þîÃh†Y¯#]ûño"í9 ‡7-õÐT¦ÄòT©ž'L�Øªœ™ÚîQ8¨4‚Ž&amp;¿pY‘&amp;"Ïd+ðl:¤Põƒ˜Ü®šzXT|ù\öŒ,—°ÈÁ›QÎ9ÌŒþ$BL²ðÌ,µEm;qø[�JÑËAì4Ñg:ý§XËÿQˆÂ=¤g‘Muµ(ƒ­XW-2&lt;ÙíØJß=~aÝ�{Å°``à…!¡¾�G
+)…Ež8
+÷™zcŸçŠ§+qï¢0¥Á·D±Öü(æ	4×5Aª€iŽ®'æO+ýƒqH·!•{€+Q!(±þGW°¦b‘TäÉ7_2I­ô»+'Ô?®…NÎ9Í·Nf[ø£�öüh®j$ÓØ’\Oq‹ÚõéêýÁ¥ãÖÞÈò�¸²R£Ü¿K‰³1Îíè´½Ó?ÎÆ0˜�"¾¸Îûù(×q…Õ–Å_²pGUý6M6<p÷Ÿ¬Û+ ¸%="" À+#£Ü!‘¬ávâpÅ ndªÑûyÆÑ+bqš#f¡›²´ž="" qw5="" �z0ÚiÕ•eÜõ8]€@nb-[Ñ³0³Æ="">ÏÙ&amp;45D%=Ôäð7CúÍ}&lt;Ô êãZ6(é3ðY&amp;ÉPCâïÞT¬i’bòF�^®—¹[ä,Â–"¸�Õ›äÄd­ë±TšƒðÈ—H1ñ¹äZú&lt;øŠ…EÔO$t{‘ª•q¾×=ð)cø€™Ëkò6È’¡QnIGl©?ðúø=é"iäÞå4¤ÉO*ÏÕTé<kgzsøÍ)ÊÔõo&ÁÏvfª‚¶¿ê*É»â)€*c%@9_µåsô2i„íÐ¨µm*Ç…±„qkó­ô“ôÊÆ©Íˆ®™›¾Ç¥…¨w¬µ"|Ü p‹Ôbšö­•v¿gláô !x)6xù¯í&g="" 4'ªÜ«ï#hèpéè¢˜väË<ÉÓíc%õqvÁ<áÕÝrŽŒp9�ÖÞ–±)²”fÓ2ÆÊé*ä?î_y“bå‚fz«å“¯="">�s
+‡(Ð
+òJUíÓ9×ÙïfVpDu™¿ì0t[Ë„Í£y‰Q•¼úntUE/²ïÛQú!árG|šØëmÉçP<s»™–Å¤Öõ�1äe3k¿<¶cË6¦ä©achŒš%~¥¢¥#¸ š›lÃ="" \²$Óµ8¢é3Ó(mÌºd›tcÛÅÚ™–?À «©aœh="" _s“wfö"="" ŠÈp‘îÈÍ�*‰="">2`IúûRH�í&amp;o&nbsp; –J8®ázkÕZ®©{QÊ�ÁjÓÁ*Kð˜lkHFßˆ�BÇÆ£],èÌÞßGõ'ŽÏ)çWM§Ajò%Õ,I˜ìÆ~�¬ÉSÂK•ë¶y.RÆ3j�Œsm�˜HØ§Nâ_ü‹[ØÜEQÔLª` ”BLºð´#4ˆù0I‹KÑ@�Ýö/kG&nbsp;ÊŠ]Ù Æò�ÖD49â#Ó.é—›úŠ@ôÝU’äHÃîý
+&nbsp;*DjÏ\çÜýûÁ¢tÚíšS•2i¥D‚ @¶ÝOÖÊµˆY	j\jkÑ4æ$?’&lt;Å
+$­Jn“sÕÛ2…—;#VEot°Û¼
+Î@Ùè	H‹�ž«¶e‰b7`L\S´§ß—±¦�„ªê·d‘
+æÚ\tØ†C·FG‘J¢j7Ó-Kµ‹¢†ÒE¦¦˜†-(®Ý³€xPN‡-´÷ø–Í8¦&nbsp;Q™†%:�\¨&amp;]!ãÀtKàyï^Q/a
+h¢µ4¢×™“&nbsp;¨.™�äå&gt;ç&amp;q8•s•úN°vxRÏ¸´G3‰Q³Y®-kœ
+ýu1e5gŒJJÏpœ¥˜1�|�FÝ4´ÏàŠBþëË–ÆÛÓ³1Ü‡+ìœôGltÅÚÌ
+vÙZMä3NlÛÕ±Ù4þ‡^†‘¹Úó2_î
+w‹Ä6z¨ØyT�½0à�¼[Z«75¿g@'{Ž'¤ÝRßâMË=i÷Ôb"×Í-B#f3SlÅ:Šžéé&gt;à‚[±	”&amp;þ Œ{jÂÉk&nbsp;÷€o…Å–ë"2¡\äÚÒ«Ø\�´¬k2{˜¼[ˆ‹‰xTRm‘ÍB%–Ý4ÍQÄæÕ
+@2¢u™y×r³OŠÀ‘r‹.…ýŒ¿�Xá­[å{N.„Ý–“àŠ³†'Y,WVio^�BKº¿+2\yÃAéZ“S†.°jc¤WåœäFäºjÃÈü'˜«0º6|FVèM‰dž&amp;B¯…� è!sî„WŠ_�
+u�Œl„†–ÎþÌFßó¥$i›ÂãtÃµ­¶1¸šÍÎ�@Ö’E	
+«-í08�¯P&amp;ÆKÎe~4½mä¾Ï°d*uˆEºn(w(Ü[7F{2v£Ð�Î4sº†9»iU´ØÄ`§ÝÈÙz€Æ&nbsp;lA#u'o7;–þ’j=X~¢x2?—�B.¼wxµé¨ôK¸qàÝÉÛèdy¬æîfyº×/H@ª,¥üP¨‚
+^4ßXÈjêîýdei(ì8I,
+/±\ª‡Çç˜ža*©œhpEr˜éƒ k[Î„LOåÃ’,®ä °JŸ�Uöðöû-±�–
+Î9šöP8e²£‘Ó ­´b§zƒÕd3+ºP 
+=NxžÑ#.0Yüí¹ê«ô		)¶¢ùò4¡nÔ–(R‘ndÞBN¢˜¢ÑE`Áõ´ÜÒ”G|&amp;eÓÎy�PEÑ, &gt;qPÿ�ÛQHÒ5»YaœKÒ­iŸ—$GêÍ/­p7«”†`G�%þ­&nbsp;Ü&nbsp;¶SVÅJ…</s»™–å¤öõ�1äe3k¿<¶cë6¦ä©achœš%~¥¢¥#¸></kgzsøí)êôõo&áïvfª‚¶¿ê*é»â)€*c%@9_µåsô2i„íð¨µm*ç…±„qkó­ô“ôêæ©íˆ®™›¾ç¥…¨w¬µ"|ü p‹ôbšö­•v¿gláô></p÷ÿ¬û+></l�wb«ýéé2{:?çjõãºtù–™þgº¢rçáƒµà[£9däôºì™iíú=*×…£´õ•;àž></b@÷üx7á$âj></s></pða�…#></g·1­©></div></div>
+<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://cybertron.cg.tu-berlin.de/eitz/pdf/2012_siggraph_classifysketch.pdf">https://cybertron.cg.tu-berlin.de/eitz/pdf/2012_siggraph_classifysketch.pdf</a></em></p>]]>
             </description>
             <link>https://cybertron.cg.tu-berlin.de/eitz/pdf/2012_siggraph_classifysketch.pdf</link>
             <guid isPermaLink="false">hacker-news-small-sites-33304132</guid>
