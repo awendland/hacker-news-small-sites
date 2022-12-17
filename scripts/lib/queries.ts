@@ -3,6 +3,7 @@ import * as t from "io-ts"
 import { getOrThrow } from "./func"
 import { PathReporter } from "io-ts/lib/PathReporter"
 import * as E from "fp-ts/lib/Either"
+import * as Log from "./simple-logger"
 
 /**
  * io-ts type for converting between Date
@@ -32,28 +33,25 @@ export type HNStory = t.TypeOf<typeof HNStory>
  * Run a query with the provided BigQuery instance. Optionally log operations as they occur.
  * @param bigquery
  */
-export const runQuery = (bigquery: BigQuery) => async (
-  query: string,
-  log = true
-) => {
-  if (log) console.group("BigQuery:")
-  if (log) console.log(`Job[TBD] queued at ${new Date().toISOString()}`)
+export const runQuery = (bigquery: BigQuery) => async (query: string) => {
+  Log.group(Log.LogLevel.INFO)
+  Log.info(`Job[TBD] queued at ${new Date().toISOString()}`)
   const [job] = await bigquery.createQueryJob({
     query,
     location: "US",
   })
   const startTime = Date.now()
-  if (log) console.log(`Job[${job.id}] started`)
+  Log.info(`Job[${job.id}] started`)
 
   const [rows] = await job.getQueryResults()
-  if (log) console.log(`Job[${job.id}] finished in ${Date.now() - startTime}ms`)
-  if (log) console.groupEnd()
-  return rows     .map((r) =>
-  getOrThrow(
-    HNStory.decode(r),
-    (e) => new Error(PathReporter.report(E.left(e)).join("\n"))
+  Log.info(`Job[${job.id}] finished in ${Date.now() - startTime}ms`)
+  Log.groupEnd(Log.LogLevel.INFO)
+  return rows.map((r) =>
+    getOrThrow(
+      HNStory.decode(r),
+      (e) => new Error(PathReporter.report(E.left(e)).join("\n"))
+    )
   )
-)
 }
 
 export const genSelectFor = <P extends t.Props>(

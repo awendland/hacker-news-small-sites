@@ -16,6 +16,7 @@ import "@js-joda/timezone"
 import * as t from "io-ts"
 import { pipe } from "fp-ts/lib/pipeable"
 import * as E from "fp-ts/lib/Either"
+import * as Log from "./lib/simple-logger"
 import { readStream } from "./lib/stream"
 import * as queries from "./lib/queries"
 import { getOrThrow } from "./lib/func"
@@ -55,7 +56,6 @@ export async function* generateRssFeeds({
   feedConfigs,
   maxStoryAge,
   allowBareDomains,
-  verbose,
   queryType,
 }: {
   feedConfigs: Iterable<FeedConfiguration>
@@ -82,13 +82,11 @@ export async function* generateRssFeeds({
             hackerNewsTable: queryType.bigQuery.hackerNewsTable,
             topSitesTable: queryType.bigQuery.topSitesTable,
           }),
-          verbose
         )
       : await selectSmallSiteStoriesSince({
           since,
           minScore: 1,
           millionsCacheDir: queryType.firebase.millionsCacheDir,
-          log: verbose,
         })
 
   console.group("RSS feeds:")
@@ -166,11 +164,10 @@ export async function run() {
         "which directory to cache the majestic million top sites list in",
       default: path.join(".cache", "millions"),
     })
-    .option("verbose", {
-      type: "boolean",
-      description:
-        "log lower level details (e.g., each time a batch of stories is fetched)",
-      default: true,
+    .option("logLevel", {
+      description: "verbosity of logging output",
+      choices: Object.keys(Log.LogLevel),
+      default: "INFO",
     })
     .option("maxStoryAge", {
       type: "number",
@@ -184,6 +181,7 @@ export async function run() {
         "bare domain articles (ie. URLs without a path) are removed as a heuristic to avoid non-blog posts",
       default: false,
     }).argv
+  Log.setLevelByString(args.logLevel)
 
   const readFeedConfigs = async (stream: Readable) =>
     getOrThrow(
