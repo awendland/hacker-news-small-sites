@@ -14,13 +14,13 @@ import {
 } from "@js-joda/core"
 import "@js-joda/timezone"
 import * as t from "io-ts"
-import { PathReporter } from "io-ts/lib/PathReporter"
 import { pipe } from "fp-ts/lib/pipeable"
 import * as E from "fp-ts/lib/Either"
 import { readStream } from "./lib/stream"
 import * as queries from "./lib/queries"
 import { getOrThrow } from "./lib/func"
-import { SmallSiteStory } from "./lib/queries"
+import { selectSmallSiteStoriesSince } from "./lib/manual-queries"
+import { HNStory } from "./lib/manual-queries"
 
 export const FeedConfiguration = t.type({
   minScore: t.number,
@@ -40,20 +40,29 @@ export type FeedConfiguration = t.TypeOf<typeof FeedConfiguration>
 
 const urlHasPath = (url: string) => new URL(url).pathname.length > 1
 
+type BigQueryConfig = {
+  queryRunner: (q: string, log?: boolean) => Promise<HNStory[]>
+  hackerNewsTable: string
+  topSitesTable: string
+}
+
+type FirebaseConfig = {
+  millionsCacheDir: string
+}
+type QueryType = { bigQuery: BigQueryConfig } | { firebase: FirebaseConfig }
+
 export async function* generateRssFeeds({
-  queryRunner,
   feedConfigs,
   maxStoryAge,
   allowBareDomains,
-  hackerNewsTable,
-  topSitesTable,
+  verbose,
+  queryType,
 }: {
-  queryRunner: (q: string) => Promise<any[]>
   feedConfigs: Iterable<FeedConfiguration>
   allowBareDomains: boolean
   maxStoryAge: number
-  hackerNewsTable: string
-  topSitesTable: string
+  verbose: boolean
+  queryType: QueryType
 }) {
   const since = convert(
     LocalDateTime.of(
@@ -63,27 +72,30 @@ export async function* generateRssFeeds({
   ).toDate()
   console.log(`Retrieving stories since ${since.toISOString()}`)
 
-  const rows = await queryRunner(
-    // TODO log query when verbose logging is on (eg. during CI)
-    queries.selectSmallSiteStoriesSince({
-      since,
-      minScore: 1,
-      hackerNewsTable,
-      topSitesTable,
-    })
-  )
+  // TODO log query when verbose logging is on (eg. during CI)
+  const stories =
+    "bigQuery" in queryType
+      ? await queryType.bigQuery.queryRunner(
+          queries.selectSmallSiteStoriesSince({
+            since,
+            minScore: 1,
+            hackerNewsTable: queryType.bigQuery.hackerNewsTable,
+            topSitesTable: queryType.bigQuery.topSitesTable,
+          }),
+          verbose
+        )
+      : await selectSmallSiteStoriesSince({
+          since,
+          minScore: 1,
+          millionsCacheDir: queryType.firebase.millionsCacheDir,
+          log: verbose,
+        })
 
   console.group("RSS feeds:")
   for (const config of feedConfigs) {
     const pubDate = new Date()
     const rss = new RSS({ ...config.rssMeta, pubDate })
-    const items = rows
-      .map((r) =>
-        getOrThrow(
-          SmallSiteStory.decode(r),
-          (e) => new Error(PathReporter.report(E.left(e)).join("\n"))
-        )
-      )
+    const items = stories
       .filter((s) => s.score > config.minScore)
       .filter((s) => allowBareDomains || urlHasPath(s.url))
     console.log(`${config.rssMeta.title} has ${items.length} items`)
@@ -97,7 +109,7 @@ Score ${sss.score} | Comments ${
           sss.id
         }">thread link</a>) | @${sss.by}
 <br/>
-${sss.timestamp.toLocaleDateString("en-US", {
+${sss.time.toLocaleDateString("en-US", {
   timeZone: "America/Los_Angeles",
   month: "long",
   year: "numeric",
@@ -108,7 +120,7 @@ ${sss.timestamp.toLocaleDateString("en-US", {
 `,
         url: sss.url,
         guid: `hacker-news-small-sites-${sss.id}`,
-        date: sss.timestamp,
+        date: sss.time,
       })
     )
     yield {
@@ -127,10 +139,12 @@ export async function run() {
       description: "path to feed configurations file, or '-' for stdin",
     })
     .demandOption("config")
-    .option("googleProjectId", {
-      alias: "google-project-id",
-      type: "string",
-      description: "id of the project to run the bigquery in",
+    .option("useBigQuery", {
+      alias: "use-big-query",
+      type: "boolean",
+      description:
+        "if bigquery should be used instead of firebase and in memory joins",
+      default: false,
     })
     .option("hackerNewsTable", {
       alias: "hn-table",
@@ -144,6 +158,19 @@ export async function run() {
       description:
         "name of the bigquery top-sites table to use (must have a 'domain' column)",
       default: `hacker-news-small-sites.top_sites.majestic_million`,
+    })
+    .option("millionsCacheDir", {
+      alias: "millions-cache-dir",
+      type: "string",
+      description:
+        "which directory to cache the majestic million top sites list in",
+      default: path.join(".cache", "millions"),
+    })
+    .option("verbose", {
+      type: "boolean",
+      description:
+        "log lower level details (e.g., each time a batch of stories is fetched)",
+      default: true,
     })
     .option("maxStoryAge", {
       type: "number",
@@ -172,16 +199,28 @@ export async function run() {
       (e) => new Error(e.join("\n"))
     )
 
-  const bigquery = new BigQuery()
   const feedConfigs = await pipe(
     args.config === "-" ? process.stdin : fs.createReadStream(args.config),
     readFeedConfigs
   )
 
+  let queryType: QueryType = {
+    firebase: { millionsCacheDir: args.millionsCacheDir },
+  }
+  if (args.useBigQuery) {
+    queryType = {
+      bigQuery: {
+        queryRunner: queries.runQuery(new BigQuery()),
+        hackerNewsTable: args.hackerNewsTable,
+        topSitesTable: args.topSitesTable,
+      },
+    }
+  }
+
   for await (const feed of generateRssFeeds({
-    queryRunner: queries.runQuery(bigquery),
-    feedConfigs,
     ...args,
+    feedConfigs,
+    queryType,
   })) {
     await fsp.mkdir(path.dirname(feed.config.outFile), { recursive: true })
     await fsp.writeFile(feed.config.outFile, feed.xml, "utf8")
