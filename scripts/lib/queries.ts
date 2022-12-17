@@ -1,5 +1,8 @@
 import { BigQuery, BigQueryTimestamp } from "@google-cloud/bigquery"
 import * as t from "io-ts"
+import { getOrThrow } from "./func"
+import { PathReporter } from "io-ts/lib/PathReporter"
+import * as E from "fp-ts/lib/Either"
 
 /**
  * io-ts type for converting between Date
@@ -13,6 +16,17 @@ const DateFromBigQueryTimestamp = new t.Type<Date, BigQueryTimestamp, unknown>(
       : t.failure(u, c),
   (d) => new BigQueryTimestamp(d)
 )
+
+export const HNStory = t.type({
+  id: t.number,
+  by: t.string,
+  descendants: t.union([t.number, t.null]),
+  score: t.number,
+  title: t.string,
+  time: DateFromBigQueryTimestamp,
+  url: t.string,
+})
+export type HNStory = t.TypeOf<typeof HNStory>
 
 /**
  * Run a query with the provided BigQuery instance. Optionally log operations as they occur.
@@ -34,7 +48,12 @@ export const runQuery = (bigquery: BigQuery) => async (
   const [rows] = await job.getQueryResults()
   if (log) console.log(`Job[${job.id}] finished in ${Date.now() - startTime}ms`)
   if (log) console.groupEnd()
-  return rows
+  return rows     .map((r) =>
+  getOrThrow(
+    HNStory.decode(r),
+    (e) => new Error(PathReporter.report(E.left(e)).join("\n"))
+  )
+)
 }
 
 export const genSelectFor = <P extends t.Props>(
@@ -51,7 +70,7 @@ export const SmallSiteStory = t.type({
   descendants: t.union([t.number, t.null]),
   score: t.number,
   title: t.string,
-  timestamp: DateFromBigQueryTimestamp,
+  time: DateFromBigQueryTimestamp,
   url: t.string,
 })
 
@@ -70,7 +89,8 @@ export const selectSmallSiteStoriesSince = ({
     small_site_stories AS (
     SELECT
       REGEXP_EXTRACT((REGEXP_EXTRACT(post.url,'https?://([^/]+)')),'([^\\\\.]+\\\\.[^\\\\.]+(?:\\\\.[a-zA-Z].)?)$') AS domain,
-      post.*
+      post.*,
+      post.timestamp as time,
     FROM
       \`${hackerNewsTable}\` AS post
     WHERE
