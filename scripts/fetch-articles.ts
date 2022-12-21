@@ -95,7 +95,7 @@ export async function run() {
     .option("maxArticleLength", {
       type: "number",
       description: "maximum length of the article, in characters",
-      default: 10_000,
+      default: 50_000,
     })
     .option("parallelism", {
       alias: "j",
