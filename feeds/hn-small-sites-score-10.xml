@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Thu, 29 Dec 2022 20:26:47 GMT</lastBuildDate>
+        <lastBuildDate>Fri, 30 Dec 2022 01:50:18 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-10.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Thu, 29 Dec 2022 20:26:47 GMT</pubDate>
+        <pubDate>Fri, 30 Dec 2022 01:50:18 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,370 @@
         <ttl>240</ttl>
         <item>
             <title>
-<![CDATA[Whistleblower Rebekah Jones wins dismissal]]>
+<![CDATA[Golang is evil on shitty networks]]>
             </title>
             <description>
 <![CDATA[
-Score 46 | Comments 5 (<a href="https://news.ycombinator.com/item?id=34176854">thread link</a>) | @colinprince
+Score 303 | Comments 156 (<a href="https://news.ycombinator.com/item?id=34179426">thread link</a>) | @withinboredom
+<br/>
+December 29, 2022 | https://withinboredom.info/blog/2022/12/29/golang-is-evil-on-shitty-networks/ | <a href="https://web.archive.org/web/*/https://withinboredom.info/blog/2022/12/29/golang-is-evil-on-shitty-networks/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+<p>This adventure starts with <code>git-lfs</code>. It was a normal day and I added a 500 MB binary asset to my server templates. When I went to push it, I found it interesting that <code>git-lfs</code> was uploading at 50KB per second. Being that I had a bit of free time that I’d much rather be spending on something else than waiting FOREVER to upload a file, I decided to head upstairs and plug into the ethernet. I watched it instantly jump up to 2.5 MB per second. Still not very fast, but I was now intensely curious.</p>
+
+
+
+<p>Since I figured I would have originally been waiting FOREVER for this to upload, I decided to use that time and investigate what was going on. While I would expect wired ethernet to be a bit faster than wifi, I didn’t expect it to be orders (with an <code>s</code>) of magnitude faster. Just to check my sanity, I ran a speed test and saw my upload speed on wifi at 40MB per second, and wired at 60MB per second. </p>
+
+
+
+<p>After some investigations with WireShark and other tools, I learned that my wifi channels have a shitload of interference in the 2Ghz band, and just a little in the 5Ghz band. During this time, I also learned that my router wouldn’t accept a single 5Ghz client due to a misconfiguration on my part. So, non-sequitur, apparently enabling “Target Wake Time” was very important (I have no idea what that does). Once that was fixed, I saw 600MB per second on my internal network and outside throughput was about the same as wired.</p>
+
+
+
+<p>But, why on earth was <code>git-lfs</code> so slow, even on 5Ghz? After looking at Wireshark while uploading to <code>git-lfs</code>, I noticed about 30-50% of the traffic was out-of-order/duplicate ACKs, causing retransmissions. I found that especially weird, not terribly weird because remember, this wifi network “sucks” with all my noisy neighbors. It turns out there are random 50-100ms delays all over the place. Probably due to interference. When I ran a speed test or browser session, however, it was less than 1%! In fact, <code>git-lfs</code> was barely sending any packets at all, like it was eternally stuck in TCP slow-start.</p>
+
+
+
+<figure><img loading="lazy" decoding="async" width="1024" height="660" src="https://withinboredom.info/wp-content/uploads/2022/12/image-3-1024x660.png" alt="" srcset="https://withinboredom.info/wp-content/uploads/2022/12/image-3-1024x660.png 1024w, https://withinboredom.info/wp-content/uploads/2022/12/image-3-300x193.png 300w, https://withinboredom.info/wp-content/uploads/2022/12/image-3-768x495.png 768w, https://withinboredom.info/wp-content/uploads/2022/12/image-3-1536x990.png 1536w, https://withinboredom.info/wp-content/uploads/2022/12/image-3.png 1663w" sizes="(max-width: 1024px) 100vw, 1024px"><figcaption>Graph showing packets-per-second (total) and packet errors for <code>git-lfs</code></figcaption></figure>
+
+
+
+<p>When I looked at the packets, they were being sent in ~50-byte payload chunks (~100 bytes total, MTU is 1500). I found that very interesting because I would expect Nagle’s algorithm to coalesce packets so there would be fewer physical packets to send. That is when it hit me, <code>TCP_NODELAY</code> must be set.</p>
+
+
+
+<p>Between that, and extremely regular 100ms delays, it could only get off a few packets before getting a “lost packet,” not to mention nearly 50% of every packet was literally packet headers. I was literally, permanently stuck in TCP Slow Start.</p>
+
+
+
+<h2>TCP No Delay from Memory</h2>
+
+
+
+<p>Nagle’s Algorithm was written approximately 4 decades ago to solve the “tinygram” problem, where you are sending a whole bunch of little packets, flooding the network, and reducing network throughput. Nagle’s algorithm essentially bundles all the little packets into one big packet, waiting for an ACK or a full packet to be constructed, whichever is sooner. </p>
+
+
+
+<p>Theoretically. </p>
+
+
+
+<p>It’s a bit more complex than that due to decades of changes to make the web better and more performant… but turning on <code>TCP_NODELAY</code> would mean that each of those 50 bytes are sent out as one packet instead of just a few bigger packets. This increases the network load, and when there’s a probability that a packet will need to be retransmitted, you’ll see a lot more retransmissions.</p>
+
+
+
+<p>If you want to know more, use Google.</p>
+
+
+
+<h2>Diving in the code</h2>
+
+
+
+<p>From there, I went into the <code>git-lfs</code> codebase. I didn’t see any calls to <code>setNoDelay</code> and when I looked it up, it said it was the default. Sure enough:</p>
+
+
+
+<figure><img decoding="async" loading="lazy" width="1024" height="343" src="https://withinboredom.info/wp-content/uploads/2022/12/image-2-1024x343.png" alt="" srcset="https://withinboredom.info/wp-content/uploads/2022/12/image-2-1024x343.png 1024w, https://withinboredom.info/wp-content/uploads/2022/12/image-2-300x100.png 300w, https://withinboredom.info/wp-content/uploads/2022/12/image-2-768x257.png 768w, https://withinboredom.info/wp-content/uploads/2022/12/image-2.png 1076w" sizes="(max-width: 1024px) 100vw, 1024px"></figure>
+
+
+
+<p>Indeedly, the socket disables Nagle’s algorithm by default in Go.</p>
+
+
+
+<h2>Is this a trick?</h2>
+
+
+
+<p>I think this is a pretty nasty trick. The “default” in most languages I’ve used has <code>TCP_NODELAY</code> turned off. Turning it on has some serious consequences (most of them bad).</p>
+
+
+
+<ol>
+<li>Can easily saturate a network with packet overhead to send a single byte.</li>
+
+
+
+<li>Can send a whole bunch of small packets with high overhead (eg, half the data being sent is packet headers for <code>git-lfs</code>)</li>
+
+
+
+<li>Reduces latency (the only pro) by sending small packets</li>
+
+
+
+<li>Can cause havoc on an unreliable link</li>
+</ol>
+
+
+
+<p>I wasn’t able to dig out why Go chose to disable Nagle’s algorithm, though I assume a decision was made at some point and discussed. But this is tricky because it is literally the exact opposite of what you’d expect coming from any other language.</p>
+
+
+
+<p>Further, this “trick” has probably wasted hundreds of thousands of hours while transferring data over unreliable links (such as getting stuck in TCP slow start, saturating devices with “tinygram” packets, etc). As a developer, you expect the language to do “the best thing” it is able to do. In other words, I expect the network to be efficient. Literally decades of research, trial, and error have gone into making the network efficient.</p>
+
+
+
+<p>And then someone does some bozo shit like this. Except in Windows. Apparently.</p>
+
+
+
+<p>I would absolutely love to discover the original code review for this and why this was chosen as a default. If the PRs from 2011 are any indication, it was probably to get unit tests to pass faster. If you know why this is the default, I’d love to hear about it!</p>
+
+
+
+<h2>Effects elsewhere</h2>
+
+
+
+<p>This ‘default’ has some pretty significant knock-on-effects throughout the Go ecosystem. I was seeing terrible performance of Caddy, for example, on my network. It was fairly frustrating that I couldn’t identify the issue. But after some testing, now I know (I opened an issue).</p>
+
+
+
+<p>Much (all?) of Kubernetes is written Go, and how has this default affected that? In this case, this ‘default’ is probably desired. Probably. The network is (usually) reliable and with 10G+ links between them, so they can handle sending small-byte packets with 40 byte headers. Probably.</p>
+
+
+
+<p>This obviously affects <code>git-lfs</code>, much to my annoyance. I hope they fix it… I opened an issue.</p>
+
+
+
+<h2>When to use this?</h2>
+
+
+
+<p>In <strong>most</strong> cases, <code>TCP_NODELAY</code> shouldn’t be enabled. Especially if you don’t know how reliable the network is and you aren’t managing your own buffers. If you’re literally streaming data a chunk at a time, at least fill a packet before sending it! Otherwise, turn off <code>TCP_NODELAY</code> and stream your little chunks to the socket and let Nagle’s Algorithm handle it for you.</p>
+
+
+
+<p>Most people turn to <code>TCP_NODELAY</code> because of the “200ms” latency you might incur on a connection. Fun fact, this doesn’t come from Nagle’s algorithm, but from Delayed ACKs or Corking. Yet people turn off Nagle’s algorithm … :sigh:</p>
+
+
+
+<p>Here’s the thing though, would you rather your user wait 200ms, or 40s to download a few megabytes on an otherwise gigabit connection?</p>
+</div></div>]]>
+            </description>
+            <link>https://withinboredom.info/blog/2022/12/29/golang-is-evil-on-shitty-networks/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-34179426</guid>
+            <pubDate>Thu, 29 Dec 2022 23:17:43 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Software Illustrated: I'm just trying to change this lightbulb]]>
+            </title>
+            <description>
+<![CDATA[
+Score 39 | Comments 15 (<a href="https://news.ycombinator.com/item?id=34179067">thread link</a>) | @BrianB
+<br/>
+December 29, 2022 | https://www.mikesteder.com/engineering/management/gifs/software/illustrated/2014/12/31/software-engineering-illustrated-im-just-trying-to-change-this-lightbulb.html | <a href="https://web.archive.org/web/*/https://www.mikesteder.com/engineering/management/gifs/software/illustrated/2014/12/31/software-engineering-illustrated-im-just-trying-to-change-this-lightbulb.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div aria-label="Content">
+      <div>
+        <article itemscope="" itemtype="http://schema.org/BlogPosting">
+
+  
+
+  <div itemprop="articleBody">
+    
+
+<p>I like to think that I’m an GIF afficionado, but it’s hard to overstate how much this GIF can help one understand about software engineering.</p>
+
+<p>Let it wash over you.  Watch it a few times.</p>
+
+<p><img src="https://www.mikesteder.com/gifs/im_just_trying_to_change_this_lightbulb.gif" alt="a_simple_problem"></p>
+
+
+
+<ul>
+  <li>Hal enters, walks to the kitchen and immediately tries to turn on a light in the kitchen</li>
+  <li>Hal turns it off and on again</li>
+  <li>Hal check the bulb and decides it needs to be replaced</li>
+  <li>Hal goes to a kitchen cabinet to get a bulb</li>
+  <li>As he’s reaching for the bulb he notes the shelf is loose</li>
+  <li>Hal decides to fix the shelf and opens a drawer to get a screwdriver</li>
+  <li>The drawer squeaks so Hal decides to get WD-40 to fix the squeak</li>
+  <li>The WD-40 is empty so Hal decides to drive tot he store to get some more</li>
+  <li>His car won’t start</li>
+  <li>Hal decides to fix the car</li>
+  <li>Lois comes home and asks Hal to please drop what he’s doing and fix the lightbulb in the kitchen</li>
+  <li>Hal exclaims that that’s what he’s currently trying to do by fixing the car</li>
+</ul>
+
+
+
+<blockquote>
+  <p>Hal and Lois just illustrated for us what software people like to call “Technical Debt”.
+Technical debt conceptually leans very heavily on the financial concept of debt.  {“ Essentially,
+you accumulate technical debt by taking short cuts or not fixing problems when they occur. “}  Deferring fixing
+bugs or avoiding building a feature the “right way” either by ignoring best practices or cutting corners in
+the system to hit a target date forces you to essentially mortgage your code base and take on “Technical Debt”.</p>
+</blockquote>
+
+<p>Some software issues are incorrectly interpreted as debt.  For example, bugs in your software are not necessarily debt.  Some bugs can exist for years and are a non-issue.  Some people think something is a bug when it’s really a feature of the system.  Some bugs occur only infrequently or no one knows how they bug should really be fixed.  While these are frustrating, they generally not issues of debt.</p>
+
+<p>Instead, technical debt is typically design decisions that were made in the name of expediency that you may or may not have realized would cause problems down the line.  Sadly, experienced engineers sometimes incur this debt despite the fact they know it will eventually be a problem because:</p>
+
+<ul>
+  <li>I’ll rewrite it before we get enough customers that scalability will be an issue</li>
+  <li>I’ll fix it after RELEASE_DATE/CUSTOMER_DEMO when we finally have some time to do things right</li>
+  <li>I’ll fix it before I leave the company</li>
+  <li>No one cares about quality</li>
+</ul>
+
+<p>Examples of some design decisions and tradeoffs that may create debt:</p>
+
+<ul>
+  <li>We’ll write the kernel of the application in a “scripting” language and optimize later, if at all</li>
+  <li>We’ll deploy this by hand</li>
+  <li>We’ll use an ORM to do data access because we don’t know SQL</li>
+  <li>We’ll stop fixing bugs in this OLD_THING while we replatform to the NEW_THING</li>
+</ul>
+
+
+
+<p>Typically any software system has some amount of technical debt so it’s not always clear when that debt becomes a serious problem for your company or team.</p>
+
+<p>Part of what makes technical debt challenging is that software people and business people within your organization likely look at the priority of paying down technical debt completely differently.</p>
+
+<p>For example, if Hal is a typical software person on your team, from his perspective he’s trying to finish the project “Have working kitchen lights” as quickly as possible while following the boyscout rule and at each step of the process leaving the camp site nicer than it was when he arrived.  In this case, that means fixing the loose shelf in kitchen cabinet, fixing the squeaky drawer, the car, etc.</p>
+
+<p>Assuming Lois is our CEO, she’s really confused by this behavior.  She’s thinking, that kitchen light is critical for the business and needs to be completed as soon as possible so other work can proceed, a new client can be signed, etc.  Any delay for minor issues like loose shelves or squeaky drawers seems like a complete waste.  Lois can completely understand the emergency car fix, but she’s still confused as to why that’s necessary now to simply change the lightbulb.</p>
+
+<p>From an engineering perspective folks look at Hal’s odyssey to change a lightbulb and they laugh wryly, or sigh deeply and think “I’ve lived through days or weeks like that where I’m just trying to complete a simple task but ‘Technical Debt’ and other roadblocks prevented me from making progress.”</p>
+
+<p>From a management perspective, folks just look at a team of software engineers that are inexplicably taking forever to accomplish a seemingly simple task. They question if they have the right people, if they need a new team, additional resources, or even worse, a replatform.</p>
+
+<p>First of all, let’s look at why software folks behave this way.</p>
+
+<h2 id="engineer-perspective">Engineer Perspective</h2>
+
+<p>Engineers think a number of things that are all somewhat true and attempt to overcompensate for those things with this sort of extreme-Hal behavior:</p>
+
+<ol>
+  <li>I want to do a quality job and this isn’t good enough.  If only I had more time!</li>
+  <li>I don’t think my boss will care about this.  If I ask them to prioritize it they’ll tell me not to work on it.</li>
+  <li>If they won’t let me work on it now they’ll never let me work on it and It’ll never be fixed! (keeps, creates debt)</li>
+  <li>Our code base is already full of bugs, I don’t want to create more or do more maintenance work in the future.</li>
+  <li>Bugs cost us too much already in terms of maintenance and lost customers/sales, we have to improve quality (pay down debt)</li>
+</ol>
+
+<p>Now what’s true from an Engineering perspective is that this bug is likely not important enough to tackle right now and that it should be prioritized.</p>
+
+<p>What hopefully isn’t true in your business is that no-one will ever care about this issue and that it will never be fixed.  Instead, I hope you periodically address technical issues brought up during prioritized work and you fix bugs like “Loose shelf in kitchen cabinet”.</p>
+
+<h2 id="business-perspective">Business Perspective</h2>
+
+<p>Business folks of course are more concerned about time to market and really are just looking at everything being done as quickly as possible so that whatever is contingent on the work being complete can proceed.</p>
+
+<p>Business folks think the following things that are also somewhat true:</p>
+
+<ol>
+  <li>Quality can slip a “little bit” to hit target dates (it’s okay to take on debt to make a sale)</li>
+  <li>I’m not sure I trust the software people with their computer wizardry</li>
+  <li>In previous situations they were able to hit the date despite saying they couldn’t, they just need to work harder</li>
+  <li>This is the most important project at the company and they are the highest paid people, it’s okay if they work harder</li>
+</ol>
+
+<p>Yes, quality can slip a little bit to hit a date, and yes, the project is likely important and yes, you likely pay these software folks quite well compared to other roles in your company.</p>
+
+<p>However, a lack of trust is not really a good reason to assume that your software group is dragging their feet and despite the high pay, sometimes equipment and resources are still an issue.  Perhaps better IT infrastructure, better tools, or additional personnel could complete a project more quickly and if something is truly that important to your business perhaps spending more money to acquire additional resources is the answer.</p>
+
+<p>Fortunately, business people actually have a good understanding of debt and borrowing.  Unfortunately, they likely don’t have the technical expertise to understand if the debt they’ve accumulated is a little or a lot.  Determining the amount of debt the business has is something that requires a good working relationship, even trust, between the business and engineering sides of an organization.</p>
+
+
+
+<p>The path towards responsible tech debt financials lies somewhere between these two view points.  Typically the business side and software side are both looking out for the best interests of the business or project of which they’re a member.  I think that the appropriate response to the presence of technical debt on your team is the following:</p>
+
+<ol>
+  <li>
+    <p>Carve out a portion of your software team’s time to pay down technical debt.  You want to   pay down as much as you can to address some of the principle part of the loan, so that you are not just paying down interest.  To do this I advocate treating your engineering / software team as an equal stakeholder in the business in terms of time allocated.</p>
+
+    <p>For example, if you currently work on 4 projects at a time, one for each of 4 business units at your company, you first need to recognize that there are actually 5 “real” projects you need to be able to tackle and that a portion of hours from the 4 projects needs to be allocated to this fifth, home improvement project.</p>
+
+    <p>e.g.: if you’re currently allocating 25 hours a week to each of the four projects, I’d reduce each of those projects hours from 25 to 20 and run 5 projects at 20 hours a piece.</p>
+  </li>
+  <li>
+    <p>Prioritize technical debt tasks.  Estimate them and treat them like real work.  The only thing really different is that the stakeholder for this work is the engineers, not some customer or project manager elsewhere in your company.</p>
+  </li>
+  <li>
+    <p>Create a “home improvement” rotation or otherwise allocate this work to members of your software team.</p>
+  </li>
+  <li>
+    <p>Demo this debt retirement work to your software team, and where appropriate, to the rest of the business.  Better quality, faster, and/or easier to use features should be relevant to all and something that should be recognized and positively reinforced.</p>
+  </li>
+</ol>
+
+  </div>
+
+  
+</article>
+
+      </div>
+    </div></div>]]>
+            </description>
+            <link>https://www.mikesteder.com/engineering/management/gifs/software/illustrated/2014/12/31/software-engineering-illustrated-im-just-trying-to-change-this-lightbulb.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-34179067</guid>
+            <pubDate>Thu, 29 Dec 2022 22:39:02 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Breaking up with Python]]>
+            </title>
+            <description>
+<![CDATA[
+Score 66 | Comments 143 (<a href="https://news.ycombinator.com/item?id=34177703">thread link</a>) | @n8ta
+<br/>
+December 29, 2022 | https://cedwards.xyz/breaking-up-with-python/ | <a href="https://web.archive.org/web/*/https://cedwards.xyz/breaking-up-with-python/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+            
+
+            <div>
+                <div>
+                    <p>Breaking Up With Python</p>
+                    <p>December 27, 2022</p>
+                </div>
+                <p>For years, Python has been my go-to language for a quick bit of scripting where another language might feel too heavy duty. As time has gone by, I’ve grown more and more disillusioned with it to the point where I now avoid it if possible in favor of something like Go or JavaScript.</p>
+<h2 id="pythons-documentation-sucks">Python’s documentation sucks</h2>
+<p>Sorry. It’s absolutely terrible. Take <a href="https://docs.python.org/3/library/urllib.request.html#module-urllib.request">this</a> page for instance. It’s horrible to navigate. How do I see a list of functions exposed by this module? I can’t. I have to scroll and Ctrl+F to find what I’m looking for.</p>
+<p>Now take Go’s documentation for <a href="https://pkg.go.dev/net/http"><code>net/http</code></a>. The sidebar has a clear view of all constants, variables, functions, and types exposed by this package. The design makes much better use of screen space and there’s a search modal that shows instant results.</p>
+<h2 id="pythons-package-management-sucks">Python’s package management sucks</h2>
+<p>Every project seems to use a different tool and it’s a massive headache. Off the top of my head there’s:</p>
+<ul>
+<li>Pip</li>
+<li>Pipenv</li>
+<li>Poetry</li>
+<li>Virtualenv</li>
+<li>Conda</li>
+<li>Twine</li>
+</ul>
+<p>…and probably others I’ve forgotten. It’s exhausting when you need to get a Python project working and it uses a snowflake package manager you’ve not encountered before. Not to mention the frustrating issues you can encounter if one of the dependencies uses C bindings. In my experience, such issues are usually hellish to resolve.</p>
+<h2 id="pythons-standard-library-sucks">Python’s standard library sucks</h2>
+<p>It’s extremely barebones. You can do some basic things with it but the HTTP server/client is far from production grade. On the other hand, you can write a robust Go backend without needing to import a single dependency. Go’s <code>net/http</code> can suffice. Go’s standard library has pretty much everything you could ever need.</p>
+<p>Expect to add a dependency to your Python project the moment you go beyond Hello World.</p>
+<h2 id="python-is-slow">Python is slow</h2>
+<p>This isn’t exactly a secret. We all know about the GIL. There have been efforts to optimise the runtime in recent years but it’s still nowhere near the performance of V8.</p>
+<h2 id="python-is-huge">Python is huge</h2>
+<p>The <code>python:3.9-slim</code> Docker image is 118MB! Once you add your own code and its dependencies, you can expect it to be even larger, especially if you can’t use the slim variant for some reason.</p>
+<h2 id="python-sucks">Python sucks</h2>
+<p>I mean the syntax itself. It’s like everything under the kitchen sink has been jammed in. Like there’s a serious lack of coherent design or vision. Type annotations were a step in the right direction but they don’t even do anything! Why!?</p>
+
+            </div>
+            
+
+        </div></div>]]>
+            </description>
+            <link>https://cedwards.xyz/breaking-up-with-python/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-34177703</guid>
+            <pubDate>Thu, 29 Dec 2022 20:47:09 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Whistleblower Rebekah Jones wins dismissal at a price]]>
+            </title>
+            <description>
+<![CDATA[
+Score 62 | Comments 18 (<a href="https://news.ycombinator.com/item?id=34176854">thread link</a>) | @colinprince
 <br/>
 December 29, 2022 | https://www.mynwfl.com/post/rebekahjonescasedismissed | <a href="https://web.archive.org/web/*/https://www.mynwfl.com/post/rebekahjonescasedismissed">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-hook="post-description"><article><div><div><div><div data-rce-version="9.3.6"><div dir="ltr" data-id="rich-content-viewer"><div><p id="viewer-foo"><span><span>More than a dozen police arrived early in the morning on December 7, 2020 to the Tallahassee home of Florida scientist and whistleblower Rebekah Jones. </span></span></p><p id="viewer-927bu"><span><span>In the <a data-hook="linkViewer" href="https://twitter.com/GeoRebekah/status/1336065787900145665" target="_blank" rel="noopener noreferrer"><span><u>disturbing video </u></span></a>released by both Jones and state police, an officer wielding a sledgehammer banged on Jones’ front door, falsely claiming to have a warrant, though police did not produce one until three hours after arriving at Jones’ home.</span></span></p><p id="viewer-90k96"><span><span>One officer pointed a gun at Jones’ head through a window next to the front door and demanded she open it. She complied, hands raised, calm. </span></span></p><p id="viewer-boah9"><span><span>Then police entered the home and drew more weapons, pointing them at Jones’ husband, 11-year-old son and two-year-old daughter as they came down the stairs.</span></span></p><p id="viewer-3q0ff"><span><span>Police later lied and released an official statement claiming “at no point were guns drawn” during the raid before Jones released home surveillance video showing at least six officers with guns drawn on her and her family. </span></span></p><p id="viewer-f0769"><span><span>The dramatic episode dominated American news for weeks and outrage from the public, <a data-hook="linkViewer" href="https://www.tampabay.com/florida-politics/buzz/2020/12/08/florida-investigation-into-covid-19-whistleblower-draws-rebuke-from-crist-others/" target="_blank" rel="noopener noreferrer"><span><u>members of Congress</u></span></a>, <a data-hook="linkViewer" href="https://www.tallahassee.com/story/news/2020/12/08/scientists-speak-out-raid-fired-florida-doh-employee-rebekah-jones-home/3862377001/" target="_blank" rel="noopener noreferrer"><span><u>the scientific community</u></span></a>, <a data-hook="linkViewer" href="https://www.tallahassee.com/story/news/2020/12/08/rebekah-jones-video-twitter-raid-social-media/6488830002/" target="_blank" rel="noopener noreferrer"><span><u>celebrities and technology advocates alike </u></span></a>catapulted Jones from Florida<em> cause célèbre</em> to international hero.</span></span></p><p id="viewer-7elt5"><span><span>The harrowing details sent shockwaves across a nation in political turmoil at a time when scientists were already reluctant to speak out.</span></span></p><p id="viewer-6tbgs"><span><span>Jones and her attorneys sued the police for the armed raid under federal civil rights statutes. </span></span></p><p id="viewer-4bs37"><span><span>The day after a Tallahassee judge ordered Florida State Police to either charge Rebekah Jones with a crime or return the equipment taken from her home, police charged the 31-year-old scientist with a third-degree felony.</span></span></p><p id="viewer-40h51"><span><span>Using Florida Statutes 815.06 2A, Jones was charged with “misuse of computer systems without authorization or exceeding authorized use.” </span></span></p><p id="viewer-ee7uq"><span><span>The state alleged Jones sent a text message to former coworkers from a state server that read, <em>“It’s time to speak up before another 17,000 people are dead. You know this is wrong. You don’t have to be a part of this. Be a hero. Speak out before it’s too late.”</em></span></span></p><p id="viewer-5e6al"><span><span>Months later, a coordinated disinformation campaign targeting Jones aimed to question her credibility, undermine her efforts to track COVID-19 at the national level, and sought to paint Jones in a light that would <strong><em>justify to others pointing weapons at her and her family</em></strong>. A scientist with no criminal record. A whistleblower with an active case against the state of Florida at the time state police raided her home.</span></span></p><p id="viewer-5mfpk"><span><span>The case against Jones is now closed and the state agreed to dismiss the charge in exchange for $20,000 and an admission of guilt, though even the agreement has come with its own controversy. </span></span></p><p id="viewer-cmn87"><span><span><strong><u>The text message that caused an armed raid on a family</u></strong></span></span></p><p id="viewer-dp7b2"><span><span>The only connection between Jones and the text message sent November 10, 2020 was provided by one of the state employees involved in Jones’ whistleblower complaint. He personally provided an IP address he claimed was responsible for sending the message, according to the lead investigator on the case. The IP address belonged to Jones’ residence in Tallahassee. </span></span></p><p id="viewer-385q7"><span><span>Using IP addresses in criminal cases comes with its own <a data-hook="linkViewer" href="https://www.eff.org/deeplinks/2020/12/raid-covid-whistleblower-florida-shows-need-reform-overbroad-computer-crime-laws" target="_blank" rel="noopener noreferrer"><span><u>limitations</u></span></a>, especially when Jones often worked from home and thus the state would have records of her IP address from her time of employment. </span></span></p><p id="viewer-8k1t1"><span><span>However, court documents show that the company which provides the application used to send the text, ReadyOp, <a data-hook="linkViewer" href="https://mynwfl.files.wordpress.com/2022/12/logs.pdf" target="_blank" rel="noopener noreferrer"><span><strong><em><u>does not keep and had no record of the end user IP address of who sent the text.</u></em></strong></span></a><strong> </strong></span></span></p><p id="viewer-2koti"><span><span>The list of IP addresses accessing the <em>application </em>on the same day the text was sent was submitted as evidence by police as an excel spreadsheet with no other validation or corroboration.</span></span></p><p id="viewer-a81as"><span><span>The state server <a data-hook="linkViewer" href="https://mynwfl.files.wordpress.com/2022/12/inv-4-history_login.xlsx" target="_blank" rel="noopener noreferrer"><span><u>showed six different computers logging</u></span></a> into the ReadyOp system using the same user ID during the period the message was sent, any one of which could have been responsible for sending it. </span></span></p><p id="viewer-78vk9"><span><span>Police only sought a warrant from Comcast for the owner of two<a data-hook="linkViewer" href="https://mynwfl.files.wordpress.com/2022/12/inv-7-comcastsubpoena111220.pdf" target="_blank" rel="noopener noreferrer"><span><u> of the six IP addresses,</u></span></a> however. One led to Jones’ home. </span></span></p><p id="viewer-fdar9"><span><span>The other IP address<a data-hook="linkViewer" href="https://mynwfl.files.wordpress.com/2022/12/inv-40-final-response-lcr548791-4.docx" target="_blank" rel="noopener noreferrer"><span><u> led to the home of Tom Liberti,</u></span></a> who was the Bureau Chief at the Florida Department of Health at the time the text was sent. Liberti received national recognition for his work on HIV/AIDS and was a known activist for the LGBT community. Police did not follow any leads or even interview Liberti who, as a researcher in the HIV/AIDS office, would not normally use or otherwise have access to the state’s ReadyOp emergency response application.</span></span></p><p id="viewer-99v33"><span><span>Additionally, in the days after the raid, experts found that the whole state used one username and password to access the server, which was <a data-hook="linkViewer" href="https://arstechnica.com/tech-policy/2020/12/florida-posted-the-password-to-a-key-disaster-system-on-its-website/" target="_blank" rel="noopener noreferrer"><span><u>available publicly online in at least seven places</u></span></a>. </span></span></p><p id="viewer-dekdv"><span><span><strong><u>Forensic analysis and criminal charge</u></strong></span></span></p><p id="viewer-botiu"><span><span>Forensic analysis of Jones’ computer was completed on December 8, 2020, but showed no evidence of her computer accessing the ReadyOp website or platform, according to<a data-hook="linkViewer" href="https://mynwfl.files.wordpress.com/2022/12/inv-21-detailed_user_activity_november_10.pdf" target="_blank" rel="noopener noreferrer"><span><u> discovery data provided by the state attorney’s office</u></span></a>. </span></span></p><p id="viewer-2kcan"><span><span>A warrant to CenturyLink issued December 11, 2020 requesting a log of incidents in which Jones’ IP address accessed the state’s servers when the text was sent re<a data-hook="linkViewer" href="https://mynwfl.files.wordpress.com/2022/12/inv-38-centurylinksubpoenaresponse123020.pdf" target="_blank" rel="noopener noreferrer"><span><u>turned with “No Records Found.”</u></span></a></span></span></p><p id="viewer-6b963"><span><span>On the same day, police sought access to cloud storage accounts Jones had connected to her computer, including <a data-hook="linkViewer" href="https://mynwfl.files.wordpress.com/2022/12/inv-24-dropboxpreservation121420.pdf" target="_blank" rel="noopener noreferrer"><span><u>Dropbox</u></span></a>, <a data-hook="linkViewer" href="https://mynwfl.files.wordpress.com/2022/12/inv-25-googlepreservation121420.pdf" target="_blank" rel="noopener noreferrer"><span><u>Google Drive</u></span></a> and <a data-hook="linkViewer" href="https://mynwfl.files.wordpress.com/2022/12/inv-26-onedrivepreservationrequest.pdf" target="_blank" rel="noopener noreferrer"><span><u>OneDrive</u></span></a>. </span></span></p><p id="viewer-4kcc7"><span><span>What was supposed to be a limited search under the supervision of a third party exclusively for evidence of a text turned into <a data-hook="linkViewer" href="https://mynwfl.files.wordpress.com/2022/12/inv-44-microsoft-one-drive-signedsw_redact_redacted.pdf" target="_blank" rel="noopener noreferrer"><span><u>state police gaining access </u></span></a>to Jones’ email accounts and passwords, PIN codes, all images and videos in her cloud storage space, and her communication records for the entire month preceding the raid. </span></span></p><p id="viewer-3lp45"><span><span>What the state found and what Jones was eventually charged with possessing was a <a data-hook="linkViewer" href="https://mynwfl.files.wordpress.com/2022/12/inv-43-screen-shot.jpg" target="_blank" rel="noopener noreferrer"><span><u>document</u></span></a> titled “Roster_contacts.xlsx.” </span></span></p><p id="viewer-fm1mk"><span><span>Emails obtained from The Miami Herald revealed that Jones had received that document from officials at the Florida Department of Health - legally - no fewer than three times during her time working at the state.</span></span></p><p id="viewer-d872i"><span><span>When state police eventually charged Jones - the day after a judge gave an unfavorable ruling to the state in her lawsuit against the police for the raid - they misrepresented the timeline on how they accessed what and when.</span></span></p><p id="viewer-9mue5"><span><span><a data-hook="linkViewer" href="https://mynwfl.files.wordpress.com/2022/12/affadavit.png" target="_blank" rel="noopener noreferrer"><span><u>Police claimed</u></span></a> the “Roster_contacts.xlsx” file was downloaded November 10, 2020 (the day of the text), but none of the warrants returned showed Jones accessed the server on that date. Police also claimed they requested subpoenas for her cloud storage drive <em>after</em> finding the contact roster on December 17, 2020, but those warrants were signed and issued December 11, 2020.</span></span></p><p id="viewer-3itp1"><span><span>Jones never denied having the contact roster on her backup storage drives, and when the state required her to “admit guilt” as part of the state’s agreement to dismiss the case against her, Jones issued the following statement in the agreement:</span></span></p><p id="viewer-1bm9v"><span><span><em>“Following my employment at the Department of Health, I possessed a contact roster of state employees.”</em> </span></span></p><p id="viewer-6hrhb"><span><span>On social media, Jones added, “<em>At no point did I say I obtained that document illegally or that I had no right or reason to have it.”</em></span></span></p><p id="viewer-a05r4"><span><span>The contact roster Jones was charged with a third-degree felony for possessing is available to anyone who submits a public records request to the state, as it only included the names, email addresses and office phone numbers of state employees and contractors assigned to the COVID-19 response effort.</span></span></p><p id="viewer-7kavg"><span><span><strong><u>Van Buren vs. the United States and whistleblower status</u></strong></span></span></p><p id="viewer-6njdo"><span><span>Adding to the controversy of Jones’ political persecution , the statute Jones was charged under was ruled unconstitutional in the <a data-hook="linkViewer" href="https://en.wikipedia.org/wiki/Van_Buren_v._United_States" target="_blank" rel="noopener noreferrer"><span><u>June 2021 Supreme Court Van Buren </u></span></a>case. </span></span></p><p id="viewer-9npvg"><span><span>The Supreme Court decision settled continued controversy involving the “unauthorized use or exceeding authorized access” of computer systems under 18 U.S.C. § 1030(a)(2), which had resulted in criminal charges with lengthy prison sentences for any person who violated a company’s Terms of Service. </span></span></p><p id="viewer-7cj6o"><span><span>Aaron Swartz’ case is perhaps the most high-profile example of the abuse of the Computer Fraud and Abuse Act in the United States. Swartz faced 35 years in federal prison and $1 million in fines for downloading academic journals using a username and password MIT provided him.</span></span></p><p id="viewer-8oa2j"><span><span>Swartz rejected a plea offer to serve six months in prison and committed suicide two days later. Swartz was considered a prodigy in programming, developed RSS, was the architect behind Creative Commons, Markdown, and Reddit. And the federal government sought to send him to prison for nearly all of his adult life for downloading academic journals from a server he was granted access to.</span></span></p><p id="viewer-3r5bn"><span><span>The Van Buren decision came too late for Swartz, who committed suicide in 2013.  The Van Buren case nullified the law used to target both Swartz and Jones in June 2021. Jones’ lawyers filed a motion to dismiss based on the Van Buren ruling, but the judge refused to even hear arguments on the merits.</span></span></p><p id="viewer-59ssr"><span><span>Instead, the state continued with its case against Jones, who r<a data-hook="linkViewer" href="https://www.miamiherald.com/opinion/editorials/article251781273.html" target="_blank" rel="noopener noreferrer"><span><u>eceived legal whistleblower protection status </u></span></a>two days before the US Supreme Court ruled on Van Buren.</span></span></p><p id="viewer-fqig8"><span><span><strong><u>Plea Offers and Dismissal</u></strong></span></span></p><p id="viewer-ffrhf"><span><span>Prosecutors offered a plea deal to Jones in March 2021. The deal would have required her to plead “no contest” and agree to probation for two years. Jones refused. The state continued making offers with differing terms of “adjudication withheld,” but Jones stated she would “accept nothing less than a dismissal.”</span></span></p><p id="viewer-ff9nh"><span><span>Prosecutors then offered a deferred prosecution agreement in June 2022 that would have resulted in the case being dismissed after one year, but added requirements for admitting guilt, along with other terms that Jones’ lawyers were willing to negotiate the language on, <a data-hook="linkViewer" href="https://grantstern.substack.com/p/leaked-documents-depict-politicized" target="_blank" rel="noopener noreferrer"><span><u>according to leaked documents published by Grant Stern</u></span></a>.</span></span></p><p id="viewer-57bje"><span><span>After Jones won the Democratic primary for Florida’s 1st Congressional District in August 2022, the State Attorney’s office in Leon County made an offer that legal experts and other Florida prosecutors described as <a data-hook="linkViewer" href="https://grantstern.substack.com/p/leaked-documents-depict-politicized" target="_blank" rel="noopener noreferrer"><span><u>“bullshit,” “politically charged,” and “coercive.”</u></span></a></span></span></p><p id="viewer-akknc"><span><span>The new dismissal offer came contingent upon Jones admitting guilt, <a data-hook="linkViewer" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fbucketeer-e05bbc84-baa3-437e-9518-adb32be77984.s3.amazonaws.com%2Fpublic%2Fimages%2F96abf7ba-bb89-4bb9-9a0f-f7fbdb0394bb_1256x1032.png" target="_blank" rel="noopener noreferrer"><span><u>apologizing to the Florida Department of Health, destroying evidence related to her whistleblower case (evidence and data the state falsely stated she never had access to), dropping her whistleblower case, $21,000 paid to state police</u></span></a>, and an agreement to never work with or for the state of Florida again, among other retaliatory conditions. </span></span></p><p id="viewer-caqsm"><span><span>In a <a data-hook="linkViewer" href="https://www.tiktok.com/@georebekah/video/7140754781278113070?is_from_webapp=1&amp;sender_device=pc&amp;web_id=7123641481378940458" target="_blank" rel="noopener noreferrer"><span><u>now infamous and viral video</u></span></a>, Jones told prosecutors: “Go fuck yourself.”</span></span></p><p id="viewer-4b3ho"><span><span>Just weeks after Jones’ congressional campaign ended in a loss to <a data-hook="linkViewer" href="https://www.cnn.com/2022/11/30/politics/joel-greenberg-matt-gaetz-investigation-hearing/index.html" target="_blank" rel="noopener noreferrer"><span><u>Republican Matt Gaetz</u></span></a>, prosecutors changed their minds yet again and removed most of the incendiary language from the dismissal agreement.</span></span></p><p id="viewer-4jib1"><span><span>Jones stated, “after the election and everything that’s happened these past two years, my family and I just want this part of my life to be over. I’m tired. I’m broke. A dismissal is still a dismissal.”</span></span></p><p id="viewer-1njo"><span><span>When the time came to finalize the agreement, however, the prosecutor assigned to the case, Georgia Cappleman, switched the terms and forged Jones’ signature on a new agreement that neither Jones nor her lawyers had ever seen. </span></span></p><p id="viewer-bpuj1"><span><span>Capplemen, when asked about the incident <a data-hook="linkViewer" href="https://mynwfl.files.wordpress.com/2022/12/rebekah-jones-mail-press-inquiry.pdf" target="_blank" rel="noopener noreferrer"><span><u>via email</u></span></a>, confirmed she copied Jones’ signature from a previous document and pasted it into the new agreement, but added “I’m saying that what I did is not a crime.”</span></span></p><p id="viewer-cs5md"><span><span>Jones’ lawyer informed Cappleman that they would not agree to the new terms in the document with Jones’ forged signature and wanted to return to the original agreement or go to trial.</span></span></p><p id="viewer-bo09s"><span><span>Cappleman instructed Jones’ lawyer to “cross out” any language they didn’t like, which included restrictions on gun use, additional fines and fees, unannounced home visits by police, limits on travel, and more extreme and invasive measures.</span></span></p><p id="viewer-f2dvf"><span><span>Jones said she did not contest language her lawyer informed her was standard, like randomized drug testing and mental health treatment, because she regularly saw a therapist due to the trauma of the raid and had no concerns about passing a drug test.</span></span></p><p id="viewer-9lq57"><span><span>The agreement was signed on December 7, 2022 - two years exactly since the raid on her home. The agreement was processed the next day, and it took less than two days for conservative media outlets to falsely claim Jones had “pled guilty” to a felony.</span></span></p><p id="viewer-j7ga"><span><span>The case has been closed in Leon County and the result is a complete dismissal, but hoards of anonymous accounts online continue to assault any mention of Jones on the platform, falsely claiming she took a “plea deal,” which she demonstrably did not. </span></span></p><p id="viewer-3uu9c"><span><span>When pressed about what level of influence Governor Ron DeSantis’ office had in Jones’ prolonged prosecution, Cappleman declined to answer and instead told the reporter not to contact her again.</span></span></p><p id="viewer-65ttl"><span><span>Jones walks away with a dismissal (at a price) and after nearly three years of persecution by the state of Florida comes out with no criminal record, no guilty plea, no adjudication withheld, no plea of no contest. Jones managed to best a radical and increasingly dangerous Governor with Presidential aspirations at each turn.</span></span></p><p id="viewer-a035u"><span><span>She lived to tell the tale. The problem is hardly anyone is still listening. </span></span></p><p id="viewer-ds99n"><span><span>“When there’s so much disinformation online, when any mention or reference to me is met with dozens of single-purpose hate accounts defaming and attacking me, people give up on the truth,” Jones said. “Truth got me into this, truth got me out of this, and truth will be the anecdote to these crimes against reality going forward.”</span></span></p></div></div></div></div></div></div></article></div></div>]]>
@@ -35,11 +394,26 @@ December 29, 2022 | https://www.mynwfl.com/post/rebekahjonescasedismissed | <a h
         </item>
         <item>
             <title>
+<![CDATA[ULIDs and Primary Keys]]>
+            </title>
+            <description>
+<![CDATA[
+Score 70 | Comments 35 (<a href="https://news.ycombinator.com/item?id=34175639">thread link</a>) | @s4i
+<br/>
+December 29, 2022 | https://blog.daveallie.com/ulid-primary-keys | <a href="https://web.archive.org/web/*/https://blog.daveallie.com/ulid-primary-keys">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
+            </description>
+            <link>https://blog.daveallie.com/ulid-primary-keys</link>
+            <guid isPermaLink="false">hacker-news-small-sites-34175639</guid>
+            <pubDate>Thu, 29 Dec 2022 18:00:10 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Show HN: GUI for making animated webcomics]]>
             </title>
             <description>
 <![CDATA[
-Score 81 | Comments 25 (<a href="https://news.ycombinator.com/item?id=34173761">thread link</a>) | @jimhi
+Score 111 | Comments 27 (<a href="https://news.ycombinator.com/item?id=34173761">thread link</a>) | @jimhi
 <br/>
 December 29, 2022 | https://elonman.com/page/how/ | <a href="https://web.archive.org/web/*/https://elonman.com/page/how/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -94,10 +468,51 @@ December 29, 2022 | https://elonman.com/page/how/ | <a href="https://web.archive
             </title>
             <description>
 <![CDATA[
-Score 85 | Comments 66 (<a href="https://news.ycombinator.com/item?id=34172240">thread link</a>) | @DanielVZ
+Score 110 | Comments 80 (<a href="https://news.ycombinator.com/item?id=34172240">thread link</a>) | @DanielVZ
 <br/>
 December 29, 2022 | https://app.pressnt.net/post/4/ | <a href="https://web.archive.org/web/*/https://app.pressnt.net/post/4/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+
+<h2 id="_1">🐛?</h2>
+<p>Turn's out I may have left some fields unprotected from xss worm attacks <em>a la Samy</em>. This meant that there were particularly virulent posts and comments. </p>
+<p>I replaced all malicious content with a 🐛 emoji for now. I won't ban anyone yet since the attacks were mostly my fault.</p>
+<p>Sorry for everyone that lost their posts, but the vulnerability should be corrected now. Shame on me. </p>
+<p>PD: img tags will be sanitized until further notice. for now you'll need to use <code>![alttext](img_url)</code></p>
+<h2 id="the-gist">The gist</h2>
+<ol>
+<li>You can only have a single post</li>
+<li>You can update your post</li>
+<li>People can follow other posts</li>
+<li>You can read your followed posts' latest updates</li>
+<li>You can upvote posts</li>
+<li>You can find trending posts (depends on upvotes and last time updated)</li>
+<li>There are also comments</li>
+</ol>
+<h2 id="why">Why?</h2>
+<p>There are plenty of reasons, and they range from why I made <strong>a</strong> site,  to what I want this site to be. But first, let's dig into <strong>why you would want to have a single post</strong>.</p>
+<h2 id="why-a-single-post">Why a single post?</h2>
+<p>Modern social media is great. You can satisfy dopamine cravings like never before. Videos of derpy cats and dogs are just a few taps away. Same with the opinions of celebrities you like. You don't even need to tap anymore! Just Let the endless TikTok wall fill your dopamine tank...</p>
+<p>But sometimes I don't want dopamine, I want to consume content with meaning. I want to read into other people's mind like I can do when <a href="http://paulgraham.com/read.html">reading</a> <a href="http://paulgraham.com/index.html">Paul Graham's</a> <a href="http://paulgraham.com/articles.html">essays</a>. But those are hard to get by, and a bit harder to set up for non-tech people. There's twitter (and mastodon), yes. its product isn't fit for meaningful writing. It's meant to match short written content with that dopamine hit we all crave. Blogging websites also exist but there's just too much noise.</p>
+<p>But I do agree with the microblogging site's idea that limits foster creativity and communication. In their case, the character limit fosters quick and effective idea-sharing, and that's great. But here I want to foster <strong>noise-free</strong> and <strong>meaningful</strong> content.</p>
+<p>The solution: A single post where you have to <strong>be thoughtful</strong> about what you write. </p>
+<p>It's the only thing people will read from you. Of course, you may want to edit everything later and change the post completely, but that's the point: <strong>you are encouraged to write whatever you think is meaningful enough to share at the moment</strong>. And for that, you need easy and full control over what you're currently sharing.</p>
+<p><em>That's what I want this site to be.</em></p>
+<h3 id="so-the-tldr-here-is">So the TLDR here is...</h3>
+<ul>
+<li>Less noise</li>
+<li>Thoughtful content</li>
+<li>Control what people see of you</li>
+</ul>
+<h2 id="why-i-made-this-site">Why I made this site</h2>
+<p>These are more personal growth reasons. And I might write them down here later on. But I think the focus now should be on <strong>Pressn't</strong> mission.</p>
+<h2 id="todo">TODO</h2>
+<ul>
+<li>Fix dark mode css</li>
+<li>Fix mobile css</li>
+<li>Ask a friend to pentest the site</li>
+<li>Use a CDN</li>
+<li>Investigate ranking algorithms</li>
+</ul></div></div>]]>
             </description>
             <link>https://app.pressnt.net/post/4/</link>
             <guid isPermaLink="false">hacker-news-small-sites-34172240</guid>
@@ -109,7 +524,7 @@ December 29, 2022 | https://app.pressnt.net/post/4/ | <a href="https://web.archi
             </title>
             <description>
 <![CDATA[
-Score 62 | Comments 22 (<a href="https://news.ycombinator.com/item?id=34170868">thread link</a>) | @fortym2
+Score 66 | Comments 21 (<a href="https://news.ycombinator.com/item?id=34170868">thread link</a>) | @fortym2
 <br/>
 December 29, 2022 | https://davquar.it/post/self-hosting/ntopng-fritzbox-monitoring/ | <a href="https://web.archive.org/web/*/https://davquar.it/post/self-hosting/ntopng-fritzbox-monitoring/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><main><div><div><ul><li><em></em>
@@ -275,7 +690,7 @@ December 29, 2022 | https://davquar.it/post/self-hosting/ntopng-fritzbox-monitor
             </title>
             <description>
 <![CDATA[
-Score 15 | Comments 3 (<a href="https://news.ycombinator.com/item?id=34169106">thread link</a>) | @zdw
+Score 18 | Comments 3 (<a href="https://news.ycombinator.com/item?id=34169106">thread link</a>) | @zdw
 <br/>
 December 28, 2022 | http://dusted.dk/pages/c64/MaxFake64/ | <a href="https://web.archive.org/web/*/http://dusted.dk/pages/c64/MaxFake64/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
@@ -510,7 +925,7 @@ December 28, 2022 | http://dusted.dk/pages/c64/MaxFake64/ | <a href="https://web
     <p>We're in the last period of the golden age of electronics, as the world has moved to SMD and extremely-high-integration, the stores of cool stuff that we can play around with are being depleated, but let's make the most out of it while it lasts!</p>
     <h2>Misc</h2>
     <hr>
-    <img src="http://dusted.dk/pages/c64/MaxFake64/pic/slide.png">
+    <a href="https://archive.org/details/hvad_20221229"><img src="http://dusted.dk/pages/c64/MaxFake64/pic/slide.png"><br>Try it online</a>
     <p><a href="http://dusted.dk/pages/c64/MaxFake64/software/hvad.d64">hvad.d64</a> Slideshow telling about this project, use F1 and F3 for prev/next</p>
     <p>Unordered resources I've collected during this project</p>
     <p><a href="http://dusted.dk/pages/c64/MaxFake64/datasheets/AtmelEeprom27c512.pdf">datasheets/AtmelEeprom27c512.pdf</a></p>
@@ -541,7 +956,7 @@ December 28, 2022 | http://dusted.dk/pages/c64/MaxFake64/ | <a href="https://web
             </title>
             <description>
 <![CDATA[
-Score 66 | Comments 9 (<a href="https://news.ycombinator.com/item?id=34165560">thread link</a>) | @drdee
+Score 66 | Comments 10 (<a href="https://news.ycombinator.com/item?id=34165560">thread link</a>) | @drdee
 <br/>
 December 28, 2022 | https://aljazaribook.com/en/2019/10/15/a-goblet-which-arbitrates_en/ | <a href="https://web.archive.org/web/*/https://aljazaribook.com/en/2019/10/15/a-goblet-which-arbitrates_en/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -595,7 +1010,7 @@ December 28, 2022 | https://aljazaribook.com/en/2019/10/15/a-goblet-which-arbitr
             </title>
             <description>
 <![CDATA[
-Score 181 | Comments 35 (<a href="https://news.ycombinator.com/item?id=34165014">thread link</a>) | @daneel_w
+Score 182 | Comments 35 (<a href="https://news.ycombinator.com/item?id=34165014">thread link</a>) | @daneel_w
 <br/>
 December 28, 2022 | https://mastodon.laurenweinstein.org/@lauren/109588605178700335 | <a href="https://web.archive.org/web/*/https://mastodon.laurenweinstein.org/@lauren/109588605178700335">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -610,7 +1025,7 @@ December 28, 2022 | https://mastodon.laurenweinstein.org/@lauren/109588605178700
             </title>
             <description>
 <![CDATA[
-Score 472 | Comments 466 (<a href="https://news.ycombinator.com/item?id=34163874">thread link</a>) | @jasoneckert
+Score 475 | Comments 472 (<a href="https://news.ycombinator.com/item?id=34163874">thread link</a>) | @jasoneckert
 <br/>
 December 28, 2022 | https://www.omglinux.com/devs-prefer-linux-to-mac-stackoverflow-survey/ | <a href="https://web.archive.org/web/*/https://www.omglinux.com/devs-prefer-linux-to-mac-stackoverflow-survey/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -762,7 +1177,7 @@ December 28, 2022 | https://www.omglinux.com/devs-prefer-linux-to-mac-stackoverf
             </title>
             <description>
 <![CDATA[
-Score 210 | Comments 39 (<a href="https://news.ycombinator.com/item?id=34162001">thread link</a>) | @preetamjinka
+Score 212 | Comments 39 (<a href="https://news.ycombinator.com/item?id=34162001">thread link</a>) | @preetamjinka
 <br/>
 December 28, 2022 | https://misfra.me/2022/sqlite-automatic-indexes/ | <a href="https://web.archive.org/web/*/https://misfra.me/2022/sqlite-automatic-indexes/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section>
@@ -875,7 +1290,7 @@ robust B-tree implementation to create automatic indexes to achieve the same big
             </title>
             <description>
 <![CDATA[
-Score 964 | Comments 550 (<a href="https://news.ycombinator.com/item?id=34161822">thread link</a>) | @sbuccini
+Score 969 | Comments 557 (<a href="https://news.ycombinator.com/item?id=34161822">thread link</a>) | @sbuccini
 <br/>
 December 28, 2022 | https://www.stevenbuccini.com/8-hard-truths-on-getting-laid-off | <a href="https://web.archive.org/web/*/https://www.stevenbuccini.com/8-hard-truths-on-getting-laid-off">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div aria-label="Content">
@@ -958,7 +1373,7 @@ December 28, 2022 | https://www.stevenbuccini.com/8-hard-truths-on-getting-laid-
 
 <p>Here’s an example of how radical honesty backfired for yours truly. I am a big believer in transparency: I respect people who try to shatter the “everything’s flawless” facade that social media bombards us with. Whether that’s discussing their struggles as a startup founder, opening up about past trauma, or posting an unpopular, yet well-reasoned, political opinion: it takes guts to put a side of ourselves that we have long kept hidden into the world. After nine fruitless months on the interview circuit, I was fed up with failure. Every day, I would see founders post “We’re hiring!” on LinkedIn as I received yet another rejection. As a way of venting my frustrations (or perhaps to garner sympathy, I don’t know), I posted my interview tracker spreadsheet on Twitter under the guise of “being transparent.”</p>
 
-<p>The very next day, I was on a phone screen with a recruiter when they said “Yeah, I looked at the interview spreadsheet you posted on Twitter and just based on that I can tell you’re not going to be a good fit here. I just took this call as a favor to <redacted> since they referred you."</redacted></p>
+<p>The very next day, I was on a phone screen with a recruiter when they said “Yeah, I looked at the interview spreadsheet you posted on Twitter and just based on that I can tell you’re not going to be a good fit here. I just took this call as a favor to &lt;redacted&gt; since they referred you.”</p>
 
 <p>Call me naïve, but I never would have imagined that post being interpreted in such a manner when I posted it. Only in retrospect did I understand the connotations that post broadcast to potential employers.</p>
 
@@ -1010,7 +1425,7 @@ December 28, 2022 | https://www.stevenbuccini.com/8-hard-truths-on-getting-laid-
             </title>
             <description>
 <![CDATA[
-Score 43 | Comments 39 (<a href="https://news.ycombinator.com/item?id=34161628">thread link</a>) | @sbolt
+Score 43 | Comments 40 (<a href="https://news.ycombinator.com/item?id=34161628">thread link</a>) | @sbolt
 <br/>
 December 28, 2022 | https://seanbolton.dev/2022/12/28/stop-the-scroll-how-muting-everyone-on-social-media-can-put-you-back-in-control/ | <a href="https://web.archive.org/web/*/https://seanbolton.dev/2022/12/28/stop-the-scroll-how-muting-everyone-on-social-media-can-put-you-back-in-control/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1103,11 +1518,26 @@ December 28, 2022 | https://seanbolton.dev/2022/12/28/stop-the-scroll-how-muting
         </item>
         <item>
             <title>
+<![CDATA[TeXmacs “The Jolly Writer” book is now available as pdf download]]>
+            </title>
+            <description>
+<![CDATA[
+Score 58 | Comments 18 (<a href="https://news.ycombinator.com/item?id=34161044">thread link</a>) | @amichail
+<br/>
+December 28, 2022 | https://www.scypress.com/book_download.html | <a href="https://web.archive.org/web/*/https://www.scypress.com/book_download.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
+            </description>
+            <link>https://www.scypress.com/book_download.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-34161044</guid>
+            <pubDate>Wed, 28 Dec 2022 14:05:40 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Show HN: Listen To The Ocean – JavaScript game w. AI-generated sprites]]>
             </title>
             <description>
 <![CDATA[
-Score 40 | Comments 22 (<a href="https://news.ycombinator.com/item?id=34160801">thread link</a>) | @neontomo
+Score 40 | Comments 23 (<a href="https://news.ycombinator.com/item?id=34160801">thread link</a>) | @neontomo
 <br/>
 December 28, 2022 | https://neontomo.com/play/ocean/ | <a href="https://web.archive.org/web/*/https://neontomo.com/play/ocean/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -1137,7 +1567,7 @@ December 28, 2022 | https://www.mewho.com/ritos/ | <a href="https://web.archive.
             </title>
             <description>
 <![CDATA[
-Score 173 | Comments 96 (<a href="https://news.ycombinator.com/item?id=34160097">thread link</a>) | @sysrpl
+Score 175 | Comments 98 (<a href="https://news.ycombinator.com/item?id=34160097">thread link</a>) | @sysrpl
 <br/>
 December 28, 2022 | https://www.getlazarus.org/guides/intro/ | <a href="https://web.archive.org/web/*/https://www.getlazarus.org/guides/intro/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -1152,7 +1582,7 @@ December 28, 2022 | https://www.getlazarus.org/guides/intro/ | <a href="https://
             </title>
             <description>
 <![CDATA[
-Score 247 | Comments 23 (<a href="https://news.ycombinator.com/item?id=34159868">thread link</a>) | @NotPractical
+Score 251 | Comments 24 (<a href="https://news.ycombinator.com/item?id=34159868">thread link</a>) | @NotPractical
 <br/>
 December 28, 2022 | https://downrightnifty.me/blog/2022/12/26/hacking-google-home.html | <a href="https://web.archive.org/web/*/https://downrightnifty.me/blog/2022/12/26/hacking-google-home.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article itemscope="" itemtype="http://schema.org/BlogPosting">
@@ -1764,7 +2194,7 @@ pip install flask
             </title>
             <description>
 <![CDATA[
-Score 112 | Comments 77 (<a href="https://news.ycombinator.com/item?id=34159699">thread link</a>) | @usgroup
+Score 113 | Comments 77 (<a href="https://news.ycombinator.com/item?id=34159699">thread link</a>) | @usgroup
 <br/>
 December 28, 2022 | https://emiruz.com/post/2022-12-28-composable-sql/ | <a href="https://web.archive.org/web/*/https://emiruz.com/post/2022-12-28-composable-sql/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1988,75 +2418,10 @@ change both the workflow and maintainability of SQL codebases.</p>
             </title>
             <description>
 <![CDATA[
-Score 127 | Comments 44 (<a href="https://news.ycombinator.com/item?id=34159022">thread link</a>) | @jereze
+Score 133 | Comments 50 (<a href="https://news.ycombinator.com/item?id=34159022">thread link</a>) | @jereze
 <br/>
 December 28, 2022 | https://jereze.com/blog/4-year-side-project/ | <a href="https://web.archive.org/web/*/https://jereze.com/blog/4-year-side-project/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="main" role="main">
-      
-        <article>
-            
-            <address>
-                
-            </address>
-            
-            <time pubdate="" datetime="2022-12-28">
-                December 28, 2022
-            </time>
-            
-            <p>I started to work on my side project 4 years ago, in November 2018. At the time, I knew how to code websites, had experience in product, sales and marketing, and most of all I liked to read the posts of people talking about their side project. My goal was to experiment the full picture on my own, make a micro SaaS from scratch. I suppose I like learning by doing.</p>
-<p>This post is about what I have learned.</p>
-<h2>Don't project too much from your experience</h2>
-<p>I worked as a Product Manager, so I know that solving users problems is the root of a product. For <strong>Sheet.chat</strong>, I wanted to solve a pretty simple problem that I had in my job. We use shared spreadsheets, Google Sheets, to organize our work, and we use Slack to communicate and collaborate. Combing the two, with for example change notifications happening in our important spreadsheets in a Slack channel, seems valuable to me. I created my side project to solve my own problem.</p>
-<figure><img src="https://jereze.com/blog/4-year-side-project/sheetchat.png" alt="Screenshot of sheet.chat homepage" data-action="zoom" loading="lazy"><figcaption>Here is the homepage of my side project.</figcaption>
-</figure>
-<p>While building my product, I envisioned every single person of my current company being a user. I’ve learned later over the months that the real audience is different. I projected too much. The users of my side project are digital startups, but also teachers, garage owners, no-code freelancers. I figured out that my messaging and user interface were not really adapted to my users. It is too complex for a good number of them. One simple example: for the configuration of a spreadsheets, users are supposed to copy/paste the URL of the source spreadsheet, and this action that seemed obvious to me is not for a part of the audience.</p>
-<p>Although I was prepared that my users would not be the one I expected, I was still surprised. I guess you just need to accept it and learn to know your audience.</p>
-<h2>Focus on a narrow product</h2>
-<p>We all read that it is easier to build a niche software product, an industry-specific software. Was I building a generic or niche product?</p>
-<p>At first look, I was definitely on the side of a simple and integrated software. Sheet.chat solves a narrow problem between two services with 3 main features. Seems simple and integrated, right?</p>
-<p>The thing is, as a coder, you will be more attracted by generic product. Generalizing is more elegant, and if, like me, you like to solve problems, you will want to try to figure out a bigger problem than your initial scope. Also, when building something simple, you will keep asking yourself "Is this product too simple? Too bare-bones? Would anyone pay for this?".</p>
-<p>This happened to me as well as. Among the 3 big features of Sheet.chat, I really needed one (notifications) more than the 2 others (search and add) but took the decision to integrate them in the initial scope. It was not too much extra work and the problem they solve seems legitimate. Looking back, I think part of the reason was that I was too ashamed to launch a product that was too simple.</p>
-<p>I had plenty of other ideas, for example I spent some time on generalization to integrate with other services such as Airtable or Salesforce. Which I never did at the end.</p>
-<p>You need to stay focused. Write a few user stories, like 1 or 2 or 3, and start with them. You have probably two good reasons for this: you prefer a niche product, and you want to solve a not too wide problem because you have limited time. Side benefit : Your product will most likely have a better user experience than you would have if you were to build a generic product.</p>
-<h2>Spend some time organizing your code</h2>
-<p>On the coding side, I was worried enough that my project could fail (never be public) that I kept everything very simple. I've read so many stories of developers wasting their time into fine-tuning their code but ultimately their project never launch or don't get any user. At this point, I was determined to make it happen, to release it.</p>
-<p>It took me 6 months to build a usable version and get my first user. Then, I improved it bit by bit with a little work every week or so. Onboarding messages, better integration with Slack, payment system, etc. Overall, it took me a year to get a product I was able to sell.</p>
-<p>My stack is Python, using the Flask framework. I took this stack because that's the one I'm the most used to. It was a good decision. However, on the structure and organization, I believe I oversimplified it. I kept postponing the idea of organizing or structuring my project. My <code>app.py</code> file is today 1500 rows, my <code>sheet.py</code> 700 rows, and few other files of 100 lines.</p>
-<p>Even though my code is good enough that it works, I feel that the project seriously needs a better structure and a better separation of concerns. This lack of organization is preventing the development of new functionalities.</p>
-<p>If I had to start again, I'd spend more time from the beginning to organize a better structure for my project, or pick a more opinionated framework such as Django.</p>
-<figure><img src="https://jereze.com/blog/4-year-side-project/code.png" alt="Screenshot of text editor" data-action="zoom" loading="lazy"><figcaption>One giant app file, one big sheet file 😟</figcaption>
-</figure>
-<h2>Find happiness in other things than revenue</h2>
-<p>Generating income, no matter how small, with your own project is very rewarding and satisfying.</p>
-<p>My first sale was a joy, but most of all, I think it was a great relief to know that I could do it. I immediately bought a bottle of champagne (much more expensive than the first sale, obviously :) ). But that’s very ephemeral, you quickly forget and move to the next step.</p>
-<p>In terms of income, my side project brings me little besides my salary: between 100 and 200 euros per month (MRR). Let's say it paid for my last MacBook.</p>
-<p>You need to find something else than revenue to pursue. For me, I like the idea of building a product useful and actually used. What really pleases me is to receive thank you messages.</p>
-<p>You may also want to focus on the outputs rather than on the outcomes. The process, the struggle, the day-to-day… you can try to see all that as the fun part. I find coding is also a satisfying activity. But coding is only a portion of the work building a micro-SaaS. Marketing, maintenance, support are also important. So pick wisely your side project depending on the tasks you are willing to have.</p>
-<h2>User onboarding is key</h2>
-<p>Onboarding is making it easy for new users to get started with your product and get to the point where they achieved value from it.</p>
-<p>When a user signup, it means that your SaaS is probably solving one issue they have. But that's only half of the way. Users need to get up and running with your product, to actually solve their issue.</p>
-<p>Having a clean, intuitive, and easy-to-use interface is definitely key here. I'm not a big fan of interactive product tours or in-app messaging, so I added in the first months a quick product walkthrough with 3 steps for all users (it goes away when the 3 steps are done). It really helped most of my users to actually do their first steps pretty quickly.</p>
-<p>But there are tons of little edge cases that your users will fall into. What really helped me to improve the product is having a direct chat on the website and also session recording. I don't like the idea of invasion of privacy that this entails, but it has been a big change for me. Some users will encounter a block and never contact you; it's very difficult to detect.</p>
-<p>Running some analytics will help you to have a global picture, such as the percentage of users that reach a certain point in the onboarding process. This is usually called a funnel analysis. Running your own SQL queries on your database is fine to get started. Otherwise, you can use an additional service for this.</p>
-<p>Every small improvement you do to facilitate the onboarding of your users will be valuable in the long term. I didn't know it was that important. My advice is to start early and proactively with appropriate tooling. Of course, if you can discuss with your users, that's even better.</p>
-<h2>Accept waves</h2>
-<p>It is okay to have productive waves. I find myself doing 2 weeks of super productive work with shipping things and then suddenly my motivation drops for several months. I believe it is normal. You probably have also a main job, a family, social life, sport, etc. and you can't have a mental energy to do all of this at the same time. Play the long-term goal with your side project.</p>
-<p>If I look back, I realize that it was every little step that got me there. The times when I've been able to work a whole day on it have been so rare. What counts 4 years later are the hours spent here and there, regularly.</p>
-<figure><img src="https://jereze.com/blog/4-year-side-project/commits.png" alt="Graph with number of commits per month" data-action="zoom" loading="lazy"><figcaption>My commits’ activity over the last 4 years for Sheet.chat</figcaption>
-</figure>
-<h2>It's never perfect, and that's OK</h2>
-<p>You’ll find your product never good enough. The marketing. The code. The logo. It can be the whole thing.</p>
-<p>For example, I've not changed my homepage for the last 4 years. I'm ashamed of it. I want to change the screenshots, the text, add testimonials, tell a better story, but haven't figured the time yet.</p>
-<p>On the side of the code, I had to convince myself already several times that a full rewrite is a bad idea. If I do this, it is like starting a new side project, with the risk of never ending. Instead, I do small iterations to improve real users problems.</p>
-<p>So, I guess you need to learn to live with this feeling. Done is better than perfect.</p>
-<h2>Near future</h2>
-<p>Looking back, I can say that the initial goal was reached, as I learned a lot of new things and built something that is useful for a few people.</p>
-<p>I haven't thought too much about the future of the project for now. I'd like to keep the product alive as long as it is useful for some of my users and the costs are low for me.</p>
-<p>I don’t plan to develop it further. I'll keep the current functional scope. I prefer to focus on other things.</p>
-
-        </article>
-
-    </div></div>]]>
+<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
             </description>
             <link>https://jereze.com/blog/4-year-side-project/</link>
             <guid isPermaLink="false">hacker-news-small-sites-34159022</guid>
@@ -2071,7 +2436,7 @@ December 28, 2022 | https://jereze.com/blog/4-year-side-project/ | <a href="http
 Score 259 | Comments 259 (<a href="https://news.ycombinator.com/item?id=34157907">thread link</a>) | @peter_d_sherman
 <br/>
 December 27, 2022 | https://wildcardpeople.com/what-is-a-wildcard-person | <a href="https://web.archive.org/web/*/https://wildcardpeople.com/what-is-a-wildcard-person">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
+<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
             </description>
             <link>https://wildcardpeople.com/what-is-a-wildcard-person</link>
             <guid isPermaLink="false">hacker-news-small-sites-34157907</guid>
@@ -2083,12 +2448,10 @@ December 27, 2022 | https://wildcardpeople.com/what-is-a-wildcard-person | <a hr
             </title>
             <description>
 <![CDATA[
-Score 216 | Comments 78 (<a href="https://news.ycombinator.com/item?id=34157636">thread link</a>) | @markchristian
+Score 357 | Comments 114 (<a href="https://news.ycombinator.com/item?id=34157636">thread link</a>) | @markchristian
 <br/>
 December 27, 2022 | https://drew.shoes/posts/sup/ | <a href="https://web.archive.org/web/*/https://drew.shoes/posts/sup/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><article><div><p>When I was in junior high, my friends and I discovered that a Command Prompt command called <a href="https://drew.shoes/posts/sup/(https://www.lifewire.com/net-send-2618095)">net send</a> was enabled on our school network. AIM and similar services were blocked, but if we wanted to send messages to each other we could open up the Command Prompt and type something like:</p><p>and get an alert that looked like:
-<img loading="lazy" src="https://drew.shoes/posts/sup/images/net%20send%20alert.png" alt="net send alert screenshot"></p><p>The computer names were predictable, something like lab + room number + computer number, and the computer numbers were physically written on the machines themselves. It was pretty clunky, and there was no scrollback, but it was a fun way to goof off during class by sending each other short messages.</p><p>We quickly discovered a few interesting characteristics of <code>net send</code> that could be used for some silliness. For one, the alert dialog that opened up stole keyboard focus and was generally disruptive. You could spam as many <code>net send</code> commands as you wanted and the alerts would just pile up on a user’s screen, with no clear way to dismiss them all. We took advantage of this by mashing up and enter as well as writing batch scripts to render our friends’ computers useless. Eventually a tense truce was called, when we found out that receiving a <code>net send</code> message while playing the hidden copy of Unreal Tournament GOTY we had installed on the school network would temporarily take the player out of the game for just long enough to be killed in a critical moment.</p><p>The most creative exploit we came up with for <code>net send</code> was on students (and teachers) who weren’t yet aware of the feature. We had the ability to open an official windows alert on anyone’s machine, and at a glance it wasn’t obvious these messages were coming from another computer on the network. We started sending messages like “Critical Error: Please Restart Your Computer Immediately” and would watch with glee as our victim sighed deeply before restarting their computer.</p><p>The <code>net send</code> joyriding was shortlived, however. Curious about any other avenues of abuse, I looked up the documentation for <code>net send</code> at home one evening and saw that it had wildcard support! Reading the docs, it appeared that if you did <code>net send * MESSAGE</code>, the MESSAGE would be sent to every computer on the entire network. As I did not have a home network to test this on at the time, I anxiously waited until the next day at school to tell my friends.</p><p>The next day at lunch, I went to the computer lab and pulled up the documentation online for my friend Eric, and began explaining what I thought it did. As I was explaining that of course we shouldn’t try such a thing because we would get in huge trouble if it worked, he ignored me and quickly typed into his machine and submitted the command that would forever live in infamy among our friends:
-<img loading="lazy" src="https://drew.shoes/posts/sup/images/net%20send%20*%20sup.png" alt="screenshot of windows command prompt with the command: net send * sup"></p><p>After a very brief moment, Eric’s computer received the sup message. I glanced at mine and saw the very same sup message. A terrifying slow pan of our heads across the entire lab confirmed our fears: sup on every screen. <strong>We’d gone wall to wall sup!</strong></p><p>If you look back at the screenshot of the alert above, there’s another detail you might have missed: the alert text contains the name of the computer that sent the message. We were sitting at computer XX in room YYYY while everyone else looked at a message from lab-YYYY-XX. We were seated directly in front of the smoking gun. Like any reasonable 8th graders, we responded by immediately unplugging the computer and sprinting out of the room and down the stairs.</p><p>When I got home from school, my younger sister who went to another school in the same district told me and my parents that every machine in her school had received a strange message that day that simply said “sup”. I held the best poker face my 14 year old self could, which I’m sure was not very convincing.</p><p>In retrospect, it’s fortunate that the <code>net send</code> alert didn’t include the username, only the originating machine. I’m not sure if there are potentially audit logs that could determine which user sent which message, and now that I’m a grownup I know that this was pretty harmless and we wouldn’t have gotten in very much trouble anyway.</p><p>By the time we got to school the next day, the IT person had disabled <code>net send</code> across the network. We’d flown too close to the sun, and I forever learned my lesson: <strong>never read the docs</strong>.</p><p>This is my first post on this website, and when trying to think of what to say first this story came back to me, because Eric said everything that needed to be said on that fateful day:</p></div></article></div></div>]]>
+<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
             </description>
             <link>https://drew.shoes/posts/sup/</link>
             <guid isPermaLink="false">hacker-news-small-sites-34157636</guid>
@@ -2103,7 +2466,7 @@ December 27, 2022 | https://drew.shoes/posts/sup/ | <a href="https://web.archive
 Score 15 | Comments 6 (<a href="https://news.ycombinator.com/item?id=34157024">thread link</a>) | @RyanCaoDev
 <br/>
 December 27, 2022 | https://blobfox.coffee/@RyanCaoDev/109589043419432643 | <a href="https://web.archive.org/web/*/https://blobfox.coffee/@RyanCaoDev/109589043419432643">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
+<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
             </description>
             <link>https://blobfox.coffee/@RyanCaoDev/109589043419432643</link>
             <guid isPermaLink="false">hacker-news-small-sites-34157024</guid>
@@ -2118,141 +2481,7 @@ December 27, 2022 | https://blobfox.coffee/@RyanCaoDev/109589043419432643 | <a h
 Score 14 | Comments 3 (<a href="https://news.ycombinator.com/item?id=34156887">thread link</a>) | @st00p
 <br/>
 December 27, 2022 | https://www.driverlesscrocodile.com/art-and-culture/niall-ferguson-on-reading-remembering-and-shared-culture/ | <a href="https://web.archive.org/web/*/https://www.driverlesscrocodile.com/art-and-culture/niall-ferguson-on-reading-remembering-and-shared-culture/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
-<h3>Two kinds of reading</h3>
-
-
-
-<p><strong>Niall Ferguson: </strong>I think there are two kinds of reading. When one’s reading for work, when one has to grapple with a great pile of books… I’m certainly not going to read faithfully each of the pages of those books but I am going to try and work out what each of those books is saying.</p>
-
-
-
-<p>But then reading for pleasure is a different matter, and I’ve hardly ever given up a book that I’ve embarked from as a read for pleasure. I gave up on <em>Children of the New Forest</em> by Captain Marryat when I was about twelve and I remember an enormous, keen sense of sin – it was the only book I didn’t finish as a boy. So I’m not one for tossing books aside lightly, and I’m quite a tenacious reader…</p>
-
-
-
-<h3>Re-reading</h3>
-
-
-
-<p><strong>Joe Walker:</strong> Do you ever re-read books?</p>
-
-
-
-<p><strong>Niall Ferguson: </strong>There are some books that I’ve read multiple times… There are the books I’ve read to all my children, so there are plenty of those including the Harry Potter books. The best of all the books I’ve ever read to a child is still Tolkien’s <em>The Hobbit</em>, an extraordinary book that benefits from being read aloud. So I’ve read the Hobbit five times at least, six if you count the time I read it as a boy… I certainly read <em>The Lord of the Rings</em> several times when I was young. I was a devoted Tolkein reader, to my mother’s great disappointment.</p>
-
-
-
-<p>The book that I’ve read multiple times in later life is Tolstoy’s <em>War and Peace</em>, which is another of the reasons that I became a historian, and that’s a book that repays multiple readings. </p>
-
-
-
-<h3>Reading, forgetting and selective memory</h3>
-
-
-
-<p>I probably don’t have a wonderfully good memory… and I’m always slightly shocked at how little I’ve retained and therefore how fresh the books seems.</p>
-
-
-
-<p>I think this is a disadvantage in one respect, because in a way a historian needs to have a really good memory and have a lot of raw data sort of floating around accessibly. On the other hand I think if one remembered too much of each book, there might be a problem of cluttering. I have always said to students, “Trust your brain to be selective without too much coercion. It’ll remember the things that are memorable, and that probably will be enough.”</p>
-
-
-
-<h3>Note-taking</h3>
-
-
-
-<p>Teaching people, for many years at Oxford and Harvard especially, how to read was a part of what I did, and I would see them – there’s a particular kind of student – taking incredibly detailed notes, but proceeding at a snail’s pace, whereas it’s much better to have read all the books on the list, even if you had to read them quite fast. And my advice to people who would get bogged down in reading was don’t worry about taking such detailed notes. Read it, and then write down the things that are memorable, and that way you can be much more efficient. And your brain will forget the boring parts.</p>
-
-
-
-<p>So rather than <a href="https://www.driverlesscrocodile.com/books-and-recommendations/tyler-cowen-on-reading-fast-reading-well-and-reading-widely/">be like Tyler [Cowen] and throw the book aside</a>, keep going, because there’s probably a couple of nuggets between where you are and the end of the book. You’ll spot them.</p>
-
-
-
-<h3>Reading fitness in a distracted age</h3>
-
-
-
-<p>People are sort of unfit about their reading. They don’t read in a way that they would accept in their own physical fitness. So I’m always trying to encourage young people to think of their brains as these slightly out of shape bodies that they can train up to be much faster and much quicker. And you’ve got to let the brain do what it’s good at, which is ultimately at forgetting the boring stuff. That’s actually important.</p>
-
-
-
-<p><strong>Joe Walker: </strong>… And the other thing is, reading compounds, and the more you do it the easier it becomes because you start to recognise references, you get quicker just by building that muscle.</p>
-
-
-
-<p><strong>Niall Ferguson:</strong> And unfortunately, today’s young people are distracted by any number of devices – and now I really do sound like I’m 57, but in fact it’s a tremendous problem because they lose the ability to read <em>War and Peace.</em> I noticed at Harvard over the 12 years that each year when I asked “Who’s read War and Peace?” the number of people in the class would be smaller, until finally nobody had. And I’m not sure that it’s possible to have the power – the physical mental fitness – to read <em>War and Peace</em> if you’ve spent too long gaming.</p>
-
-
-
-<p>So the game world is gradually eating the book world, and that’s sad because in the great works of literature, that’s where the wisdom is. It’s all there. And if we lose the ability to get young people to read Tolstoy then our civilisation will basically start to be deleted, and that’s a great preoccupation.</p>
-
-
-
-<p>…</p>
-
-
-
-<h3>Compounding benefits of reading</h3>
-
-
-
-<p>You’ve got to get that reading speed up early, and then you just have to read and read and read. And it is cumulative, not only in the sense that you get better at reading, but in a fascinating way the knowledge that you imbibe from books is cumulative. History is very much a data processing activity. And you should get better at being a historian over time, whereas you get worse at being a mathematician over time because a mathematician just has to have that early, very rapid processing power… whereas the historian gets better until the memory starts to go because there’s just this accumulation of references.</p>
-
-
-
-<p>My old mentor, Norman Stone – a brilliant and wayward man – had read such a phenomenal amount of european literature in multiple languages… that it felt when you had a conversation with Norman as if a library had sort of found its way into a somebody’s head and was talking to you…</p>
-
-
-
-<h3>Cultural atrophy</h3>
-
-
-
-<p>That’s the thing that really begins to be lost at this point. I just don’t know what percentage of what I’d read, at the age of let’s say, twenty-seven, my eldest has read. And I don’t suppose it’s fair to guess, but it’s probably pretty small. And I’d say that even the best students at Harvard and Stanford must be a long long way behind.</p>
-
-
-
-<p>And that means that you appear to be speaking the same language to people in a different generation, but in fact a lot of what you’re saying is not intelligible in the way that you think it is because the allusions are completely lost…</p>
-
-
-
-<h3>On (avoiding) reading lists and finding great authors</h3>
-
-
-
-<p><strong>Joe Walker: </strong>For people interested in reading some of these literary landmarks, would you recommend them making their way through Harold Bloom’s list in <em><a href="http://sonic.net/~rteeter/grtbloom.html">The Western Canon</a>,</em> or do you think there’s a better or more limited list?</p>
-
-
-
-<p><strong>Niall Ferguson:</strong> I think you should find a good library and just follow your nose. I think all these lists are strangely deadening, and I hate lists. I think it’s a sign of a petty mind to think you could boil it down to a hundred books.</p>
-
-
-
-<p>So don’t even look at that wretched list. Go to the library as I did as a boy and just follow your nose, and find the authors. And then when you find one that connects, read it all. I remember having that experience as a teenager with the great Russian writers of the nineteenth century. I couldn’t believe it when I’d run out of Dostoyevsky, and I felt the same way when I’d run out of Dickens.</p>
-
-
-
-<p>So I’m of the view that you should not think of great books, but great authors. And once you find a great author, why would just read one book? Read them all.</p>
-
-
-
-<h3>Libraries and the pleasure of reading</h3>
-
-
-
-<p>Libraries are very important in that respect… because of the way that books are ordered in a library, rather differently from the way they’re ordered on Google – you will, as intended by the people who catalogue libraries, find kindred books, and you can then spend happy hours dipping in and finding your way around the author, seeing who grabs you and who does not.</p>
-
-
-
-<p>And then you don’t have this sense of, “Ah, I’m on number 19, I’m nearly a quarter of the way through the list.” You should never feel that you’re even one percent of the way through the list.</p>
-
-
-
-
-<cite>Niall Ferguson on <em><a href="https://josephnoelwalker.com/">The Jolly Swagman Podcast</a></em></cite></div></div>]]>
+<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
             </description>
             <link>https://www.driverlesscrocodile.com/art-and-culture/niall-ferguson-on-reading-remembering-and-shared-culture/</link>
             <guid isPermaLink="false">hacker-news-small-sites-34156887</guid>
@@ -2912,7 +3141,7 @@ comments, please feel free to send me a message
             </title>
             <description>
 <![CDATA[
-Score 261 | Comments 75 (<a href="https://news.ycombinator.com/item?id=34152100">thread link</a>) | @PixelForg
+Score 262 | Comments 76 (<a href="https://news.ycombinator.com/item?id=34152100">thread link</a>) | @PixelForg
 <br/>
 December 27, 2022 | https://www.juliensobczak.com/inspect/2022/05/30/anki-srs.html | <a href="https://web.archive.org/web/*/https://www.juliensobczak.com/inspect/2022/05/30/anki-srs.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
@@ -5251,7 +5480,7 @@ December 27, 2022 | https://memo.co/blog/unmasking-metas-bad-news-strategy/ | <a
             </title>
             <description>
 <![CDATA[
-Score 97 | Comments 38 (<a href="https://news.ycombinator.com/item?id=34146425">thread link</a>) | @deepanker70
+Score 98 | Comments 38 (<a href="https://news.ycombinator.com/item?id=34146425">thread link</a>) | @deepanker70
 <br/>
 December 27, 2022 | https://breached.vc/Thread-Selling-INDIA-RAILWAYS-30-Million-User-Invoices-2022 | <a href="https://web.archive.org/web/*/https://breached.vc/Thread-Selling-INDIA-RAILWAYS-30-Million-User-Invoices-2022">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -5266,7 +5495,7 @@ December 27, 2022 | https://breached.vc/Thread-Selling-INDIA-RAILWAYS-30-Million
             </title>
             <description>
 <![CDATA[
-Score 15 | Comments 0 (<a href="https://news.ycombinator.com/item?id=34145854">thread link</a>) | @timqian
+Score 16 | Comments 0 (<a href="https://news.ycombinator.com/item?id=34145854">thread link</a>) | @timqian
 <br/>
 December 26, 2022 | https://sideproject.guide/en | <a href="https://web.archive.org/web/*/https://sideproject.guide/en">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article><main>
@@ -5433,7 +5662,7 @@ as: cython, numba, async programming and the multiprocessing library. Stay tuned
             </title>
             <description>
 <![CDATA[
-Score 299 | Comments 215 (<a href="https://news.ycombinator.com/item?id=34145680">thread link</a>) | @behnamoh
+Score 300 | Comments 216 (<a href="https://news.ycombinator.com/item?id=34145680">thread link</a>) | @behnamoh
 <br/>
 December 26, 2022 | https://www.maxwellrules.com/misc/nvim_jupyter.html | <a href="https://web.archive.org/web/*/https://www.maxwellrules.com/misc/nvim_jupyter.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -5521,7 +5750,7 @@ following contents:</p>
             </title>
             <description>
 <![CDATA[
-Score 79 | Comments 38 (<a href="https://news.ycombinator.com/item?id=34145672">thread link</a>) | @pabs3
+Score 81 | Comments 39 (<a href="https://news.ycombinator.com/item?id=34145672">thread link</a>) | @pabs3
 <br/>
 December 26, 2022 | https://systemstack.dev/2022/12/new-old-computer/ | <a href="https://web.archive.org/web/*/https://systemstack.dev/2022/12/new-old-computer/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -5784,11 +6013,11 @@ December 26, 2022 | https://blog.miris.design/not-a-programmer | <a href="https:
 Score 48 | Comments 34 (<a href="https://news.ycombinator.com/item?id=34139850">thread link</a>) | @kuba_dmp
 <br/>
 December 26, 2022 | https://ronakganatra.com/email-marketing-to-developers | <a href="https://web.archive.org/web/*/https://ronakganatra.com/email-marketing-to-developers">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><main><div><div><div><p><span>email-marketing-to-developers</span></p></div><div><p><span><p>Marketing</p><p>Developer Marketing</p></span></p></div><div><p><span>Do developers really hate emails or is it just because we’re all guilty of spamming a barrage of mediocre updates that don’t really matter?</span></p></div></div></div><p>One of the senior devs on a former team had a habit of letting his iOS email app grow to <code>9,999</code> unread emails on his work account. He liked that red iOS bubble flex. He’d then open Gmail, delete all emails, and let the cycle start again.</p><p>“If it’s important enough they’ll Slack me”, he’d say, “most of it is just newsletters, marketing, spam, and Renovate updates anyways”.</p><figure></figure><p>I didn’t think much of it until recently, when I was catching up with someone in another dev tooling company in charge of CRM and Email Marketing, and found out that they were struggling with atrocious email stats. On average they’d get 7-9% open rates, and even though the total subscriber base was under 10,000, a good 80-90 would unsubscribe every month, with several others marking the emails as spam.</p><p>This turned into quite the discussion on our <a target="_blank" rel="noopener noreferrer" href="https://marketingto.dev/">Developer Marketing Slack</a>, where everyone shared their best practices for emails to developer audiences, and I shared a summary of what worked and didn’t work when I faced the same issues back at Hygraph.</p><h3 data-id="7d3ebfc5919f4d8fb08222ac2f5d3fa7"><span><a href="#7d3ebfc5919f4d8fb08222ac2f5d3fa7" title="1. New user onboarding"><svg viewBox="0 0 16 16" width="16" height="16"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a><span>1. New user onboarding</span></span></h3><p>One of the most critical user journeys we had was for new signups who were getting a hang of GraphCMS.</p><p>We originally tried a vast range of designs, witty copywriting, and templates inspired by <a target="_blank" rel="noopener noreferrer" href="https://reallygoodemails.com/">ReallyGoodEmails</a>.  </p><figure><p><img src="https://www.notion.so/image/https%3A%2F%2Fs3.us-west-2.amazonaws.com%2Fsecure.notion-static.com%2Fcb9e9a80-16f2-40be-a9e8-f3b4f4c3c4f8%2FUntitled.png%3FX-Amz-Algorithm%3DAWS4-HMAC-SHA256%26X-Amz-Content-Sha256%3DUNSIGNED-PAYLOAD%26X-Amz-Credential%3DAKIAT73L2G45EIPT3X45%252F20221229%252Fus-west-2%252Fs3%252Faws4_request%26X-Amz-Date%3D20221229T202427Z%26X-Amz-Expires%3D86400%26X-Amz-Signature%3D156d6b4e465c9b08cfcb734dd2354068f343608819a7df27801bb5b8fec9ceac%26X-Amz-SignedHeaders%3Dhost%26x-id%3DGetObject?table=block&amp;id=d38db940-a137-49c9-91e9-a417b95a6772&amp;cache=v2" loading="lazy" alt="notion image" decoding="async"></p></figure><p>While RGE has incredible resources, we found that none of these “styles” really resonated much with devs. Open rates were low, many marked us as spam, account activation links were lost in graphics, and click-through rates were basically non-existent.</p><p>Our devrel team and sales team were always challenging one another on what those emails should contain:</p><p>“Add the [enterprise] case study!”</p><p>“No that’s silly they just signed up, send them to the docs.”</p><p>“But then they’ll get lost we need to guide them and show them cool features.”</p><p>… and on and on</p><p>So we tried all of those — case studies, video embeds, free demos, features, 30-day drips, 5-day drips, docs, free watermelon popsicles, everything — and the results barely changed.</p><p>Finally, on a completely unrelated task, when I was looking to implement <a target="_blank" rel="noopener noreferrer" href="https://segment.com/">Segment</a> in our staging web app with a colleague to experiment with a few other things, and I was blown away by the welcome flow.</p><p>I don’t have access to that email anymore, but the welcome email from <a target="_blank" rel="noopener noreferrer" href="https://www.linkedin.com/in/kevbosaurus/">Kevin</a> (then the Head of Growth at Segment) was something so ridiculously simple that it was something along the lines of:</p><pre><code>Hi Ronak<span>,</span>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><main><div><div><div><p><span>email-marketing-to-developers</span></p></div><div><p><span><p>Marketing</p><p>Developer Marketing</p></span></p></div><div><p><span>Do developers really hate emails or is it just because we’re all guilty of spamming a barrage of mediocre updates that don’t really matter?</span></p></div></div></div><p>One of the senior devs on a former team had a habit of letting his iOS email app grow to <code>9,999</code> unread emails on his work account. He liked that red iOS bubble flex. He’d then open Gmail, delete all emails, and let the cycle start again.</p><p>“If it’s important enough they’ll Slack me”, he’d say, “most of it is just newsletters, marketing, spam, and Renovate updates anyways”.</p><figure></figure><p>I didn’t think much of it until recently, when I was catching up with someone in another dev tooling company in charge of CRM and Email Marketing, and found out that they were struggling with atrocious email stats. On average they’d get 7-9% open rates, and even though the total subscriber base was under 10,000, a good 80-90 would unsubscribe every month, with several others marking the emails as spam.</p><p>This turned into quite the discussion on our <a target="_blank" rel="noopener noreferrer" href="https://marketingto.dev/">Developer Marketing Slack</a>, where everyone shared their best practices for emails to developer audiences, and I shared a summary of what worked and didn’t work when I faced the same issues back at Hygraph.</p><h3 data-id="7d3ebfc5919f4d8fb08222ac2f5d3fa7"><span><a href="#7d3ebfc5919f4d8fb08222ac2f5d3fa7" title="1. New user onboarding"><svg viewBox="0 0 16 16" width="16" height="16"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a><span>1. New user onboarding</span></span></h3><p>One of the most critical user journeys we had was for new signups who were getting a hang of GraphCMS.</p><p>We originally tried a vast range of designs, witty copywriting, and templates inspired by <a target="_blank" rel="noopener noreferrer" href="https://reallygoodemails.com/">ReallyGoodEmails</a>.  </p><figure><p><img src="https://www.notion.so/image/https%3A%2F%2Fs3.us-west-2.amazonaws.com%2Fsecure.notion-static.com%2Fcb9e9a80-16f2-40be-a9e8-f3b4f4c3c4f8%2FUntitled.png%3FX-Amz-Algorithm%3DAWS4-HMAC-SHA256%26X-Amz-Content-Sha256%3DUNSIGNED-PAYLOAD%26X-Amz-Credential%3DAKIAT73L2G45EIPT3X45%252F20221230%252Fus-west-2%252Fs3%252Faws4_request%26X-Amz-Date%3D20221230T015103Z%26X-Amz-Expires%3D86400%26X-Amz-Signature%3Dfad9c9b668ec7373f064b8237550382d6529b6e972c79e42487100c543cf940e%26X-Amz-SignedHeaders%3Dhost%26x-id%3DGetObject?table=block&amp;id=d38db940-a137-49c9-91e9-a417b95a6772&amp;cache=v2" loading="lazy" alt="notion image" decoding="async"></p></figure><p>While RGE has incredible resources, we found that none of these “styles” really resonated much with devs. Open rates were low, many marked us as spam, account activation links were lost in graphics, and click-through rates were basically non-existent.</p><p>Our devrel team and sales team were always challenging one another on what those emails should contain:</p><p>“Add the [enterprise] case study!”</p><p>“No that’s silly they just signed up, send them to the docs.”</p><p>“But then they’ll get lost we need to guide them and show them cool features.”</p><p>… and on and on</p><p>So we tried all of those — case studies, video embeds, free demos, features, 30-day drips, 5-day drips, docs, free watermelon popsicles, everything — and the results barely changed.</p><p>Finally, on a completely unrelated task, when I was looking to implement <a target="_blank" rel="noopener noreferrer" href="https://segment.com/">Segment</a> in our staging web app with a colleague to experiment with a few other things, and I was blown away by the welcome flow.</p><p>I don’t have access to that email anymore, but the welcome email from <a target="_blank" rel="noopener noreferrer" href="https://www.linkedin.com/in/kevbosaurus/">Kevin</a> (then the Head of Growth at Segment) was something so ridiculously simple that it was something along the lines of:</p><pre><code>Hi Ronak<span>,</span>
 Welcome to Segment<span>.</span> Check out our docs and <span>if</span> you need any help getting started just <span>let</span> us know<span>.</span>
 
 Best<span>,</span>
-Kevin</code></pre><p>For a second I actually thought it was manually sent — so I replied. Said thanks. Felt like an idiot for replying to a bot. But then actually got a reply back asking if I needed to speak to someone in Sales. That gave us the 💡 to completely revamp the onboardings and go with an ultra-casual approach. </p><p>We scrapped all the HTML templates and fancy styling and started experimenting with a cadence that worked extremely well for us (80%+ open rates on day 1 dropping to 50%~ on day 10, and more surprisingly, 30% REPLY RATES — something we used to get conversations started in Intercom).</p><h4 data-id="67f095a0d30744108ff26b924594c57b"><span><a href="#67f095a0d30744108ff26b924594c57b" title="Day 1 — Welcome message from the CEO"><svg viewBox="0 0 16 16" width="16" height="16"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a><span>Day 1 — Welcome message from the CEO</span></span></h4><figure><p><img src="https://www.notion.so/image/https%3A%2F%2Fs3.us-west-2.amazonaws.com%2Fsecure.notion-static.com%2F079f8ac9-907e-4fba-806b-fa9d4b48cbbe%2FUntitled.png%3FX-Amz-Algorithm%3DAWS4-HMAC-SHA256%26X-Amz-Content-Sha256%3DUNSIGNED-PAYLOAD%26X-Amz-Credential%3DAKIAT73L2G45EIPT3X45%252F20221229%252Fus-west-2%252Fs3%252Faws4_request%26X-Amz-Date%3D20221229T202427Z%26X-Amz-Expires%3D86400%26X-Amz-Signature%3Deb08267d6fc307e8145ab11f5b9df06d59f338cb8a084fd056fb19797bcb1071%26X-Amz-SignedHeaders%3Dhost%26x-id%3DGetObject?table=block&amp;id=caaab3c8-7892-4aa8-a61b-61681936f3e7&amp;cache=v2" loading="lazy" alt="notion image" decoding="async"></p></figure><p>The message was super short and straight to the point. The only CTA(s) were purely dev centric to get a DIY experience of the product - by watching a video or by going to the docs.</p><p>We added a <code>PS</code> at the end for any feedback and noticed that the simple nature of the product led to almost 30% of the new users writing back with comments, questions, and feedback — something that our team used Intercom for to make sure we got back to them and had a conversation going.</p><h4 data-id="61b7c54f4e094af092b2e711c34c98ce"><span><a href="#61b7c54f4e094af092b2e711c34c98ce" title="Day 3 — Casual Check-in"><svg viewBox="0 0 16 16" width="16" height="16"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a><span>Day 3 — Casual Check-in</span></span></h4><figure><p><img src="https://www.notion.so/image/https%3A%2F%2Fs3.us-west-2.amazonaws.com%2Fsecure.notion-static.com%2F5c1c97c1-4db7-4ed6-b111-8d44a39511ac%2FUntitled.png%3FX-Amz-Algorithm%3DAWS4-HMAC-SHA256%26X-Amz-Content-Sha256%3DUNSIGNED-PAYLOAD%26X-Amz-Credential%3DAKIAT73L2G45EIPT3X45%252F20221229%252Fus-west-2%252Fs3%252Faws4_request%26X-Amz-Date%3D20221229T202427Z%26X-Amz-Expires%3D86400%26X-Amz-Signature%3D0420911970755dc4318e79fef12789d13b599cacd4c019dcea230aa43fa97315%26X-Amz-SignedHeaders%3Dhost%26x-id%3DGetObject?table=block&amp;id=291f3232-33fd-4be9-a495-9d626c1efde0&amp;cache=v2" loading="lazy" alt="notion image" decoding="async"></p></figure><p>If that user was still active on Day 3 (i.e. no Day 0 churn) they’d get a check-in from me to make sure there weren’t many issues getting started. The link went straight to my Calendly (shared with DevRel) to have conversations with free users to unblock their onboarding. While many did book calls, most devs were keen to get back on building themselves and used the links and/or joined Slack to get the conversation started there. The most clicked links were consistently the docs and the repo of OSS examples our devrel team had put together.</p><h4 data-id="17a483b5bd8a4d0399587e4a7c75ebd9"><span><a href="#17a483b5bd8a4d0399587e4a7c75ebd9" title="Day 7 — First-week recap"><svg viewBox="0 0 16 16" width="16" height="16"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a><span>Day 7 — First-week recap</span></span></h4><figure><p><img src="https://www.notion.so/image/https%3A%2F%2Fs3.us-west-2.amazonaws.com%2Fsecure.notion-static.com%2Fb2331efd-7c72-4fd6-ab6e-1595c828ba2d%2FUntitled.png%3FX-Amz-Algorithm%3DAWS4-HMAC-SHA256%26X-Amz-Content-Sha256%3DUNSIGNED-PAYLOAD%26X-Amz-Credential%3DAKIAT73L2G45EIPT3X45%252F20221229%252Fus-west-2%252Fs3%252Faws4_request%26X-Amz-Date%3D20221229T202427Z%26X-Amz-Expires%3D86400%26X-Amz-Signature%3D88f003186bb11a8e44688f38672d9e8f84a2ddc7cda8671d7786c5a6c8f842ac%26X-Amz-SignedHeaders%3Dhost%26x-id%3DGetObject?table=block&amp;id=8ca6ba8a-d463-497c-88ff-66fda470a99a&amp;cache=v2" loading="lazy" alt="notion image" decoding="async"></p></figure><p>At the end of their first week, they’d get another casual check-in to start a conversation if they wanted to discuss their projects. We started to tease the prospect of <em>some</em> public support via the G2 CTA, but tried to keep the overall messaging casual. The goal was always to initiate a conversation rather than push an upsell.</p><h4 data-id="0735d4fc07734d05b57507f5be165157"><span><a href="#0735d4fc07734d05b57507f5be165157" title="Day 30+ — Product Feedback"><svg viewBox="0 0 16 16" width="16" height="16"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a><span>Day 30+ — Product Feedback</span></span></h4><figure><p><img src="https://www.notion.so/image/https%3A%2F%2Fs3.us-west-2.amazonaws.com%2Fsecure.notion-static.com%2F78691e0e-7558-41cf-bb35-9a0fd4323b46%2FUntitled.png%3FX-Amz-Algorithm%3DAWS4-HMAC-SHA256%26X-Amz-Content-Sha256%3DUNSIGNED-PAYLOAD%26X-Amz-Credential%3DAKIAT73L2G45EIPT3X45%252F20221229%252Fus-west-2%252Fs3%252Faws4_request%26X-Amz-Date%3D20221229T202427Z%26X-Amz-Expires%3D86400%26X-Amz-Signature%3Ddf36579feb3088aa15bdd3e92c531e9a221f904ff2d366e4ba6be0ba10688951%26X-Amz-SignedHeaders%3Dhost%26x-id%3DGetObject?table=block&amp;id=6d97c29f-6117-4783-a6ad-853dace68813&amp;cache=v2" loading="lazy" alt="notion image" decoding="async"></p></figure><p>Lastly, if we had new power users (active for 15+ days in the first 30 days) they’d get a nudge for a review and/or feedback from me. The G2 link didn’t perform as well (eventually killed this in the flow and reduced our onboarding to just 7 days and 3 emails) since devs are less likely to take that route compared to business users, but it still did result in great insights for us via replies. </p><p>Everything after this was taken off emails. We never continued cadences leading to pages about features, pricing, case studies, or other commercial pages. If users were still engaged we’d reach out to them on Slack and encourage them to speak with us or with each other. </p><h3 data-id="c6eb1063e9b042a1a471bc4fb526cf92"><span><a href="#c6eb1063e9b042a1a471bc4fb526cf92" title="2. Newsletters and Updates"><svg viewBox="0 0 16 16" width="16" height="16"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a><span>2. Newsletters and Updates</span></span></h3><p>One of the first email campaigns I ran at Hygraph was a Halloween campaign (ironically the same time of the year as this post 😅). It had worked great for me in the past (my previous company was B2C) so to try and get the pipeline rolling we thought it would be a great test to go with. We whipped together an email drip campaign targeting all our free users, and again, used the same generic discount mentality to give it another spin — “No tricks, only treats this Halloween. Get 31% off all plans”.</p><p>We pushed it live. A campaign targeting all ~30,000 (back then) free users with really cringe messaging. After the weekend, I excitedly checked on the stats.</p><p>The tracking wasn’t broken. There were no attribution issues. The coupon hadn’t been claimed even once. That was it&nbsp; —&nbsp; 0 conversions. Nobody gave a fuck about getting 31% off. On the contrary, about 2-2.5% of the audience just flat-out unsubscribed.</p><p>This experience was my first, and hopefully biggest, mistake in email marketing to developers&nbsp; —&nbsp; treating them like any other user.</p><p>After this, every “campaign” was treated very differently. Discounts never came back, and we rarely tried to send anything “promotional” or “seasonal” to the user base regardless of what that month’s growth was looking like. After some more trial and error with emails and newsletters that combined product details, features, case studies, community updates, content updates, and internal news, we thought we had a pretty good idea of what to go with — we’d figured out what consistently gave us 40%+ Open Rates and 15%+ Click Rates, something we were comfortable with given our steadily increasing user base over 3 years.</p><p>We started sending a “Monthly Product Update” to everyone without any marketing fluff, and always signed off as the actual sender (in several instances that was me, or a colleague from Marketing) with a very simple way to respond with any 1on1 feedback. Eventually, we followed a few standardized components for each email to maximize value and reduce the expectation of spam. Each release contained:</p><ul><li>A human sender and receiver (no group emails, no no-replies),</li></ul><figure><p><img src="https://www.notion.so/image/https%3A%2F%2Fs3.us-west-2.amazonaws.com%2Fsecure.notion-static.com%2Fd68bfaa5-4e2b-4655-b107-8d534094ea1a%2FUntitled.png%3FX-Amz-Algorithm%3DAWS4-HMAC-SHA256%26X-Amz-Content-Sha256%3DUNSIGNED-PAYLOAD%26X-Amz-Credential%3DAKIAT73L2G45EIPT3X45%252F20221229%252Fus-west-2%252Fs3%252Faws4_request%26X-Amz-Date%3D20221229T202427Z%26X-Amz-Expires%3D86400%26X-Amz-Signature%3D56bfddc20ead7a952dd46ed0d373241c90a97a3f1fb57fe4af0a7657615c7be4%26X-Amz-SignedHeaders%3Dhost%26x-id%3DGetObject?table=block&amp;id=ff0beba0-5290-40d2-a5d2-0313213834bf&amp;cache=v2" loading="lazy" alt="notion image" decoding="async"></p></figure><ul><li>A clear TLDR on what the email contained in the subject itself,</li></ul><figure><p><img src="https://www.notion.so/image/https%3A%2F%2Fs3.us-west-2.amazonaws.com%2Fsecure.notion-static.com%2Fa6ea1948-9c0b-49ee-9021-9c3cb80f58be%2FUntitled.png%3FX-Amz-Algorithm%3DAWS4-HMAC-SHA256%26X-Amz-Content-Sha256%3DUNSIGNED-PAYLOAD%26X-Amz-Credential%3DAKIAT73L2G45EIPT3X45%252F20221229%252Fus-west-2%252Fs3%252Faws4_request%26X-Amz-Date%3D20221229T202427Z%26X-Amz-Expires%3D86400%26X-Amz-Signature%3D2ba66d2b2c9ef2288c53f74118623a0c9eda57d1bc7c8fa0cb24eb45d14acaca%26X-Amz-SignedHeaders%3Dhost%26x-id%3DGetObject?table=block&amp;id=701e085b-267a-43ff-b5d5-6a21cd48565c&amp;cache=v2" loading="lazy" alt="notion image" decoding="async"></p></figure><ul><li>A very simple template that was easy to skim,</li></ul><figure><p><img src="https://www.notion.so/image/https%3A%2F%2Fs3.us-west-2.amazonaws.com%2Fsecure.notion-static.com%2Fb4ab8852-6612-4d04-9641-3a4c8c6373ec%2FUntitled.png%3FX-Amz-Algorithm%3DAWS4-HMAC-SHA256%26X-Amz-Content-Sha256%3DUNSIGNED-PAYLOAD%26X-Amz-Credential%3DAKIAT73L2G45EIPT3X45%252F20221229%252Fus-west-2%252Fs3%252Faws4_request%26X-Amz-Date%3D20221229T202427Z%26X-Amz-Expires%3D86400%26X-Amz-Signature%3Dc688765edd5a06d2a6ad86d93c46ca6284e88ac32fcee76bd580afb84c52a298%26X-Amz-SignedHeaders%3Dhost%26x-id%3DGetObject?table=block&amp;id=98a9c22c-cfac-4404-963a-5220409ece71&amp;cache=v2" loading="lazy" alt="notion image" decoding="async"></p></figure><ul><li>A clear CTA to read the full release or view the online version,</li></ul><figure><p><img src="https://www.notion.so/image/https%3A%2F%2Fs3.us-west-2.amazonaws.com%2Fsecure.notion-static.com%2F4e8c3690-cdb0-480c-95f5-f7ac8f15e875%2FUntitled.png%3FX-Amz-Algorithm%3DAWS4-HMAC-SHA256%26X-Amz-Content-Sha256%3DUNSIGNED-PAYLOAD%26X-Amz-Credential%3DAKIAT73L2G45EIPT3X45%252F20221229%252Fus-west-2%252Fs3%252Faws4_request%26X-Amz-Date%3D20221229T202427Z%26X-Amz-Expires%3D86400%26X-Amz-Signature%3Ddb3f35891c66671abc4bf0d7e1e4a714183cb182c3242c0b198f1570a09cee16%26X-Amz-SignedHeaders%3Dhost%26x-id%3DGetObject?table=block&amp;id=530c9efe-3f14-46a8-b715-954d69b209a9&amp;cache=v2" loading="lazy" alt="notion image" decoding="async"></p></figure><ul><li>Relevant “larger” product updates with quick CTAs that don’t lead to gated content or sales conversations, but to the relevant demos and repos,</li></ul><figure><p><img src="https://www.notion.so/image/https%3A%2F%2Fs3.us-west-2.amazonaws.com%2Fsecure.notion-static.com%2Fde6ff06c-0805-4bc5-b14c-9223f02faf7b%2FUntitled.png%3FX-Amz-Algorithm%3DAWS4-HMAC-SHA256%26X-Amz-Content-Sha256%3DUNSIGNED-PAYLOAD%26X-Amz-Credential%3DAKIAT73L2G45EIPT3X45%252F20221229%252Fus-west-2%252Fs3%252Faws4_request%26X-Amz-Date%3D20221229T202427Z%26X-Amz-Expires%3D86400%26X-Amz-Signature%3Dc5262a4b2a47ffd9900a18021541d6f180681ea9d1d9afe478bcbd7b189607ba%26X-Amz-SignedHeaders%3Dhost%26x-id%3DGetObject?table=block&amp;id=67888da3-f3ee-4f70-ad9a-62f900b5d8f2&amp;cache=v2" loading="lazy" alt="notion image" decoding="async"></p></figure><ul><li>Followed by updates from the community,</li></ul><figure><p><img src="https://www.notion.so/image/https%3A%2F%2Fs3.us-west-2.amazonaws.com%2Fsecure.notion-static.com%2F9f4a85c5-0cbc-478f-b564-2f19fb88b4bd%2FUntitled.png%3FX-Amz-Algorithm%3DAWS4-HMAC-SHA256%26X-Amz-Content-Sha256%3DUNSIGNED-PAYLOAD%26X-Amz-Credential%3DAKIAT73L2G45EIPT3X45%252F20221229%252Fus-west-2%252Fs3%252Faws4_request%26X-Amz-Date%3D20221229T202427Z%26X-Amz-Expires%3D86400%26X-Amz-Signature%3Dc1b935135b7d9d0850c7435f30fadf2aa888c8dfe86ffb5bfdc69ad35c42f4a6%26X-Amz-SignedHeaders%3Dhost%26x-id%3DGetObject?table=block&amp;id=36ad45ce-c09b-4679-9663-29bebaa5d212&amp;cache=v2" loading="lazy" alt="notion image" decoding="async"></p></figure><ul><li>A clear path to get in touch (LinkedIn, email, Twitter, Slack) for any feedback or discussions, and</li></ul><figure><p><img src="https://www.notion.so/image/https%3A%2F%2Fs3.us-west-2.amazonaws.com%2Fsecure.notion-static.com%2Fe3985983-1132-4b58-8383-0af98a7d0a7e%2FUntitled.png%3FX-Amz-Algorithm%3DAWS4-HMAC-SHA256%26X-Amz-Content-Sha256%3DUNSIGNED-PAYLOAD%26X-Amz-Credential%3DAKIAT73L2G45EIPT3X45%252F20221229%252Fus-west-2%252Fs3%252Faws4_request%26X-Amz-Date%3D20221229T202427Z%26X-Amz-Expires%3D86400%26X-Amz-Signature%3Dfb104632d3f8104a301b7713bddc3d13fd2c45b7dcbc72ec3e153989d95889da%26X-Amz-SignedHeaders%3Dhost%26x-id%3DGetObject?table=block&amp;id=2ffc0856-8c25-4290-bb55-249d167e7edd&amp;cache=v2" loading="lazy" alt="notion image" decoding="async"></p></figure><ul><li>No case studies, no sales CTAs, no upsells, no discounts, no fluff.</li></ul><div><p><span role="img" aria-label="📫">📫</span></p><p>To see what a “standard” monthly release looked like, check out the online version of the April 2021 update (for as long as it stays online) — <a target="_blank" rel="noopener noreferrer" href="https://ximi8.mjt.lu/nl2/ximi8/11nq.html?m=AL4AAJ6FpzEAAAAEBwIAAAOvVIYAAAAAq1EAAMfZABSw-wBggYtRJcGqQKBLRyCKVXCYVxC3kwAUhdQ&amp;b=e6e958ef&amp;e=19eabf68&amp;x=0D3StnOtzrsCQAjgTVE0Zw-O9akF4pirk3SpSjkKvM4">GraphCMS Update April 2021</a>.</p></div><div><p><span role="img" aria-label="📣">📣</span></p><p>Shoutout to our Head of Design, <a target="_blank" rel="noopener noreferrer" href="https://darshan.design/">Darshan</a>, here for introducing me to this template direction based on <a target="_blank" rel="noopener noreferrer" href="https://www.notion.so/">Notion’s</a> releases.</p></div><h3 data-id="f1c9eb2646914f8f9689ccdfc182aab8"><span><a href="#f1c9eb2646914f8f9689ccdfc182aab8" title="3. Leadgen and “Sales”"><svg viewBox="0 0 16 16" width="16" height="16"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a><span>3. Leadgen and “Sales”</span></span></h3><p>No learnings here — never even bothered sending forced upsell emails to developers that were free users 😁</p><p>If anyone downloaded gated resources, they got a simple confirmation with a link to their assets. No drips. No cadences. No SDR giving them missed calls on their personal phones.</p><figure><p><img src="https://www.notion.so/image/https%3A%2F%2Fs3.us-west-2.amazonaws.com%2Fsecure.notion-static.com%2F6cfd06f8-c1c0-41ac-a587-b971499bd9e1%2FUntitled.png%3FX-Amz-Algorithm%3DAWS4-HMAC-SHA256%26X-Amz-Content-Sha256%3DUNSIGNED-PAYLOAD%26X-Amz-Credential%3DAKIAT73L2G45EIPT3X45%252F20221229%252Fus-west-2%252Fs3%252Faws4_request%26X-Amz-Date%3D20221229T202427Z%26X-Amz-Expires%3D86400%26X-Amz-Signature%3Dae3aac530b80f33c770fcdd79626baf298299cb148b7f1dd0bf379a0de091067%26X-Amz-SignedHeaders%3Dhost%26x-id%3DGetObject?table=block&amp;id=d45873ef-36b1-4b76-ad2f-e56f8462bef6&amp;cache=v2" loading="lazy" alt="notion image" decoding="async"></p></figure><h3 data-id="69e0fd0097a74e33b424df4df9a32c0c"><span><a href="#69e0fd0097a74e33b424df4df9a32c0c" title="5 Takeaways to wrap it up"><svg viewBox="0 0 16 16" width="16" height="16"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a><span>5 Takeaways to wrap it up</span></span></h3><ol start="1"><li><b>Keep it short.</b> Don’t add too many links and CTAs to 50 shades of content. Treat marketing emails to developers as “transactional” where you get to the point and address one very specific point.</li></ol><ol start="2"><li><b>Experiment with plain text.</b> We tried a wide range of HTML And MJML templates with all sorts of designs, animations, and visuals. In the end, the winner was a simple one-liner written as a human. </li></ol><ol start="3"><li><b>Keep it human.</b> We ended up getting great actual replies back when we combined simple text with a human face. Emails were sent as <code>[name]@</code> rather than <code>marketing@</code> or <code>no-reply@</code>. Signatures had an avatar, as well as links to personal social profiles. <code>reply-to</code> was set as a human email rather than <code>support@</code> or <code>no-reply@</code>.</li></ol><ol start="4"><li><b>Skip the sales.</b> We love ending all emails with “BTW if you’re looking to do X then get a demo of our product” as a generic footer. Skip it. It’s not relevant to 99% of the messages in emails, and devs seem to have collectively formed an allergy to commercial CTAs from most software.</li></ol><ol start="5"><li><b>Use it sparingly.</b> Not everything deserves to be an email, and devs are more likely to hit that spam button than you’d like to admit. A new bugfix or changelog entry isn’t an email, a new blog post isn’t an email. </li></ol></main></div></div>]]>
+Kevin</code></pre><p>For a second I actually thought it was manually sent — so I replied. Said thanks. Felt like an idiot for replying to a bot. But then actually got a reply back asking if I needed to speak to someone in Sales. That gave us the 💡 to completely revamp the onboardings and go with an ultra-casual approach. </p><p>We scrapped all the HTML templates and fancy styling and started experimenting with a cadence that worked extremely well for us (80%+ open rates on day 1 dropping to 50%~ on day 10, and more surprisingly, 30% REPLY RATES — something we used to get conversations started in Intercom).</p><h4 data-id="67f095a0d30744108ff26b924594c57b"><span><a href="#67f095a0d30744108ff26b924594c57b" title="Day 1 — Welcome message from the CEO"><svg viewBox="0 0 16 16" width="16" height="16"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a><span>Day 1 — Welcome message from the CEO</span></span></h4><figure><p><img src="https://www.notion.so/image/https%3A%2F%2Fs3.us-west-2.amazonaws.com%2Fsecure.notion-static.com%2F079f8ac9-907e-4fba-806b-fa9d4b48cbbe%2FUntitled.png%3FX-Amz-Algorithm%3DAWS4-HMAC-SHA256%26X-Amz-Content-Sha256%3DUNSIGNED-PAYLOAD%26X-Amz-Credential%3DAKIAT73L2G45EIPT3X45%252F20221230%252Fus-west-2%252Fs3%252Faws4_request%26X-Amz-Date%3D20221230T015103Z%26X-Amz-Expires%3D86400%26X-Amz-Signature%3D485dc6ca41ea1c22de5cc4af9254c24403e3ee6fe1f9b0dba47581191bd1cef6%26X-Amz-SignedHeaders%3Dhost%26x-id%3DGetObject?table=block&amp;id=caaab3c8-7892-4aa8-a61b-61681936f3e7&amp;cache=v2" loading="lazy" alt="notion image" decoding="async"></p></figure><p>The message was super short and straight to the point. The only CTA(s) were purely dev centric to get a DIY experience of the product - by watching a video or by going to the docs.</p><p>We added a <code>PS</code> at the end for any feedback and noticed that the simple nature of the product led to almost 30% of the new users writing back with comments, questions, and feedback — something that our team used Intercom for to make sure we got back to them and had a conversation going.</p><h4 data-id="61b7c54f4e094af092b2e711c34c98ce"><span><a href="#61b7c54f4e094af092b2e711c34c98ce" title="Day 3 — Casual Check-in"><svg viewBox="0 0 16 16" width="16" height="16"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a><span>Day 3 — Casual Check-in</span></span></h4><figure><p><img src="https://www.notion.so/image/https%3A%2F%2Fs3.us-west-2.amazonaws.com%2Fsecure.notion-static.com%2F5c1c97c1-4db7-4ed6-b111-8d44a39511ac%2FUntitled.png%3FX-Amz-Algorithm%3DAWS4-HMAC-SHA256%26X-Amz-Content-Sha256%3DUNSIGNED-PAYLOAD%26X-Amz-Credential%3DAKIAT73L2G45EIPT3X45%252F20221230%252Fus-west-2%252Fs3%252Faws4_request%26X-Amz-Date%3D20221230T015103Z%26X-Amz-Expires%3D86400%26X-Amz-Signature%3D7729e3703464025fdedc54ea05919246aa38b52aa2ed729a077b9d9080b0f7a4%26X-Amz-SignedHeaders%3Dhost%26x-id%3DGetObject?table=block&amp;id=291f3232-33fd-4be9-a495-9d626c1efde0&amp;cache=v2" loading="lazy" alt="notion image" decoding="async"></p></figure><p>If that user was still active on Day 3 (i.e. no Day 0 churn) they’d get a check-in from me to make sure there weren’t many issues getting started. The link went straight to my Calendly (shared with DevRel) to have conversations with free users to unblock their onboarding. While many did book calls, most devs were keen to get back on building themselves and used the links and/or joined Slack to get the conversation started there. The most clicked links were consistently the docs and the repo of OSS examples our devrel team had put together.</p><h4 data-id="17a483b5bd8a4d0399587e4a7c75ebd9"><span><a href="#17a483b5bd8a4d0399587e4a7c75ebd9" title="Day 7 — First-week recap"><svg viewBox="0 0 16 16" width="16" height="16"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a><span>Day 7 — First-week recap</span></span></h4><figure><p><img src="https://www.notion.so/image/https%3A%2F%2Fs3.us-west-2.amazonaws.com%2Fsecure.notion-static.com%2Fb2331efd-7c72-4fd6-ab6e-1595c828ba2d%2FUntitled.png%3FX-Amz-Algorithm%3DAWS4-HMAC-SHA256%26X-Amz-Content-Sha256%3DUNSIGNED-PAYLOAD%26X-Amz-Credential%3DAKIAT73L2G45EIPT3X45%252F20221230%252Fus-west-2%252Fs3%252Faws4_request%26X-Amz-Date%3D20221230T015103Z%26X-Amz-Expires%3D86400%26X-Amz-Signature%3D56b5851e30dd0611fb22199fa8dad100d10da55a81b6c25f220a212723a3c514%26X-Amz-SignedHeaders%3Dhost%26x-id%3DGetObject?table=block&amp;id=8ca6ba8a-d463-497c-88ff-66fda470a99a&amp;cache=v2" loading="lazy" alt="notion image" decoding="async"></p></figure><p>At the end of their first week, they’d get another casual check-in to start a conversation if they wanted to discuss their projects. We started to tease the prospect of <em>some</em> public support via the G2 CTA, but tried to keep the overall messaging casual. The goal was always to initiate a conversation rather than push an upsell.</p><h4 data-id="0735d4fc07734d05b57507f5be165157"><span><a href="#0735d4fc07734d05b57507f5be165157" title="Day 30+ — Product Feedback"><svg viewBox="0 0 16 16" width="16" height="16"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a><span>Day 30+ — Product Feedback</span></span></h4><figure><p><img src="https://www.notion.so/image/https%3A%2F%2Fs3.us-west-2.amazonaws.com%2Fsecure.notion-static.com%2F78691e0e-7558-41cf-bb35-9a0fd4323b46%2FUntitled.png%3FX-Amz-Algorithm%3DAWS4-HMAC-SHA256%26X-Amz-Content-Sha256%3DUNSIGNED-PAYLOAD%26X-Amz-Credential%3DAKIAT73L2G45EIPT3X45%252F20221230%252Fus-west-2%252Fs3%252Faws4_request%26X-Amz-Date%3D20221230T015103Z%26X-Amz-Expires%3D86400%26X-Amz-Signature%3D27ba9e600f9f4c3b8c07c7773730533bd9cae52e6670bcec558b9788841c6392%26X-Amz-SignedHeaders%3Dhost%26x-id%3DGetObject?table=block&amp;id=6d97c29f-6117-4783-a6ad-853dace68813&amp;cache=v2" loading="lazy" alt="notion image" decoding="async"></p></figure><p>Lastly, if we had new power users (active for 15+ days in the first 30 days) they’d get a nudge for a review and/or feedback from me. The G2 link didn’t perform as well (eventually killed this in the flow and reduced our onboarding to just 7 days and 3 emails) since devs are less likely to take that route compared to business users, but it still did result in great insights for us via replies. </p><p>Everything after this was taken off emails. We never continued cadences leading to pages about features, pricing, case studies, or other commercial pages. If users were still engaged we’d reach out to them on Slack and encourage them to speak with us or with each other. </p><h3 data-id="c6eb1063e9b042a1a471bc4fb526cf92"><span><a href="#c6eb1063e9b042a1a471bc4fb526cf92" title="2. Newsletters and Updates"><svg viewBox="0 0 16 16" width="16" height="16"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a><span>2. Newsletters and Updates</span></span></h3><p>One of the first email campaigns I ran at Hygraph was a Halloween campaign (ironically the same time of the year as this post 😅). It had worked great for me in the past (my previous company was B2C) so to try and get the pipeline rolling we thought it would be a great test to go with. We whipped together an email drip campaign targeting all our free users, and again, used the same generic discount mentality to give it another spin — “No tricks, only treats this Halloween. Get 31% off all plans”.</p><p>We pushed it live. A campaign targeting all ~30,000 (back then) free users with really cringe messaging. After the weekend, I excitedly checked on the stats.</p><p>The tracking wasn’t broken. There were no attribution issues. The coupon hadn’t been claimed even once. That was it&nbsp; —&nbsp; 0 conversions. Nobody gave a fuck about getting 31% off. On the contrary, about 2-2.5% of the audience just flat-out unsubscribed.</p><p>This experience was my first, and hopefully biggest, mistake in email marketing to developers&nbsp; —&nbsp; treating them like any other user.</p><p>After this, every “campaign” was treated very differently. Discounts never came back, and we rarely tried to send anything “promotional” or “seasonal” to the user base regardless of what that month’s growth was looking like. After some more trial and error with emails and newsletters that combined product details, features, case studies, community updates, content updates, and internal news, we thought we had a pretty good idea of what to go with — we’d figured out what consistently gave us 40%+ Open Rates and 15%+ Click Rates, something we were comfortable with given our steadily increasing user base over 3 years.</p><p>We started sending a “Monthly Product Update” to everyone without any marketing fluff, and always signed off as the actual sender (in several instances that was me, or a colleague from Marketing) with a very simple way to respond with any 1on1 feedback. Eventually, we followed a few standardized components for each email to maximize value and reduce the expectation of spam. Each release contained:</p><ul><li>A human sender and receiver (no group emails, no no-replies),</li></ul><figure><p><img src="https://www.notion.so/image/https%3A%2F%2Fs3.us-west-2.amazonaws.com%2Fsecure.notion-static.com%2Fd68bfaa5-4e2b-4655-b107-8d534094ea1a%2FUntitled.png%3FX-Amz-Algorithm%3DAWS4-HMAC-SHA256%26X-Amz-Content-Sha256%3DUNSIGNED-PAYLOAD%26X-Amz-Credential%3DAKIAT73L2G45EIPT3X45%252F20221230%252Fus-west-2%252Fs3%252Faws4_request%26X-Amz-Date%3D20221230T015103Z%26X-Amz-Expires%3D86400%26X-Amz-Signature%3Dfef3bf093abcab0e201875b8bfbd93d09eb4a0ce94fb99a6b656070810a19ca0%26X-Amz-SignedHeaders%3Dhost%26x-id%3DGetObject?table=block&amp;id=ff0beba0-5290-40d2-a5d2-0313213834bf&amp;cache=v2" loading="lazy" alt="notion image" decoding="async"></p></figure><ul><li>A clear TLDR on what the email contained in the subject itself,</li></ul><figure><p><img src="https://www.notion.so/image/https%3A%2F%2Fs3.us-west-2.amazonaws.com%2Fsecure.notion-static.com%2Fa6ea1948-9c0b-49ee-9021-9c3cb80f58be%2FUntitled.png%3FX-Amz-Algorithm%3DAWS4-HMAC-SHA256%26X-Amz-Content-Sha256%3DUNSIGNED-PAYLOAD%26X-Amz-Credential%3DAKIAT73L2G45EIPT3X45%252F20221230%252Fus-west-2%252Fs3%252Faws4_request%26X-Amz-Date%3D20221230T015103Z%26X-Amz-Expires%3D86400%26X-Amz-Signature%3D808ba80b2380860f770a69a57359716a038d9aad2af8849c606d3266a5d068a6%26X-Amz-SignedHeaders%3Dhost%26x-id%3DGetObject?table=block&amp;id=701e085b-267a-43ff-b5d5-6a21cd48565c&amp;cache=v2" loading="lazy" alt="notion image" decoding="async"></p></figure><ul><li>A very simple template that was easy to skim,</li></ul><figure><p><img src="https://www.notion.so/image/https%3A%2F%2Fs3.us-west-2.amazonaws.com%2Fsecure.notion-static.com%2Fb4ab8852-6612-4d04-9641-3a4c8c6373ec%2FUntitled.png%3FX-Amz-Algorithm%3DAWS4-HMAC-SHA256%26X-Amz-Content-Sha256%3DUNSIGNED-PAYLOAD%26X-Amz-Credential%3DAKIAT73L2G45EIPT3X45%252F20221230%252Fus-west-2%252Fs3%252Faws4_request%26X-Amz-Date%3D20221230T015103Z%26X-Amz-Expires%3D86400%26X-Amz-Signature%3Df5992fda8af40f36ce7e0cbacb7c0cb203ef547b730390def78319308577f296%26X-Amz-SignedHeaders%3Dhost%26x-id%3DGetObject?table=block&amp;id=98a9c22c-cfac-4404-963a-5220409ece71&amp;cache=v2" loading="lazy" alt="notion image" decoding="async"></p></figure><ul><li>A clear CTA to read the full release or view the online version,</li></ul><figure><p><img src="https://www.notion.so/image/https%3A%2F%2Fs3.us-west-2.amazonaws.com%2Fsecure.notion-static.com%2F4e8c3690-cdb0-480c-95f5-f7ac8f15e875%2FUntitled.png%3FX-Amz-Algorithm%3DAWS4-HMAC-SHA256%26X-Amz-Content-Sha256%3DUNSIGNED-PAYLOAD%26X-Amz-Credential%3DAKIAT73L2G45EIPT3X45%252F20221230%252Fus-west-2%252Fs3%252Faws4_request%26X-Amz-Date%3D20221230T015103Z%26X-Amz-Expires%3D86400%26X-Amz-Signature%3D63418e42f2d13e5602ede52a26c8bc57edc29910f12f376aca789d58a1846706%26X-Amz-SignedHeaders%3Dhost%26x-id%3DGetObject?table=block&amp;id=530c9efe-3f14-46a8-b715-954d69b209a9&amp;cache=v2" loading="lazy" alt="notion image" decoding="async"></p></figure><ul><li>Relevant “larger” product updates with quick CTAs that don’t lead to gated content or sales conversations, but to the relevant demos and repos,</li></ul><figure><p><img src="https://www.notion.so/image/https%3A%2F%2Fs3.us-west-2.amazonaws.com%2Fsecure.notion-static.com%2Fde6ff06c-0805-4bc5-b14c-9223f02faf7b%2FUntitled.png%3FX-Amz-Algorithm%3DAWS4-HMAC-SHA256%26X-Amz-Content-Sha256%3DUNSIGNED-PAYLOAD%26X-Amz-Credential%3DAKIAT73L2G45EIPT3X45%252F20221230%252Fus-west-2%252Fs3%252Faws4_request%26X-Amz-Date%3D20221230T015103Z%26X-Amz-Expires%3D86400%26X-Amz-Signature%3D281f604fd3d44a6f07d252fb484f40831942ab4305184e15471d108aa296c32c%26X-Amz-SignedHeaders%3Dhost%26x-id%3DGetObject?table=block&amp;id=67888da3-f3ee-4f70-ad9a-62f900b5d8f2&amp;cache=v2" loading="lazy" alt="notion image" decoding="async"></p></figure><ul><li>Followed by updates from the community,</li></ul><figure><p><img src="https://www.notion.so/image/https%3A%2F%2Fs3.us-west-2.amazonaws.com%2Fsecure.notion-static.com%2F9f4a85c5-0cbc-478f-b564-2f19fb88b4bd%2FUntitled.png%3FX-Amz-Algorithm%3DAWS4-HMAC-SHA256%26X-Amz-Content-Sha256%3DUNSIGNED-PAYLOAD%26X-Amz-Credential%3DAKIAT73L2G45EIPT3X45%252F20221230%252Fus-west-2%252Fs3%252Faws4_request%26X-Amz-Date%3D20221230T015103Z%26X-Amz-Expires%3D86400%26X-Amz-Signature%3Da93bfe4458c7eeea07df5cc88b3586381b7339bb9a190acd6ff1e57642947222%26X-Amz-SignedHeaders%3Dhost%26x-id%3DGetObject?table=block&amp;id=36ad45ce-c09b-4679-9663-29bebaa5d212&amp;cache=v2" loading="lazy" alt="notion image" decoding="async"></p></figure><ul><li>A clear path to get in touch (LinkedIn, email, Twitter, Slack) for any feedback or discussions, and</li></ul><figure><p><img src="https://www.notion.so/image/https%3A%2F%2Fs3.us-west-2.amazonaws.com%2Fsecure.notion-static.com%2Fe3985983-1132-4b58-8383-0af98a7d0a7e%2FUntitled.png%3FX-Amz-Algorithm%3DAWS4-HMAC-SHA256%26X-Amz-Content-Sha256%3DUNSIGNED-PAYLOAD%26X-Amz-Credential%3DAKIAT73L2G45EIPT3X45%252F20221230%252Fus-west-2%252Fs3%252Faws4_request%26X-Amz-Date%3D20221230T015103Z%26X-Amz-Expires%3D86400%26X-Amz-Signature%3D69d3617e622ad58b34cbed876b4dfb4d00119c7fc365186be61677a9782a3228%26X-Amz-SignedHeaders%3Dhost%26x-id%3DGetObject?table=block&amp;id=2ffc0856-8c25-4290-bb55-249d167e7edd&amp;cache=v2" loading="lazy" alt="notion image" decoding="async"></p></figure><ul><li>No case studies, no sales CTAs, no upsells, no discounts, no fluff.</li></ul><div><p><span role="img" aria-label="📫">📫</span></p><p>To see what a “standard” monthly release looked like, check out the online version of the April 2021 update (for as long as it stays online) — <a target="_blank" rel="noopener noreferrer" href="https://ximi8.mjt.lu/nl2/ximi8/11nq.html?m=AL4AAJ6FpzEAAAAEBwIAAAOvVIYAAAAAq1EAAMfZABSw-wBggYtRJcGqQKBLRyCKVXCYVxC3kwAUhdQ&amp;b=e6e958ef&amp;e=19eabf68&amp;x=0D3StnOtzrsCQAjgTVE0Zw-O9akF4pirk3SpSjkKvM4">GraphCMS Update April 2021</a>.</p></div><div><p><span role="img" aria-label="📣">📣</span></p><p>Shoutout to our Head of Design, <a target="_blank" rel="noopener noreferrer" href="https://darshan.design/">Darshan</a>, here for introducing me to this template direction based on <a target="_blank" rel="noopener noreferrer" href="https://www.notion.so/">Notion’s</a> releases.</p></div><h3 data-id="f1c9eb2646914f8f9689ccdfc182aab8"><span><a href="#f1c9eb2646914f8f9689ccdfc182aab8" title="3. Leadgen and “Sales”"><svg viewBox="0 0 16 16" width="16" height="16"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a><span>3. Leadgen and “Sales”</span></span></h3><p>No learnings here — never even bothered sending forced upsell emails to developers that were free users 😁</p><p>If anyone downloaded gated resources, they got a simple confirmation with a link to their assets. No drips. No cadences. No SDR giving them missed calls on their personal phones.</p><figure><p><img src="https://www.notion.so/image/https%3A%2F%2Fs3.us-west-2.amazonaws.com%2Fsecure.notion-static.com%2F6cfd06f8-c1c0-41ac-a587-b971499bd9e1%2FUntitled.png%3FX-Amz-Algorithm%3DAWS4-HMAC-SHA256%26X-Amz-Content-Sha256%3DUNSIGNED-PAYLOAD%26X-Amz-Credential%3DAKIAT73L2G45EIPT3X45%252F20221230%252Fus-west-2%252Fs3%252Faws4_request%26X-Amz-Date%3D20221230T015103Z%26X-Amz-Expires%3D86400%26X-Amz-Signature%3D869b508aa48b5e131511a9b74b02674feb5640575f9c01a4a31a9794ea3bb01d%26X-Amz-SignedHeaders%3Dhost%26x-id%3DGetObject?table=block&amp;id=d45873ef-36b1-4b76-ad2f-e56f8462bef6&amp;cache=v2" loading="lazy" alt="notion image" decoding="async"></p></figure><h3 data-id="69e0fd0097a74e33b424df4df9a32c0c"><span><a href="#69e0fd0097a74e33b424df4df9a32c0c" title="5 Takeaways to wrap it up"><svg viewBox="0 0 16 16" width="16" height="16"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a><span>5 Takeaways to wrap it up</span></span></h3><ol start="1"><li><b>Keep it short.</b> Don’t add too many links and CTAs to 50 shades of content. Treat marketing emails to developers as “transactional” where you get to the point and address one very specific point.</li></ol><ol start="2"><li><b>Experiment with plain text.</b> We tried a wide range of HTML And MJML templates with all sorts of designs, animations, and visuals. In the end, the winner was a simple one-liner written as a human. </li></ol><ol start="3"><li><b>Keep it human.</b> We ended up getting great actual replies back when we combined simple text with a human face. Emails were sent as <code>[name]@</code> rather than <code>marketing@</code> or <code>no-reply@</code>. Signatures had an avatar, as well as links to personal social profiles. <code>reply-to</code> was set as a human email rather than <code>support@</code> or <code>no-reply@</code>.</li></ol><ol start="4"><li><b>Skip the sales.</b> We love ending all emails with “BTW if you’re looking to do X then get a demo of our product” as a generic footer. Skip it. It’s not relevant to 99% of the messages in emails, and devs seem to have collectively formed an allergy to commercial CTAs from most software.</li></ol><ol start="5"><li><b>Use it sparingly.</b> Not everything deserves to be an email, and devs are more likely to hit that spam button than you’d like to admit. A new bugfix or changelog entry isn’t an email, a new blog post isn’t an email. </li></ol></main></div></div>]]>
             </description>
             <link>https://ronakganatra.com/email-marketing-to-developers</link>
             <guid isPermaLink="false">hacker-news-small-sites-34139850</guid>
@@ -5800,7 +6029,7 @@ Kevin</code></pre><p>For a second I actually thought it was manually sent — so
             </title>
             <description>
 <![CDATA[
-Score 422 | Comments 157 (<a href="https://news.ycombinator.com/item?id=34138188">thread link</a>) | @nabla9
+Score 423 | Comments 157 (<a href="https://news.ycombinator.com/item?id=34138188">thread link</a>) | @nabla9
 <br/>
 December 26, 2022 | https://www.bath.ac.uk/announcements/social-media-may-prevent-users-from-reaping-creative-rewards-of-profound-boredom-new-research/ | <a href="https://web.archive.org/web/*/https://www.bath.ac.uk/announcements/social-media-may-prevent-users-from-reaping-creative-rewards-of-profound-boredom-new-research/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section>
@@ -5841,7 +6070,7 @@ December 26, 2022 | https://www.bath.ac.uk/announcements/social-media-may-preven
             </title>
             <description>
 <![CDATA[
-Score 330 | Comments 189 (<a href="https://news.ycombinator.com/item?id=34137751">thread link</a>) | @exp1orer
+Score 332 | Comments 189 (<a href="https://news.ycombinator.com/item?id=34137751">thread link</a>) | @exp1orer
 <br/>
 December 26, 2022 | https://borretti.me/article/unbundling-tools-for-thought | <a href="https://web.archive.org/web/*/https://borretti.me/article/unbundling-tools-for-thought">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -6838,7 +7067,7 @@ Comparison:
             </title>
             <description>
 <![CDATA[
-Score 13 | Comments 4 (<a href="https://news.ycombinator.com/item?id=34134790">thread link</a>) | @kevmo314
+Score 14 | Comments 4 (<a href="https://news.ycombinator.com/item?id=34134790">thread link</a>) | @kevmo314
 <br/>
 December 25, 2022 | https://blog.kevmo314.com/faster-twitter.html | <a href="https://web.archive.org/web/*/https://blog.kevmo314.com/faster-twitter.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
