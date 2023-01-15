@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Sat, 14 Jan 2023 20:25:34 GMT</lastBuildDate>
+        <lastBuildDate>Sun, 15 Jan 2023 01:56:11 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-20.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Sat, 14 Jan 2023 20:25:34 GMT</pubDate>
+        <pubDate>Sun, 15 Jan 2023 01:56:11 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,478 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Finding Nice MD5s Using Rust]]>
+            </title>
+            <description>
+<![CDATA[
+Score 36 | Comments 4 (<a href="https://news.ycombinator.com/item?id=34385212">thread link</a>) | @zdw
+<br/>
+January 14, 2023 | https://blog.youmu.moe/posts/finding-nice-md5s-using-rust/ | <a href="https://web.archive.org/web/*/https://blog.youmu.moe/posts/finding-nice-md5s-using-rust/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>At the start of the week, a friend of mine sent me a <a rel="noopener nofollow noreferrer" href="https://crypto.stackexchange.com/questions/68674/md5-existence-of-invariant-fixed-point" target="_blank">link</a>. "What an interesting yet pointless question!", both of us agreed. Later that day, <a rel="noopener nofollow noreferrer" href="https://github.com/zvibazak/Nice-MD5s" target="_blank">another link</a> was also sent to me. Apparently there was someone who did care a little bit. Out of curiosity, I opened the <code>find_md5.py</code> file, and it hit me: "How can I optimize this task?" The task did shout SIMD to me, and I knew rust has <a rel="noopener nofollow noreferrer" href="https://doc.rust-lang.org/core/arch/index.html" target="_blank"><code>core::arch</code></a> which provides many SIMD intrinsics. Hence my journey to try out Rust's SIMD and inline assembly began.</p><p>By looking at <a rel="noopener nofollow noreferrer" href="https://github.com/zvibazak/Nice-MD5s#definitions" target="_blank">zvibazak/Nice-MD5s</a>, I got a closer picture of the task on hand. More formally we want to deal with 3 tasks:</p><ol><li>Randomly generate a string with 32 characters, each from <code>[0-9a-z]</code>. There are some caveats on the so-called "Gold MD5", also known as the fixed point, but we will ignore that for now.</li><li>Compute the MD5 hash of the generate string.</li><li>Compute different metrics of the hash to determine how nice it is: <ol><li>The length of the longest consecutive digits as prefix</li><li>The length of the longest consecutive letters as prefix</li><li>The length of the longest consecutive homogeneous character as prefix</li><li>The length of the longest prefix matching $\pi$</li><li>The length of the longest prefix matching $e$</li></ol></li></ol><p>Following the chronological order of me writing the code, I will first talk about how to accomplish task 3, which I call "computing niceties". For the sake of brevity, I will assume we only care about the longest consecutive digits, and only gloss over other "niceties". I will then talk about generating strings, and finally the MD5 hash computation.</p><p>The complete codebase could be found at <a rel="noopener nofollow noreferrer" href="https://github.com/johnmave126/nice-md5s" target="_blank">johnmave126/nice-md5s</a>. And for SIMD and inline assembly, we only consider <code>x86</code> and <code>x86_64</code> architecture.</p><p>We are looking for a function like follows:</p><pre data-lang="rust"><code data-lang="rust"><span>fn </span><span>count_leading_digits</span><span>(</span><span>x</span><span>: [</span><span>u8</span><span>; 16]) -&gt; </span><span>u8</span><span>;
+</span></code></pre><p>The input is a 16-byte array (MD5 produces 128 bits, aka 16 bytes), and the output is a number counting the number of digits from the beginning. To make sense of "a digit", we break a byte into 2 nibbles, and we call a nibble <code>n</code> "digit" if <code>0x0 &lt;= n &lt; 0xa</code>, and "letter" otherwise. Within each byte, we consider the most significant nibble comes before the least significant nibble.</p><h2 id="baseline">Baseline</h2><p>It is quite tempting to have a baseline algorithm as follows:</p><pre data-lang="rust"><code data-lang="rust"><span>fn </span><span>count_leading_digits</span><span>(</span><span>x</span><span>: [</span><span>u8</span><span>; 16]) -&gt; </span><span>u8 </span><span>{
+</span><span>    x.</span><span>into_iter</span><span>()
+</span><span>        .</span><span>map</span><span>(|</span><span>b</span><span>| [b </span><span>&gt;&gt; </span><span>4</span><span>, b </span><span>&amp; </span><span>0x0F</span><span>])
+</span><span>        .</span><span>flatten</span><span>()
+</span><span>        .</span><span>take_while</span><span>(|</span><span>&amp;</span><span>n</span><span>| n </span><span>&lt; </span><span>0xA</span><span>)
+</span><span>        .</span><span>count</span><span>() </span><span>as </span><span>u8
+</span><span>}
+</span></code></pre><p>where we construct an iterator over the nibbles from the byte array and count. It turns out that, especially in the case where we want to compute multiple metrics, it is more performant to convert the byte array to a nibble array first.</p><pre data-lang="rust"><code data-lang="rust"><span>struct </span><span>Nibbles([</span><span>u8</span><span>; 32]);
+</span><span>
+</span><span>impl From</span><span>&lt;[</span><span>u8</span><span>; </span><span>16</span><span>]&gt; </span><span>for </span><span>Nibbles {
+</span><span>    </span><span>fn </span><span>from</span><span>(</span><span>x</span><span>: [</span><span>u8</span><span>; 16]) -&gt; </span><span>Self </span><span>{
+</span><span>        </span><span>let</span><span> nibbles </span><span>=</span><span> x.</span><span>map</span><span>(|</span><span>b</span><span>| [b </span><span>&gt;&gt; </span><span>4</span><span>, b </span><span>&amp; </span><span>0x0F</span><span>]);
+</span><span>        </span><span>// SAFETY: size_of::&lt;[[u8; 2]; 16]&gt;() == size_of::&lt;[u8; 32]&gt;()
+</span><span>        </span><span>Self</span><span>(</span><span>unsafe </span><span>{ </span><span>transmute</span><span>(nibbles) })
+</span><span>    }
+</span><span>}
+</span><span>
+</span><span>fn </span><span>count_leading_digits</span><span>(</span><span>x</span><span>: [</span><span>u8</span><span>; 16]) -&gt; </span><span>u8 </span><span>{
+</span><span>    </span><span>// Here we convert `x` to `Nibbles`, while in practice we would convert
+</span><span>    </span><span>// beforehand and reuse `Nibbles` to compute multiple metrics
+</span><span>    Nibbles::from(x).</span><span>0.</span><span>iter</span><span>().</span><span>take_while</span><span>(|</span><span>&amp;</span><span>n</span><span>| n </span><span>&lt; </span><span>0xA</span><span>).</span><span>count</span><span>() </span><span>as </span><span>u8
+</span><span>}
+</span></code></pre><h2 id="simd">SIMD</h2><p>The first step is to load <code>[u8; 16]</code> into an SIMD register. We also want it to be in nibbles form for easier later processing. Conveniently <code>[u8; 32]</code> fits perfectly into a 256-bit SIMD vector, aka an <code>__m256i</code>.</p><p>I came up with two approaches to achieve this:</p><ul><li>Load <code>[u8; 16]</code> into an <code>__m128i</code>, convert each byte to a <code>u16</code> with zero extending to get an <code>__m256i</code>, and finally using bit shifting to adjust positions of the nibbles.<pre data-lang="rust"><code data-lang="rust"><span>unsafe </span><span>fn </span><span>load</span><span>(</span><span>x</span><span>: [</span><span>u8</span><span>; 16]) -&gt; __m256i {
+</span><span>    </span><span>let</span><span> x </span><span>= </span><span>_mm_loadu_si128</span><span>(x.</span><span>as_ptr</span><span>().</span><span>cast</span><span>());
+</span><span>    </span><span>// Each byte now occupies 2 bytes
+</span><span>    </span><span>let</span><span> x </span><span>= </span><span>_mm256_cvtepu8_epi16</span><span>(x);
+</span><span>    </span><span>// Shift left to place lo-nibble in hi-byte and clear excess nibbles
+</span><span>    </span><span>let</span><span> lo_nibble </span><span>= </span><span>_mm256_and_si256</span><span>(</span><span>_mm256_slli_epi16</span><span>(x, </span><span>8</span><span>), </span><span>_mm256_set1_epi8</span><span>(</span><span>0x0F</span><span>u8 </span><span>as </span><span>i8</span><span>));
+</span><span>    </span><span>// Shift right to place hi-nibble in lo-byte
+</span><span>    </span><span>let</span><span> hi_nibble </span><span>= </span><span>_mm256_srli_epi16</span><span>(x, </span><span>4</span><span>);
+</span><span>
+</span><span>    </span><span>_mm256_or_si256</span><span>(hi_nibble, lo_nibble)
+</span><span>}
+</span></code></pre></li><li>Load <code>[u8; 16]</code> into an <code>__m128i</code>, use bit shifting to move hi-nibbles, interleave the bytes and then assemble the <code>__m256i</code>.<pre data-lang="rust"><code data-lang="rust"><span>unsafe </span><span>fn </span><span>load</span><span>(</span><span>x</span><span>: [</span><span>u8</span><span>; 16]) -&gt; __m256i {
+</span><span>    </span><span>let</span><span> x </span><span>= </span><span>_mm_loadu_si128</span><span>(x.</span><span>as_ptr</span><span>().</span><span>cast</span><span>());
+</span><span>    </span><span>// Shift hi nibbles of each byte into lo nibbles
+</span><span>    </span><span>// Hi-nibbles of each byte will contain some garbage now
+</span><span>    </span><span>// Note: there is no `_mm_srli_epi8`
+</span><span>    </span><span>let</span><span> hi_nibble </span><span>= </span><span>_mm_srli_si128</span><span>(x, </span><span>4</span><span>);
+</span><span>    </span><span>// Interleave
+</span><span>    </span><span>// Hi-nibbles of each byte will contain some garbage
+</span><span>    </span><span>let</span><span> lo_128 </span><span>= </span><span>_mm_unpacklo_epi8</span><span>(hi_nibble, x);
+</span><span>    </span><span>let</span><span> hi_128 </span><span>= </span><span>_mm_unpackhi_epi8</span><span>(hi_nibble, x);
+</span><span>    </span><span>// Assemble `__m256i`
+</span><span>    </span><span>let</span><span> x </span><span>= </span><span>_mm256_set_m128i</span><span>(hi_128, lo_128);
+</span><span>    </span><span>// Apply mask to clear hi-nibble of each byte
+</span><span>    </span><span>_mm256_and_si256</span><span>(x, </span><span>_mm256_set1_epi8</span><span>(</span><span>0x0F</span><span>u8 </span><span>as </span><span>i8</span><span>))
+</span><span>}
+</span></code></pre></li></ul><p>Quick benchmark showed that the two approaches had very similar performance, so I went with the first one.</p><p>Next, we want to determine whether each nibble is a digit or a letter. This is quite straightforward.</p><pre data-lang="rust"><code data-lang="rust"><span>let</span><span> x </span><span>= </span><span>load</span><span>(x);
+</span><span>let</span><span> mask </span><span>= </span><span>_mm256_cmpgt_epi8</span><span>(</span><span>_mm256_set1_epi8</span><span>(</span><span>0x0A</span><span>u8 </span><span>as </span><span>i8</span><span>), x);
+</span></code></pre><p>For each byte in <code>mask</code>, the byte is <code>0xFF</code> if the corresponding byte in <code>x</code> is smaller than <code>0x0A</code>, and <code>0x00</code> otherwise. In other words, if the nibble is a digit, the byte becomes <code>0xFF</code>. Otherwise, the nibble is a letter, and the byte becomes <code>0x00</code>.</p><p>For other metrics, this kind of mask is also easy to compute.</p><ul><li>For longest prefix matching $\pi$/$e$, we can use <code>_mm256_cmpeq_epi8</code>:<pre data-lang="rust"><code data-lang="rust"><span>let</span><span> x </span><span>= </span><span>load</span><span>(x);
+</span><span>const </span><span>PI</span><span>: [</span><span>u8</span><span>; </span><span>32</span><span>] </span><span>= </span><span>[</span><span>3</span><span>, </span><span>1</span><span>, </span><span>4</span><span>, </span><span>1</span><span>, </span><span>5</span><span>, </span><span>9</span><span>, </span><span>/* the rest omitted */</span><span>];
+</span><span>let</span><span> mask </span><span>= </span><span>_mm256_cmpeq_epi8</span><span>(x, </span><span>_mm256_loadu_si256</span><span>(</span><span>PI</span><span>.</span><span>as_ptr</span><span>().</span><span>cast</span><span>()));
+</span></code></pre></li><li>For homogeneous prefix, we can make an vector where each byte is the least significant byte of the original vector:<pre data-lang="rust"><code data-lang="rust"><span>let</span><span> x </span><span>= </span><span>load</span><span>(x);
+</span><span>// Duplicate the least significant 64-bit to all 64-bit lanes.
+</span><span>// The main motivation is to copy the least significant byte to 64-th position.
+</span><span>let</span><span> b </span><span>= </span><span>_mm256_permute4x64_epi64</span><span>(x, </span><span>0</span><span>);
+</span><span>// Within 128-bit (16-byte) lane, set all byte to be the least significant one.
+</span><span>let</span><span> b </span><span>= </span><span>_mm256_shuffle_epi8</span><span>(b, </span><span>_mm256_setzero_si256</span><span>());
+</span><span>let</span><span> mask </span><span>= </span><span>_mm256_cmpeq_epi8</span><span>(x, b);
+</span></code></pre></li></ul><p>Now that we have the mask, it is a classical technique to use <code>movemask</code> to collect the mask:</p><pre data-lang="rust"><code data-lang="rust"><span>let</span><span> packed_mask </span><span>= </span><span>_mm256_movemask_epi8</span><span>(mask) </span><span>as </span><span>u32</span><span>;
+</span></code></pre><p>The $i$-th bit of <code>packed_mask</code> is 1 if and only if the $i$-th byte of <code>mask</code> is <code>0xFF</code>. So our answer is the number of consecutive 1's in <code>packed_mask</code>. Conveniently, there is a intrinsic to count the number of consecutive <strong>0's</strong> in a number:</p><pre data-lang="rust"><code data-lang="rust"><span>// Need to invert the bits first
+</span><span>let</span><span> answer </span><span>= </span><span>_tzcnt_u32</span><span>(</span><span>!</span><span>packed_mask) </span><span>as </span><span>u8</span><span>;
+</span></code></pre><p>And we arrive at a SIMD solution, which requires AVX, AVX2, SSE2, and BMI1 extension on a x86/x86_64 processor.</p><h2 id="a-failed-simd-approach">A Failed SIMD Approach</h2><p>At this point I had another idea: nice MD5s should not be common. Maybe I could use SIMD to quickly rule out MD5s that are not very nice, and only run the SIMD algorithm on potentially nice one.</p><p>If we take look at 2 bytes, which are 4 nibbles, we have:</p><ul><li>The probability that they are all digits is $(10/16)^4\approx 15.3\%$.</li><li>The probability that they are all letters is $(6/16)^4\approx 1.98\%$.</li><li>The probability that they are all the same is $(1/16)^3\approx 0.024\%$.</li><li>The probability that they match $\pi$/$e$ is $(1/16)^4\approx 0.0015\%$.</li></ul><p>So, my idea was: apart from the initial screening, no additional runtime would be incurred with high probability.</p><p>Consider 4 nibbles occupying 4 bytes, we can fit 8 instances in an <code>__m256i</code> and process them simultaneously.</p><p>To load the first 4 nibbles of each of <code>[[u8; 16]; 8]</code>, we can simply generate an array containing the first 2 bytes of each array, and use the load method above.</p><pre data-lang="rust"><code data-lang="rust"><span>// x is `[[u8; 16]; 8]`
+</span><span>let</span><span> first_2_bytes </span><span>=</span><span> x.</span><span>map</span><span>(|</span><span>v</span><span>| [v[</span><span>0</span><span>], v[</span><span>1</span><span>]]);
+</span><span>let</span><span> first_2_bytes </span><span>= </span><span>load</span><span>(</span><span>unsafe </span><span>{ </span><span>transmute</span><span>(first_2_bytes) });
+</span></code></pre><p>We are filtering hashes that are not very nice, so I deem that the first 4 nibbles of a hash have to be all nice before we further investigate it. We can apply a similar strategy as above, but with 32-bit lanes.</p><pre data-lang="rust"><code data-lang="rust"><span>let</span><span> byte_mask </span><span>= </span><span>_mm256_cmpgt_epi8</span><span>(</span><span>_mm256_set1_epi8</span><span>(</span><span>0x0A</span><span>u8 </span><span>as </span><span>i8</span><span>), first_2_bytes);
+</span><span>// If any of the bits in a 32-bit lane is not 1, set all 32 bits to 0
+</span><span>let</span><span> mask </span><span>= </span><span>_mm256_cmpeq_epi8</span><span>(first_2_bytes, </span><span>_mm256_set1_epi8</span><span>(</span><span>0xFF</span><span>u8 </span><span>as </span><span>i8</span><span>));
+</span><span>// movemask for each 32-bit lane, 8 lanes total
+</span><span>let</span><span> packed_mask </span><span>= </span><span>_mm256_movemask_ps</span><span>(</span><span>_mm256_cvtepi32_ps</span><span>(mask)) </span><span>as </span><span>u8</span><span>;
+</span></code></pre><p>There are only $2^8=256$ different <code>packed_mask</code>, so we build a look up table such that each <code>packed_mask</code> is mapped to a <code>u32</code> where indices of 1's in <code>packed_mask</code> are packed together. For example, if <code>packed_mask=0b0110_1110</code>, where bit-index <code>1, 2, 3, 5, 6</code> are 1's, we map to a <code>u32</code> of <code>0x00076432</code>. Observe that we use 1-indexing in <code>u32</code>, so that we can easily detect whether there are more by a zero-test.</p><p>Given the packed indices, we can initialize the answers to 0, and only compute hashes that has potential.</p><pre data-lang="rust"><code data-lang="rust"><span>// `indices` stores the packed indices
+</span><span>let</span><span> answers </span><span>= </span><span>[</span><span>0</span><span>; </span><span>8</span><span>];
+</span><span>while</span><span> indices </span><span>!= </span><span>0 </span><span>{
+</span><span>    </span><span>let</span><span> idx </span><span>= </span><span>(indices </span><span>&amp; </span><span>0xF</span><span>) </span><span>as </span><span>usize </span><span>- </span><span>1</span><span>;
+</span><span>    </span><span>// Use SIMD algorithm to compute the actual number
+</span><span>    answers[idx] </span><span>= </span><span>count_leading_digits_simd</span><span>(x[idx]);
+</span><span>    indices </span><span>&gt;&gt;= </span><span>4</span><span>;
+</span><span>}
+</span></code></pre><p>The algorithm will report 0 if the number is less than 4, as opposed to the accurate number from the algorithms above.</p><p>When computing multiple metrics, to avoid loading an array multiple times, a small optimization would be to <code>OR</code> all the masks together and only generate <code>__m256i</code> for the corresponding arrays.</p><pre data-lang="rust"><code data-lang="rust"><span>// We have multiple masks from different metrics
+</span><span>let</span><span> mask </span><span>=</span><span> mask_1 </span><span>|</span><span> mask_2 </span><span>|</span><span> mask_3;
+</span><span>// SAFETY: MaybeUninit is always initialized
+</span><span>let </span><span>mut</span><span> simds: [MaybeUninit&lt;__m256i&gt;; </span><span>8</span><span>] </span><span>= unsafe </span><span>{ MaybeUninit::uninit().</span><span>assume_init</span><span>() };
+</span><span>while</span><span> indices </span><span>!= </span><span>0 </span><span>{
+</span><span>    </span><span>let</span><span> idx </span><span>= </span><span>(indices </span><span>&amp; </span><span>0xF</span><span>) </span><span>as </span><span>usize </span><span>- </span><span>1</span><span>;
+</span><span>    simds[idx].</span><span>write</span><span>(</span><span>load</span><span>(x[idx]));
+</span><span>    indices </span><span>&gt;&gt;= </span><span>4</span><span>;
+</span><span>}
+</span></code></pre><p>It turns out that, although the performance of this approach is better than baseline, it is still much slower than the previous SIMD algorithm. So, I call this a failed attempt.</p><h2 id="performance-comparison">Performance Comparison</h2><h3 id="benchmark-system">Benchmark System</h3><table><thead><tr><th>Component</th><th>Detail</th></tr></thead><tbody><tr><td>CPU</td><td>Intel Core i7-6700K</td></tr><tr><td>RAM</td><td>32GB DDR4 2400MHz</td></tr><tr><td>OS</td><td>5.15.0.56-ubuntu-22.04.1-lts</td></tr><tr><td>Rust</td><td>1.66.0</td></tr><tr><td>RUSTFLAGS</td><td><code>-C target-cpu=native</code></td></tr></tbody></table><h3 id="best-case-throughput">Best Case Throughput</h3><ul><li><p>Computing all the metrics</p> <table><thead><tr><th>Method</th><th>Block Size<sup><a href="#block_size">1</a></sup></th><th>Throughput</th></tr></thead><tbody><tr><td>Baseline</td><td>16</td><td>43.980 Melem/s</td></tr><tr><td>SIMD</td><td>2</td><td><strong>280.26 Melem/s</strong></td></tr><tr><td>Failed SIMD</td><td>8</td><td>147.88 Melem/s</td></tr></tbody></table></li><li><p>Computing number of consecutive digits as prefix</p> <table><thead><tr><th>Method</th><th>Block Size<sup><a href="#block_size">1</a></sup></th><th>Throughput</th></tr></thead><tbody><tr><td>Baseline</td><td>1</td><td>85.079 Melem/s</td></tr><tr><td>SIMD</td><td>4</td><td><strong>860.68 Melem/s</strong></td></tr><tr><td>Failed SIMD</td><td>8</td><td>181.60 Melem/s</td></tr></tbody></table></li><li><p>Computing number nibbles equal to $\pi$ as prefix</p> <table><thead><tr><th>Method</th><th>Block Size<sup><a href="#block_size">1</a></sup></th><th>Throughput</th></tr></thead><tbody><tr><td>Baseline</td><td>1</td><td>368.23 Melem/s</td></tr><tr><td>SIMD</td><td>4</td><td><strong>780.78 Melem/s</strong></td></tr><tr><td>Failed SIMD</td><td>8</td><td>517.12 Melem/s</td></tr></tbody></table></li><li><p>... other metrics results omitted ...</p></li></ul><p>It might be statistically the same to iterate the input space sequentially, but it is definitely less fun. So, I went with generating random inputs. Obviously we don't need a cryptographic secure random string generation. My requirements are simple:</p><ul><li>String has length 32 and each character is from <code>[0-9a-z]</code>.</li><li>Each valid string has a non-zero probability to appear.</li></ul><p>Mainly the input space is so large that I don't really care about the quality of the randomness. We will use <a rel="noopener nofollow noreferrer" href="https://docs.rs/rand/0.8.5/rand/rngs/struct.SmallRng.html" target="_blank"><code>SmallRng</code></a> from <a rel="noopener nofollow noreferrer" href="https://crates.io/crates/rand" target="_blank"><code>rand</code></a> crate for the source of randomness.</p><h2 id="baseline-1">Baseline</h2><p>I simply compute a random byte modulo 36, and map that to <code>[0-9a-z]</code> to generate a random character:</p><pre data-lang="rust"><code data-lang="rust"><span>// `POOL` is a map from `0-35` to `[0-9a-z]`
+</span><span>const </span><span>POOL</span><span>: [</span><span>u8</span><span>; </span><span>36</span><span>] </span><span>= </span><span>[ </span><span>/* omitted */ </span><span>];
+</span><span>let</span><span> v: [</span><span>u8</span><span>; </span><span>32</span><span>] </span><span>= unsafe </span><span>{
+</span><span>   </span><span>transmute</span><span>([
+</span><span>       rng.</span><span>next_u64</span><span>(),
+</span><span>       rng.</span><span>next_u64</span><span>(),
+</span><span>       rng.</span><span>next_u64</span><span>(),
+</span><span>       rng.</span><span>next_u64</span><span>(),
+</span><span>   ])
+</span><span>};
+</span><span>let</span><span> my_random_string </span><span>=</span><span> v.</span><span>map</span><span>(|</span><span>b</span><span>| </span><span>POOL</span><span>[(b </span><span>% </span><span>36</span><span>) </span><span>as </span><span>usize</span><span>]);
+</span></code></pre><h2 id="simd-1">SIMD</h2><p><code>[u8; 32]</code> fits perfectly into a <code>__m256i</code>, so it is natural to try SIMD. Given a random byte, I really want to use <code>_mm256_rem_epu8</code> to have the same behavior as the baseline algorithm. Unfortunately, that is part of SVML and not a part of Rust intrinsics. Hence I resorts to the following:</p><ul><li>Take 6 bits from a random byte (0-63).</li><li>Subtract 36 if the byte is greater than or equal to 36.</li><li>Adjust the byte to <code>[0-9a-z]</code>.</li></ul><p>This way we make sure that every character has non-zero probability to appear. And the randomness is not too skewed.</p><pre data-lang="rust"><code data-lang="rust"><span>// Load 128 random bits
+</span><span>let</span><span> v </span><span>= </span><span>_mm256_loadu_si256</span><span>(
+</span><span>    [
+</span><span>        rng.</span><span>next_u64</span><span>(),
+</span><span>        rng.</span><span>next_u64</span><span>(),
+</span><span>        rng.</span><span>next_u64</span><span>(),
+</span><span>        rng.</span><span>next_u64</span><span>(),
+</span><span>    ]
+</span><span>    .</span><span>as_ptr</span><span>()
+</span><span>    .</span><span>cast</span><span>(),
+</span><span>);
+</span><span>// Keep 6 bits (0-63)
+</span><span>let</span><span> v </span><span>= </span><span>_mm256_and_si256</span><span>(v, </span><span>_mm256_set1_epi8</span><span>(</span><span>0x3F</span><span>u8 </span><span>as </span><span>i8</span><span>));
+</span><span>// Mask bytes in range 36-63
+</span><span>let</span><span> gt_35 </span><span>= </span><span>_mm256_cmpgt_epi8</span><span>(v, </span><span>_mm256_set1_epi8</span><span>(</span><span>35</span><span>));
+</span><span>// Subtract 36 for those bytes
+</span><span>let</span><span> v </span><span>= </span><span>_mm256_sub_epi8</span><span>(v, </span><span>_mm256_and_si256</span><span>(</span><span>_mm256_set1_epi8</span><span>(</span><span>36</span><span>), gt_35));
+</span><span>// Set each byte to 0xFF if it should be a letter (10-35), otherwise 0x00
+</span><span>let</span><span> alpha_mask </span><span>= </span><span>_mm256_cmpgt_epi8</span><span>(v, </span><span>_mm256_set1_epi8</span><span>(</span><span>0x09</span><span>u8 </span><span>as </span><span>i8</span><span>));
+</span><span>// Shift each byte so that range starts at ASCII `0`
+</span><span>let</span><span> to_numbers </span><span>= </span><span>_mm256_add_epi8</span><span>(v, </span><span>_mm256_set1_epi8</span><span>(</span><span>0x30</span><span>u8 </span><span>as </span><span>i8</span><span>));
+</span><span>// Shift bytes that should be a letter by additional 0x27, so that the range
+</span><span>// starts at ASCII `a`
+</span><span>let</span><span> to_alphas </span><span>= </span><span>_mm256_and_si256</span><span>(</span><span>_mm256_set1_epi8</span><span>(</span><span>0x27</span><span>u8 </span><span>as </span><span>i8</span><span>), alpha_mask);
+</span><span>// Add shifting together to get correct bytes
+</span><span>let</span><span> v </span><span>= </span><span>_mm256_add_epi8</span><span>(to_numbers, to_alphas);
+</span><span>
+</span><span>let </span><span>mut</span><span> my_random_string </span><span>= </span><span>[</span><span>0</span><span>; </span><span>32</span><span>];
+</span><span>_mm256_storeu_si256</span><span>(my_random_string.</span><span>as_mut_ptr</span><span>().</span><span>cast</span><span>(), v);
+</span></code></pre><h2 id="performance-comparison-1">Performance Comparison</h2><table><thead><tr><th>Method</th><th>Block Size</th><th>Throughput</th></tr></thead><tbody><tr><td>Baseline</td><td>16</td><td>25.383 Melem/s</td></tr><tr><td>SIMD</td><td>32</td><td><strong>107.15 Melem/s</strong></td></tr></tbody></table><p>Looking through benchmark results for each method, the performance generally improves as the block size increases.</p><p>After I implemented computing all the metrics and generating random strings, I ran some preliminary benchmarks, which showed that computing MD5 hashes was indeed the bottleneck. When I first started the project, I didn't really want to implement MD5 myself. But at that point, it seems inevitable for me to at least investigate.</p><h2 id="baseline-2">Baseline</h2><p>We establish baseline using <a rel="noopener nofollow noreferrer" href="https://crates.io/crates/md-5" target="_blank"><code>md-5</code></a> provided by <a rel="noopener nofollow noreferrer" href="https://github.com/RustCrypto" target="_blank"><code>RustCrypto</code></a>.</p><pre data-lang="rust"><code data-lang="rust"><span>use </span><span>md5::{Digest, Md5};
+</span><span>
+</span><span>pub </span><span>fn </span><span>digest_md5</span><span>(</span><span>buf</span><span>: [</span><span>u8</span><span>; 32]) -&gt; [</span><span>u8</span><span>; </span><span>16</span><span>] {
+</span><span>    Md5::digest(buf.</span><span>as_slice</span><span>()).</span><span>into</span><span>())
+</span><span>}
+</span></code></pre><h2 id="inline-assembly">Inline Assembly</h2><p><code>md-5</code> does have a feature <a rel="noopener nofollow noreferrer" href="https://docs.rs/crate/md-5/0.10.5/features" target="_blank"><code>asm</code></a> that uses an assembly implementation from <a rel="noopener nofollow noreferrer" href="https://www.nayuki.io/page/fast-md5-hash-implementation-in-x86-assembly" target="_blank">Project Nayuki</a>. However according to <a rel="noopener nofollow noreferrer" href="https://github.com/RustCrypto/asm-hashes/issues/17" target="_blank">this issue</a>, the implementation does not work on <code>x86_64-pc-windows-msvc</code> target due to mismatching calling conventions. Unfortunately, that is the target of my developing machine, so I think it is a good time I start to investigate the inline assembly of Rust.</p><h3 id="basics-of-rust-inline-assembly">Basics of Rust Inline Assembly</h3><p>For what we concerned, Rust's inline assembly is a macro call with 2 parts: instructions and register specifications (I omit various configuration options here). Instructions is basically a string template, with each instruction separated by <code>\n</code>. A little quality of life feature by <code>asm!()</code> is that programmer can also write multiple strings separated by comma, and the macro will automatically concatenate them by <code>\n</code>. The second part is a list of registers the assembly requires. Programmers are able to specify specific registers to use, or have the compiler automatically allocate registers with constraints. Programmers also need to specify whether each register is an input, an output, or some other combinations, and the compiler will generate glue code between assembly code and Rust code.</p><p>A quick example from <a rel="noopener nofollow noreferrer" href="https://doc.rust-lang.org/rust-by-example/unsafe/asm.html" target="_blank">Rust By Example</a>:</p><pre data-lang="rust"><code data-lang="rust"><span>asm!(
+</span><span>    </span><span>"mov {0}, {1}"</span><span>,
+</span><span>    </span><span>"add {0}, 5"</span><span>,
+</span><span>    </span><span>out</span><span>(reg) o,
+</span><span>    </span><span>in</span><span>(reg) i,
+</span><span>);
+</span></code></pre><p>We can see this works very much like <code>format!()</code> with a little bit more custom syntax.</p><h3 id="basics-of-md5">Basics of MD5</h3><p>The MD5 algorithm takes data in chunks of 512 bit, with the last chunk padded. For each chunk, the data is regarded as 16 32-bit integers in little endian. And the algorithm maintains 4 32-bit integers as state. The algorithm has 4 rounds, using 4 operators known as <code>f</code>, <code>g</code>, <code>h</code>, and <code>i</code>. In each round, every input integer gets to mix with the state integers in different orders.</p><p>For example, <code>f</code> operator looks like follows:</p><pre data-lang="rust"><code data-lang="rust"><span>fn </span><span>operator_f</span><span>(</span><span>a</span><span>: </span><span>u32</span><span>, </span><span>b</span><span>: </span><span>u32</span><span>, </span><span>c</span><span>: </span><span>u32</span><span>, </span><span>d</span><span>: </span><span>u32</span><span>, </span><span>t</span><span>: </span><span>u32</span><span>, </span><span>s</span><span>: </span><span>u32</span><span>, </span><span>k</span><span>: </span><span>u32</span><span>) -&gt; </span><span>u32 </span><span>{
+</span><span>    (((c </span><span>^</span><span> d) </span><span>&amp;</span><span> b) </span><span>^</span><span> d).</span><span>wrapping_add</span><span>(a)
+</span><span>        .</span><span>wrapping_add</span><span>(k)
+</span><span>        .</span><span>wrapping_add</span><span>(t)
+</span><span>        .</span><span>rotate_left</span><span>(s)
+</span><span>        .</span><span>wrapping_add</span><span>(b)
+</span><span>}
+</span></code></pre><p>And a sneak peek of the first round looks like follows:</p><pre data-lang="rust"><code data-lang="rust"><span>// `a`, `b`, `c`, `d` are 4 state integers, and `data` is the input
+</span><span>a </span><span>= </span><span>operator_f</span><span>(a, b, c, d, data[</span><span>0</span><span>], </span><span>7</span><span>, </span><span>0xd76aa478</span><span>);
+</span><span>b </span><span>= </span><span>operator_f</span><span>(d, a, b, c, data[</span><span>1</span><span>], </span><span>12</span><span>, </span><span>0xe8c7b756</span><span>);
+</span><span>c </span><span>= </span><span>operator_f</span><span>(c, d, b, a, data[</span><span>2</span><span>], </span><span>17</span><span>, </span><span>0x242070db</span><span>);
+</span><span>d </span><span>= </span><span>operator_f</span><span>(b, c, d, a, data[</span><span>3</span><span>], </span><span>22</span><span>, </span><span>0xc1bdceee</span><span>);
+</span><span>
+</span><span>/* ... Omitted 12 more invocations in the first round ... */
+</span></code></pre><p>For a complete explanation of MD5, read <a rel="noopener nofollow noreferrer" href="https://www.comparitech.com/blog/information-security/md5-algorithm-with-examples/" target="_blank"><em>The MD5 algorithm (with examples)</em></a>.</p><h3 id="implement-md5-for-x86-64">Implement MD5 for x86-64</h3><p>We can do one small optimization for our case. We know our input is always 32 bytes, so the padding of the data is fixed:</p><table><thead><tr><th>Position</th><th>Content</th></tr></thead><tbody><tr><td><code>data[0..8]</code></td><td>Input data</td></tr><tr><td><code>data[8]</code></td><td><code>0x80</code></td></tr><tr><td><code>data[14]</code></td><td><code>0x100</code></td></tr><tr><td><code>data[9..14]</code> and <code>data[15]</code></td><td>All 0</td></tr></tbody></table><p>So, for data known to be 0, we can shave 1 <code>add</code> instruction from the operator.</p><p>On x86-64, we have lots of registers available, so we can load all 4 state integers, all 8 input integers into registers, with 2 more registers used for temporaries.</p><p>We need to perform the same operators on different registers inputs many times, so we need something like a function, but not involving the calling overhead. In other words, we want a macro.</p><p>In <code>asm!()</code>, apart from using positional substitution, we can also name the registers like in <code>format!()</code>. And our inline assembly would look like:</p><pre data-lang="rust"><code data-lang="rust"><span>asm!(
+</span><span>    </span><span>/* inline assemblies */
+</span><span>
+</span><span>    </span><span>// state integers
+</span><span>    a </span><span>= </span><span>inout</span><span>(reg) state[</span><span>0</span><span>],
+</span><span>    b </span><span>= </span><span>inout</span><span>(reg) state[</span><span>1</span><span>],
+</span><span>    c </span><span>= </span><span>inout</span><span>(reg) state[</span><span>2</span><span>],
+</span><span>    d </span><span>= </span><span>inout</span><span>(reg) state[</span><span>3</span><span>],
+</span><span>    </span><span>// input integers
+</span><span>    x0 </span><span>= in</span><span>(reg) data[</span><span>0</span><span>],
+</span><span>    x1 </span><span>= in</span><span>(reg) data[</span><span>1</span><span>],
+</span><span>    </span><span>/* x2-x15 omitted */
+</span><span>    </span><span>// clobbered temporaries
+</span><span>    tmp0 </span><span>= </span><span>out</span><span>(reg) </span><span>_</span><span>,
+</span><span>    tmp1 </span><span>= </span><span>out</span><span>(reg) </span><span>_</span><span>,
+</span><span>);
+</span></code></pre><p>So the macro needs to take <code>ident</code> of the register, and generates appropriate string. One thing we need to be careful is that since we operates on 32-bit integers, all registers have to appear like <code>{reg_name:e}</code> in the template string. Let's see a first attempt to write <code>operator_f</code>.</p><pre data-lang="rust"><code data-lang="rust"><span>#[cfg_attr(rustfmt, rustfmt_skip)]
+</span><span>macro_rules! </span><span>op_f {
+</span><span>    ($a: ident, $b: ident, $c: ident, $d: ident, $t: ident, $s: literal, $k: literal) </span><span>=&gt; </span><span>{
+</span><span>        concat!(
+</span><span>            </span><span>"mov {tmp0:e}, {"</span><span>, stringify!($c), </span><span>":e}</span><span>\n</span><span>"</span><span>,
+</span><span>            </span><span>"add {"</span><span>, stringify!($a), </span><span>":e}, {"</span><span>, stringify!($t), </span><span>":e}</span><span>\n</span><span>"</span><span>,
+</span><span>            </span><span>"xor {tmp0:e}, {"</span><span>, stringify!($d), </span><span>":e}</span><span>\n</span><span>"</span><span>,
+</span><span>            </span><span>"and {tmp0:e}, {"</span><span>, stringify!($b), </span><span>":e}</span><span>\n</span><span>"</span><span>,
+</span><span>            </span><span>"xor {tmp0:e}, {"</span><span>, stringify!($d), </span><span>":e}</span><span>\n</span><span>"</span><span>,
+</span><span>            </span><span>"lea {"</span><span>, stringify!($a), </span><span>":e}, [{tmp0:e} + {"</span><span>, stringify!($a) ,</span><span>":e} + "</span><span>, $k ,</span><span>"]</span><span>\n</span><span>"</span><span>,
+</span><span>            </span><span>"rol {"</span><span>, stringify!($a), </span><span>":e}, "</span><span>, $s, </span><span>"</span><span>\n</span><span>"</span><span>,
+</span><span>            </span><span>"add {"</span><span>, stringify!($a), </span><span>":e}, {"</span><span>, stringify!($b), </span><span>":e}</span><span>\n</span><span>"</span><span>,
+</span><span>        )
+</span><span>    };
+</span><span>}
+</span></code></pre><p>This already looks awful and close to unreadable. It is also really error-prone to write this. Note I put <code>#[cfg_attr(rustfmt, rustfmt_skip)]</code> at the top?, this is how it looks if I don't do that:</p><details><summary>Truly incomprehensible after formatting</summary> <pre data-lang="rust"><code data-lang="rust"><span>macro_rules! </span><span>op_f {
+</span><span>    ($a: ident, $b: ident, $c: ident, $d: ident, $t: ident, $s: literal, $k: literal) </span><span>=&gt; </span><span>{
+</span><span>        concat!(
+</span><span>            </span><span>"mov {tmp0:e}, {"</span><span>,
+</span><span>            stringify!($c),
+</span><span>            </span><span>":e}</span><span>\n</span><span>"</span><span>,
+</span><span>            </span><span>"add {"</span><span>,
+</span><span>            stringify!($a),
+</span><span>            </span><span>":e}, {"</span><span>,
+</span><span>            stringify!($t),
+</span><span>            </span><span>":e}</span><span>\n</span><span>"</span><span>,
+</span><span>            </span><span>"xor {tmp0:e}, {"</span><span>,
+</span><span>            stringify!($d),
+</span><span>            </span><span>":e}</span><span>\n</span><span>"</span><span>,
+</span><span>            </span><span>"and {tmp0:e}, {"</span><span>,
+</span><span>            stringify!($b),
+</span><span>            </span><span>":e}</span><span>\n</span><span>"</span><span>,
+</span><span>            </span><span>"xor {tmp0:e}, {"</span><span>,
+</span><span>            stringify!($d),
+</span><span>            </span><span>":e}</span><span>\n</span><span>"</span><span>,
+</span><span>            </span><span>"lea {"</span><span>,
+</span><span>            stringify!($a),
+</span><span>            </span><span>":e}, [{tmp0:e} + {"</span><span>,
+</span><span>            stringify!($a),
+</span><span>            </span><span>":e} + "</span><span>,
+</span><span>            $k,
+</span><span>            </span><span>"]</span><span>\n</span><span>"</span><span>,
+</span><span>            </span><span>"rol {"</span><span>,
+</span><span>            stringify!($a),
+</span><span>            </span><span>":e}, "</span><span>,
+</span><span>            $s,
+</span><span>            </span><span>"</span><span>\n</span><span>"</span><span>,
+</span><span>            </span><span>"add {"</span><span>,
+</span><span>            stringify!($a),
+</span><span>            </span><span>":e}, {"</span><span>,
+</span><span>            stringify!($b),
+</span><span>            </span><span>":e}</span><span>\n</span><span>"</span><span>,
+</span><span>        )
+</span><span>    };
+</span><span>}
+</span></code></pre></details><hr><p>So we need an instruction level abstraction to make it much easier to read:</p><pre data-lang="rust"><code data-lang="rust"><span>// stringify an operand
+</span><span>#[cfg_attr(rustfmt, rustfmt_skip)]
+</span><span>macro_rules! </span><span>asm_operand {
+</span><span>    (eax) </span><span>=&gt; </span><span>{ </span><span>"eax" </span><span>};
+</span><span>    (ebx) </span><span>=&gt; </span><span>{ </span><span>"ebx" </span><span>};
+</span><span>    </span><span>/* ... omitted transcribing all the register names ... */
+</span><span>
+</span><span>    ($x: ident) </span><span>=&gt; </span><span>{
+</span><span>        concat!(</span><span>"{"</span><span>, stringify!($x), </span><span>":e}"</span><span>)
+</span><span>    };
+</span><span>    ($x: literal) </span><span>=&gt; </span><span>{
+</span><span>        stringify!($x)
+</span><span>    };
+</span><span>    ([ $first: tt </span><span>$</span><span>(+ $rest: tt)</span><span>*</span><span> ]) </span><span>=&gt; </span><span>{
+</span><span>        concat!(</span><span>"["</span><span>, asm_operand!($first) </span><span>$</span><span>(, </span><span>"+"</span><span>, asm_operand!($rest))</span><span>* </span><span>,</span><span>"]"</span><span>)
+</span><span>    };
+</span><span>}
+</span><span>
+</span><span>// stringify a block of instructions
+</span><span>#[cfg_attr(rustfmt, rustfmt_skip)]
+</span><span>macro_rules! </span><span>asm_block {
+</span><span>    </span><span>// Instructions separated by semicolon
+</span><span>    </span><span>// Each instruction is an operator followed by one or more operands
+</span><span>    </span><span>// NOTE: does not handle 0 argument operator, labels, etc.
+</span><span>    (</span><span>$</span><span>($op: ident $a0: tt $(, $args: tt)</span><span>*</span><span>);+ $(;)?) =&gt; {
+</span><span>        concat!(
+</span><span>            </span><span>$</span><span>(
+</span><span>                stringify!($op), " ",
+</span><span>                asm_operand!($a0) $(, ", ", asm_operand!($args))*,
+</span><span>                "\n"
+</span><span>            ),+
+</span><span>        )
+</span><span>    };
+</span><span>}
+</span></code></pre><p>Now we can rewrite our <code>op_f</code> to:</p><pre data-lang="rust"><code data-lang="rust"><span>#[cfg_attr(rustfmt, rustfmt_skip)]
+</span><span>macro_rules! </span><span>op_f {
+</span><span>    ($a: ident, $b: ident, $c: ident, $d: ident, $t: tt, $s: literal, $k: literal) </span><span>=&gt; </span><span>{
+</span><span>        asm_block!(
+</span><span>            mov tmp0, $c;
+</span><span>            add $a, $t;
+</span><span>            xor tmp0, $d;
+</span><span>            and tmp0, $b;
+</span><span>            xor tmp0, $d;
+</span><span>            lea $a, [$a </span><span>+</span><span> tmp0 </span><span>+ </span><span>$k];
+</span><span>            rol $a, $s;
+</span><span>            add $a, $b;
+</span><span>        )
+</span><span>    };
+</span><span>}
+</span></code></pre><p>This looks much more readable, and closer to actual assembly. Note that we change <code>$t: ident</code> to <code>$t: tt</code>, for later use in x86 version. As a matter of fact, we have a tiny "type system" here to enforce the input type of the macro:</p><ul><li><code>ident</code> means a register,</li><li><code>literal</code> means an immediate,</li><li><code>tt</code> means anything: a register, an immediate, or a memory address <code>[reg1 + reg2 + imm]</code>.</li></ul><p>We can easily invoke <code>op_f</code> by:</p><pre data-lang="rust"><code data-lang="rust"><span>asm!(
+</span><span>    op_f!(a, b, c, d, x0, </span><span>7</span><span>,  </span><span>0xd76aa478</span><span>),
+</span><span>    op_f!(d, a, b, c, x1, </span><span>12</span><span>, </span><span>0xe8c7b756</span><span>),
+</span><span>    op_f!(c, d, b, a, x2, </span><span>17</span><span>, </span><span>0x242070db</span><span>),
+</span><span>    op_f!(b, c, d, a, x3, </span><span>22</span><span>, </span><span>0xc1bdceee</span><span>),
+</span><span>    </span><span>/* ... omitted the rest of MD5 algorithm ... */
+</span><span>
+</span><span>    </span><span>// state integers
+</span><span>    a </span><span>= </span><span>inout</span><span>(reg) state[</span><span>0</span><span>],
+</span><span>    b </span><span>= </span><span>inout</span><span>(reg) state[</span><span>1</span><span>],
+</span><span>    c </span><span>= </span><span>inout</span><span>(reg) state[</span><span>2</span><span>],
+</span><span>    d </span><span>= </span><span>inout</span><span>(reg) state[</span><span>3</span><span>],
+</span><span>    </span><span>// input integers
+</span><span>    x0 </span><span>= in</span><span>(reg) data[</span><span>0</span><span>],
+</span><span>    x1 </span><span>= in</span><span>(reg) data[</span><span>1</span><span>],
+</span><span>    </span><span>/* x2-x7 omitted */
+</span><span>    </span><span>// clobbered temporaries
+</span><span>    tmp0 </span><span>= </span><span>out</span><span>(reg) </span><span>_</span><span>,
+</span><span>    tmp1 </span><span>= </span><span>out</span><span>(reg) </span><span>_</span><span>,
+</span><span>);
+</span></code></pre><p>And it becomes straightforward to implement MD5 and apply our little optimizations.</p><h3 id="implement-md5-for-x86">Implement MD5 for x86</h3><p>In an ideal world, I could use the exact same assembly as in x86-64 and call it a day. Unfortunately, we need 14 general registers for our <code>asm!()</code> call. However, on x86, we only have 7 general registers. One idea is to keep input on stack and use a register to store the address of it. This reduces the number of registers needed to 7. However, <a rel="noopener nofollow noreferrer" href="https://github.com/rust-lang/rust/issues/106781" target="_blank">the code is not guaranteed to compile</a>. We need to manually specify each register to use, save and restore those registers to utilize them.</p><pre data-lang="rust"><code data-lang="rust"><span>asm!(
+</span><span>    </span><span>// Save esi and ebp
+</span><span>    </span><span>"sub esp, 8"</span><span>,
+</span><span>    </span><span>"mov [esp], esi"</span><span>,
+</span><span>    </span><span>"mov [esp + 4], ebp"</span><span>,
+</span><span>
+</span><span>    </span><span>// Move address of data to ebp
+</span><span>    </span><span>"mov ebp, edi"</span><span>,
+</span><span>
+</span><span>    </span><span>// op_f needs to be changed to use esi and edi as temp register
+</span><span>    op_f!(eax, ebx, ecx, edx, [ebp], </span><span>7</span><span>,  </span><span>0xd76aa478</span><span>),
+</span><span>    op_f!(edx, eax, ebx, ecx, [ebp </span><span>+ </span><span>4</span><span>], </span><span>12</span><span>, </span><span>0xe8c7b756</span><span>),
+</span><span>    op_f!(ecx, edx, ebx, eax, [ebp </span><span>+ </span><span>8</span><span>], </span><span>17</span><span>, </span><span>0x242070db</span><span>),
+</span><span>    op_f!(ebx, ecx, edx, eax, [ebp </span><span>+ </span><span>12</span><span>], </span><span>22</span><span>, </span><span>0xc1bdceee</span><span>),
+</span><span>    </span><span>/* ... omitted the rest of MD5 algorithm ... */
+</span><span>
+</span><span>    </span><span>// Restore esi and ebp
+</span><span>    </span><span>"mov esi, [esp]"</span><span>,
+</span><span>    </span><span>"mov ebp, [esp + 4]"</span><span>,
+</span><span>    </span><span>"add esp, 8"</span><span>,
+</span><span>
+</span><span>    </span><span>// state integers
+</span><span>    </span><span>inout</span><span>(</span><span>"eax"</span><span>) state[</span><span>0</span><span>],
+</span><span>    </span><span>inout</span><span>(</span><span>"ebx"</span><span>) state[</span><span>1</span><span>],
+</span><span>    </span><span>inout</span><span>(</span><span>"ecx"</span><span>) state[</span><span>2</span><span>],
+</span><span>    </span><span>inout</span><span>(</span><span>"edx"</span><span>) state[</span><span>3</span><span>],
+</span><span>    </span><span>// input integers
+</span><span>    </span><span>in</span><span>(</span><span>"edi"</span><span>) data.</span><span>as_ptr</span><span>(),
+</span><span>    </span><span>// clobbered temporaries
+</span><span>    </span><span>lateout</span><span>(</span><span>"edi"</span><span>) </span><span>_</span><span>,
+</span><span>);
+</span></code></pre><h2 id="simd-2">SIMD</h2><p>There is no way to apply SIMD to generate one MD5 hash. But we can fit 8 32-bit integers into a <code>__m256i</code>, so it is natural to compute 8 MD5 hashes simultaneously using SIMD.</p><p>The biggest roadblock is the lack of <code>rol</code> in SIMD intrinsics. But no big deal, <code>rol</code> is just 2 bit shiftings followed by an or. One might try this:</p><pre data-lang="rust"><code data-lang="rust"><span>unsafe </span><span>fn </span><span>rotate_left</span><span>(</span><span>x</span><span>: __m256i, </span><span>by</span><span>: </span><span>i32</span><span>) -&gt; __m256i {
+</span><span>    </span><span>let</span><span> hi </span><span>= </span><span>_mm256_slli_epi32</span><span>(x, by);
+</span><span>    </span><span>let</span><span> lo </span><span>= </span><span>_mm256_srli_epi32</span><span>(x, </span><span>32 </span><span>-</span><span> by);
+</span><span>    </span><span>_mm256_or_si256</span><span>(hi, lo)
+</span><span>}
+</span></code></pre><p>Well this does not work, if we look closer at the signature of <a rel="noopener nofollow noreferrer" href="https://doc.rust-lang.org/stable/core/arch/x86_64/fn._mm256_slli_epi32.html" target="_blank"><code>_mm256_slli_epi32</code></a> we shall see</p><pre data-lang="rust"><code data-lang="rust"><span>pub unsafe </span><span>fn </span><span>_mm256_slli_epi32</span><span>(</span><span>a</span><span>: __m256i, </span><span>const </span><span>IMM8</span><span>: </span><span>i32</span><span>) -&gt; __m256i;
+</span><span>                                            </span><span>^^^^^
+</span></code></pre><p><code>IMM8</code> must be a constant, although the documentation is using the legacy const generics syntax, which makes it really hard to spot. One might go ahead and write:</p><pre data-lang="rust"><code data-lang="rust"><span>unsafe </span><span>fn </span><span>rotate_left</span><span>&lt;</span><span>const</span><span> BY: </span><span>i32</span><span>&gt;(</span><span>x</span><span>: __m256i) -&gt; __m256i {
+</span><span>    </span><span>let</span><span> hi </span><span>= </span><span>_mm256_slli_epi32</span><span>(x, </span><span>BY</span><span>);
+</span><span>    </span><span>let</span><span> lo </span><span>= </span><span>_mm256_srli_epi32</span><span>(x, </span><span>32 </span><span>- </span><span>BY</span><span>);
+</span><span>    </span><span>_mm256_or_si256</span><span>(hi, lo)
+</span><span>}
+</span></code></pre><p>Not really working, because we only have <code>min_const_generics</code>, which means <code>32 - BY</code> is not considered a constant that can be used for the purpose of const generics. I had to settle with this:</p><pre data-lang="rust"><code data-lang="rust"><span>unsafe </span><span>fn </span><span>rotate_left</span><span>&lt;</span><span>const</span><span> L: </span><span>i32</span><span>, </span><span>const</span><span> R: </span><span>i32</span><span>&gt;(</span><span>x</span><span>: __m256i) -&gt; __m256i {
+</span><span>    debug_assert_eq!(L </span><span>+</span><span> R, </span><span>32</span><span>);
+</span><span>    </span><span>let</span><span> hi </span><span>= </span><span>_mm256_slli_epi32</span><span>(x, L);
+</span><span>    </span><span>let</span><span> lo </span><span>= </span><span>_mm256_srli_epi32</span><span>(x, R);
+</span><span>    </span><span>_mm256_or_si256</span><span>(hi, lo)
+</span><span>}
+</span></code></pre><p>Not the best solution, but it works. Implementation for the MD5 rounds is easy:</p><pre data-lang="rust"><code data-lang="rust"><span>unsafe </span><span>fn </span><span>op_f</span><span>&lt;</span><span>const</span><span> L: </span><span>i32</span><span>, </span><span>const</span><span> R: </span><span>i32</span><span>&gt;(
+</span><span>    </span><span>mut </span><span>a</span><span>: __m256i,
+</span><span>    </span><span>b</span><span>: __m256i,
+</span><span>    </span><span>c</span><span>: __m256i,
+</span><span>    </span><span>d</span><span>: __m256i,
+</span><span>    </span><span>t</span><span>: __m256i,
+</span><span>    </span><span>k</span><span>: </span><span>u32</span><span>,
+</span><span>) -&gt; __m256i {
+</span><span>    </span><span>let</span><span> k </span><span>= </span><span>_mm256_set1_epi32</span><span>(k </span><span>as </span><span>i32</span><span>);
+</span><span>    </span><span>let </span><span>mut</span><span> tmp </span><span>= </span><span>_mm256_xor_si256</span><span>(c, d);
+</span><span>    a </span><span>= </span><span>_mm256_add_epi32</span><span>(a, t);
+</span><span>    tmp </span><span>= </span><span>_mm256_and_si256</span><span>(tmp, b);
+</span><span>    tmp </span><span>= </span><span>_mm256_xor_si256</span><span>(tmp, d);
+</span><span>    a </span><span>= </span><span>_mm256_add_epi32</span><span>(a, k);
+</span><span>    a </span><span>= </span><span>_mm256_add_epi32</span><span>(a, tmp);
+</span><span>    a </span><span>= </span><span>rotate_left::&lt;L, R&gt;(a);
+</span><span>    </span><span>_mm256_add_epi32</span><span>(a, b)
+</span><span>}
+</span></code></pre><p>And the invocations look like:</p><pre data-lang="rust"><code data-lang="rust"><span>a </span><span>= </span><span>op_f::&lt;7, 25&gt;(a, b, c, d, x0, </span><span>0xd76aa478</span><span>);
+</span><span>d </span><span>= </span><span>op_f::&lt;12, 20&gt;(d, a, b, c, x1, </span><span>0xe8c7b756</span><span>);
+</span><span>c </span><span>= </span><span>op_f::&lt;17, 15&gt;(c, d, a, b, x2, </span><span>0x242070db</span><span>);
+</span><span>b </span><span>= </span><span>op_f::&lt;22, 10&gt;(b, c, d, a, x3, </span><span>0xc1bdceee</span><span>);
+</span></code></pre><h2 id="performance-comparison-2">Performance Comparison</h2><table><thead><tr><th>Method</th><th>Block Size</th><th>Throughput</th></tr></thead><tbody><tr><td>Baseline</td><td>32</td><td>8.5480 Melem/s</td></tr><tr><td>Assembly</td><td>8</td><td>10.229 Melem/s</td></tr><tr><td>SIMD</td><td>8</td><td><strong>59.416 Melem/s</strong></td></tr></tbody></table><p>The assembly version does not have much of a performance gain over baseline, which is in line with the observation by Project Nayuki. The SIMD version gives us quite some performance boost.</p><p>I quickly put everything together:</p><ul><li>$n$ (default to be the value of <a rel="noopener nofollow noreferrer" href="https://doc.rust-lang.org/stable/std/thread/fn.available_parallelism.html" target="_blank"><code>available_parallelism()</code></a>) threads to generate random strings, compute their MD5s, and compute metrics. Each thread maintains the thread-local best for each metric and passes that to the main thread every 1024 (a hand-wavy constant I chose) strings generated.</li><li>One thread to update the terminal UI.</li><li>Main thread maintains the global best and notifies the UI thread for updates.</li></ul><p>For the terminal UI, I wanted a live update UI like <code>vnstat -l</code> or <code>wget</code>. Unfortunately, <code>tui</code> only supports full-screen app. My workaround was to use <a rel="noopener nofollow noreferrer" href="https://crates.io/crates/indicatif" target="_blank"><code>indicatif</code></a>, and customize the appearance of the progress bars to make it look like a live update.</p><p>On my developing machine (AMD Ryzen 5900X), when running 24 workers, I can get about 0.5B strings generated and tested per second.</p><p><img alt="Screenshot" src="https://blog.youmu.moe/images/posts/finding-nice-md5s-using-rust/bin-screenshot.png"></p><p>Overall, this is quite a nice little pet project to get me familiar with SIMD and inline assembly in Rust, arguably one of the <code>unsafe</code>st part of Rust. The result performance is within my expectation. I do have some thoughts on what can be improved to smooth out the developing experience:</p><ul><li><p>Supporting SIMD on both <code>x86</code> and <code>x86-64</code> is a pain. Every import turns into two, and rust-analyzer won't automatically add a new import into the other one. It could easily become</p> <pre data-lang="rust"><code data-lang="rust"><span>#[cfg(target_arch </span><span>= </span><span>"x86"</span><span>)]
+</span><span>use </span><span>std::arch::x86::{
+</span><span>    __m256i, _mm256_add_epi32, _mm256_and_si256, _mm256_loadu_si256, _mm256_or_si256,
+</span><span>    _mm256_set1_epi32, _mm256_set1_epi8, _mm256_slli_epi32, _mm256_srli_epi32,
+</span><span>    _mm256_storeu_si256, _mm256_xor_si256,
+</span><span>};
+</span><span>#[cfg(target_arch </span><span>= </span><span>"x86_64"</span><span>)]
+</span><span>use </span><span>std::arch::x86_64::{
+</span><span>    __m256i, _mm256_add_epi32, _mm256_and_si256, _mm256_loadu_si256, _mm256_or_si256,
+</span><span>    _mm256_set1_epi32, _mm256_set1_epi8, _mm256_slli_epi32, _mm256_srli_epi32,
+</span><span>    _mm256_storeu_si256, _mm256_xor_si256,
+</span><span>};
+</span></code></pre> <p>Not a fan. I had to make this macro</p> <pre data-lang="rust"><code data-lang="rust"><span>macro_rules! </span><span>use_intrinsic {
+</span><span>    (</span><span>$</span><span>($item: tt), </span><span>+ $</span><span>(,)?) </span><span>=&gt; </span><span>{
+</span><span>        #[cfg(target_arch </span><span>= </span><span>"x86"</span><span>)]
+</span><span>        </span><span>use </span><span>std::arch::x86::{</span><span>$</span><span>($item), </span><span>+</span><span>};
+</span><span>        #[cfg(target_arch </span><span>= </span><span>"x86_64"</span><span>)]
+</span><span>        </span><span>use </span><span>std::arch::x86_64::{</span><span>$</span><span>($item), </span><span>+</span><span>};
+</span><span>    };
+</span><span>}
+</span></code></pre> <p>and I can write</p> <pre data-lang="rust"><code data-lang="rust"><span>use_intrinsic! {
+</span><span>    __m256i, _mm256_add_epi32, _mm256_and_si256, _mm256_loadu_si256, _mm256_or_si256,
+</span><span>    _mm256_set1_epi32, _mm256_set1_epi8, _mm256_slli_epi32, _mm256_srli_epi32,
+</span><span>    _mm256_storeu_si256, _mm256_xor_si256,
+</span><span>}
+</span></code></pre> <p>Though I now completely lose the ability to automatically add imports through rust-analyzer. One may suggest</p> <pre data-lang="rust"><code data-lang="rust"><span>#[cfg(target_arch </span><span>= </span><span>"x86"</span><span>)]
+</span><span>use </span><span>std::arch::x86::</span><span>*</span><span>;
+</span><span>#[cfg(target_arch </span><span>= </span><span>"x86_64"</span><span>)]
+</span><span>use </span><span>std::arch::x86_64::</span><span>*</span><span>;
+</span></code></pre> <p>But this makes my editor very laggy.</p> <p>No perfect solution either way, and I wonder whether some improvements can be made here.</p></li><li><p>Trying to keep DRY when using inline assembly is hard. I do think with more careful design, my little <code>asm_operand</code>, <code>asm_block</code> macros may be able to grow into a more robust library to provide better user experience when writing inline assembly. I do hope more experienced community member can chime in and explore the idea with me.</p></li><li><p>I do think it is a bug that a piece of code only compiles with <code>#[inline(never)]</code>, so I hope <a rel="noopener nofollow noreferrer" href="https://github.com/rust-lang/rust/issues/106781" target="_blank">this issue</a> gets addressed. Most importantly <code>#[inline(never)]</code> is only a hint, so it shouldn't affect whether the compilation succeeds or not.</p></li><li><p>I like the fine control of the <a rel="noopener nofollow noreferrer" href="https://doc.rust-lang.org/nightly/reference/attributes/codegen.html#the-target_feature-attribute" target="_blank"><code>target_feature</code> attribute</a>. This allows me to compile the code without <code>-C target-cpu=native</code>, but still get SIMD after runtime detection if my CPU supports it. But this forces the function to be <code>unsafe</code>, for good reason. But if I want to have a trait for both non-SIMD implementation and SIMD implementation, I will run into a dilemma:</p> <ul><li>I can make two traits, one for safe Rust (non-SIMD), and one for unsafe Rust (SIMD). But DRY be damned.</li><li>I can make a safe function, assuming runtime checks has been done, calls the unsafe SIMD function. But I technically create a safe function that is unsound, lose the protection from compiler, and rely on downstream developers to read the documentation.</li><li>I can still make a safe function, but adding <code>assert!()</code> to asserts the existence of the features required. But if I am so desperate that I use SIMD, that will be an expensive one in a hot loop.</li></ul> <p>At the end of the day, I made some compromises. I added <code>debug_assert!()</code> for feature detections in my function to hope bugs could be caught while running tests, benchmarks and so on.</p> <p>I thought of a system which uses type system to guard detection of feature. Here is a sketch</p> <pre data-lang="rust"><code data-lang="rust"><span>trait </span><span>Feature {
+</span><span>    </span><span>fn </span><span>detect</span><span>() -&gt; </span><span>bool</span><span>;
+</span><span>}
+</span><span>
+</span><span>// Bunch of feature types
+</span><span>struct </span><span>SSE2;
+</span><span>impl </span><span>Feature </span><span>for </span><span>SSE2 {
+</span><span>    </span><span>fn </span><span>detect</span><span>() -&gt; </span><span>bool </span><span>{
+</span><span>        is_x86_feature_detected!(</span><span>"sse2"</span><span>)
+</span><span>    }
+</span><span>}
+</span><span>
+</span><span>struct </span><span>AVX2;
+</span><span>impl </span><span>Feature </span><span>for </span><span>AVX2 {
+</span><span>    </span><span>fn </span><span>detect</span><span>() -&gt; </span><span>bool </span><span>{
+</span><span>        is_x86_feature_detected!(</span><span>"avx2"</span><span>)
+</span><span>    }
+</span><span>}
+</span><span>
+</span><span>impl</span><span>&lt;F0&gt; Feature </span><span>for</span><span> (F0)
+</span><span>where
+</span><span>    F0: Feature,
+</span><span>{
+</span><span>    </span><span>fn </span><span>detect</span><span>() -&gt; </span><span>bool </span><span>{
+</span><span>        </span><span>F0</span><span>::detect()
+</span><span>    }
+</span><span>}
+</span><span>
+</span><span>impl</span><span>&lt;F0, F1&gt; Feature </span><span>for</span><span> (F0, F1)
+</span><span>where
+</span><span>    F0: Feature,
+</span><span>    F1: Feature,
+</span><span>{
+</span><span>    </span><span>fn </span><span>detect</span><span>() -&gt; </span><span>bool </span><span>{
+</span><span>        </span><span>F0</span><span>::detect() </span><span>&amp;&amp; </span><span>F1</span><span>::detect()
+</span><span>    }
+</span><span>}
+</span><span>/* omitted more impl for longer tuple */
+</span><span>
+</span><span>/* omitted some macro magic to make a larger tuple into-able to its subset */
+</span><span>
+</span><span>#[derive(Clone, Copy)]
+</span><span>struct </span><span>FeatureToken&lt;T&gt;(PhantomData&lt;T&gt;);
+</span><span>
+</span><span>impl</span><span>&lt;T: Feature&gt; FeatureToken&lt;T&gt; {
+</span><span>    </span><span>fn </span><span>new</span><span>() -&gt; </span><span>Option</span><span>&lt;</span><span>Self</span><span>&gt; {
+</span><span>        </span><span>if </span><span>T::detect() {
+</span><span>            </span><span>Some</span><span>(</span><span>Self</span><span>(PhantomData))
+</span><span>        } </span><span>else </span><span>{
+</span><span>            </span><span>None
+</span><span>        }
+</span><span>    }
+</span><span>}
+</span><span>
+</span><span>// we can have functions like this
+</span><span>fn </span><span>this_fn_needs_sse2_and_avx2</span><span>(</span><span>a</span><span>: </span><span>u32</span><span>, </span><span>b</span><span>: </span><span>u32</span><span>, </span><span>_</span><span>: FeatureToken&lt;(SSE2, AVX2)&gt;);
+</span></code></pre> <p>The only way <code>FeatureToken&lt;(SSE2, AVX2)&gt;</code> can be created is by testing features, so the type system should ensure that such function is only called when we actually does the runtime feature detection, and tested feature exists.</p></li><li><p>I think the legacy const generics syntax in documentation is easy to miss</p> <pre data-lang="rust"><code data-lang="rust"><span>pub unsafe </span><span>fn </span><span>_mm256_slli_epi32</span><span>(</span><span>a</span><span>: __m256i, </span><span>const </span><span>IMM8</span><span>: </span><span>i32</span><span>) -&gt; __m256i;
+</span><span>                                            </span><span>^^^^^
+</span></code></pre> <p>We almost never encounter this syntax anywhere else in Rust, and it is easy to skim over it. I think <code>rustdoc</code> should make this easier to spot.</p></li></ul><p>One more thing: the friend who sent me the link did a crude CUDA implementation in C++ (to solve a simplified version) after seeing me having fun with this. His preliminary result showed about 40B/s on a 3070. I might revisit this one day to try out <a rel="noopener nofollow noreferrer" href="https://github.com/Rust-GPU/Rust-CUDA" target="_blank"><code>Rust-CUDA</code></a>, but that's the story for another day!</p></div></div>]]>
+            </description>
+            <link>https://blog.youmu.moe/posts/finding-nice-md5s-using-rust/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-34385212</guid>
+            <pubDate>Sat, 14 Jan 2023 23:37:03 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[I don't understand terminals, shells and SSH]]>
             </title>
             <description>
 <![CDATA[
-Score 51 | Comments 17 (<a href="https://news.ycombinator.com/item?id=34382976">thread link</a>) | @janvdberg
+Score 93 | Comments 56 (<a href="https://news.ycombinator.com/item?id=34382976">thread link</a>) | @janvdberg
 <br/>
 January 14, 2023 | https://j11g.com/2023/01/14/i-dont-understand-terminals-shells-and-ssh/ | <a href="https://web.archive.org/web/*/https://j11g.com/2023/01/14/i-dont-understand-terminals-shells-and-ssh/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -102,14 +569,29 @@ January 14, 2023 | https://j11g.com/2023/01/14/i-dont-understand-terminals-shell
         </item>
         <item>
             <title>
-<![CDATA[How to Draw Ideas]]>
+<![CDATA[Homelab analog telephone exchange]]>
             </title>
             <description>
 <![CDATA[
-Score 23 | Comments 1 (<a href="https://news.ycombinator.com/item?id=34382655">thread link</a>) | @Sujan
+Score 70 | Comments 15 (<a href="https://news.ycombinator.com/item?id=34382751">thread link</a>) | @zdw
+<br/>
+January 14, 2023 | https://skagmo.com/page.php?p=projects/42_pbx | <a href="https://web.archive.org/web/*/https://skagmo.com/page.php?p=projects/42_pbx">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
+            </description>
+            <link>https://skagmo.com/page.php?p=projects/42_pbx</link>
+            <guid isPermaLink="false">hacker-news-small-sites-34382751</guid>
+            <pubDate>Sat, 14 Jan 2023 18:42:52 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[How to draw ideas]]>
+            </title>
+            <description>
+<![CDATA[
+Score 154 | Comments 20 (<a href="https://news.ycombinator.com/item?id=34382655">thread link</a>) | @Sujan
 <br/>
 January 14, 2023 | https://ralphammer.com/how-to-draw-ideas/ | <a href="https://web.archive.org/web/*/https://ralphammer.com/how-to-draw-ideas/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><p><span><span></span><time datetime="2022-12-01T05:33:44+00:00">1. December 2022</time></span><span>9189 Views</span>			</p><div>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><p><span><span></span><time datetime="2022-12-01T05:33:44+00:00">1. December 2022</time></span><span>16063 Views</span>			</p><div>
 				
 <p>Great ideas are hard to find. Drawing makes it a lot easier. And fun. How?</p>
 
@@ -346,7 +828,7 @@ January 14, 2023 | https://ralphammer.com/how-to-draw-ideas/ | <a href="https://
             </title>
             <description>
 <![CDATA[
-Score 74 | Comments 11 (<a href="https://news.ycombinator.com/item?id=34381598">thread link</a>) | @karmanyaahm
+Score 107 | Comments 19 (<a href="https://news.ycombinator.com/item?id=34381598">thread link</a>) | @karmanyaahm
 <br/>
 January 14, 2023 | https://unifiedpush.org/users/distributors/conversations/ | <a href="https://web.archive.org/web/*/https://unifiedpush.org/users/distributors/conversations/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -423,7 +905,7 @@ There are multiple options for rewrite proxies.</p>
             </title>
             <description>
 <![CDATA[
-Score 272 | Comments 237 (<a href="https://news.ycombinator.com/item?id=34378460">thread link</a>) | @ingve
+Score 420 | Comments 322 (<a href="https://news.ycombinator.com/item?id=34378460">thread link</a>) | @ingve
 <br/>
 January 14, 2023 | https://www.jntrnr.com/youtube-addiction/ | <a href="https://web.archive.org/web/*/https://www.jntrnr.com/youtube-addiction/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -476,7 +958,7 @@ January 14, 2023 | https://www.jntrnr.com/youtube-addiction/ | <a href="https://
             </title>
             <description>
 <![CDATA[
-Score 126 | Comments 87 (<a href="https://news.ycombinator.com/item?id=34377461">thread link</a>) | @snowypine
+Score 135 | Comments 92 (<a href="https://news.ycombinator.com/item?id=34377461">thread link</a>) | @snowypine
 <br/>
 January 13, 2023 | https://snowingpine.com/2023/01/05/on-trucking | <a href="https://web.archive.org/web/*/https://snowingpine.com/2023/01/05/on-trucking">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section><h2>On Trucking</h2><p>6182 words, 37159 characters</p><h3 id="introduction"><strong>Introduction</strong></h3><p>Last year, I cofounded a trucking startup, went through YC W22, visited truck stops, raised a seed round, and left the startup. Speed running startups, any %.</p><p>Recently, I’ve been reflecting on my time in trucking with a couple of other founders in the trucking space. It’s, well, interesting.</p><p>Building in trucking is incredibly rewarding because you have a real impact on real people (trucking is the number one employer in 35 states).</p><p>Building in trucking is also incredibly frustrating. Drivers, owners, brokers, dispatchers, shippers, providers, and others working in the industry all have different opinions on the space. With so much fragmentation, it becomes difficult to truly understand what the customer wants.</p><p>So, below are my thoughts on trucking for future trucking founders.</p><h3 id="why-is-trucking-so-dominant"><strong>Why is trucking so dominant?</strong></h3><p>Trucking: the process or business of transporting goods on trucks.</p><p>Trucking accounts for 80.4% of US freight costs and is 4x larger than rail, air, and ocean freight combined. [0] One of my favorite statistics: 95% of fruits and vegetables in the US are transported by truck. [1]</p><p>Compared to other forms of freight, trucking is neither the cheapest nor the quickest. But it carries two distinct advantages - infrastructure and flexibility.</p><p>Between <a href="https://www.whitehouse.gov/bipartisan-infrastructure-law/">Biden’s $1 trillion infrastructure bill</a>, <a href="https://apnews.com/article/f1b2c8dee7ea45b2a91b2d306b180429">Obama’s $305 billion infrastructure spending bill</a>, and <a href="https://www.nbcnews.com/id/wbna8894520">Bush’s $286.4 billion highway bill</a>, investing in transportation infrastructure has strong bipartisan support - it’s a platform nearly all Americans agree on.</p><p>A significant portion of infrastructure investment goes towards highways and roads. In 2019 alone, $203 billion was spent on highways and roads. [2] Of that sum, 42% went towards operational costs, such as maintenance, repair, and removal of snow and ice. Trucks are a large part of why that percentage is so high. An average truck deals 3,660x more damage to the road surface than a Toyota Camry. [3]</p><p>Trucking companies are faced with no such dilemma. Because the government subsidizes all infrastructure costs, trucks can reach almost every warehouse in the US, even if the warehouse is in the middle of Montana.</p><p>The other advantage of trucking is flexibility.</p><p>First - flexibility in weight. Most companies don’t need to ship 220,000 lbs of freight (one rail car) at any given moment. Rather, the freight is usually dispersed between shipments of 10,000 lbs to 45,000 lbs. At those weights, it’s too costly for air freight but perfect for a truck.</p><p>Second - flexibility in dispatch speed. A shipper (someone who needs their freight moved) can get their load picked up and onto a truck with just one day’s notice. That truck can then cover 600 miles per day. All other forms of freight are either far slower (rail, ocean) or far more expensive (air).</p><p>With all these positives, it’s little wonder that trucking has become the backbone of the US economy.</p><h3 id="all-about-trucking">All about trucking</h3><p>While it’s great to understand why trucking is so dominant, it’s not helpful to founders when they’re building a product or pitching to investors. Let’s shift gears to something a bit more concrete: market size.</p><p>Surprisingly, there’s no consensus on just how big the trucking market is.</p><p>What is certain: it’s massive.</p><p>Some places quote $732 billion while others peg trucking at $1.2 trillion or more. Just a cool range of $500 billion. Given that trucking covers so much - freight brokers, fuel stations, private fleets, and owner operators - it makes sense that it’s been difficult to reach consensus on market size.</p><p>But we need a number. So let’s approach the market size by looking at the number of truck tractors operating in the US.</p><p>In 2022, that figure is roughly 3.071 million truck tractors on the road. [5] From there, we can estimate the average yearly net transactions per truck at roughly $340k per year. [6] Multiply the two numbers together, and we get $1.04 trillion!</p><p>That’s a lot of money (see footnotes for calculations and disclaimers). It’s natural that every year, founders like me decide to try building a business in trucking.</p><p>While a round number is nice, it hides how complex the industry is in reality.</p><p>Trucking is a potpourri of different services and needs. There’s drayage: the process of moving containers from docks to warehouses. There’s reefer (refrigerated truck): the truck trailer is temperature controlled. There’s hazmat: transport of hazardous materials. Flatbed, dry van, tankers, partials, hotshots, box trucks, and more.</p><p>For our purposes, we’ll be looking specifically at class 8 vehicles with a gross vehicle weight rating of above 33,000 lbs. This disqualifies hotshots, box trucks, and cargo vans. [7]</p><p>For some background, let’s explore the industry based on the perspective of a driver.</p><ol><li>Carriers - trucking companies that employ drivers</li><li>Brokers - how drivers and carriers make money</li><li>Expenses - what drivers spend money on</li></ol><h3 id="carriers">Carriers</h3><p>Let’s start with some stats.</p><p>Right now (18-DEC-2022), there are 1,946,308 registered motor carriers in the US. Of these, 1,868,399 have fewer than 10 trucks. In other words, 96% of carriers in the US operate fewer than 10 trucks. [4] Another 4% operate 11-100 trucks. Only 5,538 companies have a fleet size greater than 100 trucks, 0.2%.</p><p>However, of the ~2 million registered carriers, only 10% or ~200,000 carriers are legally active. When a carrier decides to pause or quit trucking, they’ll submit a form to revoke their motor carrier authority. But rather than deleting the registration, FMCSA will simply mark the authority as inactive and carriers can reinstate their authority at a later date.</p><p>More importantly, if we look at the carrier market in terms of trucks rather than companies, roughly 85% of trucks on the road come from fleets and mega-fleets (more information below).</p><p>Broadly speaking, we can break down carriers into three categories: owner operators, fleets, and mega-fleets.</p><p>Owner operators are carriers with one to five trucks. As the name suggests, the owner of these trucking companies is typically also an operator/driver. Most owner operators work in the spot market. In other words, these carriers negotiate and book 95% of their loads piecemeal with behemoth brokers like CH Robinson and TQL.</p><p>90% of owner operators fail in their first year - trucking is incredibly cutthroat.</p><p>Booking a load in the spot market requires looking at several factors such as RPM (rate per mile), net rate, pickup location, backhaul, deadhead, detention, weight, broker, cashflow, tools, fuel cost, driving hours, and distance. In fact, I got my start in trucking by acting as a dispatcher (someone who finds and books loads on behalf of a truck driver).</p><p>It was some of the most difficult work I’ve ever done.</p><p>Growing from 5 trucks to 25 trucks is a huge transition for the carrier. We’ll call carriers with 5-25 truck as fleets. The biggest change for fleets is the introduction of dedicated lanes, long-term contracts with brokers/shippers to establish dedicated routes between two consistent destinations.</p><p>Contracts usually start with local lanes (less than 200 miles). As the carrier establishes their reputation, they can look for more lucrative, long-haul lanes. At the 25 truck mark, most carriers have dedicated 60-90% of their capacity running dedicated contract freight.</p><p>But besides dedicated lanes, operationally, a 25-truck carrier looks entirely different than one with 5 trucks. For starters, the role of the owner is entirely different. At 5 trucks, the owner is probably doing a bit of driving and dispatching. At 25 trucks, the owner’s role is almost entirely on sales with shippers and recruiting new drivers.</p><p>For the company, 5 trucks might mean one or two dispatchers. At 25 trucks, you now have a team of 5-6 dispatchers with a small accounting / hr arm. On average, I saw roughly 3-4 back-office members for every 10 drivers. And on the technology side, pen and paper no longer cut it. Instead, carriers invest in a dedicated TMS (Transportation Management System), ELD (Electronic Logging Device) integrations, payroll and compliance solutions, and more.</p><p>Moving up the food chain, we find ourselves in the 25+ range - mega-fleet territory (I know someone in trucking is yelling at me that mega-fleets means 100 or 200+ trucks, but 25 and 100 truck carriers have similar fundamental operations). This is where trucking gets fun.</p><p>As an asset-based carrier, finances become fairly simple. Buy truck for $X, pay driver for $Y, and profit $Z every month. This stability allows carriers to scale up operations at a sustainable clip. Other scale benefits include cheaper insurance, deals on equipment, partnerships with CDL schools, and large discounts on fuel.</p><p>Mega-carrier aren’t problem-free. But as long as ownership isn’t literally asleep at the wheel, the momentum of reaching 25+ trucks is often enough to keep propelling the carrier forward.</p><h2 id="brokers">Brokers</h2><p>Talk to any truck driver - one of the first things they’ll complain about is freight brokers.</p><p>As the middlemen between shippers (companies like Walmart that need their product moved) and the carriers (companies that haul that product), brokers play a zero-sum game. Because most brokers quote shippers a fixed price, every dollar that the carrier earns is a dollar less for the broker.</p><p>It’s possible to write whole books on the inner workings of freight brokers. Some, like TQL, exist as a high-pressure sales environment where they eke out a margin through sheer force of will. It also helps that they have tremendous pricing power over drivers and carriers. Others, like CH Robinson, take on high-value contracts that have generous amounts of margin.</p><p>It’s easiest to understand the role brokers serve by walking through the lifecycle of a single load.</p><p>It all starts with the shipper. Shippers almost never need just a single load hauled.</p><p>Rather, they have a consistent schedule of freight to transport from one location to another, e.g. shipping Pork Rinds from Chicago, IL to Houston, TX weekly for 6 months.</p><p>The shipper will call up freight brokers and ask them to submit bids for how much they’ll charge for this contract.</p><p>The freight brokers will then solicit carriers in the network for quotes. For the best quote they find, the broker tacks on an extra 15-25% and send a bid back to the shipper.</p><p>The shipper looks through these bids and builds a waterfall list of brokers with different contracts. For our purposes, let’s assume the shipper picks a single broker.</p><p>Now the broker is on the hook for moving this freight. They have two options.</p><p>First, they can sell this contract a dedicated lane and find a carrier partner to take these loads on a weekly basis. The broker will correspond with the shipper on the shipment’s status and regularly check in with the carrier when the freight in en route. This is fairly low-touch, so the broker can sit back and pocket the difference between what the shipper pays and what the carrier is promised.</p><p>The second option - perhaps the broker decides to break up the loads individually, or the assigned partner carrier misses a load. The shipper doesn’t really care about these details, all they care about is the freight to arriving on time and in one piece.</p><p>In these cases, the broker will look to fill these loads quickly by listing them on the spot market.</p><p>To do this, they post the load onto load boards like DAT, Truckstop, and 123 Loadbards. These load boards host millions of carriers (mostly owner operators) who will bid on open loads. A broker could post a load and receive 50-100 emails or phone calls back from carriers within just twenty minutes.</p><p>The broker then goes through a back and forth with a couple of the carriers. On average, brokers post loads for 20-30% below their target price. It’s a known game between carriers and brokers to negotiate for every dollar on the load.</p><p>Once the broker and carrier agree on price, the broker sends over a final rate confirmation. This so-called rate con includes all the details of the loads, where and when to pick up, as well as the agreed upon rate for the load.</p><p>The carrier deadheads (drives empty) to the pick-up location for warehouse workers to load the freight. For smaller trucks like box trucks or hot shots, drivers will help with loading. After everything is loaded, the driver receives a Bill of Lading (BOL) from the warehouse and takes legal possession of the freight in the truck.</p><p>Once that’s done, the carrier hits the open road. Throughout the haul, the broker periodically checks up on the carrier to update the shipper. It’s a relatively hands off process most of the time.</p><p>However, a lot of edge cases show up with an 80,000 pound machine covering hundreds of miles. A wheel might blow out, an engine might malfunction, the driver might get stopped at the scales, or the truck might get into an accident.</p><p>In these cases, brokers function as the human connection between carrier and shipper. They figure out what, if anything, has happened to the load, any necessary contingency plans (including hiring another carrier to finish the load), and how best to communicate issues with the shipper.</p><p>Assuming a smooth journey, the carrier arrives at the receiving warehouse. The shipper unloads the freight and hands the carrier a Proof of Delivery (POD). The carrier sends the POD over to the broker, who in turn requests payment from the shipper. The shipper pays the broker, who in turn pays the driver roughly 30-45 days after the load is completed.</p><p>And with that, we’re finally done with a load.</p><p>Despite the tension between truck drivers and freight brokers, brokers are a vital piece of the trucking industry.</p><p>There are roughly 17,000 brokers in the US today. We can also broadly classify them into three groups:</p><ol><li>Regional broker</li><li>Asset-based broker</li><li>National broker</li></ol><p>Regional brokers are just what the name suggests - brokers with shipping relationships in a specific region.</p><p>For example, Cal Freight is a regional broker that operate primarily out of Northern California (they’re also an asset-based broker). Most of the loads from regional brokers will be intrastate, local lanes. They primarily service smaller shippers and have a dedicated list of partner carriers in the area.</p><p>Regional brokers also make region-specific investments. Cal Freight operates around 500,000 square feet of warehousing to help their clients manage storage needs. Drayage carriers such as Viper Transportation own yards for stacking containers. These investments help regional broker differentiate themselves from larger brokers and lock in smaller shippers.</p><p>Asset-based brokers are both a broker and a carrier.</p><p>Most mega-carriers (25+ trucks) start branching into brokerage business. After all, they already have the necessary shipper connections and it’s far easier to scale a brokerage than an asset-based carrier. For example, Cheema Transport is another Northern California freight broker that also operates a fleet of 60 trucks (primarily reefers). Usually, asset-based brokers will funnel the best loads to their internal fleet and then broker out their lower quality loads.</p><p>National brokers are - well - national, with multiple brokerage offices.</p><p>For example, TQL is headquartered in Cincinnati, OH but has 56 offices in 26 states. Besides size, a key advantage of a national brokerage is the variety of loads. Regional brokers are limited to a specific area, so it’s harder for carriers to find a suitable backhaul. National brokerages don’t face this problem (TQL posts 65,000+ loads a week), and more often than not, can sell a packaged round-trip route.</p><h3 id="expenses">Expenses</h3><p>It’s difficult to balance earnings and expenses in trucking. A carrier grossing $250k per truck will often lose $200k in expenses. Some large expense categories (based on ATRI data) include:</p><table><tbody><tr><td>Category</td><td>% of Spend</td><td>$ / Year</td></tr><tr><td>Driver Wages</td><td>34%</td><td>$ 51k</td></tr><tr><td>Driver Benefits</td><td>10%</td><td>$ 15k</td></tr><tr><td>Fuel Costs</td><td>19%</td><td>$ 28k</td></tr><tr><td>Truck Payments</td><td>16%</td><td>$ 24k</td></tr><tr><td>Repair Costs</td><td>9%</td><td>$ 13k</td></tr><tr><td>Insurance</td><td>5%</td><td>$8k</td></tr><tr><td>Permits, Tires, Tolls</td><td>6%</td><td>$ 9k</td></tr><tr><td>Total</td><td>100%</td><td>$ 147k</td></tr></tbody></table><p>Driver benefits, repairs, permits, tires, and tolls are fairly self-explanatory. Let’s dive into the other categories.</p><p><strong>Driver wages</strong></p><p>In most cases, driver pay is directly tied to the number of miles they’ve driven on a weekly basis. There are three main categories: self-employed, lease-on, and company drivers.</p><p>Self-employed drivers are also known as owner operators (which we’ve gone over above). They’re responsible for finding loads and bearing all costs involved in transporting them. A dry van owner operator makes between $2 to $3.5 per mile, before expenses.</p><p>Lease-on drivers own their equipment, but are running under another carrier’s motor carrier authority. CloudTrucks, TrueNorth, and LandStar are carriers that operate with a high percentage of lease-on drivers. By leasing-on to an established carrier, drivers get lower insurance rates, dispatching help, and the support of a larger organization on accounting, tires, fuel, and more. The carrier takes around 10-20% of the driver’s earnings for providing this support.</p><p>Company drivers simply drive. They don’t own the equipment or any of the costs involved with trucking. Generally, they drive ~1,500 miles a week and earn $0.5 to $1 for each mile.</p><p><strong>Fuel costs</strong></p><p>Trucking isn’t very fuel efficient - it’s nearly 9x worse than rail. Rail fuel efficiency ranges 196 to 1,179 ton-miles per gallon while truck fuel efficiency ranges from 84 to 167 ton-miles per gallon. [8]</p><p>But like we discussed above, trucks have significant infrastructure and flexibility advantages over other methods of freight transportation. Truck stops are plentiful, strung all over the nation’s highways to support truck fuel consumption. Pilot Flying J, one of the largest truck stop chains, has over 720 truck stops alone. Love’s Travel Stops has another 550+ locations.</p><p>Truck stops are such great businesses that the Pilot Flying J is the 5th largest private company in the US with $42 billion in revenue annually. Love’s is the 10th largest private company with $26 billion.</p><p>Part of what makes these truck stop companies so dominant is their scale. At a certain size, the economics of a gas business closely resemble those of software. Lots of infrastructure costs like operations, land, and buildings are fixed costs, while fuel and snacks as high-margin products.</p><p><strong>Truck Payments</strong></p><p>An average class 8 truck costs anywhere from $150k to $250k new. A 53’ trailer costs $50k to $100k. All told, a standard dry van truck costs the carrier around $250k. Most carriers don’t have a cool quarter million just lying around.</p><p>So, they’ll go and get a commercial truck loan with a payback period of 24-84 months. Interest rates for truck purchases are far above market. Usually, they’re 8-10% APY with a 20% down payment. That means that just the interest payments on the truck is around $15-$20k a year. If we factor in principle, that number becomes somewhere closer to $25-30k per year.</p><p>There’s not a lot of opportunity in the actual manufacturing of trucks. Freightliner, International, Volvo, Peterbilt, and Kenworths are some of the most popular brands in trucking and the sales motion for these trucks looks surprisingly similar to the average retail car-buying experience: truck dealers, show-rooms, and lots of negotiation.</p><p><strong>Insurance</strong></p><p>One of the fastest-rising costs for carriers in recent years has been insurance.</p><p>Most trucking insurance providers look at fairly basic factors like credit score, authority age, equipment type, safety rating, and driver experience.</p><p>Of these, the most important factor usually is authority age. The longer a trucking company has been in business, the safer it is to insure that company. After all, if 90% of trucking companies go out of business in their first year, an insurance company will want to price out that risk.</p><p>Disparity between insurance costs between a new carrier and an established one can be high - upwards of $10,000 per truck per year. That’s a hefty chunk of the driver’s earnings.</p><p>It’s also a key reason why virtual carriers and lease-on driving is so popular.</p><h3 id="so-you-want-to-build-in-trucking">So you want to build in trucking…</h3><p>Now that we’ve laid out the basics of trucking, it’s time to talk about the opportunities. Trucking’s a big industry and there are a bunch of million to billion dollar opportunities on things as mundane as paperwork. Let’s walk through a few opportunities/startups along with my assessment for each:</p><ol><li>Virtual Carriers</li><li>Fuel Cards</li><li>Digital Brokers</li><li>Load boards</li><li>Factoring</li></ol><h3 id="virtual-carriers">Virtual Carriers</h3><p>Carrier life is all about how many trucks you have.</p><p>Unlike software, it’s quite hard to build a carrier that’s significantly better than your competition. After all, carriers sell a single commodity - transportation of goods in a timely manner.</p><p>As a result, the primary way for carriers to scale is to buy more trucks. More trucks mean better lanes, better rates from brokers, and higher discounts from everyone. As a result, most mega-carriers have decades-long lifespans.</p><p>There’s also a different way for carriers to scale: building a virtual carrier of lease-on drivers.</p><p>These are carriers that don’t own any assets themselves. Instead, they sign on owner operators (trucking companies with fewer than 5 trucks) and provide all the necessary backend support</p><p>By pooling various owner operators together, virtual fleets get the advantages of a larger fleet without having to go through the motions of building a fleet from scratch.</p><p>Most of these advantages have to do with costs.</p><p>Fleet insurance is far cheaper when you have an older motor carrier number and more trucks in your fleet. Purchasing trucking equipment is also cheaper in bulk and software investments can be amortized across the entire fleet.</p><p>Some of the largest virtual carriers include CloudTrucks and TrueNorth.</p><p>However, virtual carriers thrive in good times and hurt in bad times. With higher freight rates, more truck drivers buy their own truck and strike out on their own. That’s great for virtual carriers. But when freight rates lower, owner operators park their trucks and go back to company driving.</p><p>Additionally, safety starts to play a large factor as virtual carriers scale up. With more trucks, a fleet becomes inherently less safe.</p><p>Most carriers use a rigorous testing/training system to maintain good safety ratings (an official statistic with FMCSA). Virtual carriers don’t have that luxury. Growing their fleet requires them to sign owner operators with varying degrees of skill. This means that they’re exposed to higher risk of road accidents, and when something does go wrong, that leads to higher insurance premiums. Higher costs eat into the scale benefits that come with more trucks.</p><p>Neither of these problems are fatal. Another way to think about virtual carriers is expensive customer acquisition cost. Once a virtual carrier signs on a driver, it becomes easy to integrate vertically, offering factoring, dispatching, business intelligence, and more.</p><p>That’s the exact model CloudTruck is pursuing. Owner operators that sign on the CloudTruck’s virtual carrier offering are incentivized to use other services that CloudTruck offers. The more touchpoints CloudTrucks has with its drivers, the more opportunities there are available for monetization.</p><h3 id="fuel-cards">Fuel Cards</h3><p>A single truck will purchase 10-15,000 gallons of fuel a year. Even a 10 cent discount makes a material impact.</p><p>That’s where fuel cards shine.</p><p>Fuel cards are debit (or credit) cards that discount 5 to 50 cents off per gallon. Some, like Wex, even offer cost plus fuel options (pay the base cost of fuel plus some fixed rate per gallon).</p><p>These discounts are primarily a function of the number of trucks in a fleet. More trucks = bigger discounts.</p><p>Fuel card providers derive most of their business through fuel volume. With enough volume, they can strike partnerships with truck stops for better rates and pass on a portion of these discounts to their customers. Incumbents in the fuel card space include Wex ($7b public company) and TCS.</p><p>There is a massive opportunity to build a better fuel card.</p><p>Mudflap is one of the most promising startups in the fuel card space, offering up to 40 cents off per gallon. Their strategy focused on striking pre-purchasing deals with smaller mom &amp; pop truck stops with their own POS scanner/code, getting the best discounts while building up their coverage.</p><p>But discounts isn’t the only way for fuel cards to win.</p><p>Interchange rates for cards is anywhere from 2.5% (debit) to 3.5% (credit). That’s a $2.15 to $3.01 billion opportunity, for fuel transactions alone. [9]</p><p>Expanding further, fuel cards can easily extend into general purpose cards and take on more of a driver’s spend, including maintenance, meals, and parking. Traditional fuel cards from Wex and Flexcor are “closed networks” that work in specific truck stops or vendors. By building an “open network” card, startups can drive towards easy adoption.</p><p>Atob is a leader pursuing this strategy. They’ve gained significant traction with drivers with their general purpose, net-7 card.</p><h3 id="digital-brokers">Digital Brokers</h3><p>The traditional brokerage activities market, which is roughly $99 billion, is also ripe for innovation. [10]</p><p>There’s a fair amount of margin in the brokerage industry and plenty of room for automation, so the easiest opportunity is to create a better, digital brokerage.</p><p>Convoy and Loadsmart started with exactly this thesis. More specifically, these two digital brokerages bet that the smartphone would transform how brokers and carriers work together.</p><p>The smartphone would lead to two distinct shifts.</p><p>First, load discovery. Previously, carriers had to call brokers or dispatchers over the phone to find loads. With smartphones, these carriers could easily access all the brokerage’s loads in one place, then place high-intent calls to book loads that they were most interested in covering. In the case of Convoy and Loadsmart, drivers can book directly through the brokerages’ app.</p><p>The second shift was a decrease in servicing costs. Whenever a shipper asked their broker for an update on their load status, the broker needed to manually call their driver and pass on the information. With smartphones, brokers can automatically track their driver’s location and expose that information to the shipper.</p><p>But a natural consequence of the digitalization process is a decrease in quality of edge-case service. Convoy as a brokerage works great - until the driver runs into an issue. And drivers run into plenty of issues while trucking.</p><p>Further, brokering isn’t really about load discovery or servicing costs. Those are great to have, but the real difference maker is broker relationships with shippers. To shippers, it doesn’t really matter whether the company is digital first or phone call only. All shippers care about is how easy they are to work with, their reliability, and how cheaply their loads can get covered.</p><p>Digital brokerages have a lead against traditional brokers on price - but not enough to convince shippers to switch over en-masse from traditional brokers like CH Robinson, TQL, and JB Hunt.</p><p>As a result, growth by Convoy and Loadsmart has slowed as they’ve saturated their initial target market. This also shows in their capitalization, Convoy has raised $930m while Loadsmart has raised $346m.</p><p>Rather than being capital light software businesses, digital brokerages have found themselves looking more like traditional brokerages and competing on shipper relationships rather than product differentiation.</p><h3 id="load-boards">Load boards</h3><p>Another massive digitalization opportunity is the load board market, probably net $1 billion per year. [11]</p><p>The average truck driver is 46 years old, with most used to using the phone to book loads. But, the reality is that drivers will always go to wherever the loads are. Trucking is a market where supply (trucks) follows demand (loads).</p><p>If demand is on the load boards, that’s where truck drivers will also be. In the past few years, load boards like DAT, Truckstop (acquired for north of $1b), and 123 have seen explosive growth.</p><p>On average, these load boards charge anywhere from $50 to $300 a month for access to loads posted on the boards. Assuming a 15-24 month active subscription (roughly the lifespan for most carriers), that leaves an LTV of at most $7,200.</p><p>When we consider that the average truck is seeing roughly $342k in transactions per year [2], that leaves quite a bit to be desired. This also gets reflected in how brokerages have a much larger market size than load boards.</p><p>As a result, startups like Trucksmarter have a thesis that you can use load boards as a loss-leader to attract drivers. Once the drivers are on the platform, you can then monetize with various methods such as fuel cards, insurance, and even becoming a new digital brokerage.</p><p>But most trucking startups go vertical. Factoring is a heavily contested space now with multiple trucking startups in the fray. Insurance, fuel cards, and digital brokerages also have dozens of players. While offering load boards is an easy way to gain traction, it remains to be seen if the attach rates will remain high across products.</p><h3 id="factoring">Factoring</h3><p>And that brings us to our final opportunity, factoring.</p><p>Factoring is an interesting business. The motion is as follows -</p><ol><li>Carrier completes a load and pays for transportation costs (fuel, food, tolls etc.) out of pocket</li><li>Load is on a net 30, 45, or even 60 payment schedule with the broker</li><li>Factoring company loans 96 to 98 cents on the dollar to the carrier</li><li>Factoring company tries to collect money from broker</li><li>If successful, factoring company will keep the extra 2-4% of the broker payment. If unsuccessful, factoring will ask for their money back from the carrier.</li></ol><p>Essentially, a factoring company is making a bunch of short-term loans to carriers and taking on the accounts receivable function of the carrier.</p><p>Assuming a net 30 day payment and 3% factoring fee, a factoring company can earn ~36% on their capital each year. That’s a pretty great business.</p><p>There are just two problems with this business model.</p><p>First is incentives. The best customers for factoring companies are carriers that work with reputable brokers, have a rainy day fund, and are generally well run. These are also carriers that least need factoring. After all, why pay 3% of gross if you have the capital reserves. So, factoring companies have a natural dilemma of good customers churning and bad customers coming in the door.</p><p>Second is the cost of operations. Trucking is a highly fragmented and sometimes, difficult industry. Brokers will delay payment, only pay a portion of the promised rate, or even refuse to pay for a load. The responsibility for collecting the payment falls primarily on the factoring company. That means a lot of paperwork and dealing with problem brokers. Fraud rates can be as high as 15% of total payments.</p><p>As a result, the effective capital return is somewhere closer to 5-10% yearly (after we account for cost of capital, fraud &amp; operations, and customer acquisition cost). It’s not a bad business, it’s just not a great business either.</p><h3 id="conclusion">Conclusion</h3><p>My time in trucking was an incredible experience. I made some great memories visiting truck stops and seeing truck drivers believe in my vision was marvelous (thank you Jeff &amp; Tina).</p><p>I believe that trucking is an industry that needs and is ready for change. Hopefully, you’ll be that person that changes everything.</p><p><em>Special thanks to Dan Bogachek, Jeff Zhao, and Michael Ip for generously donating their time and looking through crappy first drafts of this post. Wouldn’t have been possible without ya.</em></p><h3 id="footnotes">Footnotes</h3><p>[0] <a href="https://www.trucking.org/news-insights/trucking-moved-1184-billion-tons-freight-2019">Data from the American Trucking Association</a></p><p>[1] Page 9 of <a href="https://jcast.fresnostate.edu/ifa/documents/1An%20Analysis%20of%20California%20Agricultural%20Transportation.pdf">this report</a></p><p>[2] State and local government spent $155 billion, while the federal government spent $48 billion on <a href="https://www.urban.org/policy-centers/cross-center-initiatives/state-and-local-finance-initiative/state-and-local-backgrounders/highway-and-road-expenditures">highways and roads in 2019</a>.</p><p>[3] Based on a <a href="https://www.gao.gov/assets/109954.pdf">federal report from 1979</a>. With a near full load, trucks weigh around 70,000 lbs. Across five axles, that’s an average axle load of 14,000 lbs. For comparison, a Toyota Camry weighs around 3,600 lbs and has an axle load of 1,800 lbs. The formula for measuring relative weight damage is (w2 / w1) ^ 4.</p><p>[4] <a href="https://www.washingtonpost.com/archive/business/1977/11/30/conrail-planning-to-abandon-22-rail-lines-as-unprofitable/62a4190c-0c50-4106-9657-ef606e3fa234/">Rail abandonment from 1977</a></p><p>[5] In 2020, that figure was 2.979 million from the <a href="https://www.fhwa.dot.gov/policyinformation/">Office of Highway Policy Information</a>. Averaging data for the 6 years from 2015 to 2020 (small table below), we can assume growth in truck tractors at roughly 46k new truck tractors each year. So, 2.979 + 0.046 *2 gets us to 3.071.</p><table><tbody><tr><td>Year</td><td>Combination Trucks</td><td>Delta</td></tr><tr><td>2020</td><td>2,979,277</td><td>54,067</td></tr><tr><td>2019</td><td>2,925,210</td><td>19,199</td></tr><tr><td>2018</td><td>2,906,011</td><td>13,793</td></tr><tr><td>2017</td><td>2,892,218</td><td>140,175</td></tr><tr><td>2016</td><td>2,752,043</td><td>5,161</td></tr><tr><td>2015</td><td>2,746,882</td><td>&nbsp;</td></tr></tbody></table><p>DOT shows roughly 7.2 million registered trucks as of 12/18/2022. But this figure includes hotshots and box trucks which generally earn less than traditional semi trucks.</p><p>[6]</p><p>$340k per truck per year is calculated from 89,358 * 1.646 / 0.85 / 0.8 / 0.85/ 0.75 = $339,292 and (59,498 * 0.473 + 110,000 + 80,000) / 0.85 / 0.75 = $342,184.</p><p><strong>ATRI Calculation</strong></p><p>Let’s start by looking at the <a href="https://truckingresearch.org/wp-content/uploads/2021/11/ATRI-Operational-Cost-of-Trucking-2021-FINAL.pdf">2021 ATRI trucking report</a>. Average miles driven per truck per year in 2020 was 89,358 with the average motor carrier cost per mile at $1.646. Multiply the two numbers together, and we get a yearly operating cost of $147,083.</p><p>Let’s assume that a carrier spends 15% of costs on internal operations, including factoring costs, back-office wages, office rentals, accounting, and payroll. That brings our yearly cost to $173,038.</p><p>Then, let’s say that a carrier targets a 20% profit margin per truck. A bit on the higher end, but humor me here. $216,299.</p><p>Now, we can add brokerage costs. Generally, brokers earn about 15% of the gross, bringing the total up to $254,469.</p><p>And finally, we can tack on the shipper costs, including loading/unloading, personnel scheduling with warehouses, contract negotiations, tracking, and more. There’s some more complexity with the various types of freight, dry, reefer, flatbed, special, and local but for the purposes of this post, we’ll smooth over these complexities. Let’s call this an even 25%, totaling up to a net cost per truck at $339,292.</p><p><strong>FMCSA Calculation</strong></p><p>But the average yearly mileage number from ATRI is higher than FMCSA (59,498). So using the FMCSA data, we can find - (59,498 * 0.473 + 110,000 + 80,000) / 0.85 / 0.75 = $342,184.</p><p>Let’s start by figuring out the cost per mile per truck.</p><p>There are two ways to calculate this. First is to find the sum of both total number of tractor trucks (easy) and find the total amount paid to the drivers of those tractor trucks (near impossible). We won’t be using this method.</p><p>Second is to start at the fuel costs and build up from there. On average, a tractor trucks gets 6 miles per gallon of fuel. Average price of diesel in the past 6 years is $2.838. So, the fuel cost per mile is $0.473 or $28,142.</p><p>Let’s then put a target salary and benefits of $110k per year per driver. This is quite a bit higher than the ATRI driver pay. A flaw in the ATRI survey is that most respondents had more than 5 trucks, with fewer truckload respondents than the national percentages. As a result, I use the <a href="https://corporate.walmart.com/newsroom/2022/04/07/drive-in-opportunity-walmart-raises-driver-pay-and-launches-private-fleet-development-program">base pay of Walmart drivers</a> as a benchmark for driver pay.</p><p>On top of fuel + salary, let’s look at costs such as truck payments, insurance, repair + maintenance, truck and tractor depreciation, eld, tolls, and more. Truck payments is around $25-30k a year, insurance is around $15-20k a year, repair + maintenance is another $15k a year, everything else combined is roughly $20k a year. Combined, we get $75-85k a year. Let’s call it $80k a year (See expenses section for a more detailed accounting of trucking costs).</p><p>So now we get 59,498 * 0.473 + 110,000 + 80,000 = $218,143.</p><p>We then go through the same math with broker and shipper costs. 15% and 25% margin respectively. So, we get a net earning per truck of $342,184.</p><p>[7] I know someone’s yelling at me that hotshots or box trucks are technically part of tucking. And well, they’re kind of right. But humor me here. This is a pretty long post and talking about every detail means that we’re going to be stuck here all night.</p><p>[8] Gotta love all these studies done in the old days. Here’s a 1991 government study on <a href="https://railroads.dot.gov/sites/fra.dot.gov/files/fra_net/16332/1991_RAIL%20VS%20TRUCK%20FUEL%20EFFICIENCY%20-%20THE%20RELATIVE%20F%282%29.PDF">The Relative Fuel Efficiency of Truck Competitive Rail Freight and Truck Operations Compared in a Range of Corridors</a>.</p><p>[9] So we start with 3.071 million truck tractors on the road. On average, a truck will drive 59,498 miles per year. And the fuel efficiency of an average truck is 6 miles per gallon. So 3.071 * 59,498 / 6 = 30,453 million gallons per year. We’re also not counting other types of trucks like box trucks or hotshots.</p><p>Multiplied by the price of diesel at $2.838, we get $86.4 billion spent on fuel.</p><p>[10] Data from Ibis world.</p><p>We can also run some hand-wavy math on stock valuation. Let’s take a company like CH Robinson - they’re the largest freight brokerage in the US and most of their revenue is derived from truckload freight. They also currently have a roughly 3-5% market share on truckload brokerage.</p><p>Their spread between revenue generated from Transportation and expense paid for Purchased transportation and related services was $3 billion for 2021 (historically, it’s been around $2.5 billion). So, we can put the freight brokerage market at anywhere from $60b to $99b.</p><p>Assuming the upper end of that gets us to our $99b market size figure.</p><p>[11] Since most load board companies are private, it’s hard to discern figures here. But ICONIQ capital made a&nbsp;majority investment into Truckstop at a $1 billion valuation in 2019. Assuming that Truckstop has since then growth 15% YoY (especially given how hot the trucking market became during the pandemic), that valuation is now likely to be $1.75 billion. Assuming a revenue multiple of 6x (low software, high trucking multiple), we get their annual revenue to be $291 million. DAT is likely double Truckstop’s size, so let’s call it $600 million. And then the last $100 million is taken by smaller players in the market.</p><span><time datetime="2023-01-05T00:00:00+00:00">January 5, 2023</time> · <a href="https://snowingpine.com/tag/Trucking">Trucking</a>, <a href="https://snowingpine.com/tag/Startups">Startups</a></span></section></div>]]>
@@ -491,7 +973,7 @@ January 13, 2023 | https://snowingpine.com/2023/01/05/on-trucking | <a href="htt
             </title>
             <description>
 <![CDATA[
-Score 102 | Comments 116 (<a href="https://news.ycombinator.com/item?id=34377227">thread link</a>) | @tannhaeuser
+Score 104 | Comments 125 (<a href="https://news.ycombinator.com/item?id=34377227">thread link</a>) | @tannhaeuser
 <br/>
 January 13, 2023 | https://www.magiclasso.co/insights/triumph-of-safari/ | <a href="https://web.archive.org/web/*/https://www.magiclasso.co/insights/triumph-of-safari/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -571,7 +1053,7 @@ January 13, 2023 | https://www.magiclasso.co/insights/triumph-of-safari/ | <a hr
             </title>
             <description>
 <![CDATA[
-Score 309 | Comments 37 (<a href="https://news.ycombinator.com/item?id=34376276">thread link</a>) | @user890104
+Score 321 | Comments 38 (<a href="https://news.ycombinator.com/item?id=34376276">thread link</a>) | @user890104
 <br/>
 January 13, 2023 | https://q3k.org/wInd3x.html | <a href="https://web.archive.org/web/*/https://q3k.org/wInd3x.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
@@ -1186,7 +1668,7 @@ buildroot login:
             </title>
             <description>
 <![CDATA[
-Score 132 | Comments 122 (<a href="https://news.ycombinator.com/item?id=34375137">thread link</a>) | @lycopodiopsida
+Score 134 | Comments 141 (<a href="https://news.ycombinator.com/item?id=34375137">thread link</a>) | @lycopodiopsida
 <br/>
 January 13, 2023 | https://project-mage.org/emacs-is-not-enough | <a href="https://web.archive.org/web/*/https://project-mage.org/emacs-is-not-enough">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content">
@@ -1202,6 +1684,14 @@ On Flexibility and Software Temples →
 
 <p>
 <i>(Dear reader, I sometimes will call you "anon" in this article. Just treat it as a literary device.</i>)
+</p>
+
+<p>
+<i>(<b>Warning</b>: This is going to be a <span>rant</span>. I don't really propose any solutions here, just expose some problems (which, really, apply to most text editors). For non-rants, please see the other articles, and <a href="https://project-mage.org/the-power-of-structure.html">the previous article</a> for the project description.)</i>
+</p>
+
+<p>
+<i>(Also, see this <a href="https://news.ycombinator.com/item?id=34375137#34384420">HackerNews discussion</a> from 14 January 2023, where I have responded to some questions.)</i>
 </p>
 
 <p>
@@ -2637,7 +3127,7 @@ On Flexibility and Software Temples →
             </title>
             <description>
 <![CDATA[
-Score 258 | Comments 107 (<a href="https://news.ycombinator.com/item?id=34373279">thread link</a>) | @harryvederci
+Score 261 | Comments 112 (<a href="https://news.ycombinator.com/item?id=34373279">thread link</a>) | @harryvederci
 <br/>
 January 13, 2023 | https://blog.information-superhighway.net/what-the-hell-is-forth | <a href="https://web.archive.org/web/*/https://blog.information-superhighway.net/what-the-hell-is-forth">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>Forth is perhaps the tiniest possible useful interactive programming language.  It is tiny along a number of dimensions:</p>
@@ -2781,7 +3271,7 @@ January 13, 2023 | https://blog.information-superhighway.net/what-the-hell-is-fo
             </title>
             <description>
 <![CDATA[
-Score 42 | Comments 2 (<a href="https://news.ycombinator.com/item?id=34368666">thread link</a>) | @samwillis
+Score 46 | Comments 2 (<a href="https://news.ycombinator.com/item?id=34368666">thread link</a>) | @samwillis
 <br/>
 January 13, 2023 | https://linus.dev/posts/road-to-working-on-serenityos-and-ladybird-full-time/ | <a href="https://web.archive.org/web/*/https://linus.dev/posts/road-to-working-on-serenityos-and-ladybird-full-time/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><section>Published on 2023-01-13.</section><hr><p>When I submitted my first pull request to the SerenityOS repo I had no idea where this journey would take me. Since then, almost three years and 3,200+ commits later, I have:</p><ul><li>Learned C++, and a ton about systems programming in general</li><li>Helped building LibJS, our from-scratch JavaScript engine, from the ground up</li><li>Become the first appointed project maintainer</li><li>Joined TC39 as an Invited Expert to represent LibJS</li><li>Made a bunch of friends in our community :^)</li></ul><p>You can read more about my history in the SerenityOS project in a <a href="https://linus.dev/posts/my-journey-with-serenityos/">previous blog post</a>.</p><p>All of this I have done on the side, as a hobby project. I truly enjoy leading LibJS development, working on LibWeb, and everything else around it so I didn't mind spending a bunch of my spare time on it. The only issue here is that spare time is, well, limited. You might see where this is going… :^)</p><h2 id="a-new-chapter" tabindex="-1"><a href="#a-new-chapter">A New Chapter</a></h2><p>It was clear this needed to happen eventually so I could keep up with the expectations I set for myself, but today it becomes official: <strong>I have now made it my goal to transition to working on <a href="https://github.com/SerenityOS/serenity/" target="_blank" rel="noreferrer">SerenityOS</a>, <a href="https://awesomekling.github.io/Ladybird-a-new-cross-platform-browser-project/" target="_blank" rel="noreferrer">Ladybird</a>, and open source in general full time!</strong></p><p>As a first step I have reduced the hours at my regular job — beginning with one day a week for open source work, every week :^)</p><p>I will still do contributions in my spare time of course, but having dedicated full days allows me to tackle bigger projects and have more uninterrupted time.</p><p>It's not just doing more work for the sake of it, primarily I want to get Ladybird to a point where you &amp; I can use it as an everyday web browser. This will take a lot of time and effort, but I think it's totally feasible!</p><p>Of course I will need to find other sources of income before I can even think about fully committing, and GitHub sponsors is a big part of that! I joined back in June 2021 so people could support me financially if they wanted to, and while it definitely helped with covering domain costs and purchasing better hardware for making videos, I didn't want to advertise it much without a larger goal in mind.</p><p>Now I have such a goal, and the best way to help me achieving it is sponsorship on <a href="https://github.com/sponsors/linusg" target="_blank" rel="noreferrer">GitHub</a> or <a href="https://liberapay.com/linusg" target="_blank" rel="noreferrer">Liberapay</a>! A huge thanks to everyone already supporting me this way, or considering it now — I couldn't do the next part of this journey without you ❤️</p></div></div>]]>
@@ -2796,7 +3286,7 @@ January 13, 2023 | https://linus.dev/posts/road-to-working-on-serenityos-and-lad
             </title>
             <description>
 <![CDATA[
-Score 159 | Comments 192 (<a href="https://news.ycombinator.com/item?id=34368601">thread link</a>) | @caseysoftware
+Score 160 | Comments 194 (<a href="https://news.ycombinator.com/item?id=34368601">thread link</a>) | @caseysoftware
 <br/>
 January 13, 2023 | https://caseysoftware.com/blog/working-for-a-dating-website | <a href="https://web.archive.org/web/*/https://caseysoftware.com/blog/working-for-a-dating-website">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2857,7 +3347,7 @@ January 13, 2023 | https://blog.cedriccharly.com/post/20210523-how-cue-wins/ | <
             </title>
             <description>
 <![CDATA[
-Score 134 | Comments 162 (<a href="https://news.ycombinator.com/item?id=34367905">thread link</a>) | @sebg
+Score 136 | Comments 164 (<a href="https://news.ycombinator.com/item?id=34367905">thread link</a>) | @sebg
 <br/>
 January 13, 2023 | https://return.life/2022/05/endemic-pathogens/ | <a href="https://web.archive.org/web/*/https://return.life/2022/05/endemic-pathogens/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2925,7 +3415,7 @@ January 13, 2023 | https://return.life/2022/05/endemic-pathogens/ | <a href="htt
             </title>
             <description>
 <![CDATA[
-Score 157 | Comments 115 (<a href="https://news.ycombinator.com/item?id=34367390">thread link</a>) | @JNRowe
+Score 158 | Comments 116 (<a href="https://news.ycombinator.com/item?id=34367390">thread link</a>) | @JNRowe
 <br/>
 January 13, 2023 | https://val.packett.cool/blog/ergonice/ | <a href="https://web.archive.org/web/*/https://val.packett.cool/blog/ergonice/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><p>I made a custom split mechanical keyboard! Because it's me, this involved things like contributing to a PCB design tool and discovering a ridiculously optimized way to read a keyboard matrix.</p><div>
@@ -3328,7 +3818,7 @@ any level of support would be appreciated.</p>
             </title>
             <description>
 <![CDATA[
-Score 154 | Comments 185 (<a href="https://news.ycombinator.com/item?id=34366286">thread link</a>) | @vincelt
+Score 155 | Comments 187 (<a href="https://news.ycombinator.com/item?id=34366286">thread link</a>) | @vincelt
 <br/>
 January 13, 2023 | https://vincelwt.com/darkforest | <a href="https://web.archive.org/web/*/https://vincelwt.com/darkforest">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><header><a href="https://vincelwt.com/">← Home</a></header><p><small>Written <!-- -->Jan 12, 2023<!-- -->.</small></p><blockquote>
@@ -3487,7 +3977,7 @@ How many are actually desperate to pretend and simply maintain a year long prese
             </title>
             <description>
 <![CDATA[
-Score 106 | Comments 27 (<a href="https://news.ycombinator.com/item?id=34363974">thread link</a>) | @deepbow
+Score 107 | Comments 27 (<a href="https://news.ycombinator.com/item?id=34363974">thread link</a>) | @deepbow
 <br/>
 January 12, 2023 | https://thelampmagazine.com/2023/01/09/how-to-write-english-prose/ | <a href="https://web.archive.org/web/*/https://thelampmagazine.com/2023/01/09/how-to-write-english-prose/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4500,7 +4990,7 @@ $28M
             </title>
             <description>
 <![CDATA[
-Score 432 | Comments 258 (<a href="https://news.ycombinator.com/item?id=34361651">thread link</a>) | @goleary
+Score 433 | Comments 259 (<a href="https://news.ycombinator.com/item?id=34361651">thread link</a>) | @goleary
 <br/>
 January 12, 2023 | https://blog.elevenlabs.io/enter-the-new-year-with-a-bang/ | <a href="https://web.archive.org/web/*/https://blog.elevenlabs.io/enter-the-new-year-with-a-bang/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4613,7 +5103,7 @@ January 12, 2023 | https://www.the-microbiologist.com/opinion/manufacturing-cert
             </title>
             <description>
 <![CDATA[
-Score 248 | Comments 120 (<a href="https://news.ycombinator.com/item?id=34361063">thread link</a>) | @brendannee
+Score 248 | Comments 121 (<a href="https://news.ycombinator.com/item?id=34361063">thread link</a>) | @brendannee
 <br/>
 January 12, 2023 | https://hoho.com/posts/your-stack-is-not-the-product/ | <a href="https://web.archive.org/web/*/https://hoho.com/posts/your-stack-is-not-the-product/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>If you are the technical co-founder or early engineering lead at a startup, and you want to talk about your microservices, hand-rolled CI/CD, in-house monitoring stack, or any other unique part of your stack, I will say: Cool. Let’s riff. Take me deep, I’m ready.</p><p>But there’s something I’m likely to tell you in return, something I’ll probably insist you’re overlooking and need to internalize as soon as possible: <em>Your technology stack is not the product.</em></p><p>A mindset of technology being the means, not the end, is uncomfortable. But it will help you stay focused on what matters most (the product and your customers), avoid wasteful misadventures, and maximize the company’s chance of success.</p><h2 id="the-typical-startup">The typical startup</h2><p>At most software startups, customers typically don’t care if your product runs on Heroku, Kubernetes, or a really brittle singly-homed machine in Joe’s closet. No purchasing decisions hinge on your commitment to write servers in Rust or use Nix for hermetic everything. And although they might exist, I have sadly never had a customer write a testimonial for the elegant collection of internal services involved in responding to that single HTTP request.</p><p>No; customers are not paying for, nor give a shit about, these things. Sorry. It’s still cool stuff. It’s just not what you’re selling.<sup id="fnref:1"><a href="#fn:1" role="doc-noteref">1</a></sup></p><p>Customers want software that delivers problem-solving <em>impact</em>. And at the early stage, which is all the way until you’ve reached product-market fit, they’re almost certainly not getting enough, fast enough. You should be spending as much time as you can at this level of the stack, The Product: thinking, building, learning.</p><p>So what then, is that it? Is Kube always silly and Joe’s closet machine always good? Am I saying just YOLO it? Of course not.</p><p>There are still better and worse decisions. Being able to make good decisions, ones that maximize product impact, starts with <em>intentionality</em>: realizing how and when you as a leader are actually making them.</p><h2 id="recognize-implicit-decisions">Recognize implicit decisions</h2><p>Many of the most consequential technology decisions happen <em>implicitly</em>, without even realizing a decision is being made. This is especially true when the team is small and everything is a green field. For example:</p><ul><li>You’ve used Go before, so you start writing the stack in it. Suddenly you’re a “Go shop”.</li><li>You were curious to play with Kubernetes<sup id="fnref:2"><a href="#fn:2" role="doc-noteref">2</a></sup>, and got Hello World working, so since nothing else is around it becomes the <em>de facto</em> serving environment.</li><li>You are coming from a much later-stage and/or higher-scale company, so approach problems for a scale the company does not yet have.</li></ul><p>These decisions glide through so easily because they feel good, fun, and natural. There’s probably nobody else around to notice! And they can often be the right decisions.</p><p>But there are many instances where an innocent, ill-considered early decision turned out much worse over the longer term. It becomes a time-sucking, success-hindering mess requiring costly correction later. I’ve certainly been responsible for my share of them.</p><p>How do we get out of making these sort of “just because” decisions, and increase our chances of success?</p><h2 id="set-overarching-goals">Set overarching goals</h2><p>A good technology decision—one that is more than a “just because”—is decision that can be connected to an overarching long-term goal. As a technology team, why do we exist?</p><p>Set technology goals, early, which answer that question and which will be used guide technology decisions. Here’s a starting set:</p><blockquote><p>Our Technology Goals</p><ol><li><strong>Ship the product.</strong> Frequently and reliably.</li><li><strong>Support growth.</strong> Be able to bring in more people, gradually, that can do (1).</li></ol></blockquote><p>These might seem unrealistically simple, but it’s pretty easy for me to connect all variety of technical decisions to these.</p><ul><li>If the system is unreliable, we won’t ship as much product.</li><li>If we’re constantly building/maintaining infrastructure, we won’t ship as much product.</li><li>If we pick exotic technology, it’ll be harder to hire (and we won’t ship as much product).</li></ul><p>They work well at a later stage, too:</p><ul><li>If we don’t hire a dedicated SRE, product builders will spend more time maintaining infra, and we won’t ship as much.</li><li>If we don’t replace this system, more and more customers will experience a broken product, and the costs to fix will grow.</li></ul><p>Best of all, by keeping “the stack” out of the picture, these goals make it clear where your brainpower is best focused: on keeping the product moving and improving. The stack is but a means to that end.</p><p>Now you can start evaluating some of those concrete decisions the same way:</p><ul><li>Why is Joe’s closet computer a bad choice? Because it’s a single point of failure and we won’t be able to ship fast if it breaks, which it will.</li><li>Why am I building in Python and not Arc? Because I know the language and when we start hiring, there are a lot of others who do, too.</li><li>Why are we building a monolith? Because the product isn’t at the scale where anything benefits from more services, and building more tooling would cut into the time we have for product features.</li></ul><p>Goal alignment moves the “why” behind your decisions from “because I’m awesome and have great instincts” to “it’s what we need, now”. (You are still awesome.)</p><p>Still, there will be situations where multiple options would seem to meet the goal. How do you make a choice when there is not clear winner?</p><p>Goals alone tell us what we want to achieve, but not how. Pair your technology goals with a set of <em>values</em> that accelerate the process of picking “the how”.</p><p>I usually start with a set something like this:</p><ol><li><strong>No sacred bits: Launch, learn, iterate.</strong> It’s expected we’ll throw things out and outgrow past decisions. And some of our product ideas won’t succeed no matter how well-built the software was. We value <em>getting it out the door</em> over <em>getting it perfect</em>, and we will quickly and unemotionally change our approach when new information supports it.</li><li><strong>Today’s bets over tomorrow’s theoreticals.</strong> We do our best to anticipate future needs, but we place the most emphasis on building what we <em>know</em> we need today.</li><li><strong>Favor “boring technology” and in-house expertise.</strong> We move fastest when we know our tools well, not just their strengths but also their limitations. The ideal tools are the ones we’re already expert in, or at least can learn to proficiency quickly, even if they have some drawbacks.</li><li><strong>Buy non-core competencies whenever prudent.</strong> If we need something we don’t have, <em>and it’s not something this company needs to become a leader in</em>, buy it whenever practical (i.e. affordable and easily integrated).</li></ol><p>You don’t have to use my values as long as you set <em>some</em><sup id="fnref:3"><a href="#fn:3" role="doc-noteref">3</a></sup>. There are plenty of examples out there. An old friend turned me on to <a href="https://medium.com/the-ready/even-overs-the-prioritization-tool-that-brings-your-strategy-to-life-e4f28f2949ac">“even-over” values</a>, which put two virtues in tension (to emphasize the primacy of the first). Someone even built <a href="https://www.keyvalues.com/">an aggregator of values by company</a> so you can select your next job accordingly. Go be you. Have fun with it.</p><p>The important thing values should do is create cultural license for breaking habits and instincts that might send us in the wrong direction. <em>Make it okay</em> to say “we’re not Google”, or, “we’ll solve that later”.</p><h2 id="you-still-set-and-edit-strategy">You still set, and edit, strategy</h2><p>Panicking about the “simplicity” of the stack this would lead to? Worried that when you reach scale, the PaaS bill will be through the roof? Upset that you’ll have nothing crazy to blog about for years?</p><p>Relax. You will still own the technology strategy. You will be making decisions continuously, and have both the right and the obligation to make changes when needed.</p><p>But your stack is unlikely to ever be the “main character” your customers rave about it. At best, only its qualities are what stand out. That’s a good thing. Feel good about keeping it that way.</p></div></div>]]>
@@ -4628,7 +5118,7 @@ January 12, 2023 | https://hoho.com/posts/your-stack-is-not-the-product/ | <a hr
             </title>
             <description>
 <![CDATA[
-Score 84 | Comments 35 (<a href="https://news.ycombinator.com/item?id=34358912">thread link</a>) | @semihsalihoglu
+Score 85 | Comments 35 (<a href="https://news.ycombinator.com/item?id=34358912">thread link</a>) | @semihsalihoglu
 <br/>
 January 12, 2023 | https://kuzudb.com/blog/what-every-gdbms-should-do-and-vision.html | <a href="https://web.archive.org/web/*/https://kuzudb.com/blog/what-every-gdbms-should-do-and-vision.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="main-content" role="main"> <p>by Semih Salihoğlu, Jan 12th, 2023</p>  <p>As a co-implementor of the Kùzu GDBMS and a professor at University of Waterloo, I have been thinking of GDBMSs day in and day out for many years now. After years of understanding and publishing on the architectural principles of graph data management (<a href="http://www.vldb.org/pvldb/vol12/p1692-mhedhbi.pdf">1</a>, <a href="https://www.vldb.org/pvldb/vol14/p2491-gupta.pdf">2</a>, <a href="https://www.vldb.org/pvldb/vol15/p1011-jin.pdf">3</a>, <a href="https://www.vldb.org/pvldb/vol15/p1533-chen.pdf">4</a>), we decided to develop <a href="https://github.com/kuzudb/kuzu">Kùzu</a> as a state-of-the-art modern embeddable GDBMS. This post covers my broad opinions on GDBMSs, and the feature set they should optimize for and why. In doing so, it also gives an overall vision of Kùzu!</p> <blockquote> <p><strong>Tldr: The key takeaways are:</strong></p> <ul> <li><strong>Overview of GDBMSs</strong>: GDBMSs are relational in their cores but offer an elegant graph model to model application data and SQL-like query languages with elegant graph-specific syntax. Many applications, e.g., in <a href="https://tinyurl.com/3x89ceum">fraud detection</a>, <a href="https://www.tigergraph.com/solutions/recommendation-engine/">recommendations</a>, <a href="https://tinyurl.com/3z9bckmm">personalization</a>, etc. benefit from such modeling and query language features.</li> <li><strong>Key Feature Set of GDBMSs</strong>: Despite being relational, GDBMS optimize (or at least they should!) for a distinct set of features/use cases that RDBMSs do not traditionally optimize for: (i) pre-defined/pointer-based joins; (ii) growing many-to-many joins; (iii) recursive joins; (iv) schema querying; (v) efficient storage of semi-structured data and URIs. GDBMSs that want to be competitive in terms of performance need to perfect this feature set and that’s exactly what Kùzu aims to do!</li> <li><strong>Kùzu as the GDBMS for Graph Data Science</strong>: One example application domain the Kùzu team is excited about is to be a usable, efficient, and scalable GDBMS of graph data science in the Python graph analytics ecosystem. Here we are looking at how DuckDB revolutionized tabular data science and want to repeat it in graph data science!</li> </ul> </blockquote> <p>This week, I presented Kùzu to the database community at the <a href="https://www.cidrdb.org/cidr2023/papers/p48-jin.pdf">CIDR 2023</a> conference in Amsterdam. For those who are not familiar with academic database conferences, CIDR brings together work from academia and industry to discuss recent research on systems aspects of database technology. Our paper was about Kùzu’s goals and vision and its core query processor design for evaluating complex growing joins. We intentionally targeted CIDR for our paper because of its systems focus and we thought many system gurus would be there: the attendees included creators of <a href="https://www.monetdb.org/">MonetDB</a>, <a href="https://en.wikipedia.org/wiki/Vectorwise">Vectorwise</a>, <a href="https://duckdb.org/">DuckDB</a>, <a href="https://www.snowflake.com/en/">Snowflake</a>, <a href="https://www.databricks.com/">Databricks</a>, amongst others. It also meant a lot to share our ambitious goal of developing a usable GDBMS from an academic setting in this CIDR because it was organized locally by CWI. The late <a href="https://en.wikipedia.org/wiki/Martin_L._Kersten">Martin Kersten</a> founded the CWI database group and was a pioneer of this style of research projects and his successors are continuing this tradition very successfully today. CWI has created many successful DBMSs, including MonetDB (Martin’s legacy), Vectorwise, and most recently DuckDB. People paid their respects to Martin during an emotional memorial on the first night of the conference. As a surprise, <a href="https://memgraph.com/">MemGraph</a> co-founder and CTO <a href="https://www.linkedin.com/in/markobudiselic/">Marko Budiselić</a> was also there (it was his first CIDR)! Marko is an extremely friendly and humble person you should meet and it was great to share our insights about where GDBMSs make a difference in enterprise applications.</p> <p>I want to start a 3-part blog post to cover the contents of our CIDR paper in a less academic language:</p> <ul> <li>Post 1: Kùzu’s goals and vision as a system</li> <li>Post 2: Factorization technique for compression</li> <li>Post 3: Worst-case optimal join algorithms</li> </ul> <p>In this Post 1, I discuss the following: (i) <a href="#overview-of-gdbms-and-a-bit-of-history">an overview of GDBMSs</a>. (ii) <a href="#features-every-competent-gdbms-should-optimize-for-">the features GDBMSs should optimize for and why;</a> and (iii) <a href="#kùzu-as-a-gdbms-for-graph-data-science-pipelines">an example application domain (graph data science!) we are immediately targeting with Kùzu. </a> (ii) and (iii) should give you a good idea about the current goals and vision of Kùzu. If you know GDBMSs well, you should skip over (i).</p> <h2 id="overview-of-gdbmss-and-a-bit-of-history"> <a href="#overview-of-gdbmss-and-a-bit-of-history" aria-labelledby="overview-of-gdbmss-and-a-bit-of-history"></a> Overview of GDBMSs and a Bit of History </h2> <p>In one sentence, GDBMSs are read-optimized analytical DBMSs for modeling and querying application data as a graph. As a consequence they are optimized for fast querying of node and relationship records. Modern GDBMSs, such as Neo4j, Tigergraph, MemGraph, or Kùzu, adopt the <a href="https://neo4j.com/developer/graph-database/#property-graph">property graph data model</a> (or its variants), where you can model your records as a set of labeled nodes and edges/relationships, and key-value properties on these relationships. When I say GDBMSs in this post, I specifically refer to the systems that adopt this model but I will also discuss <a href="https://en.wikipedia.org/wiki/Triplestore">RDF systems</a> (aka triplestores) here and there, which are also DBMSs that adopt a graph-based model.</p> <p>Here’s a side comment that I have to make because I’m a professor and professors are always ready to profess. DBMSs based on graph models are anything but new. They have existed even before the relational model: DBMS die-hards love remembering that the <a href="https://en.wikipedia.org/wiki/Integrated_Data_Store">IDS system</a> from 1960s was based on the “network model”, which is is just another term for graph. IDS was lead by the amazing Charlie Bachmann <img src="https://kuzudb.com/img/bachmann.png"> (<a href="https://amturing.acm.org/award_winners/bachman_9385610.cfm">1</a>, <a href="https://youtu.be/iDVsNqFEkB0">2</a>, <a href="https://youtu.be/jByIpJNrm50">3</a>), whose photo is shown on the left and who is credited for inventing DBMSs<sup id="fnref:1" role="doc-noteref"><a href="#fn:1" rel="footnote">1</a></sup>. If you click on <a href="http://wp.sigmod.org/wp-content/uploads/2012/12/image4.jpg">this 1962 ad of the IDS system</a>, you will see a graph of node and edge records. Note 1960s are pre-relational times. Ever since, every decade has seen a surge of DBMSs that adopted a graph-based model with mixed levels of adoption success: hierarchical model, XML, and RDF are examples. In my view, current property GDBMSs is the most generic and suitable to model a very broad range of application data out of these. So they probably established themselves most successfully out of these. There is a very fundamental reason why graph-based DBMSs have always existed and will always exist: graphs and tables are the two most natural and generic abstract data structures to model application data. It’s no surprise they were the first two proposed data models when the field of DBMSs were born and both have existed ever since and will continue to exist.</p> <p>Back to property GDBMSs. How about their query languages? They support SQL-like high-level query languages with several graph-specific syntax. I call them “graph-specific” SQL. Let’s look at a query snippet. Assume this is on a database that models a set of financial “accounts” and money “transfers” between accounts:</p> <div><div><pre><code>MATCH (a:Account)-[e:Transfer]-&gt;(b:Account)
@@ -5142,7 +5632,7 @@ https://archy.deberker.com/static/83a45ec176da2f1b82ae4c5fd4dca6d9/74ab4/map.png
             </title>
             <description>
 <![CDATA[
-Score 107 | Comments 38 (<a href="https://news.ycombinator.com/item?id=34358663">thread link</a>) | @pxeger1
+Score 108 | Comments 38 (<a href="https://news.ycombinator.com/item?id=34358663">thread link</a>) | @pxeger1
 <br/>
 January 12, 2023 | http://strictlypositive.org/diff.pdf | <a href="https://web.archive.org/web/*/http://strictlypositive.org/diff.pdf">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -5417,7 +5907,7 @@ January 12, 2023 | https://wundergraph.com/index | <a href="https://web.archive.
             </title>
             <description>
 <![CDATA[
-Score 660 | Comments 92 (<a href="https://news.ycombinator.com/item?id=34354213">thread link</a>) | @_Microft
+Score 661 | Comments 92 (<a href="https://news.ycombinator.com/item?id=34354213">thread link</a>) | @_Microft
 <br/>
 January 12, 2023 | https://www.zephray.me/post/grayscale_lcd/ | <a href="https://web.archive.org/web/*/https://www.zephray.me/post/grayscale_lcd/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -5660,11 +6150,28 @@ January 12, 2023 | https://www.zephray.me/post/grayscale_lcd/ | <a href="https:/
         </item>
         <item>
             <title>
+<![CDATA[Probletronics]]>
+            </title>
+            <description>
+<![CDATA[
+Score 21 | Comments 0 (<a href="https://news.ycombinator.com/item?id=34351887">thread link</a>) | @mkarliner
+<br/>
+January 12, 2023 | http://blog.karliner.net/posts/probletronics/ | <a href="https://web.archive.org/web/*/http://blog.karliner.net/posts/probletronics/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p><img src="http://blog.karliner.net/fundamental_particle.png" alt="Problems, problems, problems">
+Probletronics is the science of problems and their associated solutions.</p><p>The fundamental particle of problems is the probletron. It has an associated anti-particle (solution) called the solutron.
+As might be expected, the encounter of a probletron and a solutron can result in annihilation of the probletron.</p><p>However, both particles have a property called complexity.</p><p>If for example, a simple probletron encounters a complex solutron, the result is not, as might be imagined, a solution, but a shower of new probletrons. A similar, but worse situation results when both particles are complex. In this case, there is still a shower of new probletrons, but also the solutron absorbs vast amounts of energy, generally preventing the creation of new, and hopefully more effective solutions.</p><p>Both particles are unstable. Probletrons will, if left alone long enough, just evaporate away. Complex solutrons, however, if left alone, will spontaneously decay into new probletrons.</p><p>Probletronics has many real-world applications, especially in the realm of software development.</p><p>This is due to the first, and indeed only law of probletronics.</p><p>Keep It Simple, Stupid.</p></div></div>]]>
+            </description>
+            <link>http://blog.karliner.net/posts/probletronics/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-34351887</guid>
+            <pubDate>Thu, 12 Jan 2023 11:09:05 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[The Yaml document from hell]]>
             </title>
             <description>
 <![CDATA[
-Score 537 | Comments 341 (<a href="https://news.ycombinator.com/item?id=34351503">thread link</a>) | @ruuda
+Score 539 | Comments 343 (<a href="https://news.ycombinator.com/item?id=34351503">thread link</a>) | @ruuda
 <br/>
 January 12, 2023 | https://ruudvanasseldonk.com/2023/01/11/the-yaml-document-from-hell | <a href="https://web.archive.org/web/*/https://ruudvanasseldonk.com/2023/01/11/the-yaml-document-from-hell">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="content" itemscope=""><header><p>written by <br>published <time datetime="2023-01-11" itemprop="datePublished">11 January, 2023</time></p></header><p><span>For a data format</span>, yaml is extremely complicated. It aims to be a human-friendly format, but in striving for that it introduces so much complexity, that I would argue it achieves the opposite result. Yaml is full of footguns and its friendliness is deceptive. In this post I want to demonstrate this through an example.</p><p>This post is a rant, and more opinionated than my usual writing.</p><h2 id="yaml-is-really-really-complex"><a href="#yaml-is-really-really-complex"></a>Yaml is really, really complex</h2><p>Json is simple. <a href="https://www.json.org/json-en.html">The entire json spec</a> consists of six railroad diagrams. It’s a simple data format with a simple syntax and that’s all there is to it. Yaml on the other hand, is complex. So complex, that <a href="https://yaml.org/spec/1.2.2/">its specification</a> consists of <em>10 chapters</em> with sections numbered four levels deep and a dedicated <a href="https://yaml.org/spec/1.2/errata.html">errata page</a>.</p><p>The json spec is not versioned. There were <a href="https://youtu.be/-C-JoyNuQJs?t=965">two changes</a> to it in 2005 (the removal of comments, and the addition of scientific notation for numbers), but it has been frozen since — almost two decades now. The yaml spec on the other hand is versioned. The latest revision is fairly recent, 1.2.2 from October 2021. Yaml 1.2 differs substantially from 1.1: the same document can parse differently under different yaml versions. We will see multiple examples of this later.</p><p>Json is so obvious that Douglas Crockford claims <a href="https://www.youtube.com/watch?v=-C-JoyNuQJs">to have discovered it</a> — not invented. I couldn’t find any reference for how long it took him to write up the spec, but it was probably hours rather than weeks. The change from yaml 1.2.1 to 1.2.2 on the other hand, was <a href="https://yaml.com/blog/2021-10/new-yaml-spec/">a multi-year effort by a team of experts</a>:</p><blockquote><p>This revision is the result of years of work by the new <abbr>YAML</abbr> language development team. Each person on this team has a deep knowledge of the language and has written and maintains important open source <abbr>YAML</abbr> frameworks and tools.</p></blockquote><p>Furthermore this team plans to actively evolve yaml, rather than to freeze it.</p><p>When you work with a format as complex as yaml, it is difficult to be aware of all the features and subtle behaviors it has. There is <a href="https://yaml-multiline.info/">an entire website</a> dedicated to picking one of <a href="https://stackoverflow.com/a/21699210/135889">the 63 different multi-line string syntaxes</a>. This means that it can be very difficult for a human to predict how a particular document will parse. Let’s look an example to highlight this.</p><h2 id="the-yaml-document-from-hell"><a href="#the-yaml-document-from-hell"></a>The yaml document from hell</h2><p>Consider the following document.</p><pre><code>server_config:
@@ -5740,7 +6247,7 @@ January 12, 2023 | https://ruudvanasseldonk.com/2023/01/11/the-yaml-document-fro
             </title>
             <description>
 <![CDATA[
-Score 63 | Comments 20 (<a href="https://news.ycombinator.com/item?id=34350877">thread link</a>) | @eniac111
+Score 64 | Comments 20 (<a href="https://news.ycombinator.com/item?id=34350877">thread link</a>) | @eniac111
 <br/>
 January 12, 2023 | https://petrovs.info/post/2023-01-12-shaiba/ | <a href="https://web.archive.org/web/*/https://petrovs.info/post/2023-01-12-shaiba/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content">
@@ -5975,7 +6482,7 @@ January 11, 2023 | https://dearproducer.com/the-disappearance-of-the-hit-driven-
             </title>
             <description>
 <![CDATA[
-Score 142 | Comments 172 (<a href="https://news.ycombinator.com/item?id=34349484">thread link</a>) | @rl1987
+Score 145 | Comments 176 (<a href="https://news.ycombinator.com/item?id=34349484">thread link</a>) | @rl1987
 <br/>
 January 11, 2023 | https://www.trickster.dev/post/vim-is-touch-typing-on-steroids/ | <a href="https://web.archive.org/web/*/https://www.trickster.dev/post/vim-is-touch-typing-on-steroids/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div class="page">
@@ -6263,7 +6770,7 @@ ASCII art tables. It can be entered by typing Ctrl-V.</p>
             </title>
             <description>
 <![CDATA[
-Score 234 | Comments 57 (<a href="https://news.ycombinator.com/item?id=34347193">thread link</a>) | @zdw
+Score 236 | Comments 57 (<a href="https://news.ycombinator.com/item?id=34347193">thread link</a>) | @zdw
 <br/>
 January 11, 2023 | https://www.benshoof.org/blog/sierras-macintosh-timebomb | <a href="https://web.archive.org/web/*/https://www.benshoof.org/blog/sierras-macintosh-timebomb">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -6459,7 +6966,7 @@ January 11, 2023 | https://www.chrisarmstrong.dev/posts/api-mismatch--why-boltin
             </title>
             <description>
 <![CDATA[
-Score 175 | Comments 110 (<a href="https://news.ycombinator.com/item?id=34346411">thread link</a>) | @preetamjinka
+Score 176 | Comments 110 (<a href="https://news.ycombinator.com/item?id=34346411">thread link</a>) | @preetamjinka
 <br/>
 January 11, 2023 | https://misfra.me/2023/ctes-as-lookup-tables/ | <a href="https://web.archive.org/web/*/https://misfra.me/2023/ctes-as-lookup-tables/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section>
@@ -6531,7 +7038,7 @@ have to repeat the expression.</p>
             </title>
             <description>
 <![CDATA[
-Score 25 | Comments 3 (<a href="https://news.ycombinator.com/item?id=34344701">thread link</a>) | @GeorgeMac
+Score 26 | Comments 3 (<a href="https://news.ycombinator.com/item?id=34344701">thread link</a>) | @GeorgeMac
 <br/>
 January 11, 2023 | https://www.flipt.io/blog/embedding-react-in-go | <a href="https://web.archive.org/web/*/https://www.flipt.io/blog/embedding-react-in-go">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><div><p><span><span></span><img alt="Flipt React + Go" sizes="100vw" srcset="https://www.flipt.io/_next/image?url=https%3A%2F%2Fd2gyxfk3i23rk4.cloudfront.net%2Fblog%2Fembedding-react-in-go%2Freact-go.png&amp;w=640&amp;q=75 640w, https://www.flipt.io/_next/image?url=https%3A%2F%2Fd2gyxfk3i23rk4.cloudfront.net%2Fblog%2Fembedding-react-in-go%2Freact-go.png&amp;w=750&amp;q=75 750w, https://www.flipt.io/_next/image?url=https%3A%2F%2Fd2gyxfk3i23rk4.cloudfront.net%2Fblog%2Fembedding-react-in-go%2Freact-go.png&amp;w=828&amp;q=75 828w, https://www.flipt.io/_next/image?url=https%3A%2F%2Fd2gyxfk3i23rk4.cloudfront.net%2Fblog%2Fembedding-react-in-go%2Freact-go.png&amp;w=1080&amp;q=75 1080w, https://www.flipt.io/_next/image?url=https%3A%2F%2Fd2gyxfk3i23rk4.cloudfront.net%2Fblog%2Fembedding-react-in-go%2Freact-go.png&amp;w=1200&amp;q=75 1200w, https://www.flipt.io/_next/image?url=https%3A%2F%2Fd2gyxfk3i23rk4.cloudfront.net%2Fblog%2Fembedding-react-in-go%2Freact-go.png&amp;w=1920&amp;q=75 1920w, https://www.flipt.io/_next/image?url=https%3A%2F%2Fd2gyxfk3i23rk4.cloudfront.net%2Fblog%2Fembedding-react-in-go%2Freact-go.png&amp;w=2048&amp;q=75 2048w, https://www.flipt.io/_next/image?url=https%3A%2F%2Fd2gyxfk3i23rk4.cloudfront.net%2Fblog%2Fembedding-react-in-go%2Freact-go.png&amp;w=3840&amp;q=75 3840w" src="https://www.flipt.io/_next/image?url=https%3A%2F%2Fd2gyxfk3i23rk4.cloudfront.net%2Fblog%2Fembedding-react-in-go%2Freact-go.png&amp;w=3840&amp;q=75" decoding="async" data-nimg="responsive" loading="lazy" data-old-src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"></span></p><p>Photo by @ninjason on Unsplash</p></div></div>
@@ -6725,7 +7232,7 @@ Hot on this release's heels will be login functionality in the UI.</p>
             </title>
             <description>
 <![CDATA[
-Score 26 | Comments 27 (<a href="https://news.ycombinator.com/item?id=34344590">thread link</a>) | @LeonM
+Score 27 | Comments 27 (<a href="https://news.ycombinator.com/item?id=34344590">thread link</a>) | @LeonM
 <br/>
 January 11, 2023 | https://www.mailhardener.com/blog/why-mailhardener-recommends-spf-softfail-over-fail | <a href="https://web.archive.org/web/*/https://www.mailhardener.com/blog/why-mailhardener-recommends-spf-softfail-over-fail">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -7011,7 +7518,7 @@ It can also be used to deploy additional services, such as <a href="https://www.
             </title>
             <description>
 <![CDATA[
-Score 665 | Comments 506 (<a href="https://news.ycombinator.com/item?id=34342871">thread link</a>) | @mbil
+Score 666 | Comments 506 (<a href="https://news.ycombinator.com/item?id=34342871">thread link</a>) | @mbil
 <br/>
 January 11, 2023 | https://elkue.com/nyc-slice/ | <a href="https://web.archive.org/web/*/https://elkue.com/nyc-slice/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -7186,7 +7693,7 @@ January 11, 2023 | https://elkue.com/nyc-slice/ | <a href="https://web.archive.o
             </title>
             <description>
 <![CDATA[
-Score 373 | Comments 110 (<a href="https://news.ycombinator.com/item?id=34342371">thread link</a>) | @maxdemarzi
+Score 376 | Comments 110 (<a href="https://news.ycombinator.com/item?id=34342371">thread link</a>) | @maxdemarzi
 <br/>
 January 11, 2023 | https://maxdemarzi.com/2023/01/11/bullshit-graph-database-performance-benchmarks/ | <a href="https://web.archive.org/web/*/https://maxdemarzi.com/2023/01/11/bullshit-graph-database-performance-benchmarks/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
