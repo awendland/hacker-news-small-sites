@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Fri, 20 Jan 2023 16:37:36 GMT</lastBuildDate>
+        <lastBuildDate>Fri, 20 Jan 2023 20:27:39 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-5.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Fri, 20 Jan 2023 16:37:36 GMT</pubDate>
+        <pubDate>Fri, 20 Jan 2023 20:27:39 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,355 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Factorization and Great Ideas from Database Theory Part 1]]>
+            </title>
+            <description>
+<![CDATA[
+Score 11 | Comments 0 (<a href="https://news.ycombinator.com/item?id=34457662">thread link</a>) | @semihsalihoglu
+<br/>
+January 20, 2023 | https://kuzudb.com/blog/factorization.html | <a href="https://web.archive.org/web/*/https://kuzudb.com/blog/factorization.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="main-content" role="main"> <p> <a href="https://github.com/kuzudb/kuzu"><img src="https://kuzudb.com/kuzu-logo.png" width="300"></a> </p> <p>  <a href="https://github.com/kuzudb" data-size="large" aria-label="Follow @kuzudb on GitHub">Follow @kuzudb</a> </p> <p>by Semih Salihoğlu, Jan 20th, 2023</p>  <p>Many of the core principles of how to develop DBMSs are well understood. For example, a very good query compilation paradigm is to map high-level queries to a logical plan of relational operators, then optimize this plan, and then further map it to an executable code often in the form of a physical query plan. Similarly, if you want updates to a DBMS to be atomic and durable, a good paradigm is to use a write-ahead log that serves as a source of truth and can be used to undo or redo operations. Many systems adopt such common wisdom paradigms. As core DBMS researcher, once in a while however, you run into a very simple idea that deviates from the norm that gets you very excited. Today, I want to write about one such idea called <a href="https://www.cs.ox.ac.uk/dan.olteanu/papers/os-sigrec16.pdf">factorization</a>.</p> <blockquote> <p><strong>Tldr: The key takeaways are:</strong></p> <ul> <li><strong>Overview of Factorization &amp; Why Every GDBMS Must Adopt It</strong>: Factorization is a compression technique to compress the intermediate results that query processors generate when evaluating many-to-many (m-n) joins. Factorization can compress an intermediate result size exponentially in the number m-n joins in the query.</li> <li><strong>Example Benefits of Factorization</strong>: Benefits of keeping intermediate results smaller reduces the computation processors perform on many queries. Examples include reducing copies by keeping the output data size small, reducing filter and expression evaluation computations exponentially, and performing very fast aggregations.</li> <li><strong>How Kùzu Implements Factorization:</strong> Kùzu’s query processor is designed to achieve 3 design goals: (i) factorize intermediate results; (ii) always perform sequential scans of database files; and (iii) avoid scanning large chunks of database files when possible. In addition, the processor is vectorized as in modern columnar DBMSs. These design goals are achieved by passing multiple <em>factorized vectors</em> between each other and using modified HashJoin operators that do <em>sideways information passing</em> to avoid scans of entire files.</li> </ul> </blockquote> <p>This is a quite technical and long blog post and will appeal more to people who are interested in internals of DBMSs. It’s about a technique that’s quite dear to my heart called factorization, which is a very simple data compression technique. Probably all compression techniques you know are designed to compress database files that are stored on disk. Think of run-length encoding, dictionary compression, or bitpacking. In contrast, you can’t use factorization to compress your raw database files. Factorization has a very unique property: it is designed to compress the intermediate data that are generated when query processors of DBMSs evaluate many-to-many (m-n) growing joins. If you have read <a href="https://kuzudb.com/blog/what-every-gdbms-should-do-and-vision.html">my previous blog</a>, efficiently handling m-n joins was one of the items on my list of properties that competent GDBMSs should excel in. This is because the workloads of GDBMSs commonly contain m-n joins across node records. Each user in a social network or an account in a financial transaction network or will have thousands of connections and if you want a GDBMS to find patterns on your graphs, you are asking queries with m-n joins. Factorization is directly designed for these workloads and because of that every competent GDBMS must develop a factorized query processor. In fact, if I were to try to write a new analytical RDBMS, I would probably also integrate factorization into it.</p> <p>This post forms the 2nd part of my 3-part posts on the contents of our <a href="https://www.cidrdb.org/cidr2023/papers/p48-jin.pdf">CIDR paper</a> where we introduced Kùzu. The 3rd piece will be on another technique called worst-case optimal join algorithms, which is also designed for a specific class of m-n joins. Both in this post and the next, I have two goals. First is to try to articulate these techniques using a language that is accessible to general software engineers. Second, is to make people appreciate the role of pen-and-paper theory in advancing the field of DBMSs. Both of these techniques were first articulated in a series of purely theoretical papers which gave excellent practical advise on how to improve DBMS performance. Credit goes to the great theoreticians who pioneered these techniques whom I will cite in these posts. Their work should be highly appreciated.</p> <h2 id="a-quick-background-traditional-query-processing-using-flat-tuples"> <a href="#a-quick-background-traditional-query-processing-using-flat-tuples" aria-labelledby="a-quick-background-traditional-query-processing-using-flat-tuples"></a> A Quick Background: Traditional Query Processing Using Flat Tuples </h2> <p>Here is a short background on the basics of query processors before I explain factorization. If you know about query plans and how to interpret them, you can skip to <a href="#factorization-in-a-nutshell">here</a> after reading my running example. Consider a database of Account node and Transfer edge records below. The two Accounts with <code>accID</code> fields L1 and L2 are owned by Liz and each have 100 incoming and 100 outgoing Transfer edges.</p> <p> <img src="https://kuzudb.com/img/2-hop-data.png" width="600"> </p> <p>Now consider a 2-hop path query in Cypher returning the accID’s of source and destinations of money flows Liz’s accounts are facilitating:</p> <div><div><pre><code>MATCH (a:Account)-[t1:Transfer]-&gt;(b:Account)-[t2:Transfer]-&gt;(c:Account)
+WHERE b.name = 'Liz' 
+RETURN a.accID, c.accID
+</code></pre></div></div> <p>Here’s the SQL version of the query if you modeled your records as relations. Same query different syntax:</p> <div><div><pre><code>SELECT a.accID, c.accID
+FROM Account a, Transfer t1, Account b, Transfer t2, Account c
+WHERE b.name = 'Liz' AND
+      t1.src = a.accID AND t1.dst = b.accID
+      t2.src = b.accID AND t2.dst = c.accID
+</code></pre></div></div> <p>A standard query plan for this query is shown on the left in Fig. 2. The plan contains some Scan operators to scan the raw node or edge records (edges could be scanned from a join index) and some hash join operators to perform the joins, and a final projection operator. In some GDBMSs, you might see “linear plans” that look as in Fig. 3.</p> <p> <span><img src="https://kuzudb.com/img/2-hop-query-plan-hash-join.png"></span> <span><img src="https://kuzudb.com/img/2-hop-query-plan-extend.png"></span> </p> <p>The linear plan is from our previous GraphflowDB system. Here you are seeing an operator called Extend, which joins node records with their Transfer relationships to read the system-level IDs of the neighbors of those node records. Following the Extend is another Join operator to join the accID properties of those neighbors (specifically c.accID and a.accID). In Neo4j, you’ll instead see an Expand(All) operator, which does the Extend+Join in GraphflowDB in a single operator<sup id="fnref:1" role="doc-noteref"><a href="#fn:1" rel="footnote">1</a></sup>. For very good reasons we removed these Extend/Expand type operators in Kuzu. I will come back to this.</p> <p>The interpretation of plans is that tuples are flowing from the bottom to top and each operator will take in sets of tuples and produce sets of tuples (in a pipelined fashion). The key motivation for factorization is that what flows between operators are <strong>flat tuples</strong>. When the joins are m-n, this leads to many data repetitions, which one way or another leads to repeated computation in the operators. For example, the final projection operator in our example would take the table shown in Figure 4 (left).</p> <p> <img src="https://kuzudb.com/img/flat-vs-factorized.png" width="700"> </p> <p>There are 20K tuples in the flat representation because both L1 and L2 are part of 100 incoming x 100 outgoing=10K many 2-paths. Notice the many repetitions in this relation: L1, L2, or Liz values, or the values in a.accID and c.accID. What gets replicated may change across systems. Some may replicate the actual values, some may replicate indices where these values are stored but overall exactly 20K tuples would be generated. This redundancy leads to redundant computation here and there during query processing.</p> <h2 id="factorization-in-a-nutshell"> <a href="#factorization-in-a-nutshell" aria-labelledby="factorization-in-a-nutshell"></a> Factorization In a Nutshell </h2> <p>Factorization addresses exactly this problem. The core reason for the redundancy is this observation: <em>given a fixed b value, all a’s and c’s are conditionally independent</em>. More concretely, once b is bound to node L1, each incoming neighbor <code>a</code> for L1 will join with each outgoing neighbor <code>c</code> of L1. If you took the first standard undergraduate course in DBMSs at a university and you covered the theory of normalization, this is what is called a <a href="https://en.wikipedia.org/wiki/Multivalued_dependency">multi-valued dependency</a> in relations. Factorization exploits such dependencies to compress relations using Cartesian products. Above in Figure 4 (right), I’m showing the same 20K tuples in a factorized format using only 400 values (so 2*(100+100) instead of 2*100*100 values).</p> <p>That’s it! That’s the core of the idea! Now of course, this simple observation leads to a ton of hard and non-obvious questions that the entire theory on factorization answers. For example, given a query, what are the “factorization structures”, i.e., the Cartesian product structures that can be used to compress it? Consider a simple query that counts the number of paths that are slightly longer:</p> <div><div><pre><code>MATCH (a:Account)-[:Wire]&gt;(b:Account)-[:Deposit]&gt;(c:Account)-[:ETransfer]-&gt;(d:Account)
+RETURN count(*)
+</code></pre></div></div> <p>Should you condition on b and factor out a’s from (c, d)’s or condition on c and factor out (a, b)’s from d’s? Or you could condition on (b, c) and factor out (a)’s from (d)’s? To make a choice, a system has to reason about the number of Wire, Deposit, and ETransfer records in the database. How much and on which queries can you benefit from factorization? The theoretical questions are endless. The theory of factorization develops the formal foundation so that such questions can be answered and provides principled first answers to these questions. <a href="https://www.ifi.uzh.ch/en/dast/people/Olteanu.html">Dan Olteanu</a> and his colleagues, who lead this field, recently won the <a href="https://databasetheory.org/ICDT/test-of-time">ICDT test of time award</a> for their work on factorization. ICDT is one of the two main academic venues for theoretical work on DBMSs.</p> <p>But let’s take a step back and appreciate this theory because it gives an excellent advise to system developers: <em>factorize your intermediate results if your queries contain many-to-many joins!</em> Recall that GDBMSs most commonly evaluate many-to-many joins. So hence my point that GDBMSs should develop factorized query processors. The great thing this theory shows us is that this can all be done by static analysis of the query during compilation time by only inspecting the dependencies between variables in the query! I won’t cover the exact rules but at least in my running example, I hope it’s clear that because there is no predicate between a’s and c’s, once b is fixed, we can factor out a’s from c’s.</p> <h2 id="examples-when-factorization-significantly-benefits"> <a href="#examples-when-factorization-significantly-benefits" aria-labelledby="examples-when-factorization-significantly-benefits"></a> Examples When Factorization Significantly Benefits: </h2> <p>Factorized intermediate relations can be exponentially smaller (in terms of the number of joins in the query) than their flat versions, which can yield orders of magnitude speed ups in query performance for many different reasons. I will discuss three most obvious ones.</p> <h3 id="less-data-copiesmovement"> <a href="#less-data-copiesmovement" aria-labelledby="less-data-copiesmovement"></a> Less Data Copies/Movement </h3> <p>The most obvious benefit is that factorization reduces the amount of data copied between buffers used by operators during processing and to final <code>QueryResult</code> structure that the application gets access to. For example, a very cool feature of Kùzu is that it keeps final outputs in factorized format in its <code>QueryResult</code> class and enumerates them one by one only when the user starts calling <code>QueryResult::getNext()</code> to read the tuples. In our running example, throughout processing Kùzu would do copies of 400 data values roughly instead of 20K to produce its <code>QueryResult</code>. Needless to say, I could have picked a more exaggerated query, say a “star” query with 6 relationships, and arbitrarily increased the difference in the copies done between a flat vs factorized processor.</p> <h3 id="fewer-predicate-and-expression-evaluations"> <a href="#fewer-predicate-and-expression-evaluations" aria-labelledby="fewer-predicate-and-expression-evaluations"></a> Fewer Predicate and Expression Evaluations </h3> <p>Factorization can also reduce the amount of predicate or expression executions the system performs. Suppose we modify our 2-hop query a bit and put two additional filters on the query:</p> <div><div><pre><code>MATCH (a:Account)-[e1:Transfer]-&gt;(b:Account)-[e2:Transfer]-&gt;(c:Account)
+WHERE b.name = 'Liz' AND a.balance &gt; b.balance AND c.balance &gt; b.balance
+RETURN *
+</code></pre></div></div> <p>I’m omitting a plan for this query but a common plan would extend the plan in Figure 2 (or 3) above to also scan the balance properties and to run two filter operations: (i) above the join that joins a’s and b’s, to run the predicate <code>a.balance &gt; b.balance</code>; (ii) after the final join in Figure 2 to run the predicate <code>c.balance &gt; b.balance</code>. Suppose the first filter did not eliminate any tuples. Then, a flat processor would evaluate 20K filter execution in the second filter. In contrast, the input to the second filer operator in a factorized processor would be the 2 factorized tuples shown in Figure 4 (right) but extended with <code>balance</code> properties on a, b, and c’s. Therefore there would be only 200 filter executions: (i) for the first factorizaed tuple, there are only 100 comparison to execute <code>c.balance &gt; b.balance</code> since b is matched to a single value and there are 100 c values.; (ii) similarly for the 2nd factorized tuple. We can obtain similar benefits when running other expressions.</p> <h3 id="aggregations"> <a href="#aggregations" aria-labelledby="aggregations"></a> Aggregations </h3> <p>This is perhaps where factorization yields largest benefits. One can perform several aggregations directly on factorized tuples using algebraic properties of several aggregation functions. Let’s for instance modify our above query to a count(*) query: Find the number of 2-paths that Liz is facilitating. A factorized processor can simply count that there are 100*100 flat tuples in the first factorized tuple and similarly in the second one to compute that the answer is 20K. Or consider doing min/max aggregation on factorized variables:</p> <div><div><pre><code>MATCH (a:Account)-[e1:Transfer]-&gt;(b:Account)-[e2:Transfer]-&gt;(c:Account)
+WHERE b.accID = 'L1'
+RETURN max(a.balance), min(c.balance)
+</code></pre></div></div> <p>This is asking: find the 2-path money flow that Liz’s L1 account facilitates from the highest to lowest balance accounts (and only print the balances). If a processor processes the 10K 2-paths that L1 is part of in factorized form, then the processor can compute the max and min aggregations with only 100 comparisons each (instead of 10K comparisons each).</p> <p>In short, the benefits of factorizing intermediate results just reduces computation and data copies here and there in many cases. You can try some of these queries on Kùzu and compare its performance on large datasets with non-factorized systems.</p> <h2 id="how-does-kùzu-performe-factorized-query-processing"> <a href="#how-does-kùzu-performe-factorized-query-processing" aria-labelledby="how-does-kùzu-performe-factorized-query-processing"></a> How Does Kùzu Performe Factorized Query Processing? </h2> <p>The rest will be even more technical and forms part of the technical meat of our CIDR paper; so continue reading if you are interested in database implementations. When designing the query processor of Kùzu, we had 3 design goals:</p> <ol> <li>Factorize intermediate growing join results.</li> <li>Always perform sequential scans of database files from disk.</li> <li>When possible avoid scanning entire database files from disk.</li> </ol> <p>3rd design goal requires some motivation, which I will provide below. Let’s go one by one.</p> <h3 id="1-factorization"> <a href="#1-factorization" aria-labelledby="1-factorization"></a> 1. Factorization </h3> <p>Kùzu has a vectorized query processor, which is the common wisdom in analytical read-optimized systems. <img src="https://kuzudb.com/img/factorized-vectors.png"> Vectorization, in the context of DBMS query processors refers to the design where operators pass a set of tuples, 1024 or 2048, between each other during processing<sup id="fnref:2" role="doc-noteref"><a href="#fn:2" rel="footnote">2</a></sup>. Existing vectorized query processors (in fact processors of all systems I’m aware of) pass <em>a single vector of flat tuples</em>. Instead, Kùzu’s operators pass (possibly) multiple <em>factorized vectors of tuples</em> between each other. Each vector can either be <em>flat</em> and represent a single value or <em>unflat</em> and represent a set of values, which is marked in a field called <code>curIdx</code> associated with each vector. For example, the first 10K tuples from my running example would be represented with 3 factorized vectors as on the left and would be passed to the final projection in the query plan in Figure 2. The interpretation is this: what is passed is the Cartesian product of all sets of tuples in those vectors. Operators know during compilation time how many vector groups they will take in and how many they will output. Importantly, we still do vectorized processing, i.e., each primitive operator operates on a vector of values inside tight for loops. Credit where credit’s due: this simple-to-implement design was proposed by my PhD student <a href="http://amine.io/">Amine Mhedhbi</a> with some feedback from me and my ex-Master’s student <a href="https://www.linkedin.com/in/g31pranjal/?originalSubdomain=in">Pranjal Gupta</a> and <a href="https://www.linkedin.com/in/xingyang-feng-14198491/?originalSubdomain=ca">Xiyang Feng</a>, who is now a core developer of Kùzu. And we directly adopted it in Kùzu. Amine has continued doing other excellent work on factorization, which we have not yet integrated, and you will need to wait until his PhD thesis is out.</p> <h3 id="2-ensuring-sequential-scans"> <a href="#2-ensuring-sequential-scans" aria-labelledby="2-ensuring-sequential-scans"></a> 2. Ensuring Sequential Scans </h3> <p>I already told you above that Extend/Expand type join operators lead to non-sequential scans of database files. These operators are not robust and if you are developing a disk-based system: non-sequential scans will kill you on many queries. That’s a mistake. Instead, Kùzu uses (modified) HashJoins which are much more robust. HashJoins do not perform any scans as part of the actual join computation so if the down stream scans are sequential, you get sequential scans. I’ll give a simulation momentarily.</p> <h3 id="3-avoiding-full-scans-of-database-files"> <a href="#3-avoiding-full-scans-of-database-files" aria-labelledby="3-avoiding-full-scans-of-database-files"></a> 3. Avoiding Full Scans of Database Files </h3> <p>Although I don’t like Extend/Expand-type join operators, they have a performance advantage. Suppose you had a simple 1-hop query that only asked for the names of accounts that Liz’s L1 account has transfered money to:</p> <div><div><pre><code>MATCH (a:Account-[:Transfer]-&gt;(b:Account)
+WHERE a.accID = 'L1'
+RETURN b.name
+</code></pre></div></div> <p>Suppose your database has billions of transfers but L1 has made only 3 transfers to accounts with system-level record/node IDs: 107, 5, and 15. Then if you had a linear plan like I showed in Figure 3, then an Extend/Expand-type operator could read these system-level IDs and then only scan the name properties of these 3 nodes, avoiding the full scan of the names of all Accounts. If your query needs to read neighborhoods of millions of nodes, this type of computation that “reads the properties of each node’s neighbors” will degrade very quickly because: (i) each neighborhood of each node will require reading different parts of the disk files that store those properties; and (ii) the system might repeatedly read the same properties over and over from disk, as nodes share neighbors. Instead, you want to read all of the properties and create a hash table and read those properties from memory. However, if your query is accessing the neighborhoods of a few nodes, then avoiding the scan of entire database file is an advantage. In Kùzu, we wanted to use HashJoins but we also wanted a mechanism to scan only the necessary parts of database files. We do this through a technique called <em>sideways information passing</em><sup id="fnref:3" role="doc-noteref"><a href="#fn:3" rel="footnote">3</a></sup>. I’ll simulate this below.</p> <h3 id="a-simple-simulation"> <a href="#a-simple-simulation" aria-labelledby="a-simple-simulation"></a> A Simple Simulation </h3> <p>For simplicity, we’ll work on a simpler 1-hop query, so the benefits of factorization will not be impressive but it will allow me to explain an entire query processing pipeline. Consider this count(*) query that counts the number of transfers the L1 account has made:</p> <div><div><pre><code>MATCH (a:Account)-[t1:Transfer]-&gt;(b:Account)
+WHERE a.accID = L1
+RETURN count(*)
+</code></pre></div></div> <p>An annotated query plan we generate is shown below. The figure shows step by step the computation that will be performed and the data that will be passed between operators. For this simulation, I am assuming that the record/nodeIDs of Accounts are as in Figure 1a above. <img src="https://kuzudb.com/img/factorized-execution-simulation.png"></p> <ol> <li>A Scan operator will scan the accId column and find the records of nodes with accID=L1. There is only 1 tuple (199, Liz) that will be output.</li> <li>This tuple will passed to HashJoin’s build side, which will create a hash table from it.</li> <li>At this point the processor knows exactly the IDs of nodes, whose Transfer edges need to be scanned on the probe side: only the edges of node with ID 199! This is where we do sideways information passing. Specifically, the HashJoin constructs and passes a “nodeID filter” (effectively a bitmap) to the probe side Scan operator. Here, I’m assuming the database has 1M Accounts but as you can see only the position 199 is 1 and others are 0.</li> <li>The probe-side Scan uses the filter to only scan the edges of 199 and avoids scanning the entire Transfers file. Since Kùzu is a GDBMS, we store the edges of nodes (and their properties) in a graph-optimized format called <a href="https://en.wikipedia.org/wiki/Sparse_matrix#Compressed_sparse_row_(CSR,_CRS_or_Yale_format)">CSR</a>. Importantly, all of the edges of 199 are stored consecutively and we output them in factorized format as: [(199) X {201, 202, …, 300}].</li> <li>Next step can be skipped in an optimized system but currently we will probe the [(199) X {201, 202, …, 300}] tuple in the hash table and produce [(199, L1) X {201, 202, …, 300}], which is passed to the final aggregation operator.</li> <li>The agggregation operator counts that there are 100 “flat” tuples in [(199, L1) X {201, 202, …, 300}], simply by inspecting the size of the 2nd vector {201, 202, …, 300} in the tuple.</li> </ol> <p>As you see the processing was factorized, we only did sequential scans but we also avoided scanning the entire Transfer database file, achieving our 3 design goals. This is a simplifid example and there are many queries that are more complex and where we have more advanced modified hash join operators. But the simulation presents all core techniques in the system. You can read our <a href="https://www.cidrdb.org/cidr2023/papers/p48-jin.pdf">CIDR paper</a> if you are curious about the details!</p> <h3 id="example-experiment"> <a href="#example-experiment" aria-labelledby="example-experiment"></a> Example Experiment </h3> <p>How does it all perform? Quite well! Specifically this type of processing is quite robust. Here’s an experiment from our CIDR paper to give a sense of the behavior of using modified hash joins and factorization on a micro benchmark query. This query does a 2-hop query with aggregations on every node variable. This is on an <a href="https://ldbcouncil.org/benchmarks/snb/">LDBC</a> social network benchmark (SNB) dataset at scale factor 100 (so ~100GB of database). LDBC SNB models a social network where user post comments and react to these comments.</p> <div><div><pre><code>MATCH (a:Comment)&lt;-[:Likes]-(b:Person)-[:Likes]-&gt;(c:Comment)
+WHERE b.ID &lt; X
+RETURN min(a.ID), min(b.ID), min(c.ID)
+</code></pre></div></div> <p>Needless to say, we are picking this as it is a simple query that can demonstrate the benefits of all of the 3 techniques above. Also needless to say, we could have exaggerated the benefits by picking larger stars or branched tree patterns but this will do. In the experiment we are changing the selectivity of the predicate on the middle node, which changes the output size. What we will compare is the behavior of Kùzu, which integrates the 3 techniques above with (i) Kùzu-Extend: A configuration of Kùzu that uses factorization but instead of our modified HashJoins uses an Extend-like operator; and (ii) <a href="https://umbra-db.com/">Umbra</a><sup id="fnref:4" role="doc-noteref"><a href="#fn:4" rel="footnote">4</a></sup>, which represents the state of the art RDBMS. Umbra is as fast as existing RDBMSs get. It probably integrates every known low-level performance technique in the field. Umbra however does not do factorization or have a mechanism to avoid scanning entire database files, so we expect it to perform poorly on the above query.</p> <p>Here’s the performance table. <img src="https://kuzudb.com/img/2-hop-factorization-experiment.png">. When the selectivity is very low, Extend-like operators + factorization do quite well because they don’t yet suffer much from non-sequential scans and they avoid several overheads of our modified hash joins: no hash table creation and no semijoin filter mask creation. But they are not robust and degrade quickly. We can also see that even if you’re Umbra, without factorization or a mechanism to avoid scanning entire files, you will not perform very well on these queries with m-n joins (even if there is only 2 of them here). We conducted several other experiments all demonstrating the robustness and scalability of factorized processing using modifid hash join operators. I won’t cover them but they are all in <a href="https://www.cidrdb.org/cidr2023/papers/p48-jin.pdf">our CIDR paper</a>.</p> <h2 id="final-marks"> <a href="#final-marks" aria-labelledby="final-marks"></a> Final marks: </h2> <p>I am convinced that modern GDBMSs have to be factorized systems to remain competitive in performance. If your system assumes that most joins will be growing, factorization is one of a handful of modern technique for such workloads whose principles are relatively well understood and one can actually implement in a system. I am sure different factorized query processors will be proposed as more people attempt at it. I was happy to see in CIDR that at least 2 systems gurus told me they want to integrate factorization into their systems. If someone proposes a technique that can on some queries lead to exponential computation reductions even in a pen-and-paper theory, it is a good sign that for many queries it can make the difference between a system timing out vs providing an actual answer.</p> <p>Finally there is much more on the theory of factorization, which I did not cover. From my side, most interestingly, there are even more compressed ways to represent the intermediate results than the vanilla Cartesian product scheme I covered in this post. Just to raise some curiosity, what I have in mind is called <a href="https://fdbresearch.github.io/principles.html">d-representations</a> but that will have to wait for another time. For now, I invite you to check our performance out on large queries and let us know if we are slow on some queries! The Kùzu team says hi (👋 🙋‍♀️ 🙋🏽) and is at your service to fix all performance bugs as we continue implementing the system! My next post will be about the novel worst-case optimal join algoriothms, which emerged from another theoretical insight on m-n joins! Take care until then!</p>  </div></div>]]>
+            </description>
+            <link>https://kuzudb.com/blog/factorization.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-34457662</guid>
+            <pubDate>Fri, 20 Jan 2023 18:40:18 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Swiss firm sends Taiwan's 'carrier killer' devices to China for repairs]]>
+            </title>
+            <description>
+<![CDATA[
+Score 6 | Comments 2 (<a href="https://news.ycombinator.com/item?id=34457562">thread link</a>) | @pseudolus
+<br/>
+January 20, 2023 | https://www.taiwannews.com.tw/en/news/4770341 | <a href="https://web.archive.org/web/*/https://www.taiwannews.com.tw/en/news/4770341">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+                
+                                  <h2>Concerns arise after theodolites used with Hsiung Feng III were sent to China for repairs by Leica Geosystems</h2>
+                                                
+              </div><div>
+<section>
+  <div>
+    <div>
+            <p><img src="https://tnimage.s3.hicloud.net.tw/photos/2023/01/04/1672810761-63b51109e3538.jpg" onerror="imgRetry(this)" data-retry="0" data-main_image="https://tnimage.s3.hicloud.net.tw/photos/2023/01/04/1672810761-63b51109e3538.jpg" data-local_image="https://image.taiwannews.com.tw/photos/2023/01/04/1672810761-63b51109e3538.jpg" data-default_image="https://www.taiwannews.com.tw/images/category/58088932ac9b2.jpg" title="Hsiung Feng III missile being fired. (MND photo)
+" alt="Hsiung Feng III missile being fired. (MND photo)
+">
+      </p>
+          </div>
+        <div>
+            <div>
+                    <p>
+              <span>Hsiung Feng III missile being fired. (MND photo) </span>
+              
+              
+            </p>
+                </div>
+          </div>
+  </div>
+</section>
+</div><article>
+<p><span>
+                
+                      <p>
+            TAIPEI (Taiwan News) — Concerns have been voiced by Taiwanese media that information could have been leaked after devices used with Taiwan's "Carrier Killer" missiles were sent to China for repairs.</p>
+
+
+                      <p>
+            Amid growing Chinese military threat, Taiwan's National Chung-Shan Institute of Science and Technology (NCSIST) has developed the Hsiung-Feng III (雄風三型) anti-ship missile, which has been nicknamed the "Carrier Killer" due to its supersonic speed, range of up to 400 km, and 225 kg warhead. However, <a href="https://tw.news.yahoo.com/%E4%B8%AD%E7%A7%91%E9%99%A2%E5%86%8D%E5%87%BA%E5%8C%851-%E6%89%AF-%E5%8E%9F%E5%BB%A0%E5%9C%A8%E7%91%9E%E5%A3%AB%E7%AB%9F%E9%80%81%E4%B8%AD%E5%9C%8B%E5%B1%B1%E6%9D%B1%E7%B6%AD%E4%BF%AE-%E8%88%AA%E6%AF%8D%E6%AE%BA%E6%89%8B%E5%B0%8B%E6%A8%99%E5%88%A9%E5%99%A8%E6%81%90%E8%A2%AB%E5%8B%95%E6%89%8B%E8%85%B3-215858376.html" target="_blank">Mirror Media</a> on Wednesday (Jan. 4), cited sources as saying theodolites used to calibrate the missiles were sent by a Swiss company to China to make repairs due to malfunctions, potentially exposing sensitive data from missile tests and endangering Taiwan's national security.</p>
+
+
+                      <p>
+            According to the magazine, the theodolites used to make measurements on the Hsiung Feng III are made by the Swiss firm Leica Geosystems. The Leica Builder T100/T200 is the firm's highest-end electronic theodolite with unique telescope optics, which can accurately measure various azimuths in only 0.5 seconds, so it is widely used in precision components for aerospace, automotive, national defense, and optoelectronics. The Ministry of National Defense has recently expanded the procurement of new ranging theodolites for use by artillery units.</p>
+
+
+              
+        <!-- Primis /8095840/.2_A.39687.46_taiwannews.com.tw_tier1 -->
+
+        
+                      <p>
+            As part of its strategy to turn Taiwan into a "hedgehog island" to deter military aggression by China, the NCSIST developed the Hsiung Feng missile series, which has gained the attention of the military industry of many countries after a Hsiung Feng III accidentally launched and struck a fishing vessel in 2016. However, according to Mirror Media, theodolites used for measuring the Hsiung Feng III were sent to Leica Geosystems for repairs due to technical issues.</p>
+
+
+                      <p>
+            The NCSIST had recently discovered that the connector pins on two Leica theodolites had become loose. In early December 2021 and late February 2022, a company distributor located in New Taipei City's Xindian District sent the products back to Switzerland for Leica Geosystems to carry out repairs. However, people familiar with the matter said that the repairs were very fast and after about three months, the two theodolites were sent back to NCSIST in February and May 2022, respectively.</p>
+
+
+                      <p>
+            <img alt="Swiss firm sends Taiwan's 'carrier killer' devices to China for repairs" src="https://image.taiwannews.com.tw/photos/2023/01/04/1672811306-63b5132a6b1d4.jpg"><br>
+<span>(Leica Geosystems image)</span></p>
+
+
+                      <p>
+            After the theodolites were repaired, their measurements of the Hsiung Feng missiles returned to normal. It was not until September that NCSIST personnel checked the import declaration form and other materials returned by Leica Geosystems' maintenance center, and they noticed that something was amiss.</p>
+
+
+                      <p>
+            The documents revealed the devices had actually been sent back to Taiwan from Qingdao in China's Shandong Province. This means the equipment was repaired in China or was sent to Taiwan via China, where secrets about the missiles or other parameters may have been seen by the Chinese military.</p>
+
+
+                      <p>
+            On Wednesday, the NCSIST issued a press release pointing out that the theodolite is an optical correction device used to measure the missile body, launch box, frame, and other objects on its production assembly line, and it is not used to control the continuous positioning of the Hsiung Feng missile.</p>
+
+
+                      <p>
+            The institute said the equipment was purchased from Leica Geosystems through public bidding in 2021. Due to some equipment defects, after removing the relevant storage memory cards in the devices during the warranty period, the domestic distributor was required to send them to the original Swiss factory for repairs.</p>
+
+
+                      <p>
+            NCSIST stated that after the equipment was repaired and sent back, it took the initiative to find that the import declaration stated that it was exported from Qingdao Jiaodong International Airport ("the original manufacturer'' Asian maintenance center). Therefore, an information technology security appraisal of the devices was carried out immediately to confirm that no malicious programs were implanted, and the institute said there were no concerns over information security leaks.</p>
+
+
+                      
+
+            </span>
+
+</p>
+</article></div>]]>
+            </description>
+            <link>https://www.taiwannews.com.tw/en/news/4770341</link>
+            <guid isPermaLink="false">hacker-news-small-sites-34457562</guid>
+            <pubDate>Fri, 20 Jan 2023 18:34:05 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Job Hunting in 2022]]>
+            </title>
+            <description>
+<![CDATA[
+Score 74 | Comments 18 (<a href="https://news.ycombinator.com/item?id=34456416">thread link</a>) | @zeroonetwothree
+<br/>
+January 20, 2023 | https://mhlakhani.com/blog/2023/01/tech-job-market/ | <a href="https://web.archive.org/web/*/https://mhlakhani.com/blog/2023/01/tech-job-market/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+                        
+                        <p><a href="https://mhlakhani.com/2022/09/badge-post/">After leaving Meta recently</a>, I decided it was finally time to start looking for a job again. It's been quite an experience doing it amid a recession and layoffs (I have thankfully been quite lucky). I thought I'd share how I approached the job hunt as a few people had asked for advice. </p>
+<div>
+        <div>
+            <figure>
+                <img src="https://mhlakhani.com/static/img/2023/01/in_this_economy.png" alt="When I told people about leaving a job without anything lined up.">
+            </figure>
+        </div>
+        
+    </div>
+
+<blockquote>
+<p>Note: As always, this is just one person's experience. I'm sharing this in the hopes that this proves helpful for someone else in a similar situation. I've tried to keep the advice generally applicable, but it's most suited towards senior-ish software engineers with industry experience and a pre-existing network and less likely to apply to new grads. I was also not in a huge rush and had the luxury to be picky in the search (and was very lucky due to many other factors). If you need a job urgently, this might not be the best advice.</p>
+</blockquote>
+<h2>How it went down</h2>
+<p>I started looking in mid/late September and wrapped things up by mid-December. Here's a rough timeline:</p>
+<ul>
+<li>September: Thinking about applying (and letting my network know I'm looking), coming up with a plan, some initial exploratory calls, and interview prep</li>
+<li>October: More exploratory calls, some phone screens/initial rounds, interview prep, and a break for a vacation before the actual interviews</li>
+<li>November: Interviews all day erryday (for the first 3 weeks), then a break + follow-up calls/receiving offers</li>
+<li>December: Receiving offers, follow up-calls, negotiating, and deciding.</li>
+</ul>
+<p>My goal through the process was to find a place I'd be happy learning and growing for at least 4-5 years, and discover what type of work I wanted to do next (e.g. nonprofit, big company, small company, different industries, management vs engineering, etc). So, throughout this process, I applied to a lot more places than I would have done. But, hey, as a candidate, we get to interview companies just as much as they interview us, so I decided to use this opportunity accordingly. In terms of companies. A rough count of the numbers below:</p>
+<ul>
+<li>There were ~35 companies I tracked on my list, of which I applied to 27:
+<ul>
+<li>I applied online to 14 places, of those I only heard back from 6.</li>
+<li>I used referrals to get help applying at 9 companies. I heard back from all of these. Referrals really mattered in terms of getting a response!</li>
+<li>I generally get a lot of recruiter spam - but I started paying attention now. I accepted 4 of the reach outs, 2 of which went pretty far.</li>
+</ul>
+</li>
+<li>I dropped out of the process at 4 companies during the exploratory stage, 3 had no roles open/fille their openings early on in the process, and I dropped out of the process at 3 places after deciding it wasn't a good fit after a few interviews.</li>
+<li>I completed full interview loops at 13 companies and received 11 offers. I'm glad I got the rejections I did - it was clear there wasn't a mutual match.</li>
+</ul>
+<p>In the future, I likely won't apply as much. Depending on your needs you might have to apply to a similar amount of companies but I don't recommend going through interview loops at this many companies unless you're actively exploring. At the same time, since nerves really get to me, calming myself down by lowering the stakes (if I messed up with one company, it's ok, I am applying to a lot of others) <em>really</em> helps since you feel less stressed in each  interview.</p>
+<h2>Planning</h2>
+<p>Before starting a job hunt, think about what you want to get out of the process. All desires are valid - it's just that optimizing for "I want to find <em>the best job</em> and I'm willing to wait" is very different from "I need a job ASAP to pay the bills, anything that pays more than $X works". So think about that and be honest with yourself so that you get what you're looking for.</p>
+<p>I didn't know what I wanted from my next job (just that I wanted to stay there a while and grow myself), so I explicitly set a goal to explore and learn. And set aside a bunch of time to think through my criteria and what I wanted. This also meant more aggressive searching and sourcing of companies to apply to (via my network, and online), rather than applying to every possible opening. </p>
+<p>I also felt quite underprepared so I budgeted a bunch of time to practice and make sure I was interview ready - this included planning out which weeks I'd do what, so I could book interviews accordingly - and in particular, schedule my highest priority / riskiest interviews roughly in the middle so I'd go in with some practice but not be super worn out.</p>
+<h2>Acceptance Criteria</h2>
+<p>These are deeply personal - there's no one right answer to "is this the right opportunity for me?". But it's important to have your criteria known beforehand (feel free to refine them during the process) so that you can evaluate each opportunity fairly. Think about what you want in your life and your career.</p>
+<p>For me, the criteria were a mix of the following (importance factors left out for brevity):</p>
+<ul>
+<li>Company/role: what the company does (and what is its growth trajectory), what the org does, the role I'm interviewing for, and how my work ties to the mission, etc</li>
+<li>Team/Culture/People: how the company culture is, how my (future) co-workers are, diversity, etc</li>
+<li>Personal: growth opportunities for me, work-life balance/PTO, remote vs hybrid, compensation, how excited I am for the role, etc</li>
+</ul>
+<p>Once I had these written down, I kept a spreadsheet for each company I applied to so that I could make sure to get enough data for each of my questions/criteria throughout the process.</p>
+<h2>Finding companies to apply to</h2>
+<p>This isn't easy when starting out in the industry, unfortunately. But if you've been working for a few years, you likely have a network you can lean on. Ask your coworkers/friends what they like about their current roles and which places they'd recommend. I was lucky to have worked with some excellent people in my past role so companies with people I knew and liked working with immediately shot to the top of the list.</p>
+<p>Since that suffers from selection bias, though, I did scour LinkedIn and Twitter (if you're working in security, infosec twitter - now migrated to Mastodon mostly - has a lot of great leads) for open roles. Hacker News does great whoishiring threads every month (<a href="https://news.ycombinator.com/item?id=34219335">like this one from this week</a>) that I scoured to get an idea of what's out there.</p>
+<h2>Resume prep</h2>
+<p>Like it or not, preparing your resume is an important part of the process. There are a few main things here:</p>
+<ul>
+<li>Getting past the initial filters - you need to ensure there's enough info for the hiring team to know you're worth having an initial conversation with</li>
+<li>Showcasing your strengths - if you want to get a better role than your current one, you have to play up your strengths and highlight your best work.</li>
+</ul>
+<p>This is an art, not a science. In particular, it helps to customize your resume for each role you're applying to, depending on what the job posting is looking for. Some general tips (from mistakes I've seen and made):</p>
+<ul>
+<li>Focus less on <em>what</em> you did. Lots of resumes are full of "I built X using Y technology". Instead, focus on the <strong>impact</strong> of your work: how much revenue did it bring in? how did it help the company/org achieve its goals? You want to show that you can bring value to the place you're applying to and operate at a higher level</li>
+<li>Talk about <em>your role</em>: Lots of people can write code to build a feature. Can you go above and beyond and lead a project? Mentor others? Drive collaborations? Make that clear in your resume, and highlight what you did.</li>
+<li>Sell yourself: Highlight the projects you're most proud of. Focus on the highest scope projects (largest impact, most engineers/users affected, etc). I generally hate bragging but if there is one time to brag, it's during an interview.</li>
+</ul>
+<h2>Applying</h2>
+<p>Applying itself is thankfully fairly standardized in a lot of places. You'll apply online, submitting your resume and filling out some standard fields - or you'll ask for a referral, where someone puts in a (hopefully good) word for you, and then you get a link to the form. Then a recruiter will set up a call to ask more about you, determine if there's a mutual fit, and then schedule a screening interview. If that goes well, you'll likely have a full panel interview (4-6 interviews), potentially across multiple days.</p>
+<p>There were only a few companies that had a different process in my experience (some had takehomes, or a highly async process, etc) - and they stood out positively in my experience.</p>
+<h2>Interview prep</h2>
+<p>Treating prep seriously, like a job, really helped. I would get down and carve out a few hours a day for prep instead of playing them totally adhoc. There are a few types of interviews worth preparing for - most places will have some combination of these (and the initial screen will likely cover a bit of each).</p>
+<h3>Coding interviews</h3>
+<p>Ah, the dreaded coding interview. Unfortunately, these will happen for most places you interview at, <em>especially</em> for FAANG roles. There's no way around these except for practice. I spent a good amount of time on LeetCode just going over a lot of questions, trying my hand at solving them, and then reading through the other solutions. All in all, I'd say I did about ~60 or so questions (on the lower side).</p>
+<p>Here are a few tips I found helpful when practicing leetcode:</p>
+<ul>
+<li>Don't worry about doing all the questions (there are way too many) - do go over questions from companies you're planning to interview at, though</li>
+<li>Focus on <em>topics</em> - e.g. do a few tree questions, a few greedy algorithm questions, etc. You'll most likely face an unfamiliar problem in the interview and the most useful thing you can do is to be ready to quickly slot it into "ah, I can use a tree here" and then apply familiar techniques.</li>
+<li>Take it seriously. When I started, I'd just do the question leisurely and try to learn, look things up, etc. That didn't help much when it came to a real interview setting. So, try to time yourself, and approach it like you would a real interview, including testing.</li>
+<li>For the interview itself: think out loud (the interviewer can't read your mind), talk through what you are thinking, and get buy-in on the approach before coding. Watch for hints! And, lastly, remember to test your code thoroughly - look at what you wrote, not what you <em>think</em> you wrote.</li>
+</ul>
+<h3>System design interviews</h3>
+<p>These seem quite intimidating, especially if you've never done them before (I never had!). The way they are structured is both a plus and a minus. A friend told me "you can't really prepare for these" and it's quite true honestly. If you don't have exposure to how large-scale systems are designed, you will struggle as a lot of the concepts are different.</p>
+<p>Even if you're familiar with them, though, designing stuff in an interview setting is a different beast. I found it quite helpful to go over examples (Alex Xu's system design book came in really handy) to get an idea of the types of things that come up in an interview. And there are guides you can find on leetcode that go over the basic structure of these interviews (watching some videos on Youtube really helps!) so you can follow the pattern and make sure you cover everything.</p>
+<p>Some tips:</p>
+<ul>
+<li>Write down a timesheet and list of things to cover and reference that as you interview. <a href="https://leetcode.com/discuss/career/229177/My-System-Design-Template">I followed this one</a>.</li>
+<li>Your interviewer is your friend: ask them if you're on the right track or if you should focus on something else, etc</li>
+<li>Focus on breadth and painting the high-level picture first, go into details where asked</li>
+<li>Write down important numbers, draw out a picture, etc - so you don't forget where you are in the conversation</li>
+<li><strong>ASK QUESTIONS</strong>. Make sure you understand who's using the system, what the requirements are, etc. Don't jump into solving things upfront.</li>
+</ul>
+<h3>Behavioral interview prep</h3>
+<p>Depending on where you interview, this might be called a behavioral interview, a culture fit interview, a career interview, etc. Naming aside, they have one thing in common: you'll be expected to talk about your past experiences in some depth, with the interviewer leading the discussion. These are hard to prep for (you don't know what will be asked!) but knowing what to expect really helps. Here's how I approached it:</p>
+<ul>
+<li>Pick examples to help you shine: Focus on "the biggest" conflict, "the most impactful" project, etc. These interviews often determine what level you're hired at, and you want to show you can handle complex issues. Go over your proudest career moments, recall them, and write down some quick notes so you don't forget the details</li>
+<li>Keep it short. For every question, spend at most 45-60 seconds answering it. The interviewer will have a lot of material to cover, so just answer the question to the point, don't add too much extra detail, and offer to elaborate if needed. If you elaborate too much on every answer, you won't be able to convey your best impression.</li>
+<li>Focus on the STAR method. For each thing, explain the Situation, what the Task at hand was, what Action you took, and what the Result was. Make your role in whatever happened clear.</li>
+</ul>
+<h3>Other interviews</h3>
+<p>Depending on where you apply, there might be other types of interviews thrown in. It's totally fine (and expected!) that you might need help and would ask for a rubric or an explanation of what the interview process is like. Just take them as you get them.</p>
+<p>For example, I got a few security interviews (code review/bug finding/web application security) that I was <em>totally</em> unprepared for - they turned out ok, because I was able to ask for help and get close enough with answers. Hopefully, that strategy works out - and if it doesn't, you might be able to see if the job is a good fit or not (it might not be if they're focusing on something you don't have experience in!).</p>
+<h2>When in interview mode</h2>
+<p>Alright, you've prepared, you've set up interviews, and now it's the dreaded interview day. Here's how you can make it go better for you.</p>
+<ul>
+<li>Focus on your physical self: make sure you've gotten enough sleep, have food ready to go for lunch, and have breaks between the interviews if possible. If the interviewer asks if you need a minute at the start, and you do - please take it. At a higher level, if you're interviewing across multiple companies, try to have a half day/day between sets of interviews.</li>
+<li>Don't stress out. Nerves can make or break an interview. Failing an interview is not a negative judgment of who you are - it's just a performance in a highly artificial setting. If you lower the stakes for yourself, you'll find yourself performing better.</li>
+<li>Feel free to ask for help or a hint if you're stuck. It's okay! I did that a bunch rather than waste time and have the interviewer write me off.</li>
+<li>Learn from yourself. I kept detailed notes of every question I was asked and the responses I gave so that I could debrief myself at the end of the day and do better the next day. This is easy to do when you're remote (and hard to do in person) so take advantage of it while you can!</li>
+<li>Ask for clear expectations at the start of the interview, if not provided - e.g. for a coding interview, ask about how much they expect you to cover, whether you need to write working code or pseudocode, etc.</li>
+</ul>
+<h2>Fact finding &amp; decision making</h2>
+<p>Throughout the process, you're interviewing companies too, to find the right fit. Refer back to your criteria list to make sure you've gotten enough information for each company. I found it quite helpful to ask each interviewer a few questions from my list at the end of each interview to make sure I had everything covered. If you haven't, feel free to reach out to the recruiter or hiring manager for a follow-up - they'd be quite happy to meet to sell you on the role even further.</p>
+<p>In my case, after the first few interviews, I realized I needed to update my criteria so I went back and redid everything - and then had a bunch of follow-ups to ask places.</p>
+<p>If you're not sure about which questions to ask, <a href="https://docs.google.com/spreadsheets/d/11DoQ-Bhvs5mfRwB0Bz6OHwoChhFVK7u_KqlbFgR-ezY/edit#gid=0">this one is a great list</a>.</p>
+<p>Note that you will likely be under pressure to decide early on (companies will push for this). So make sure your criteria are ready and you have the info you need. Or be willing to push back hard to get more time to decide.</p>
+<h2>Experiences across companies</h2>
+<p>Since I was exploring, I got to talk to a wide set of people across a variety of companies doing wildly different things. Though a lot of processes were quite standard (phone screen, coding+behavioral+design+manager interview), each place had its quirks, good, and bad. Here's some stuff that I did not expect/really liked/learned through the process:</p>
+<ul>
+<li>Recruiters matter a lot. A great recruiter makes a world of a difference as a candidate - there were a few that went above and beyond, helping me with extra prep calls, answering all of my questions, and being flexible whenever I needed a change. On the flip side, a bad recruiter can be <em>very</em> off-putting, especially when it comes to things like ignoring communication preferences or ghosting you (I had a particularly bad experience there).</li>
+<li>Relatedly, candidate experience matters a lot. A few companies sent doordash/ubereats gift cards instead of the lunch they'd normally provide in an in-person interview setting, and it helped save mental energy for the interviews</li>
+<li>Unique interview experiences stand out! There were a bunch, but the most memorable ones include:
+<ul>
+<li>fly.io had an asynchronous process. The take-home was a great way to learn about the company culture, and I really loved that they delivered feedback and gave me a chance to improve my take-home before submitting it.</li>
+<li>Akita had an interesting 90-minute coding challenge where I had to work on a real-world problem and build a useful feature - beyond just coding, I got to learn about the domain and exercise problem-solving skills.</li>
+<li>Felt had a work-day exercise where (for an EM role) I got to have two 1:1s with members of the team (like I would on the job) and then debrief afterward with the interviewers to give suggestions. It was very refreshingly different and interesting.</li>
+</ul>
+</li>
+<li>The interview setup and experience tell you a lot about the company and what they value. Pay attention to the questions they ask and the people you meet. As an example, interviewing at CZI was really positive for me: I got to see exactly how passionate everyone was about the mission and how they got people from all backgrounds to work there (it was the most diverse interview panel I had).</li>
+</ul>
+<h2>Hindsight bias &amp; lessons learned</h2>
+<p>With hindsight bias, I definitely learned a lot and would do things differently next time. Hopefully, you can learn from these:</p>
+<ul>
+<li>There are a lot of good jobs out there, and not enough of "me". It's still a candidate's market for now, so use that to your advantage. Companies are looking to hire, and despite hiring freezes a lot of great companies are still growing.</li>
+<li>Core skills matter a lot - you have to be good at what you do. In the same vein, at the senior levels, it's less about pure technical depth (unless you're going for a very specialized position) and more about "soft" skills: how you lead a team, how you work with people, etc. This is good and bad: but helps for interviews as you can apply for a broad set of roles.</li>
+<li>In hindsight I wouldn't have applied to as many roles as I did - but hey, I wanted to explore. Interviewing for 6-7 hours 4-5 days/week for 3 weeks straight got a bit much, and my calendar was so full that rescheduling things became a nightmare. I had a couple of days with 6 interviews with 5 different companies and I do not recommend that experience.</li>
+<li>Don't overdo the leetcode: I felt like I prepared all the "hard" questions while I mostly got asked "easy" or "medium" ones. That would definitely have cut down on prep time.</li>
+<li>Learn about stock compensation/all the various forms of equity. I had to scramble to learn these while making my decision and in hindsight, I should have learnt about this stuff earlier.</li>
+<li>References: A surprising number of companies asked for references. I'd probably have prepared better for this rather than bother busy people at the last minute as I did. Make sure you're prepared for this.</li>
+</ul>
+<h2>TLDR</h2>
+<p>Job hunting can be stressful and take a long time. But there are a lot of resources and prep material and you'll eventually land a good role.</p>
+<p>As always, please let me know if you have any feedback/comments or if there's any way I can help!</p>
+
+                    </div></div>]]>
+            </description>
+            <link>https://mhlakhani.com/blog/2023/01/tech-job-market/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-34456416</guid>
+            <pubDate>Fri, 20 Jan 2023 17:24:13 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Circumventing Google with LLMs and Reddit]]>
+            </title>
+            <description>
+<![CDATA[
+Score 9 | Comments 0 (<a href="https://news.ycombinator.com/item?id=34455285">thread link</a>) | @CalderWhite
+<br/>
+January 20, 2023 | https://www.patterns.app/blog/2023/01/19/creating-reddit-newsletter-with-openai/ | <a href="https://web.archive.org/web/*/https://www.patterns.app/blog/2023/01/19/creating-reddit-newsletter-with-openai/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="post-content" itemprop="articleBody"><p>When I used to look for opinions on what the best phone was or what cloud provider to go with, I used to go to Google. Many people do every day, but there’s something wrong with this. Over time Google has become profit hungry and highly influenced by your browsing history and an advertiser’s appetite monetize your attention and opinions. I found myself in a conundrum where I wanted the massive collection of experiences from the internet but there was too much noise from the coporations trying to control it. This was when one of my friends told me about appending "reddit" to my search. Something that seemed so simple instantly gave me far more accurate results.</p><p>This inspired me to create a custom newsletter for any subreddit to send me Reddit's "thoughts" every day. Here's how I did it and here's a link to clone the <a href="https://studio.patterns.app/graph/y63ztre0gths37750j0n/summarization" target="_blank" rel="noopener noreferrer">public app</a> and run your own newsletter!</p><h2 id="getting-data-from-reddit">Getting data from Reddit<a href="#getting-data-from-reddit" title="Direct link to heading">​</a></h2><p>The first step was to scrape Reddit. Given that reddit is a modern tech company I assumed this would be trivial and that I could go through an API with some credentials. What I discovered instead was that I would need to provide my username/password to get a developer account. Because I wanted to make it easy for others to clone my Patterns application, I decided to turn to web scraping. </p><p>At first I looked at the "new" reddit site (reddit.com), only to find it is dynamically generated CSS and is thus hard to pin down from a web scraping perspective.</p><p><img loading="lazy" alt="Confusing Classnames" src="https://www.patterns.app/assets/images/bad_classnames-33b5fea9e55cad511a7d05531c3fd598.png" width="1404" height="950"></p><p>However, in finding this I realized that dynamic site generation is a relatively new phenomenon and that in the earlier days of the internet people used their actual internet class names and ids to style and organize their web pages. So I turned to old.reddit.com, and sure enough, it was easily scrapable with telling class names such as ".title" and ".entry".</p><p><img loading="lazy" alt="Good Classnames" src="https://www.patterns.app/assets/images/good_classnames-c65f982b27752abb96fc7b1c17f310ff.png" width="1698" height="842"></p><p>I broke out Python’s BeautifulSoup and got to work writing a web scraping script in conjunction with the requests module. Another slight problem I encountered was that reddit did have some basic bot protection in their requests, but that was easily circumvented by copying valid requests headers &amp; cookies and adding them to my GET request to make it look like it was coming from a real browser.</p><h2 id="determining-reddits-opinion-with-openai">Determining Reddit's "Opinion" with OpenAI<a href="#determining-reddits-opinion-with-openai" title="Direct link to heading">​</a></h2><p>To generate Reddit’s "opinion" on posts, I decided to take the comments as one contiguous block of text and summarize it with OpenAI’s Tl;dr feature. This way I left the tough decisions about which comments were more important up to OpenAI’s LLM instead of hard coded logic. One way this could be expanded is if I incorporated the votes of comments into how my summaries are generated, for example filtering out comments whose votes are too low.</p><p>The way Tl;dr works is that you simply insert any text up to a token limit and then append the string "Tl;dr" to it. Run that through OpenAI’s completion engine and it will output its best summary of the information provided. One limitation of this is that there is an output token limit of 60 tokens, which means that the summaries OpenAI provides will be quite small. Another tricky limitation was the input token limit which is set at 4000 tokens. Not only did many post’s comment threads exceed this limit, but calculating the exact ratio of character limits to token limits is a bit difficult. OpenAI does not actually provide you with resources to determine what is and is not a token to them. However, they do provide approximations on their website. </p><p><img loading="lazy" src="https://www.patterns.app/img/blog/reddit-llm/char_approx.png" width="200"></p><p>[<!-- -->source: <a href="https://help.openai.com/en/articles/4936856-what-are-tokens-and-how-to-count-them" target="_blank" rel="noopener noreferrer">https://help.openai.com/en/articles/4936856-what-are-tokens-and-how-to-count-them</a> <!-- -->]</p><p>Their approximation is that 1 token is roughly 4 characters. To stay in the safe zone, I approximated that 1 token is 3 characters, and multiplied the 4000 token limit by the 3 character ratio to give myself a character limit for OpenAI’s completion engine. Additionally, I implemented chunking to allow summarization of all of the comments. I simply chunked the input by the character limit, summmarized the chunks individually and then concatonated the summaries into one master summary. There is room for expansion in this strategy however. One way to achieve this may be to summarize smaller chunks of the comments and then rerun those concatonated summaries back into OpenAI for your final summary. This is essentially recursive summarizing, which I fear may cause issues due to residual errors present in OpenAI’s LLM, but if the model is good enough you might be able to get away with one iteration. This provides the added benefit of cohere text flow, instead of disjoint summaries strung together. As mentioned before, another way summarization could be improved is by filtering for the more popular opinions represented in higher vote posts instead of weighting all comments equally.</p><p>Easy to read crons! Patterns allowed me to set my own crong and also told me in plain english what the schedule was. This saved me the hassle of going to crontab.guru every single time I want to set a crontab.</p><p><img loading="lazy" alt="Crons in Patterns" src="https://www.patterns.app/assets/images/cron-3e696409e6ab6b0e234fb39239d270e4.png" width="1154" height="946"></p><p>Some nice built in features Patterns allowed me to have was the node form view option. This way I could easily see what my parameters were and quickly change them. For example, the subreddit or the email I was sending my newsletter to.</p><p>It was also nice to be able to use the OpenAI completion component as well as the "Send email with Gmail" component so I didn’t have to write all of the code to interface with these APIs. It allowed me to focus on what I was interested in, which was downloading and ingesting the data from reddit.</p><p><img loading="lazy" alt="Patterns Graph" src="https://www.patterns.app/assets/images/graph-5526c4ebaca8b7f5e026093d2bafe83e.png" width="2031" height="443"></p><h2 id="wrapping-up">Wrapping up<a href="#wrapping-up" title="Direct link to heading">​</a></h2><p>There were some really interesting results from Reddit's summaries. Although my algorithm for combining chunks from reddit comments was not perfect, the results produced were very insightful.</p><p>In wallstreetbets Reddit advised against pump and dumps</p><p><img loading="lazy" alt="Advising Against Pump and Dumps" src="data:image/png;base64,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hsegl4iIiIgMj0EvERERERkeg14iIiIiMjwGvURERERkeAx6iYiIiMjwGPQSERERkeEx6CUiIiIiw2PQS0RERESGx6CXiIiIiAyPQS8RERERGR6DXiIiIiIyPAa9RERERGR4DHqJiIiIyPAY9BIRERGR4THoJSIiIiLDY9BLRERERIbHoHcWkskkNm3aBJvNlvbX3NyMVCo16+N7vV54vd5pn6dSKTQ3N8Pv98/6HERERETXAwa9c6C7uxvRaBTRaBThcBgA0NraOieBb3l5OYDsATARERER5cagd46ZTCa0tbUhHo/j1KlTszpWeXk5rFbrHKWMiIiI6Pp1Y7ETYESlpaWwWq2Ix+NwOp0ApkZqfT4fAMDj8aClpUX5PJFIIB6PY2hoCJIkoaurC3a7HfX19QAAv9+v7AsATU1NV/kXEREREV3bONI7D0wmEywWC2KxGICpoDWRSCAcDmNwcBDBYDBtPW4oFEJHRwei0Shqa2uxf//+tKUR9fX18Hg8acEyEREREeWPQe88S6VSGBgYwPr162EymWA2m9HQ0ICBgQElsK2trYXdbgdwZQ0vEREREc0dBr06/H6/8kaGTZs2IZlM5rVfKpVCIpFAeXk5Ll26hHg8zrW5REREREXEoFdHfX298laGw4cPw2w257WfLMsIhUKwWq1p63uJiIiIqDgY9M6xVCqF/fv3o6qqCmvXroXJZML69euV5QzJZBI9PT3KcoeZMJlM2Ldvn/KgGxERERHpY9A7B9xut7IMorKyEhaLBfv27VOC2vr6elgsFlRWVqK6uhpOp7PggHXjxo3w+Xxobm7G+Pg4/3MKIiIiogIsmpycnCx2IoiIiIiI5hNHeomIiIjI8Bj0EhEREZHhMeglIiIiIsNj0EtEREREhsegl4iIiIgMj0EvERERERkeg14iIiIiMjwGvURERERkeAx6iYiIiMjwGPQSERERkeEx6CUiIiIiw2PQS0RERESG9//GXIVWFlaLlAAAAABJRU5ErkJggg==" width="701" height="78"></p><p>Some banter about Jamie Dimon stating the obvious:</p><p><img loading="lazy" alt="Jamie Obvious is Great at Stating the Obvious" src="https://www.patterns.app/assets/images/jamie_dimon-b07e0145e9e59b3300c10bdb0be18c50.png" width="1577" height="159"></p><p>Some good guidance on recession fears (with a bit of self promotion noise):</p><p><img loading="lazy" alt="Recession Opinions" src="https://www.patterns.app/assets/images/recession_opinions-a957ef68b1b2e065301a321faf7f4752.png" width="1630" height="218"></p><p>I was really impressed with the simplicity in summarizing the opinions with OpenAI + using the prebuilt components from patterns to glue these systems together! I think with some more tweaks you could certainly automate a newsletter and gain thousands of subscribers.</p><h2 id="the-code">The Code<a href="#the-code" title="Direct link to heading">​</a></h2><p>But the code! Here's a link to the <a href="https://studio.patterns.app/graph/y63ztre0gths37750j0n/summarization" target="_blank" rel="noopener noreferrer">public graph</a>.
+Feel free to clone it and run your own newsletter!</p></div></div>]]>
+            </description>
+            <link>https://www.patterns.app/blog/2023/01/19/creating-reddit-newsletter-with-openai/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-34455285</guid>
+            <pubDate>Fri, 20 Jan 2023 16:20:59 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[The deeper truth behind “Just Do It” – changing physical reality is easier]]>
+            </title>
+            <description>
+<![CDATA[
+Score 8 | Comments 0 (<a href="https://news.ycombinator.com/item?id=34453907">thread link</a>) | @sherilm
+<br/>
+January 20, 2023 | https://www.leadingsapiens.com/changing-your-mindset/ | <a href="https://web.archive.org/web/*/https://www.leadingsapiens.com/changing-your-mindset/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
+    <div>
+
+      <p><em>Is there a deeper truth in Nike's famous adage of "Just Do It"?</em></p><div><p><em>The term mindset has become common in everyday use. There is a certain romance to the idea that if we can somehow just change our mindset everything will fall into place. </em></p><p><em>This leads many to undertake retreats to “get into” the “right mindset” &nbsp;or to “fix your mindset” and stay there perennially. </em>‌‌‌‌<em>Given the proliferation of “mindset coaches” you would think that all of us should be set for life. Clearly that's not the case. So what gives?</em></p></div><p><em><strong>Mindset often follows action</strong> instead of the other way around. <strong>Decoupling mindset from actions</strong> can be transformative. The deeper truth behind "just do it" is that <strong>physical reality is often easier to change</strong> than psychological reality.</em></p><hr><h2 id="expediting-change">Expediting change</h2><p>Why do we love the idea of "mindset"? For one, it's harder to sell "just do it". It's much easier to psychologize and package mindset change.</p><p>But the real answer might lie in our desire to <em>technologize</em> change. We want <a href="https://www.leadingsapiens.com/speed-as-the-wrong-criteria/">the quick and painless path to perfection</a>. Except change is never easy. And neither is it effortless.</p><p>Robert Kegan and Lisa Lahey, in Immunity to Change, highlight this aspect of balancing <strong>reflection with action</strong> and <strong>mindset with behavior</strong> :</p><blockquote><em>Neither change in mindset nor change in behavior alone leads to transformation…each must be employed to bring about the other.</em>‌‌‌‌<em>There is an age-old battle among philosophers of personal change. </em><p><em>Are we better off trying to “reflect our way” toward transformation, expecting eventual changes in behavior as the outcome of our hard-working contemplation? Or would we be better off taking up new behaviors as best we can and trusting that our minds will catch up with the realities of our new experience? </em></p><p><em>In the world of psychology, for example, the <strong>insight-oriented approaches </strong>reflect the first school, and the <strong>behavioral modification approaches</strong> reflect the second.</em>‌‌‌‌ <em>Our answer is: neither. </em></p><p><em>… Our experience is that <strong>we cannot simply contemplate our way out of the mindset</strong> our immunity X-ray reveals, but neither can we simply elect to alter the behaviors of our second column. </em>‌‌‌‌<em>Rather <strong>we must take up an activity technically known as praxis</strong>—practice specifically designed to explore the possibility of altering our personal and organizational theories (the theories that reside in our big assumptions).</em>‌‌‌‌</p><p><em>… <strong>We can’t merely think or feel our way out</strong> of an immune system no matter how high our motivation is to accomplish our goal. Kant said “perception without conception is blind,” and we don’t disagree: the mindset does create what we see. </em>‌‌‌‌<em>But it is also true that conception without inception is paralysis. We must set out. We must begin to take new action. </em></p><p><em>Success follows from taking intentional, specific actions—the reaching hand—that are inconsistent with our immunity so that we can test our mindset.</em>‌‌‌‌</p><p>– Robert Kegan &amp; Lisa Lahey in Immunity to Change [1]</p></blockquote><p>Behavior change both on the organizational and personal level cannot happen without sustained attention, energy, time, and followup. Anyone promising you otherwise is either ignorant or hasn't tried anything of significance.</p><h2 id="embodied-change">Embodied change</h2><p>What Kegan call’s <em>praxis</em> and others have called <em>observations</em>, is an integral part of my coaching/consulting practice. These observations/practices are designed based on what emerges out of our work together. They are the instruments or <em>technology</em> that enable the “focused, structured, persistent and active reflection” that Kegan mentions.</p><p><strong>Change cannot be just taught or “transmitted”</strong>. It has to be learned and embodied by the person attempting the change. Reading about swimming and actually swimming are completely different experiences. Why do we expect any different in organizational life?</p><blockquote><em><strong>Anything that can be “taught” to another is relatively inconsequential and has little or no significant influence on behavior</strong>. </em>‌‌‌‌<p>The <em>only kind of learning which significantly influences behavior is self- discovered, self-appropriated learning. Such self-discovered learning, truth that has been personally appropriated and assimilated in experience, cannot be directly communicated to another. </em>‌‌‌‌</p><p>– Carl Rogers, cited in Educating the Reflective Practioner by Donald Schon [2]</p></blockquote><p>Experience, our observations of that experience, and reflection on our observations, are the way we integrate and assimilate learning.</p><p>But without taking action there is nothing to observe and reflect upon. More than likely it's just plain rumination.</p><h2 id="small-physical-actions-are-often-easier-than-changing-mindset">Small physical actions are often easier than changing mindset</h2><p>We tend to overestimate massive life-changing decisions and equally underestimate the small adjustments that add up to actually making a big difference over time.</p><blockquote>Traditional self-help tends to see change in terms of lofty goals and total transformation, but research actually supports the opposite view — that small, deliberate tweaks infused with your values can make a huge difference in your life. This is especially true when we tweak the routine and habitual parts of life, which then afford tremendous leverage for change. ‌‌‌‌<p><em>– Susan David in Emotional Agility</em> [3]</p></blockquote><p>Physical action also tends to be easier than controlling our mental states. As Dan Millman put it, <strong>we have significantly more control over our physical bodies than our minds</strong>. This might sound obvious but easy to forget.</p><p>It's easier to just show up at the gym than it is to get ourselves into the <em>right mindset</em> for exercise. The mindset usually "<em>sets itself"</em> following the physical actions. <strong>Waiting for the right mindset or the right feeling state to show up can be a losing strategy</strong>.</p><p>Actions can be independent of mindset and ultimately lead to the "right" mindset.<br>Most of the time we already know what needs done.</p><blockquote>An undue focus on mindset or feelings unfortunately tends to focus our efforts on the very thing that is harder to control.</blockquote><p>This notion is consistent with the <strong>Japanese philosophy of <a href="https://en.wikipedia.org/wiki/Shoma_Morita" rel="noreferrer noopener">Shoma Morita</a></strong> who emphasized focus on action and <em><strong>doing what needed done</strong></em>, regardless of our <em>mindset</em>.‌ </p><h2 id="examples-of-changing-actions-before-changing-mindset">Examples of changing actions before changing mindset</h2><ul><li>Moving the pen or the keyboard to keep writing instead of trying to “break through” writer’s block.</li><li>Picking up the phone and making the call instead of waiting for the right mindset.</li><li>Showing up at the gym. Literally moving your body to a different place and ignoring how you “feel”.</li><li>Just “showing up” at the interview or the speech, instead of trying to psych it all up.</li><li>Exercise: changing my physical state changes my mental state.</li></ul><p>The idea is not ignoring mental preparation but to keep it in check and stopping it from turning into analysis-paralysis, or even worse into inaction.</p><hr><p>The next time we pick up a book or try out a technique, consider which aspect it's emphasizing. Is it mindset or is it action? How can you increase your chances of success by balancing them out?</p><p>The framework of <strong>head, heart, and hand</strong> is a useful one to remember. We need <a href="https://www.leadingsapiens.com/drivers-of-human-performance/">the heart(meaning and purpose) </a>to balance out the head (mindset) and hand (action/behavior). No amount of analysis or action will work if it does not have meaning for us or lacks purpose.</p><p>In another post, I highlight the idea of <a href="https://www.leadingsapiens.com/technology-dumbs-you-down/">technology dumbing us down </a>and robbing us of richer experiences.</p><p>One reason people fixate on changing their "mindset" is the notion of <strong>eliminating doubt before we take action</strong>. But doubt is not going anywhere so we might as well keep moving and take action. <a href="https://www.leadingsapiens.com/dont-overcome-self-doubt/">Trying to eliminate doubt is the wrong strategy</a>.</p><hr><div><p>💡</p><div><p>Liked this article? </p><p>You will dig <strong><em>The Managerial Mind on Mondays</em></strong> newsletter. It's free and every edition covers essential frameworks on leadership, careers, and organizations in bite sized form.</p></div></div><!--kg-card-begin: html--><!--kg-card-end: html--><hr><h3 id="sources">Sources</h3><ol><li>Immunity to Change by Robert Kegan, Lisa Laskow Lahey</li><li>Educating the Reflective Practitioner by Donald Schon</li><li>Emotional Agility by Susan David</li></ol>
+    </div>
+  </article><div>
+    <div>
+  <figure>
+  </figure>
+
+<p><a href="https://www.leadingsapiens.com/author/sheril/">      <img data-srcset="/content/images/size/w100/2022/05/IMG_0524--1-.jpeg 100w,
+            /content/images/size/w300/2022/05/IMG_0524--1-.jpeg 300w" srcset="https://www.leadingsapiens.com/content/images/size/w100/2022/05/IMG_0524--1-.jpeg 100w,
+            https://www.leadingsapiens.com/content/images/size/w300/2022/05/IMG_0524--1-.jpeg 300w" data-sizes="auto" data-src="/content/images/size/w100/2022/05/IMG_0524--1-.jpeg" src="https://www.leadingsapiens.com/content/images/size/w100/2022/05/IMG_0524--1-.jpeg" alt="Sheril Mathews">
+</a></p><div>
+    
+    
+    <p>I am an executive/leadership coach. Before LS, I worked for 20 years in corporate America in various technical &amp; leadership roles. Have feedback? You can reach me at sheril@leadingsapiens.com. </p>
+    
+    
+  </div>
+</div>
+  </div></div>]]>
+            </description>
+            <link>https://www.leadingsapiens.com/changing-your-mindset/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-34453907</guid>
+            <pubDate>Fri, 20 Jan 2023 14:54:00 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[The myth of the myth of the 10x programmer (2020)]]>
             </title>
             <description>
 <![CDATA[
-Score 172 | Comments 225 (<a href="https://news.ycombinator.com/item?id=34451566">thread link</a>) | @nsoonhui
+Score 230 | Comments 295 (<a href="https://news.ycombinator.com/item?id=34451566">thread link</a>) | @nsoonhui
 <br/>
 January 20, 2023 | https://payne.org/blog/the-myth-of-the-myth-of-the-10x-programmer/ | <a href="https://web.archive.org/web/*/https://payne.org/blog/the-myth-of-the-myth-of-the-10x-programmer/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -110,7 +454,7 @@ By Jeff Johnson of <a href="https://underpassapp.com/">Underpass App Company</a>
             </title>
             <description>
 <![CDATA[
-Score 14 | Comments 1 (<a href="https://news.ycombinator.com/item?id=34449940">thread link</a>) | @dvrp
+Score 28 | Comments 5 (<a href="https://news.ycombinator.com/item?id=34449940">thread link</a>) | @dvrp
 <br/>
 January 19, 2023 | https://kevinchen.co/blog/rewind-ai-app-teardown/#how-it-works-overview | <a href="https://web.archive.org/web/*/https://kevinchen.co/blog/rewind-ai-app-teardown/#how-it-works-overview">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1237,7 +1581,7 @@ CREATE VIRTUAL TABLE "search" USING fts4("text", "otherText", tokenize=porter)
             </title>
             <description>
 <![CDATA[
-Score 9 | Comments 3 (<a href="https://news.ycombinator.com/item?id=34449828">thread link</a>) | @cjg
+Score 10 | Comments 3 (<a href="https://news.ycombinator.com/item?id=34449828">thread link</a>) | @cjg
 <br/>
 January 19, 2023 | https://onecloudplease.com/blog/cedar-a-new-policy-language | <a href="https://web.archive.org/web/*/https://onecloudplease.com/blog/cedar-a-new-policy-language">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div class="page">
@@ -1710,7 +2054,7 @@ resource: VPN::"vpn1"
             </title>
             <description>
 <![CDATA[
-Score 329 | Comments 119 (<a href="https://news.ycombinator.com/item?id=34448576">thread link</a>) | @kennybrea
+Score 350 | Comments 152 (<a href="https://news.ycombinator.com/item?id=34448576">thread link</a>) | @kennybrea
 <br/>
 January 19, 2023 | https://www.carsized.com/en/ | <a href="https://web.archive.org/web/*/https://www.carsized.com/en/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1725,16 +2069,16 @@ January 19, 2023 | https://www.carsized.com/en/ | <a href="https://web.archive.o
 											<div>
 						<div>			
 					<p><img id="compare0" src="https://www.carsized.com/images/grid_2x.png" srcset="https://www.carsized.com/images/grid_2x.png 1x, https://www.carsized.com/images/grid_2x.png 2x" alt="Background grid">				
-					<img id="compare2" src="https://www.carsized.com/resources/bmw/x3/d/2017/sl_283111138_bmw-x3-2017-side-view_4x.png" srcset="https://www.carsized.com/resources/bmw/x3/d/2017/sl_283111138_bmw-x3-2017-side-view_3x.png 725w, https://www.carsized.com/resources/bmw/x3/d/2017/sl_283111138_bmw-x3-2017-side-view_4x.png 1450w" alt="BMW X3 SUV 2017-2021">
-					<img id="compare1" src="https://www.carsized.com/resources/renault/scenic/d/2009/sl_272117101_renault-scenic-2009-side-view_4x.png" srcset="https://www.carsized.com/resources/renault/scenic/d/2009/sl_272117101_renault-scenic-2009-side-view_3x.png 668w, https://www.carsized.com/resources/renault/scenic/d/2009/sl_272117101_renault-scenic-2009-side-view_4x.png 1336w" alt="Renault ScÃ©nic Minivan 2009-2015"></p>
-					<p><span> Real height<sup>1</sup> <span>1.676 m</span> <span>2</span>&nbsp;<br><span><b>+ 4 cm</b></span></span>
+					<img id="compare2" src="https://www.carsized.com/resources/lexus/rx/d/2012/sl_280131147_lexus-rx-2012-side-view_4x.png" srcset="https://www.carsized.com/resources/lexus/rx/d/2012/sl_280131147_lexus-rx-2012-side-view_3x.png 734w, https://www.carsized.com/resources/lexus/rx/d/2012/sl_280131147_lexus-rx-2012-side-view_4x.png 1468w" alt="Lexus RX SUV 2012-2015">
+					<img id="compare1" src="https://www.carsized.com/resources/renault/clio/d/2009/sl_248114080_renault-clio-2009-side-view_4x.png" srcset="https://www.carsized.com/resources/renault/clio/d/2009/sl_248114080_renault-clio-2009-side-view_3x.png 624w, https://www.carsized.com/resources/renault/clio/d/2009/sl_248114080_renault-clio-2009-side-view_4x.png 1248w" alt="Renault Clio Hatchback 2009-2014"></p>
+					<p><span> Real height<sup>1</sup> <span>1.685 m</span> <span>2</span>&nbsp;<br><span><b>+ 18.8 cm</b></span></span>
 					</p>
-					<p><span> <span>1</span> <span>1.636 m</span> Real height<sup>1</sup>	</span>					
+					<p><span> <span>1</span> <span>1.497 m</span> Real height<sup>1</sup>	</span>					
 					</p>
 					</div>
 					<div>						
 						<div>		
-							<p><span> <span><b>+ 34.2 cm</b></span> <span>2</span> <span>4.708 m</span> Real length</span>
+							<p><span> <span><b>+ 73.8 cm</b></span> <span>2</span> <span>4.77 m</span> Real length</span>
 							</p>
 </div>
 
@@ -1750,7 +2094,7 @@ January 19, 2023 | https://www.carsized.com/en/ | <a href="https://web.archive.o
 																			<div>		
 			<p>
 							<br>
-							<h2><b>Technical specs</b> | <b>Renault Scénic (JZ) Minivan  2009</b> is 34.2 cm <b>shorter</b> and 4 cm <b>lower</b> compared to BMW X3 (G01) SUV  2017. It offers 17% <b>more</b> cargo space.<sup>4,5</sup></h2>
+							<h2><b>Technical specs</b> | <b>Renault Clio (R) 5-door Hatchback  2009</b> is 73.8 cm <b>shorter</b> and 18.8 cm <b>lower</b> compared to Lexus RX (AL1) SUV  2012. It offers 34% <b>less</b> cargo space.<sup>4,5</sup></h2>
 			</p>			
 			
 			
@@ -2088,7 +2432,7 @@ $ ssc build -r
             </title>
             <description>
 <![CDATA[
-Score 16 | Comments 1 (<a href="https://news.ycombinator.com/item?id=34446440">thread link</a>) | @federicoterzi
+Score 19 | Comments 1 (<a href="https://news.ycombinator.com/item?id=34446440">thread link</a>) | @federicoterzi
 <br/>
 January 19, 2023 | https://federicoterzi.com/blog/good-software-architectures-are-mostly-about-boundaries/ | <a href="https://web.archive.org/web/*/https://federicoterzi.com/blog/good-software-architectures-are-mostly-about-boundaries/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-v-4240d724=""><div data-v-4240d724=""><p data-v-4240d724="">As software engineers, we are always asked to design maintainable and extensible software architectures. While design patterns and best practices help, most of them are just facades to one larger and fundamental principle: designing good boundaries.</p>
@@ -2479,7 +2823,7 @@ January 19, 2023 | https://federicoterzi.com/blog/good-software-architectures-ar
             </title>
             <description>
 <![CDATA[
-Score 116 | Comments 35 (<a href="https://news.ycombinator.com/item?id=34445367">thread link</a>) | @Fr0styMatt88
+Score 118 | Comments 36 (<a href="https://news.ycombinator.com/item?id=34445367">thread link</a>) | @Fr0styMatt88
 <br/>
 January 19, 2023 | https://ultibo.org/make/ | <a href="https://web.archive.org/web/*/https://ultibo.org/make/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="container"><div id="container-inside">
@@ -2654,7 +2998,7 @@ January 19, 2023 | https://ultibo.org/make/ | <a href="https://web.archive.org/w
             </title>
             <description>
 <![CDATA[
-Score 121 | Comments 97 (<a href="https://news.ycombinator.com/item?id=34444953">thread link</a>) | @zurawiki
+Score 123 | Comments 97 (<a href="https://news.ycombinator.com/item?id=34444953">thread link</a>) | @zurawiki
 <br/>
 January 19, 2023 | https://zura.wiki/post/never-write-a-commit-message-again-with-the-help-of-gpt-3/ | <a href="https://web.archive.org/web/*/https://zura.wiki/post/never-write-a-commit-message-again-with-the-help-of-gpt-3/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div role="main"><article><section><p>GPT-3 has proven to be a valuable tool for assisting in technical tasks such as scripting and command line operations. With gptcommit, you no longer have to spend time writing your commit messages. Install <a href="https://github.com/zurawiki/gptcommit"><code>gptcommit</code></a> and let GPT-3 do the writing for you.</p><p>Commit messages are a key channel for developers to communicate their work with others, especially in code reviews. When making complex code changes, it can be tedious to thoroughly document the contents of each change. I often felt the impulse to just title my commit “fix bug” and move on. These one-liner messages often lack the full context that a review would need to understand the change. Worse, a seemingly harmless commit description like “fix typo” might omit key changes made elsewhere in the codebase. Surfacing these changes with gptcommit helps the author and reviewer by bringing attention to these additional changes.</p><h3 id="get-setup-in-minutes">Get setup in minutes</h3><blockquote><p>Prerequisites:
@@ -2843,7 +3187,7 @@ January 19, 2023 | https://sheep.horse/2023/1/improved_web_component_for_pixel-a
             </title>
             <description>
 <![CDATA[
-Score 36 | Comments 14 (<a href="https://news.ycombinator.com/item?id=34443602">thread link</a>) | @dcminter
+Score 38 | Comments 14 (<a href="https://news.ycombinator.com/item?id=34443602">thread link</a>) | @dcminter
 <br/>
 January 19, 2023 | http://dave.zfxinc.net/f1.html | <a href="https://web.archive.org/web/*/http://dave.zfxinc.net/f1.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div size="3">
@@ -3148,7 +3492,7 @@ January 19, 2023 | https://danschnau.com/blog/ChatGPT_peak_of_hype | <a href="ht
             </title>
             <description>
 <![CDATA[
-Score 57 | Comments 12 (<a href="https://news.ycombinator.com/item?id=34441672">thread link</a>) | @louislang
+Score 59 | Comments 12 (<a href="https://news.ycombinator.com/item?id=34441672">thread link</a>) | @louislang
 <br/>
 January 19, 2023 | https://blog.silentsignal.eu/2022/09/28/another-tale-of-ibm-i-as-400-hacking/ | <a href="https://web.archive.org/web/*/https://blog.silentsignal.eu/2022/09/28/another-tale-of-ibm-i-as-400-hacking/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -3284,11 +3628,82 @@ January 19, 2023 | https://blog.silentsignal.eu/2022/09/28/another-tale-of-ibm-i
         </item>
         <item>
             <title>
+<![CDATA[A Framework for Prioritizing Tech Debt]]>
+            </title>
+            <description>
+<![CDATA[
+Score 6 | Comments 0 (<a href="https://news.ycombinator.com/item?id=34441485">thread link</a>) | @todsacerdoti
+<br/>
+January 19, 2023 | https://www.maxcountryman.com/articles/a-framework-for-prioritizing-tech-debt | <a href="https://web.archive.org/web/*/https://www.maxcountryman.com/articles/a-framework-for-prioritizing-tech-debt">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><h2 id="the-importance-of-leverage">The Importance of Leverage</h2>
+<p>Having spent over a decade building tech startups, I've come across my fair share of tech debt: The gnarly Ember.js code no one wants to touch, the bespoke cloud infrastructure maintained entirely by hand, or the solitary Elixir service left behind by a long-gone former teammate.</p>
+<p>While these may be painful today, at one point in the past they were likely important accelerants that pushed the product forward in a meaningful way. In fact, tech debt is arguably a necessary evil–if a growing company isn't taking on some measure of leverage, then it's likely not shipping as fast as it should be. However as a company begins to see traction, there will come an inflection point where it becomes important to start prioritizing tech debt.<sup><a href="#user-content-fn-1" id="user-content-fnref-1" data-footnote-ref="true" aria-describedby="footnote-label">1</a></sup></p>
+<p>Usually this time will come as your business starts to scale and earlier decisions made for the sake of time start to become bottlenecks to new work. But then the question becomes, how do we prioritize paying down some of the debt we've accrued when it's competing with our bandwidth to build new features?</p>
+<h2 id="surveying-the-debt">Surveying the Debt</h2>
+<p>First we want to draft a map of the landscape. Our goal here is to understand the system and how its individual components relate to one another. This needn't be overly detailed, but should provide enough specifics that we can start to examine pieces of it in terms of how components support our product workflow. As an example, if we can answer the question, "Is this a bottleneck?" then we're on the right track</p>
+<p>Some parts of this map may require extra attention in order to understand what parts of a specific component are causing us issue. For instance, is the data model scaling with our system or is the database technology itself the problem?<sup><a href="#user-content-fn-2" id="user-content-fnref-2" data-footnote-ref="true" aria-describedby="footnote-label">2</a></sup> Examine pain points and understand not just the symptom but the underlying cause: We chose a naive data model which doesn't work at scale.</p>
+<p>It's often helpful to structure this an exercise involving folks from across the wider set of teams. Ask a few representatives from each team to document various pain points and <a target="_blank" rel="noopener" href="https://sre.google/sre-book/eliminating-toil/">toil</a>, especially things that are thematic or come up repeatedly. Collate this into a survey of the landscape of debt.<sup><a href="#user-content-fn-3" id="user-content-fnref-3" data-footnote-ref="true" aria-describedby="footnote-label">3</a></sup></p>
+<h2 id="interest-rates">Interest Rates</h2>
+<p>Once we have an idea of the landscape and where within it we're experiencing pain it's time to conduct the next exercise. Enumerate each piece of debt. Perhaps you identify a fragile relationship between two services--write this down. Go through your holistic system and document each deficiency. The goal here is not to ascribe importance just yet and instead to be comprehensive.</p>
+<p>Now with a complete list of your tech debt as it stands go through each and answer the following questions:</p>
+<ul>
+<li>If we choose to do nothing, will this issue become worse, remain the same, or improve?<!-- -->
+<ul>
+<li>If it'll become worse, how quickly will it degrade?</li>
+<li>If it remains the same, how much disruption is it causing today?</li>
+<li>If it'll improve, at what point will it improve to the degree it's no longer an obstruction?</li>
+</ul>
+</li>
+</ul>
+<figure><img alt="What's our 'interest rate' assuming we do nothing?" srcset="https://www.maxcountryman.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fdo-nothing.6ffdb3e2.png&amp;w=3840&amp;q=75 1x" src="https://www.maxcountryman.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fdo-nothing.6ffdb3e2.png&amp;w=3840&amp;q=75" width="2087" height="813" decoding="async" data-nimg="1" loading="lazy"><figcaption>Assuming we decide to do nothing, then how much worse do things become? This is effectively our "interest rate" on tech debt.</figcaption></figure>
+<ul>
+<li>Is this part of the system active or dormant–are we building new features on it today or is it in maintenance mode?<!-- -->
+<ul>
+<li>If it's dormant, how much time is spent on maintenance each engineering cycle?</li>
+<li>If it's active, take note of that: you're building on a foundation that may not be stable.</li>
+</ul>
+</li>
+</ul>
+<figure><img alt="Are we building on a stable foundation?" srcset="https://www.maxcountryman.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fdormant-or-not.2e783b38.png&amp;w=1920&amp;q=75 1x, https://www.maxcountryman.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fdormant-or-not.2e783b38.png&amp;w=3840&amp;q=75 2x" src="https://www.maxcountryman.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fdormant-or-not.2e783b38.png&amp;w=3840&amp;q=75" width="1756" height="1175" decoding="async" data-nimg="1" loading="lazy"><figcaption>If the debt isn't part of an active area of development, then we want to understand how it's impacting development velocity. If it is, then we might be building on a rocky foundation.</figcaption></figure>
+<p>Answering these questions helps us form a rubric for grading technical debt and can then be used as a key input to prioritization alongside other work, like net-new features.</p>
+<p>There's no one-size-fits all here, so you'll have to decide exactly how you want to weight these criteria. However as a high-level guide, you will generally want to prioritize things that are becoming worse and which you're actively building on more aggressively. These items tend to be like high interest rates on a credit card. Whereas items that aren't degrading quickly and aren't part of the actively developed system are a more healthful form of debt.<sup><a href="#user-content-fn-4" id="user-content-fnref-4" data-footnote-ref="true" aria-describedby="footnote-label">4</a></sup> For things somewhere in between, these will require more careful balancing relevant to your precise circumstances as a company.</p>
+<figure><img alt="When things are rapidly becoming worse and they involve active areas of development we can expect challenges." srcset="https://www.maxcountryman.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fhigh-priority.e81d94b2.png&amp;w=1920&amp;q=75 1x, https://www.maxcountryman.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fhigh-priority.e81d94b2.png&amp;w=3840&amp;q=75 2x" src="https://www.maxcountryman.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fhigh-priority.e81d94b2.png&amp;w=3840&amp;q=75" width="1860" height="1290" decoding="async" data-nimg="1" loading="lazy"><figcaption>When things are rapidly becoming worse and they involve active areas of development we can expect challenges.</figcaption></figure>
+<p>Another surprising thing you may find in conducting this exercise is that there are even a few items that are essentially self healing. These almost certainly don't require attention with the caveat that it's still important to understand how they impact product development velocity.<sup><a href="#user-content-fn-5" id="user-content-fnref-5" data-footnote-ref="true" aria-describedby="footnote-label">5</a></sup> The benefit of identifying such things is that you can know to deprioritize these things in favor of the more costly items above.</p>
+<h2 id="staying-solvent">Staying Solvent</h2>
+<p>It's important to point out that leverage is a powerful tool. Technical debt is a kind of leverage and most startups will want it if not need it. So the goal of this framework is to provide a more structured view into that debt such that we can identify "good" and "bad" debt and decide how to proceed in addressing it.</p>
+<p>While there's no universally correct answer, we'll generally want to prioritize the high interest rate items and can continue to leverage lower interest rate items so long as they don't impede us too much.</p>
+<p>In the end the key thing here is to use frameworks like this to remain solvent in terms of our code base and product workflow. With tools like this, we can avoid bankruptcy (literally and figuratively).</p>
+<section data-footnotes="true">
+<ol>
+<li id="user-content-fn-1">
+<p>Sooner or later your rate of building new features will slow to crawl, buckling under the weight of all the short cuts and quick fixes that came before. <a href="#user-content-fnref-1" data-footnote-backref="true" aria-label="Back to content">↩</a></p>
+</li>
+<li id="user-content-fn-2">
+<p>It's probably not the database. <a href="#user-content-fnref-2" data-footnote-backref="true" aria-label="Back to content">↩</a></p>
+</li>
+<li id="user-content-fn-3">
+<p>You might put this together as a document which can be referenced later. Having an artifact like this is important because it can serve as input to future iterations of this exercise. <a href="#user-content-fnref-3" data-footnote-backref="true" aria-label="Back to content">↩</a></p>
+</li>
+<li id="user-content-fn-4">
+<p>Jettison this debt last, unless there are other compelling reasons to prioritize it. Healthful debt is usually the lowest priority. <a href="#user-content-fnref-4" data-footnote-backref="true" aria-label="Back to content">↩</a></p>
+</li>
+<li id="user-content-fn-5">
+<p>It's unlikely to be the case, but even something that improves over time can do so at a velocity that artificially holds back product development–in this instance it may merit a closer look. <a href="#user-content-fnref-5" data-footnote-backref="true" aria-label="Back to content">↩</a></p>
+</li>
+</ol>
+</section></div></div>]]>
+            </description>
+            <link>https://www.maxcountryman.com/articles/a-framework-for-prioritizing-tech-debt</link>
+            <guid isPermaLink="false">hacker-news-small-sites-34441485</guid>
+            <pubDate>Thu, 19 Jan 2023 15:41:36 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Telling your inner critic to chill]]>
             </title>
             <description>
 <![CDATA[
-Score 126 | Comments 96 (<a href="https://news.ycombinator.com/item?id=34439883">thread link</a>) | @ktzn
+Score 126 | Comments 97 (<a href="https://news.ycombinator.com/item?id=34439883">thread link</a>) | @ktzn
 <br/>
 January 19, 2023 | https://www.radiatedaily.com/telling-your-inner-critic-to-chill/ | <a href="https://web.archive.org/web/*/https://www.radiatedaily.com/telling-your-inner-critic-to-chill/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>	
@@ -3755,7 +4170,7 @@ on Gleam and your kind sponsorship is how I pay my bills!</p>
             </title>
             <description>
 <![CDATA[
-Score 234 | Comments 274 (<a href="https://news.ycombinator.com/item?id=34439588">thread link</a>) | @hochmartinez
+Score 235 | Comments 274 (<a href="https://news.ycombinator.com/item?id=34439588">thread link</a>) | @hochmartinez
 <br/>
 January 19, 2023 | https://blest.co.jp/eng/service/be-h/ | <a href="https://web.archive.org/web/*/https://blest.co.jp/eng/service/be-h/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4055,7 +4470,7 @@ Note that these implementations are already complete in LBSE downstream and do n
             </title>
             <description>
 <![CDATA[
-Score 85 | Comments 42 (<a href="https://news.ycombinator.com/item?id=34439494">thread link</a>) | @ShroudedNight
+Score 85 | Comments 43 (<a href="https://news.ycombinator.com/item?id=34439494">thread link</a>) | @ShroudedNight
 <br/>
 January 19, 2023 | https://batchrocket.eu/en/ | <a href="https://web.archive.org/web/*/https://batchrocket.eu/en/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div itemscope="" itemtype="https://schema.org/Article">
@@ -4092,7 +4507,7 @@ January 19, 2023 | https://batchrocket.eu/en/ | <a href="https://web.archive.org
             </title>
             <description>
 <![CDATA[
-Score 241 | Comments 114 (<a href="https://news.ycombinator.com/item?id=34439461">thread link</a>) | @zdgeier
+Score 244 | Comments 117 (<a href="https://news.ycombinator.com/item?id=34439461">thread link</a>) | @zdgeier
 <br/>
 January 19, 2023 | https://jamsync.dev/about | <a href="https://web.archive.org/web/*/https://jamsync.dev/about">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4158,7 +4573,7 @@ This site is a preview version of the system. The features <a href="https://jams
 </p>
 <h3>Developers</h3>
 <p>
-Jamsync is being developed by <a href="https://www.linkedin.com/in/zdgeier/">Zachary Geier</a>. Please send me an email if you have any thoughts at <a href="https://jamsync.dev/cdn-cgi/l/email-protection#6d170c0e052d070c001e14030e4309081b"><span data-cfemail="4c362d2f240c262d213f35222f6228293a">[email&nbsp;protected]</span></a>.
+Jamsync is being developed by <a href="https://www.linkedin.com/in/zdgeier/">Zachary Geier</a>. Please send me an email if you have any thoughts at <a href="https://jamsync.dev/cdn-cgi/l/email-protection#4f352e2c270f252e223c36212c612b2a39"><span data-cfemail="572d36343f173d363a242e393479333221">[email&nbsp;protected]</span></a>.
 </p>
 </section>
 </div></div>]]>
@@ -4166,6 +4581,174 @@ Jamsync is being developed by <a href="https://www.linkedin.com/in/zdgeier/">Zac
             <link>https://jamsync.dev/about</link>
             <guid isPermaLink="false">hacker-news-small-sites-34439461</guid>
             <pubDate>Thu, 19 Jan 2023 12:07:47 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Writing a Vector Tileserver for Osm2streets]]>
+            </title>
+            <description>
+<![CDATA[
+Score 28 | Comments 1 (<a href="https://news.ycombinator.com/item?id=34439069">thread link</a>) | @maxerickson
+<br/>
+January 19, 2023 | https://jakecoppinger.com/2023/01/lane-accurate-street-maps-with-openstreetmap-writing-a-vector-tileserver-for-osm2streets/ | <a href="https://web.archive.org/web/*/https://jakecoppinger.com/2023/01/lane-accurate-street-maps-with-openstreetmap-writing-a-vector-tileserver-for-osm2streets/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+<figure><img loading="lazy" width="2152" height="2112" src="https://jakecoppinger.com/wp-content/uploads/2023/01/safecyclingmap.png" alt="" srcset="https://jakecoppinger.com/wp-content/uploads/2023/01/safecyclingmap.png 2152w, https://jakecoppinger.com/wp-content/uploads/2023/01/safecyclingmap-300x294.png 300w, https://jakecoppinger.com/wp-content/uploads/2023/01/safecyclingmap-1024x1005.png 1024w, https://jakecoppinger.com/wp-content/uploads/2023/01/safecyclingmap-768x754.png 768w, https://jakecoppinger.com/wp-content/uploads/2023/01/safecyclingmap-1536x1507.png 1536w, https://jakecoppinger.com/wp-content/uploads/2023/01/safecyclingmap-2048x2010.png 2048w" sizes="(max-width: 2152px) 100vw, 2152px"></figure>
+
+
+
+<p>I’ve built <a href="https://safecyclingmap.com/" target="_blank" rel="noopener" title="">safecyclingmap.com</a>, an <a href="https://github.com/jakecoppinger/safe-cycling-map" target="_blank" rel="noopener" title="">open-source</a> proof of concept map that renders cycleways and streets down to the individual lanes, to assist cyclists picking safe routes and support advocacy for reallocating road space to more efficient modes (as supported by the TfNSW Future Transport Strategy).</p>
+
+
+
+<p>I’ve open sourced the backend infrastructure so that others can incorporate the details into their web and phone maps (see <a href="https://github.com/jakecoppinger/osm2streets-vector-tileserver" target="_blank" rel="noopener" title="">osm2streets-vector-tileserver</a> or read below). This builds upon the incredible work of <a href="https://dabreegster.github.io/" target="_blank" rel="noreferrer noopener">Dustin Carlino</a> who leads the <a href="https://github.com/a-b-street/abstreet#ab-street" target="_blank" rel="noreferrer noopener">A/B Street traffic simulation project</a>.</p>
+
+
+
+<p>I wrote the initial vector tileserver from scratch in one afternoon in Typescript, calling the JS bindings for the Rust osm2streets code compiled to wasm. It generates GeoJSON which is then returned by Koa as a protobuf. I’ve spent some more hours improving performance, but there is much that could be improved.</p>
+
+
+
+<p>The TfNSW Future Transport Strategy states “We will focus on getting more out of our existing investments, by reallocating road space to more efficient modes of transport like buses, walking, cycling and micromobility devices.”</p>
+
+
+
+<p>This blog post explains how and why I built it.</p>
+
+
+
+<h3>Existing detailed street maps</h3>
+
+
+
+<p>Most street maps just use a line for each street:</p>
+
+
+
+<figure><img loading="lazy" width="1024" height="1005" src="https://jakecoppinger.com/wp-content/uploads/2023/01/straight_line_google-1024x1005.png" alt="" srcset="https://jakecoppinger.com/wp-content/uploads/2023/01/straight_line_google-1024x1005.png 1024w, https://jakecoppinger.com/wp-content/uploads/2023/01/straight_line_google-300x294.png 300w, https://jakecoppinger.com/wp-content/uploads/2023/01/straight_line_google-768x754.png 768w, https://jakecoppinger.com/wp-content/uploads/2023/01/straight_line_google-1536x1507.png 1536w, https://jakecoppinger.com/wp-content/uploads/2023/01/straight_line_google-2048x2010.png 2048w" sizes="(max-width: 1024px) 100vw, 1024px"></figure>
+
+
+
+<p>Usually the colour of this line denotes how large or important the road is. If your city doesn’t have much dedicated bicycle infrastructure, picking a safe road can be a challenge.</p>
+
+
+
+<p>In 2020 Google announced that it would be implementing more detailed street maps in selected cities:</p>
+
+
+
+<blockquote><p>Soon, you’ll be able to see highly detailed street information that shows the accurate shape and width of a road to scale. You can also see exactly where sidewalks, crosswalks, and pedestrian islands are located… We’ll start rolling out detailed street maps in London, New York, and San Francisco in the coming months, with plans to expand to more cities over time.</p><cite><a href="https://blog.google/products/maps/more-detailed-colorful-map/">A more detailed, colorful map, Aug 18th 2020, Google.</a></cite></blockquote>
+
+
+
+<p>Justin O’Beirne, a prolific writer on the consumer maps competitive landscape, <a href="https://www.justinobeirne.com/google-maps-detailed-street-maps-release-3" target="_blank" rel="noopener" title="">wrote in April 2022</a> that Google has released detailed street maps in 40 cities so far. No cities in Australia make up this list.</p>
+
+
+
+<figure>
+<figure><img loading="lazy" width="1024" height="1005" data-id="479" src="https://jakecoppinger.com/wp-content/uploads/2023/01/google_detailed-1024x1005.png" alt="" srcset="https://jakecoppinger.com/wp-content/uploads/2023/01/google_detailed-1024x1005.png 1024w, https://jakecoppinger.com/wp-content/uploads/2023/01/google_detailed-300x294.png 300w, https://jakecoppinger.com/wp-content/uploads/2023/01/google_detailed-768x754.png 768w, https://jakecoppinger.com/wp-content/uploads/2023/01/google_detailed-1536x1507.png 1536w, https://jakecoppinger.com/wp-content/uploads/2023/01/google_detailed-2048x2010.png 2048w" sizes="(max-width: 1024px) 100vw, 1024px"></figure>
+</figure>
+
+
+
+<h3>Open source competition</h3>
+
+
+
+<p>OpenStreetMap (OSM) is a free, editable map of the whole world that is being built by volunteers largely from scratch and released with an open-content license. Because of the license it has grown quickly and now rivals (and often exceeds) the detail of commercial map providers. OSM data is used in Instagram, Wikipedia, Strava, Snapchat, Uber and many others.</p>
+
+
+
+<p>An project using this data has been quietly generating highly detailed street maps. <a href="https://dabreegster.github.io/" target="_blank" rel="noreferrer noopener">Dustin Carlino</a> started building the <a href="https://github.com/a-b-street/abstreet#ab-street" target="_blank" rel="noreferrer noopener">A/B Street traffic simulation app</a> <a href="https://a-b-street.github.io/docs/project/history/year2.html" target="_blank" rel="noreferrer noopener">since around 2019</a>, and as part of this released the <a href="https://github.com/a-b-street/osm2streets" target="_blank" rel="noopener" title="">osm2streets</a> project. osm2streets takes OSM data and draws detailed shapes of streets – though didn’t yet support rendering into generic web or phone “slippy” maps as detailed on this <a href="https://github.com/a-b-street/osm2streets/issues/12" target="_blank" rel="noopener" title="">Github issue</a>.</p>
+
+
+
+<figure><img loading="lazy" width="1024" height="706" src="https://jakecoppinger.com/wp-content/uploads/2023/01/brunswick-1024x706.png" alt="" srcset="https://jakecoppinger.com/wp-content/uploads/2023/01/brunswick-1024x706.png 1024w, https://jakecoppinger.com/wp-content/uploads/2023/01/brunswick-300x207.png 300w, https://jakecoppinger.com/wp-content/uploads/2023/01/brunswick-768x530.png 768w, https://jakecoppinger.com/wp-content/uploads/2023/01/brunswick-1536x1059.png 1536w, https://jakecoppinger.com/wp-content/uploads/2023/01/brunswick-2048x1413.png 2048w" sizes="(max-width: 1024px) 100vw, 1024px"><figcaption>Brunswick, Melbourne rendered in A/B Street</figcaption></figure>
+
+
+
+<p>I wrote an open source vector tileserver <a href="https://github.com/jakecoppinger/osm2streets-vector-tileserver" target="_blank" rel="noopener" title="">osm2streets-vector-tileserver</a> to enable “slippy” web and phone maps to load the detailed car and bicycle lane information that osm2streets generates.</p>
+
+
+
+<p>As a proof of concept, I’ve built <a href="https://safecyclingmap.com/" target="_blank" rel="noopener" title="">safecyclingmap.com</a> to consume the tiles produced by <a href="https://github.com/jakecoppinger/osm2streets-vector-tileserver" target="_blank" rel="noopener" title="">osm2streets-vector-tileserver</a>. It is a visualisation of this detailed street data to assist cyclists with picking safe routes in cities with little dedicated cycling infrastructure.</p>
+
+
+
+<h2>Technical details</h2>
+
+
+
+<p><em>Bear in mind: I initially wrote the tileserver in one afternoon, and I haven’t put much effort into reliably hosting the infrastructure yet, so this could be improved.</em></p>
+
+
+
+<p>The backend works by taking vector tile requests from a frontend (with a url like https://api.safecyclingmap.com/tile/18/241180/157318).</p>
+
+
+
+<p>Once a request is received, the tile at zoom level 15 that contains the requested tile as a subset is calculated.</p>
+
+
+
+<p>The OSM XML is then fetched from a local Overpass Turbo instance for that superset tile, and the osm2streets street network output for this tile is generated (using the JS to wasm (Rust) bindings at https://www.npmjs.com/package/osm2streets-js).</p>
+
+
+
+<p>Requested subset tiles are then generated using the street network object that covers the superset tile.</p>
+
+
+
+<p>The geojson layers are then generated and combined, and returned to the client as a Protobuf.</p>
+
+
+
+<p>If you have any questions or are interested in contributing, come and join the Matrix room at <a href="https://matrix.to/#/#osm2streets-vector-tileserver:matrix.org" target="_blank" rel="noreferrer noopener">#osm2streets-vector-tileserver:matrix.org</a> or raise a PR at <a href="https://github.com/jakecoppinger/osm2streets-vector-tileserver" target="_blank" rel="noreferrer noopener">https://github.com/jakecoppinger/osm2streets-vector-tileserver</a>.</p>
+
+
+
+<h3>Caching</h3>
+
+
+
+<p>I’ve used two least-recently-used caches to cache the osm2streets network output, as well as the final individual vector tiles. Vector tiles requested that fit within the bounds of an in-progress zoom level 15 Overpass Turbo download (and associated network generation) busy-wait for the cache to become available (with a timeout if there is an error).</p>
+
+
+
+<p>Currently it works in all of Australia, as downloading all map data for the entire world needs a larger hard drive! I needed 8GB of swap space to set up the docker image without a failure.</p>
+
+
+
+<p>The frontend is currently hosted on Github pages (behind Cloudflare) because haven’t yet configured SSL config on AWS S3 for this domain.</p>
+
+
+
+<p>The backend currently runs on a Vultr VPS, using Cloudflare Tunnel to send requests to <code>localhost:3000</code>.</p>
+
+
+
+<h2>Further work</h2>
+
+
+
+<p>Further features that I think would be useful:</p>
+
+
+
+<ul><li>Making it work worldwide by passing requests outside Australia to a public Overpass instance from <a href="https://wiki.openstreetmap.org/wiki/Overpass_API#Public_Overpass_API_instances">https://wiki.openstreetmap.org/wiki/Overpass_API#Public_Overpass_API_instances</a> – with the new caching there shouldn’t too much traffic</li><li>Contributing to osm2streets to pass extra attributes in the vector tiles returned, such as:<ul><li>Speed of the street, to be able to colour code streets</li><li>Level of the street, to hide underground roads</li></ul></li></ul>
+
+
+
+
+
+
+
+
+
+</div></div>]]>
+            </description>
+            <link>https://jakecoppinger.com/2023/01/lane-accurate-street-maps-with-openstreetmap-writing-a-vector-tileserver-for-osm2streets/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-34439069</guid>
+            <pubDate>Thu, 19 Jan 2023 11:10:52 GMT</pubDate>
         </item>
         <item>
             <title>
@@ -4567,7 +5150,7 @@ January 18, 2023 | http://selfadjustingglasses.com/reviews/flexvision/en/int1j2v
                             <img src="http://selfadjustingglasses.com/reviews/domain_specific/logos/header_logo85.png" alt="FlexVision">
             		</a></p><div>
     <p><small><strong>Limited Discount: 50% Off</strong></small>
-    <a href="https://click.selfadjustingglasses.com/click.php?lp=1&amp;uclick=y9b41m17"></a></p></div>
+    <a href="https://click.selfadjustingglasses.com/click.php?lp=1&amp;uclick=y9irus3z"></a></p></div>
         		
 	</div>
 </nav>  
@@ -4758,7 +5341,7 @@ January 18, 2023 | http://selfadjustingglasses.com/reviews/flexvision/en/int1j2v
 					<li><span>30-day money-back guarantee</span></li>
 				</ul>
 				<p>Promotion valid while stocks last. Get deep discounts when you order more (perfect as a gift!)</p>
-				<p><a href="https://click.selfadjustingglasses.com/click.php?lp=1&amp;uclick=y9b41m17">
+				<p><a href="https://click.selfadjustingglasses.com/click.php?lp=1&amp;uclick=y9irus3z">
 					<span>Claim Your Discount &gt;</span>
 				</a>
 			</p></div>
@@ -4832,7 +5415,7 @@ January 18, 2023 | http://selfadjustingglasses.com/reviews/flexvision/en/int1j2v
 		<h2><img src="http://selfadjustingglasses.com/reviews/flexvision/en/int1j2v3/img/warning-icon.jpg" alt="">Claim Your FlexVision Now,</h2>
 		<p>or Risk Paying Full Price Tomorrow.</p>
 		<p>(Take advantage of our One-Time <span>50% OFF</span> Sale - It’s ending soon!)</p>
-        <p>				<a href="https://click.selfadjustingglasses.com/click.php?lp=1&amp;uclick=y9b41m17">
+        <p>				<a href="https://click.selfadjustingglasses.com/click.php?lp=1&amp;uclick=y9irus3z">
 					<span>Order Now &gt; &gt;</span>
 				</a></p>
 	</div>
@@ -6786,7 +7369,7 @@ ProxySQL does have a feature (configured in mysql_aws_aurora_hostgroups) whereby
             </title>
             <description>
 <![CDATA[
-Score 193 | Comments 304 (<a href="https://news.ycombinator.com/item?id=34427864">thread link</a>) | @nandalism
+Score 194 | Comments 304 (<a href="https://news.ycombinator.com/item?id=34427864">thread link</a>) | @nandalism
 <br/>
 January 18, 2023 | https://blog.deckc.hair/2023-01-18-stop-building-on-corporate-controlled-languages.html | <a href="https://web.archive.org/web/*/https://blog.deckc.hair/2023-01-18-stop-building-on-corporate-controlled-languages.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -8199,7 +8782,7 @@ or
             </title>
             <description>
 <![CDATA[
-Score 63 | Comments 33 (<a href="https://news.ycombinator.com/item?id=34422519">thread link</a>) | @phoebos
+Score 64 | Comments 35 (<a href="https://news.ycombinator.com/item?id=34422519">thread link</a>) | @phoebos
 <br/>
 January 17, 2023 | https://bvnf.space/blog/008-sudo-make-install.html | <a href="https://web.archive.org/web/*/https://bvnf.space/blog/008-sudo-make-install.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
@@ -8367,7 +8950,7 @@ January 17, 2023 | https://about.wvs.io/post/wevr-virtual-studio-wvs-a-devops-pl
             </title>
             <description>
 <![CDATA[
-Score 13 | Comments 2 (<a href="https://news.ycombinator.com/item?id=34421654">thread link</a>) | @benbreen
+Score 14 | Comments 2 (<a href="https://news.ycombinator.com/item?id=34421654">thread link</a>) | @benbreen
 <br/>
 January 17, 2023 | http://www.3pp.website/2013/03/piero-della-francescas-symbolic-egg.html | <a href="https://web.archive.org/web/*/http://www.3pp.website/2013/03/piero-della-francescas-symbolic-egg.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -8549,7 +9132,7 @@ January 17, 2023 | https://notes.labordata.bunkum.us/2023/01/09/corp-registry.ht
             </title>
             <description>
 <![CDATA[
-Score 102 | Comments 14 (<a href="https://news.ycombinator.com/item?id=34420959">thread link</a>) | @todsacerdoti
+Score 103 | Comments 14 (<a href="https://news.ycombinator.com/item?id=34420959">thread link</a>) | @todsacerdoti
 <br/>
 January 17, 2023 | https://blog.dziban.net/coroutines/ | <a href="https://web.archive.org/web/*/https://blog.dziban.net/coroutines/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -8986,7 +9569,7 @@ We finally reached the point where, for a few weeks, our Github repo has no open
             </title>
             <description>
 <![CDATA[
-Score 7 | Comments 0 (<a href="https://news.ycombinator.com/item?id=34420064">thread link</a>) | @metayrnc
+Score 8 | Comments 0 (<a href="https://news.ycombinator.com/item?id=34420064">thread link</a>) | @metayrnc
 <br/>
 January 17, 2023 | https://www.parsonsmatt.org/2019/03/19/sum_types_in_sql.html | <a href="https://web.archive.org/web/*/https://www.parsonsmatt.org/2019/03/19/sum_types_in_sql.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -9637,7 +10220,7 @@ January 17, 2023 | https://jakecoppinger.com/2023/01/lane-accurate-street-maps-w
             </title>
             <description>
 <![CDATA[
-Score 171 | Comments 86 (<a href="https://news.ycombinator.com/item?id=34417232">thread link</a>) | @gmays
+Score 172 | Comments 86 (<a href="https://news.ycombinator.com/item?id=34417232">thread link</a>) | @gmays
 <br/>
 January 17, 2023 | https://www.qmul.ac.uk/media/news/2023/smd/ten-minute-scan-enables-detection-and-cure-of-the-commonest-cause-of-high-blood-pressure.html | <a href="https://web.archive.org/web/*/https://www.qmul.ac.uk/media/news/2023/smd/ten-minute-scan-enables-detection-and-cure-of-the-commonest-cause-of-high-blood-pressure.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -10849,7 +11432,7 @@ Maybe DNS spoofing the defunct Nintendo servers could allow for similar battles 
             </title>
             <description>
 <![CDATA[
-Score 112 | Comments 107 (<a href="https://news.ycombinator.com/item?id=34410624">thread link</a>) | @evolve2k
+Score 113 | Comments 107 (<a href="https://news.ycombinator.com/item?id=34410624">thread link</a>) | @evolve2k
 <br/>
 January 17, 2023 | https://carhenge.club/@mattdsteele/109700383808551139 | <a href="https://web.archive.org/web/*/https://carhenge.club/@mattdsteele/109700383808551139">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -10864,7 +11447,7 @@ January 17, 2023 | https://carhenge.club/@mattdsteele/109700383808551139 | <a hr
             </title>
             <description>
 <![CDATA[
-Score 141 | Comments 134 (<a href="https://news.ycombinator.com/item?id=34410187">thread link</a>) | @signa11
+Score 141 | Comments 135 (<a href="https://news.ycombinator.com/item?id=34410187">thread link</a>) | @signa11
 <br/>
 January 17, 2023 | https://verdagon.dev/blog/when-to-use-memory-safe-part-2 | <a href="https://web.archive.org/web/*/https://verdagon.dev/blog/when-to-use-memory-safe-part-2">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -11206,7 +11789,7 @@ Cheers,
             </title>
             <description>
 <![CDATA[
-Score 217 | Comments 103 (<a href="https://news.ycombinator.com/item?id=34410072">thread link</a>) | @calpaterson
+Score 218 | Comments 103 (<a href="https://news.ycombinator.com/item?id=34410072">thread link</a>) | @calpaterson
 <br/>
 January 16, 2023 | https://csvbase.com/blog/2 | <a href="https://web.archive.org/web/*/https://csvbase.com/blog/2">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
