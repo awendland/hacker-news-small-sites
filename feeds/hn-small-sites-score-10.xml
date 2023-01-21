@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Fri, 20 Jan 2023 20:27:39 GMT</lastBuildDate>
+        <lastBuildDate>Sat, 21 Jan 2023 01:50:44 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-10.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Fri, 20 Jan 2023 20:27:39 GMT</pubDate>
+        <pubDate>Sat, 21 Jan 2023 01:50:44 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -24,7 +24,7 @@
             </title>
             <description>
 <![CDATA[
-Score 11 | Comments 0 (<a href="https://news.ycombinator.com/item?id=34457662">thread link</a>) | @semihsalihoglu
+Score 13 | Comments 0 (<a href="https://news.ycombinator.com/item?id=34457662">thread link</a>) | @semihsalihoglu
 <br/>
 January 20, 2023 | https://kuzudb.com/blog/factorization.html | <a href="https://web.archive.org/web/*/https://kuzudb.com/blog/factorization.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="main-content" role="main"> <p> <a href="https://github.com/kuzudb/kuzu"><img src="https://kuzudb.com/kuzu-logo.png" width="300"></a> </p> <p>  <a href="https://github.com/kuzudb" data-size="large" aria-label="Follow @kuzudb on GitHub">Follow @kuzudb</a> </p> <p>by Semih Salihoğlu, Jan 20th, 2023</p>  <p>Many of the core principles of how to develop DBMSs are well understood. For example, a very good query compilation paradigm is to map high-level queries to a logical plan of relational operators, then optimize this plan, and then further map it to an executable code often in the form of a physical query plan. Similarly, if you want updates to a DBMS to be atomic and durable, a good paradigm is to use a write-ahead log that serves as a source of truth and can be used to undo or redo operations. Many systems adopt such common wisdom paradigms. As core DBMS researcher, once in a while however, you run into a very simple idea that deviates from the norm that gets you very excited. Today, I want to write about one such idea called <a href="https://www.cs.ox.ac.uk/dan.olteanu/papers/os-sigrec16.pdf">factorization</a>.</p> <blockquote> <p><strong>Tldr: The key takeaways are:</strong></p> <ul> <li><strong>Overview of Factorization &amp; Why Every GDBMS Must Adopt It</strong>: Factorization is a compression technique to compress the intermediate results that query processors generate when evaluating many-to-many (m-n) joins. Factorization can compress an intermediate result size exponentially in the number m-n joins in the query.</li> <li><strong>Example Benefits of Factorization</strong>: Benefits of keeping intermediate results smaller reduces the computation processors perform on many queries. Examples include reducing copies by keeping the output data size small, reducing filter and expression evaluation computations exponentially, and performing very fast aggregations.</li> <li><strong>How Kùzu Implements Factorization:</strong> Kùzu’s query processor is designed to achieve 3 design goals: (i) factorize intermediate results; (ii) always perform sequential scans of database files; and (iii) avoid scanning large chunks of database files when possible. In addition, the processor is vectorized as in modern columnar DBMSs. These design goals are achieved by passing multiple <em>factorized vectors</em> between each other and using modified HashJoin operators that do <em>sideways information passing</em> to avoid scans of entire files.</li> </ul> </blockquote> <p>This is a quite technical and long blog post and will appeal more to people who are interested in internals of DBMSs. It’s about a technique that’s quite dear to my heart called factorization, which is a very simple data compression technique. Probably all compression techniques you know are designed to compress database files that are stored on disk. Think of run-length encoding, dictionary compression, or bitpacking. In contrast, you can’t use factorization to compress your raw database files. Factorization has a very unique property: it is designed to compress the intermediate data that are generated when query processors of DBMSs evaluate many-to-many (m-n) growing joins. If you have read <a href="https://kuzudb.com/blog/what-every-gdbms-should-do-and-vision.html">my previous blog</a>, efficiently handling m-n joins was one of the items on my list of properties that competent GDBMSs should excel in. This is because the workloads of GDBMSs commonly contain m-n joins across node records. Each user in a social network or an account in a financial transaction network or will have thousands of connections and if you want a GDBMS to find patterns on your graphs, you are asking queries with m-n joins. Factorization is directly designed for these workloads and because of that every competent GDBMS must develop a factorized query processor. In fact, if I were to try to write a new analytical RDBMS, I would probably also integrate factorization into it.</p> <p>This post forms the 2nd part of my 3-part posts on the contents of our <a href="https://www.cidrdb.org/cidr2023/papers/p48-jin.pdf">CIDR paper</a> where we introduced Kùzu. The 3rd piece will be on another technique called worst-case optimal join algorithms, which is also designed for a specific class of m-n joins. Both in this post and the next, I have two goals. First is to try to articulate these techniques using a language that is accessible to general software engineers. Second, is to make people appreciate the role of pen-and-paper theory in advancing the field of DBMSs. Both of these techniques were first articulated in a series of purely theoretical papers which gave excellent practical advise on how to improve DBMS performance. Credit goes to the great theoreticians who pioneered these techniques whom I will cite in these posts. Their work should be highly appreciated.</p> <h2 id="a-quick-background-traditional-query-processing-using-flat-tuples"> <a href="#a-quick-background-traditional-query-processing-using-flat-tuples" aria-labelledby="a-quick-background-traditional-query-processing-using-flat-tuples"></a> A Quick Background: Traditional Query Processing Using Flat Tuples </h2> <p>Here is a short background on the basics of query processors before I explain factorization. If you know about query plans and how to interpret them, you can skip to <a href="#factorization-in-a-nutshell">here</a> after reading my running example. Consider a database of Account node and Transfer edge records below. The two Accounts with <code>accID</code> fields L1 and L2 are owned by Liz and each have 100 incoming and 100 outgoing Transfer edges.</p> <p> <img src="https://kuzudb.com/img/2-hop-data.png" width="600"> </p> <p>Now consider a 2-hop path query in Cypher returning the accID’s of source and destinations of money flows Liz’s accounts are facilitating:</p> <div><div><pre><code>MATCH (a:Account)-[t1:Transfer]-&gt;(b:Account)-[t2:Transfer]-&gt;(c:Account)
@@ -64,7 +64,7 @@ RETURN min(a.ID), min(b.ID), min(c.ID)
             </title>
             <description>
 <![CDATA[
-Score 74 | Comments 18 (<a href="https://news.ycombinator.com/item?id=34456416">thread link</a>) | @zeroonetwothree
+Score 198 | Comments 151 (<a href="https://news.ycombinator.com/item?id=34456416">thread link</a>) | @zeroonetwothree
 <br/>
 January 20, 2023 | https://mhlakhani.com/blog/2023/01/tech-job-market/ | <a href="https://web.archive.org/web/*/https://mhlakhani.com/blog/2023/01/tech-job-market/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -220,7 +220,7 @@ January 20, 2023 | https://mhlakhani.com/blog/2023/01/tech-job-market/ | <a href
             </title>
             <description>
 <![CDATA[
-Score 230 | Comments 295 (<a href="https://news.ycombinator.com/item?id=34451566">thread link</a>) | @nsoonhui
+Score 240 | Comments 325 (<a href="https://news.ycombinator.com/item?id=34451566">thread link</a>) | @nsoonhui
 <br/>
 January 20, 2023 | https://payne.org/blog/the-myth-of-the-myth-of-the-10x-programmer/ | <a href="https://web.archive.org/web/*/https://payne.org/blog/the-myth-of-the-myth-of-the-10x-programmer/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -274,7 +274,7 @@ January 20, 2023 | https://payne.org/blog/the-myth-of-the-myth-of-the-10x-progra
             </title>
             <description>
 <![CDATA[
-Score 28 | Comments 5 (<a href="https://news.ycombinator.com/item?id=34449940">thread link</a>) | @dvrp
+Score 32 | Comments 8 (<a href="https://news.ycombinator.com/item?id=34449940">thread link</a>) | @dvrp
 <br/>
 January 19, 2023 | https://kevinchen.co/blog/rewind-ai-app-teardown/#how-it-works-overview | <a href="https://web.archive.org/web/*/https://kevinchen.co/blog/rewind-ai-app-teardown/#how-it-works-overview">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1378,8 +1378,8 @@ CREATE VIRTUAL TABLE "search" USING fts4("text", "otherText", tokenize=porter)
 
     
 
-    <p>You can also follow me on Twitter (<a href="https://twitter.com/kevinchen">@kevinchen</a>) or <a href="https://kevinchen.co/feed.xml">subscribe via RSS</a>.
-</p></div>
+    <p>You can also follow me on Twitter (<a href="https://twitter.com/kevinchen">@kevinchen</a>) or <a href="https://kevinchen.co/feed.xml">subscribe via RSS</a>.</p>
+</div>
 
 
 <nav>
@@ -1401,7 +1401,7 @@ CREATE VIRTUAL TABLE "search" USING fts4("text", "otherText", tokenize=porter)
             </title>
             <description>
 <![CDATA[
-Score 350 | Comments 152 (<a href="https://news.ycombinator.com/item?id=34448576">thread link</a>) | @kennybrea
+Score 355 | Comments 153 (<a href="https://news.ycombinator.com/item?id=34448576">thread link</a>) | @kennybrea
 <br/>
 January 19, 2023 | https://www.carsized.com/en/ | <a href="https://web.archive.org/web/*/https://www.carsized.com/en/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1416,16 +1416,16 @@ January 19, 2023 | https://www.carsized.com/en/ | <a href="https://web.archive.o
 											<div>
 						<div>			
 					<p><img id="compare0" src="https://www.carsized.com/images/grid_2x.png" srcset="https://www.carsized.com/images/grid_2x.png 1x, https://www.carsized.com/images/grid_2x.png 2x" alt="Background grid">				
-					<img id="compare2" src="https://www.carsized.com/resources/lexus/rx/d/2012/sl_280131147_lexus-rx-2012-side-view_4x.png" srcset="https://www.carsized.com/resources/lexus/rx/d/2012/sl_280131147_lexus-rx-2012-side-view_3x.png 734w, https://www.carsized.com/resources/lexus/rx/d/2012/sl_280131147_lexus-rx-2012-side-view_4x.png 1468w" alt="Lexus RX SUV 2012-2015">
-					<img id="compare1" src="https://www.carsized.com/resources/renault/clio/d/2009/sl_248114080_renault-clio-2009-side-view_4x.png" srcset="https://www.carsized.com/resources/renault/clio/d/2009/sl_248114080_renault-clio-2009-side-view_3x.png 624w, https://www.carsized.com/resources/renault/clio/d/2009/sl_248114080_renault-clio-2009-side-view_4x.png 1248w" alt="Renault Clio Hatchback 2009-2014"></p>
-					<p><span> Real height<sup>1</sup> <span>1.685 m</span> <span>2</span>&nbsp;<br><span><b>+ 18.8 cm</b></span></span>
+					<img id="compare2" src="https://www.carsized.com/resources/peugeot/508/sw/2014/sm_249129145_peugeot-508-2014-side-view_4x.png" srcset="https://www.carsized.com/resources/peugeot/508/sw/2014/sm_249129145_peugeot-508-2014-side-view_3x.png 743w, https://www.carsized.com/resources/peugeot/508/sw/2014/sm_249129145_peugeot-508-2014-side-view_4x.png 1487w" alt="Peugeot 508 Estate 2014-2018">
+					<img id="compare1" src="https://www.carsized.com/resources/seat/altea/freetrack/2009/sl_271121136_seat-altea-2009-side-view_4x.png" srcset="https://www.carsized.com/resources/seat/altea/freetrack/2009/sl_271121136_seat-altea-2009-side-view_3x.png 685w, https://www.carsized.com/resources/seat/altea/freetrack/2009/sl_271121136_seat-altea-2009-side-view_4x.png 1371w" alt="Seat Altea Minivan 2009-2015"></p>
+					<p><span> Real height<sup>1</sup> <span>1.476 m</span> <span>2</span></span>
 					</p>
-					<p><span> <span>1</span> <span>1.497 m</span> Real height<sup>1</sup>	</span>					
+					<p><span> <span>1</span> <span>1.622 m</span> Real height<sup>1</sup> <br>&nbsp;<span><b>+ 14.6 cm</b></span>	</span>					
 					</p>
 					</div>
 					<div>						
 						<div>		
-							<p><span> <span><b>+ 73.8 cm</b></span> <span>2</span> <span>4.77 m</span> Real length</span>
+							<p><span> <span><b>+ 33.6 cm</b></span> <span>2</span> <span>4.829 m</span> Real length</span>
 							</p>
 </div>
 
@@ -1441,7 +1441,7 @@ January 19, 2023 | https://www.carsized.com/en/ | <a href="https://web.archive.o
 																			<div>		
 			<p>
 							<br>
-							<h2><b>Technical specs</b> | <b>Renault Clio (R) 5-door Hatchback  2009</b> is 73.8 cm <b>shorter</b> and 18.8 cm <b>lower</b> compared to Lexus RX (AL1) SUV  2012. It offers 34% <b>less</b> cargo space.<sup>4,5</sup></h2>
+							<h2><b>Technical specs</b> | <b>Seat Altea Freetrack (5P) Minivan  2009</b> is 33.6 cm <b>shorter</b> and 14.6 cm <b>higher</b> compared to Peugeot 508 (8) Estate  2014. It offers 5% <b>less</b> cargo space.<sup>4,5</sup></h2>
 			</p>			
 			
 			
@@ -1463,7 +1463,7 @@ January 19, 2023 | https://www.carsized.com/en/ | <a href="https://web.archive.o
 	<div>
 		<p><span>Quick Facts</span><br>
 		</p>
-		<p><span>858705</span><br>
+		<p><span>861328</span><br>
 			<span>Comparison combinations</span>
 		</p>
 		<p><span>Germany</span><br>
@@ -1500,7 +1500,7 @@ January 19, 2023 | https://www.carsized.com/en/ | <a href="https://web.archive.o
             </title>
             <description>
 <![CDATA[
-Score 19 | Comments 1 (<a href="https://news.ycombinator.com/item?id=34446440">thread link</a>) | @federicoterzi
+Score 20 | Comments 2 (<a href="https://news.ycombinator.com/item?id=34446440">thread link</a>) | @federicoterzi
 <br/>
 January 19, 2023 | https://federicoterzi.com/blog/good-software-architectures-are-mostly-about-boundaries/ | <a href="https://web.archive.org/web/*/https://federicoterzi.com/blog/good-software-architectures-are-mostly-about-boundaries/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-v-4240d724=""><div data-v-4240d724=""><p data-v-4240d724="">As software engineers, we are always asked to design maintainable and extensible software architectures. While design patterns and best practices help, most of them are just facades to one larger and fundamental principle: designing good boundaries.</p>
@@ -1891,7 +1891,7 @@ January 19, 2023 | https://federicoterzi.com/blog/good-software-architectures-ar
             </title>
             <description>
 <![CDATA[
-Score 118 | Comments 36 (<a href="https://news.ycombinator.com/item?id=34445367">thread link</a>) | @Fr0styMatt88
+Score 121 | Comments 36 (<a href="https://news.ycombinator.com/item?id=34445367">thread link</a>) | @Fr0styMatt88
 <br/>
 January 19, 2023 | https://ultibo.org/make/ | <a href="https://web.archive.org/web/*/https://ultibo.org/make/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="container"><div id="container-inside">
@@ -2066,13 +2066,13 @@ January 19, 2023 | https://ultibo.org/make/ | <a href="https://web.archive.org/w
             </title>
             <description>
 <![CDATA[
-Score 123 | Comments 97 (<a href="https://news.ycombinator.com/item?id=34444953">thread link</a>) | @zurawiki
+Score 124 | Comments 98 (<a href="https://news.ycombinator.com/item?id=34444953">thread link</a>) | @zurawiki
 <br/>
 January 19, 2023 | https://zura.wiki/post/never-write-a-commit-message-again-with-the-help-of-gpt-3/ | <a href="https://web.archive.org/web/*/https://zura.wiki/post/never-write-a-commit-message-again-with-the-help-of-gpt-3/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div role="main"><article><section><p>GPT-3 has proven to be a valuable tool for assisting in technical tasks such as scripting and command line operations. With gptcommit, you no longer have to spend time writing your commit messages. Install <a href="https://github.com/zurawiki/gptcommit"><code>gptcommit</code></a> and let GPT-3 do the writing for you.</p><p>Commit messages are a key channel for developers to communicate their work with others, especially in code reviews. When making complex code changes, it can be tedious to thoroughly document the contents of each change. I often felt the impulse to just title my commit “fix bug” and move on. These one-liner messages often lack the full context that a review would need to understand the change. Worse, a seemingly harmless commit description like “fix typo” might omit key changes made elsewhere in the codebase. Surfacing these changes with gptcommit helps the author and reviewer by bringing attention to these additional changes.</p><h3 id="get-setup-in-minutes">Get setup in minutes</h3><blockquote><p>Prerequisites:
 To use <code>gptcommit</code>, you’ll need to have</p><ul><li><a href="https://rustup.rs/">Cargo</a>, the Rust package manager, installed</li><li>an <a href="https://beta.openai.com/account/api-keys">API key from OpenAI</a>.</li></ul></blockquote><p>1) Install the <code>gptcommit</code> binary from cargo</p><pre><code>cargo install --locked gptcommit
 </code></pre><p>2) In a local git repository, run the following to set up the <code>gptcommit</code> githooks. Note that this command needs to be run for each local git checkout that you have.</p><pre><code>gptcommit install
-</code></pre><p>2) In your dotfiles or you worming shell, set the <code>OPENAI_API_KEY</code> to your key.</p><pre><code>export OPENAI_API_KEY="sk-..."
+</code></pre><p>2) In your dotfiles or your working shell, set the <code>OPENAI_API_KEY</code> to your key.</p><pre><code>export OPENAI_API_KEY="sk-..."
 </code></pre><blockquote><p>Consider adding the line above to your ~/.bashrc, ~/.zshrc or equivalent dotfile.</p></blockquote><h3 id="demos-and-results-on-real-commits">Demos and Results on real commits</h3><p>See the ASCII screencasts below:</p><ul><li>Demo #1: the full installation and commit workflow, editing multiple rust files</li></ul><ul><li>Demo #2: a one-line change to a string inside a rust file.</li></ul><ul><li>Demo #3: Modifying non-code files, in this case a README.</li></ul><p>If you’ve found compelling commit summaries with <code>gptcommit</code>, I’d appreciate hearing from you.</p><h3 id="building-on-prior-work">Building on Prior Work</h3><p><code>gptcommit</code> this tool was inspired took heavy inspiration from previous commit summarizing tools including:</p><ul><li><a href="https://github.com/RomanHotsiy/commitgpt">https://github.com/RomanHotsiy/commitgpt</a></li></ul><p>This tool is currently not working, as it used an unofficial API to prompt ChatGPT. gptcommit uses the official completions API from OpenAI and requires users to bring their OpenAI API key. gptcommit integrates as a <a href="https://git-scm.com/docs/githooks">githook</a> so it can run seamlessly as part of the git workflow. Finally, gptcommit uses Rust so which allows for quicker execution times.</p><ul><li><a href="https://github.com/KanHarI/gpt-commit-summarizer">https://github.com/KanHarI/gpt-commit-summarizer</a></li></ul><p>This tool integrates via GitHub actions rather than in the git workflow Summarization occurs at the PR level rather than per commit. The action is already triggered after a pull request has already been summarized, and posted directly to the pull requests without human review. Many aspects of the prompt design were borrowed from this project. <code>gptcommit</code> focuses on the <code>git commit</code> workflow such that the commit author could approve or edit any output from GPT.</p><h3 id="behind-the-scenes">Behind the scenes</h3><p>Ingestion of a git commit occurs in two phases.</p><p>First, each file is summarized independently and in parallel to produce a list of bullet points from OpenAI’s models.</p><p>Then, the summarized file changes are summarized in two ways. First, the model is instructed to generate a short, one-line title for the commit. In addition, the model summarized higher-level bullet points to be included in the body of the commit message.</p><p>The final output provided to the commit message then consists of:</p><pre><code>[title]
 
 - [summary point 1]
@@ -2096,7 +2096,7 @@ To use <code>gptcommit</code>, you’ll need to have</p><ul><li><a href="https:/
             </title>
             <description>
 <![CDATA[
-Score 38 | Comments 14 (<a href="https://news.ycombinator.com/item?id=34443602">thread link</a>) | @dcminter
+Score 39 | Comments 14 (<a href="https://news.ycombinator.com/item?id=34443602">thread link</a>) | @dcminter
 <br/>
 January 19, 2023 | http://dave.zfxinc.net/f1.html | <a href="https://web.archive.org/web/*/http://dave.zfxinc.net/f1.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div size="3">
@@ -2321,7 +2321,7 @@ January 19, 2023 | https://danschnau.com/blog/ChatGPT_peak_of_hype | <a href="ht
             </title>
             <description>
 <![CDATA[
-Score 59 | Comments 12 (<a href="https://news.ycombinator.com/item?id=34441672">thread link</a>) | @louislang
+Score 59 | Comments 13 (<a href="https://news.ycombinator.com/item?id=34441672">thread link</a>) | @louislang
 <br/>
 January 19, 2023 | https://blog.silentsignal.eu/2022/09/28/another-tale-of-ibm-i-as-400-hacking/ | <a href="https://web.archive.org/web/*/https://blog.silentsignal.eu/2022/09/28/another-tale-of-ibm-i-as-400-hacking/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2461,7 +2461,7 @@ January 19, 2023 | https://blog.silentsignal.eu/2022/09/28/another-tale-of-ibm-i
             </title>
             <description>
 <![CDATA[
-Score 126 | Comments 97 (<a href="https://news.ycombinator.com/item?id=34439883">thread link</a>) | @ktzn
+Score 126 | Comments 99 (<a href="https://news.ycombinator.com/item?id=34439883">thread link</a>) | @ktzn
 <br/>
 January 19, 2023 | https://www.radiatedaily.com/telling-your-inner-critic-to-chill/ | <a href="https://web.archive.org/web/*/https://www.radiatedaily.com/telling-your-inner-critic-to-chill/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>	
@@ -2577,7 +2577,7 @@ January 19, 2023 | https://www.radiatedaily.com/telling-your-inner-critic-to-chi
             </title>
             <description>
 <![CDATA[
-Score 235 | Comments 274 (<a href="https://news.ycombinator.com/item?id=34439588">thread link</a>) | @hochmartinez
+Score 237 | Comments 274 (<a href="https://news.ycombinator.com/item?id=34439588">thread link</a>) | @hochmartinez
 <br/>
 January 19, 2023 | https://blest.co.jp/eng/service/be-h/ | <a href="https://web.archive.org/web/*/https://blest.co.jp/eng/service/be-h/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2738,7 +2738,7 @@ Please use the inquiry form from the left button.</li>
             </title>
             <description>
 <![CDATA[
-Score 14 | Comments 2 (<a href="https://news.ycombinator.com/item?id=34439500">thread link</a>) | @ksec
+Score 15 | Comments 2 (<a href="https://news.ycombinator.com/item?id=34439500">thread link</a>) | @ksec
 <br/>
 January 19, 2023 | https://wpewebkit.org/blog/05-new-svg-engine.html | <a href="https://web.archive.org/web/*/https://wpewebkit.org/blog/05-new-svg-engine.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div itemprop="articleBody">
@@ -2877,7 +2877,7 @@ Note that these implementations are already complete in LBSE downstream and do n
             </title>
             <description>
 <![CDATA[
-Score 85 | Comments 43 (<a href="https://news.ycombinator.com/item?id=34439494">thread link</a>) | @ShroudedNight
+Score 86 | Comments 43 (<a href="https://news.ycombinator.com/item?id=34439494">thread link</a>) | @ShroudedNight
 <br/>
 January 19, 2023 | https://batchrocket.eu/en/ | <a href="https://web.archive.org/web/*/https://batchrocket.eu/en/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div itemscope="" itemtype="https://schema.org/Article">
@@ -2914,7 +2914,7 @@ January 19, 2023 | https://batchrocket.eu/en/ | <a href="https://web.archive.org
             </title>
             <description>
 <![CDATA[
-Score 244 | Comments 117 (<a href="https://news.ycombinator.com/item?id=34439461">thread link</a>) | @zdgeier
+Score 245 | Comments 118 (<a href="https://news.ycombinator.com/item?id=34439461">thread link</a>) | @zdgeier
 <br/>
 January 19, 2023 | https://jamsync.dev/about | <a href="https://web.archive.org/web/*/https://jamsync.dev/about">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2980,7 +2980,7 @@ This site is a preview version of the system. The features <a href="https://jams
 </p>
 <h3>Developers</h3>
 <p>
-Jamsync is being developed by <a href="https://www.linkedin.com/in/zdgeier/">Zachary Geier</a>. Please send me an email if you have any thoughts at <a href="https://jamsync.dev/cdn-cgi/l/email-protection#4f352e2c270f252e223c36212c612b2a39"><span data-cfemail="572d36343f173d363a242e393479333221">[email&nbsp;protected]</span></a>.
+Jamsync is being developed by <a href="https://www.linkedin.com/in/zdgeier/">Zachary Geier</a>. Please send me an email if you have any thoughts at <a href="https://jamsync.dev/cdn-cgi/l/email-protection#a6dcc7c5cee6ccc7cbd5dfc8c588c2c3d0"><span data-cfemail="0c766d6f644c666d617f75626f2268697a">[email&nbsp;protected]</span></a>.
 </p>
 </section>
 </div></div>]]>
@@ -2995,7 +2995,7 @@ Jamsync is being developed by <a href="https://www.linkedin.com/in/zdgeier/">Zac
             </title>
             <description>
 <![CDATA[
-Score 28 | Comments 1 (<a href="https://news.ycombinator.com/item?id=34439069">thread link</a>) | @maxerickson
+Score 60 | Comments 6 (<a href="https://news.ycombinator.com/item?id=34439069">thread link</a>) | @maxerickson
 <br/>
 January 19, 2023 | https://jakecoppinger.com/2023/01/lane-accurate-street-maps-with-openstreetmap-writing-a-vector-tileserver-for-osm2streets/ | <a href="https://web.archive.org/web/*/https://jakecoppinger.com/2023/01/lane-accurate-street-maps-with-openstreetmap-writing-a-vector-tileserver-for-osm2streets/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -3531,7 +3531,7 @@ January 18, 2023 | https://fromdevtodev.com/people-to-follow-to-learn-art-of-tea
             </title>
             <description>
 <![CDATA[
-Score 123 | Comments 20 (<a href="https://news.ycombinator.com/item?id=34436049">thread link</a>) | @pabs3
+Score 123 | Comments 21 (<a href="https://news.ycombinator.com/item?id=34436049">thread link</a>) | @pabs3
 <br/>
 January 18, 2023 | https://udamonic.com/what-is-a-scamp.html | <a href="https://web.archive.org/web/*/https://udamonic.com/what-is-a-scamp.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -3557,7 +3557,7 @@ January 18, 2023 | http://selfadjustingglasses.com/reviews/flexvision/en/int1j2v
                             <img src="http://selfadjustingglasses.com/reviews/domain_specific/logos/header_logo85.png" alt="FlexVision">
             		</a></p><div>
     <p><small><strong>Limited Discount: 50% Off</strong></small>
-    <a href="https://click.selfadjustingglasses.com/click.php?lp=1&amp;uclick=y9irus3z"></a></p></div>
+    <a href="https://click.selfadjustingglasses.com/click.php?lp=1&amp;uclick=y9irsca8"></a></p></div>
         		
 	</div>
 </nav>  
@@ -3748,7 +3748,7 @@ January 18, 2023 | http://selfadjustingglasses.com/reviews/flexvision/en/int1j2v
 					<li><span>30-day money-back guarantee</span></li>
 				</ul>
 				<p>Promotion valid while stocks last. Get deep discounts when you order more (perfect as a gift!)</p>
-				<p><a href="https://click.selfadjustingglasses.com/click.php?lp=1&amp;uclick=y9irus3z">
+				<p><a href="https://click.selfadjustingglasses.com/click.php?lp=1&amp;uclick=y9irsca8">
 					<span>Claim Your Discount &gt;</span>
 				</a>
 			</p></div>
@@ -3822,7 +3822,7 @@ January 18, 2023 | http://selfadjustingglasses.com/reviews/flexvision/en/int1j2v
 		<h2><img src="http://selfadjustingglasses.com/reviews/flexvision/en/int1j2v3/img/warning-icon.jpg" alt="">Claim Your FlexVision Now,</h2>
 		<p>or Risk Paying Full Price Tomorrow.</p>
 		<p>(Take advantage of our One-Time <span>50% OFF</span> Sale - It’s ending soon!)</p>
-        <p>				<a href="https://click.selfadjustingglasses.com/click.php?lp=1&amp;uclick=y9irus3z">
+        <p>				<a href="https://click.selfadjustingglasses.com/click.php?lp=1&amp;uclick=y9irsca8">
 					<span>Order Now &gt; &gt;</span>
 				</a></p>
 	</div>
@@ -4198,7 +4198,7 @@ removing <code>cfg(bootstrap)</code> from std, since that requires changes outsi
             </title>
             <description>
 <![CDATA[
-Score 14 | Comments 0 (<a href="https://news.ycombinator.com/item?id=34433539">thread link</a>) | @geerlingguy
+Score 15 | Comments 0 (<a href="https://news.ycombinator.com/item?id=34433539">thread link</a>) | @geerlingguy
 <br/>
 January 18, 2023 | https://loganmarchione.com/2021/01/homelab-10-mini-rack/ | <a href="https://web.archive.org/web/*/https://loganmarchione.com/2021/01/homelab-10-mini-rack/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>Hey! Listen! This post is part of a series on 10" mini-racks. Check them all out!</p>
@@ -4458,7 +4458,7 @@ January 18, 2023 | https://loganmarchione.com/2021/01/homelab-10-mini-rack/ | <a
             </title>
             <description>
 <![CDATA[
-Score 135 | Comments 129 (<a href="https://news.ycombinator.com/item?id=34433023">thread link</a>) | @stasbar
+Score 136 | Comments 130 (<a href="https://news.ycombinator.com/item?id=34433023">thread link</a>) | @stasbar
 <br/>
 January 18, 2023 | http://stan.bar/loneliness/ | <a href="https://web.archive.org/web/*/http://stan.bar/loneliness/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content">
@@ -4492,7 +4492,7 @@ January 18, 2023 | http://stan.bar/loneliness/ | <a href="https://web.archive.or
             </title>
             <description>
 <![CDATA[
-Score 145 | Comments 109 (<a href="https://news.ycombinator.com/item?id=34432735">thread link</a>) | @mathgladiator
+Score 145 | Comments 110 (<a href="https://news.ycombinator.com/item?id=34432735">thread link</a>) | @mathgladiator
 <br/>
 January 18, 2023 | https://www.adama-platform.com/2023/01/18/daunting-over-stretched.html | <a href="https://web.archive.org/web/*/https://www.adama-platform.com/2023/01/18/daunting-over-stretched.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4762,7 +4762,7 @@ January 18, 2023 | https://www.readle.com/p/building-products-with-ai | <a href=
             </title>
             <description>
 <![CDATA[
-Score 194 | Comments 304 (<a href="https://news.ycombinator.com/item?id=34427864">thread link</a>) | @nandalism
+Score 195 | Comments 306 (<a href="https://news.ycombinator.com/item?id=34427864">thread link</a>) | @nandalism
 <br/>
 January 18, 2023 | https://blog.deckc.hair/2023-01-18-stop-building-on-corporate-controlled-languages.html | <a href="https://web.archive.org/web/*/https://blog.deckc.hair/2023-01-18-stop-building-on-corporate-controlled-languages.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -4913,7 +4913,7 @@ web server handler code.
             </title>
             <description>
 <![CDATA[
-Score 369 | Comments 167 (<a href="https://news.ycombinator.com/item?id=34427604">thread link</a>) | @rck
+Score 369 | Comments 168 (<a href="https://news.ycombinator.com/item?id=34427604">thread link</a>) | @rck
 <br/>
 January 18, 2023 | https://rauljordan.com/rust-concepts-i-wish-i-learned-earlier/ | <a href="https://web.archive.org/web/*/https://rauljordan.com/rust-concepts-i-wish-i-learned-earlier/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -5945,7 +5945,7 @@ or
             </title>
             <description>
 <![CDATA[
-Score 64 | Comments 35 (<a href="https://news.ycombinator.com/item?id=34422519">thread link</a>) | @phoebos
+Score 65 | Comments 35 (<a href="https://news.ycombinator.com/item?id=34422519">thread link</a>) | @phoebos
 <br/>
 January 17, 2023 | https://bvnf.space/blog/008-sudo-make-install.html | <a href="https://web.archive.org/web/*/https://bvnf.space/blog/008-sudo-make-install.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
@@ -6389,7 +6389,7 @@ right before any jump operation. I believe this should be enough to reduce the o
             </title>
             <description>
 <![CDATA[
-Score 278 | Comments 190 (<a href="https://news.ycombinator.com/item?id=34420306">thread link</a>) | @jandeboevrie
+Score 279 | Comments 190 (<a href="https://news.ycombinator.com/item?id=34420306">thread link</a>) | @jandeboevrie
 <br/>
 January 17, 2023 | https://xakcop.com/post/hyundai-hack-2/ | <a href="https://web.archive.org/web/*/https://xakcop.com/post/hyundai-hack-2/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="main">
@@ -6735,7 +6735,7 @@ January 17, 2023 | https://www.qmul.ac.uk/media/news/2023/smd/ten-minute-scan-en
             </title>
             <description>
 <![CDATA[
-Score 13 | Comments 1 (<a href="https://news.ycombinator.com/item?id=34416852">thread link</a>) | @yshavit
+Score 14 | Comments 1 (<a href="https://news.ycombinator.com/item?id=34416852">thread link</a>) | @yshavit
 <br/>
 January 17, 2023 | https://klo.dev/state-of-infrastructure-from-code-2023/ | <a href="https://web.archive.org/web/*/https://klo.dev/state-of-infrastructure-from-code-2023/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-id="b4867c9" data-element_type="widget" id="single_post_content" data-widget_type="theme-post-content.default">
@@ -6871,7 +6871,7 @@ January 17, 2023 | https://www.jeremiak.com/blog/datasette-the-data-hammer/ | <a
             </title>
             <description>
 <![CDATA[
-Score 214 | Comments 188 (<a href="https://news.ycombinator.com/item?id=34415732">thread link</a>) | @victorstanciu
+Score 214 | Comments 189 (<a href="https://news.ycombinator.com/item?id=34415732">thread link</a>) | @victorstanciu
 <br/>
 January 17, 2023 | https://tegowerk.eu/posts/cruel-optimism/ | <a href="https://web.archive.org/web/*/https://tegowerk.eu/posts/cruel-optimism/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article><p>Do you remember the <a href="https://www.theguardian.com/lifeandstyle/2017/may/15/australian-millionaire-millennials-avocado-toast-house">avocado toast guy</a>? I read Johann Hari’s <a href="https://www.goodreads.com/book/show/57933306-stolen-focus">Stolen Focus</a> recently (you should read it, it’s great), and I learned that someone<sup id="fnref:1"><a href="#fn:1" role="doc-noteref">1</a></sup> has come up with a name for this sort of modern reinterpretation of “let them eat cake”: <em>cruel optimism</em>.</p><p>Cruel optimism, the way Hari interprets it<sup id="fnref:2"><a href="#fn:2" role="doc-noteref">2</a></sup>, boils down to the folly of suggesting personal solutions to systemic problems. It’s about advice given from a position of privilege to people who will never be able to apply it to their own lives–because the cards are stacked so unfairly against them–but who will nonetheless interpret their failure as a personal one. The avocado guy is an egregious example, but in the end harmless because of its obvious ridiculousness. The real harm comes from the stuff that sounds reasonable and actionable, like most self-help books. You know the pattern:</p><ul><li><p>Are you depressed? Just meditate, think positive, be happy! Never mind that you have children to feed and you’re just one bad day away from unemployment and foreclosure<sup id="fnref:3"><a href="#fn:3" role="doc-noteref">3</a></sup>.</p></li><li><p>Fat? Just start running! Never mind that you can’t afford a gym subscription and live in a car-centric hellscape that’s not even bikeable, let alone walkable.</p></li><li><p>Ugly and alone? Just be yourself! Never mind that we’ve designed for you a society where personal connections are harder and harder to make and maintain, and we’ve commodified human relationships into the equivalent of online supermarket catalogs.<sup id="fnref:4"><a href="#fn:4" role="doc-noteref">4</a></sup></p></li><li><p>Lost your ability to focus and read? Just ditch social media! Never mind that thousands of our best engineers are actively working against you to make that shit as addictive and hard to put down as possible.</p></li></ul><p>So that’s where the cruelness lies. There’s Average Joe in the blue corner, and a big-ass dragon in the red corner across from him, but when Joe inevitably gets his ass kicked, we tell him it’s his own fault for not being disciplined enough. We tell him it’s not the dragon he’s fighting, but only himself.</p><p>And the dragons of the world absolutely <em>love</em> this situation, because it shifts responsibility away from them and unto the individual. Remember when BP came up with the whole <a href="https://mashable.com/feature/carbon-footprint-pr-campaign-sham">carbon footprint bullshit</a>? Yeah, think of that the next time a soggy paper straw makes your soda taste like shit.</p><p>Sadly, I used to be guilty of this too. <em>“Everybody gets the same 24 hours”</em> I would say, when asked how I found the time to read, write, play video games, and <a href="https://tegowerk.eu/tags/bikes/">repair bikes</a>. But that’s not true, is it? If you have to commute for two hours each day, then I obviously have two hours extra compared to you, because I work from home<sup id="fnref:5"><a href="#fn:5" role="doc-noteref">5</a></sup>. If you have kids–which I don’t–how many hours even is that? Probably a lot. It’s so obvious now, that I feel shame for believing it, but hey, shame and self-cringe are just side effects of growth, so I take the good with the bad.</p><h2 id="on-the-other-hand">On the other hand…</h2><p>Everything I wrote above has the ring of truth to me–that’s why I wrote it–but I have to be honest, I don’t think it’s the whole truth. Because while the dragons have a major part of the blame, assigning <em>all</em> of the blame for our woes to them doesn’t really sit well with my idea of myself as a <a href="https://en.wikipedia.org/wiki/Self-actualization">self-actualized</a> individual–or at least as an individual on the way to self-actualization. If all I am is a victim with no control over my own destiny, then why do I even get up in the morning?</p><ul><li><p>I want to lose some weight, and I live in a lovely little Austrian village with pretty fields that I could run next to, so why don’t I?</p></li><li><p>I spend way too much time on Reddit, YouTube and Hacker News. I have the means and technical knowledge to block myself from doing that until I no longer feel the need to, so why don’t I?</p></li></ul><p>The truth is, I have to shoulder part of the blame for my failings. But that’s good, because it means I have the power to improve my own life!</p><p>It seems to me that a new way of looking at the world is rapidly gaining ground, and I don’t know if there’s a term for it–English is not my first language–so I’ll just call it <em>lazy pessimism</em> for now. It’s the polar opposite of cruel optimism, and a close cousin of defeatism: we’ve uncovered the dragons, pointed our fingers at them, and done nothing else since. As we often tend to do, we’ve overcorrected.</p><p>Stephen King wrote Carrie while living in a trailer, holding a job, and raising two kids. J. K. Rowling finished the first Harry Potter book as a single mother and survivor of domestic abuse. Whatever else you may think about these two people, their stories <em>are</em> inspirational, because they prove that you don’t need perfect conditions to grow and to create.</p><p>Self love and acceptance is tremendously important, don’t get me wrong. Give yourself a sincere pat on the back for how much you’ve already accomplished. But also understand that it’s okay to be a little hard on yourself from time to time. We don’t all have the same options, that is sadly true, but we’re not all <em>without</em> options either.</p><p>I’d like to plug Hari’s book one more time before I close this. The irony of taking issue with self-help in a self-help book is not lost on me, and it’s not lost on Hari either. He makes a great argument not for dismissing self-help out of hand, but for pairing it with systemic, regulatory changes, potent weapons that might allow us to beard the dragons in their golden lairs.</p><a href="https://fedi.tegowerk.eu/notice/ARk1134pSWG1efSJuq" target="_blank"><span><svg width="24" height="24" xmlns:dc="https://purl.org/dc/elements/1.1/" xmlns:cc="https://creativecommons.org/ns#" xmlns:rdf="https://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:svg="https://www.w3.org/2000/svg" xmlns="https://www.w3.org/2000/svg" xmlns:sodipodi="https://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd" xmlns:inkscape="https://www.inkscape.org/namespaces/inkscape" viewBox="0 -15 196.52 196.52" id="svg8" inkscape:version="0.92.2 2405546, 2018-03-11" sodipodi:docname="Logo_penta_connectat-imbrincat_retallats-color.svg" inkscape:export-filename="/home/nestor/Pictures/Fediversal/Logo_penta_connectat-imbrincat_retallats-color-512x.png" inkscape:export-xdpi="66.175453" inkscape:export-ydpi="66.175453"><defs id="defs2"></defs><sodipodi:namedview id="base" pagecolor="#ffffff" bordercolor="#666666" borderopacity="1" inkscape:pageopacity="0" inkscape:pageshadow="2" inkscape:zoom=".50411932" inkscape:cx="-209.83484" inkscape:cy="399.15332" inkscape:document-units="mm" inkscape:current-layer="layer2" showgrid="false" inkscape:snap-smooth-nodes="true" inkscape:snap-midpoints="true" inkscape:snap-global="false" inkscape:window-width="1366" inkscape:window-height="736" inkscape:window-x="0" inkscape:window-y="32" inkscape:window-maximized="1" fit-margin-top="5" fit-margin-left="5" fit-margin-right="5" fit-margin-bottom="5"></sodipodi:namedview><g inkscape:groupmode="layer" id="layer2" inkscape:label="Linies" style="display:inline" transform="translate(6.6789703,-32.495842)"><path style="color:#000;font-style:normal;font-variant:normal;font-weight:400;font-stretch:normal;font-size:medium;line-height:normal;font-family:sans-serif;font-variant-ligatures:normal;font-variant-position:normal;font-variant-caps:normal;font-variant-numeric:normal;font-variant-alternates:normal;font-feature-settings:normal;text-indent:0;text-align:start;text-decoration:none;text-decoration-line:none;text-decoration-style:solid;text-decoration-color:#000;letter-spacing:normal;word-spacing:normal;text-transform:none;writing-mode:lr-tb;direction:ltr;text-orientation:mixed;dominant-baseline:auto;baseline-shift:baseline;text-anchor:start;white-space:normal;shape-padding:0;clip-rule:nonzero;display:inline;overflow:visible;visibility:visible;opacity:1;isolation:auto;mix-blend-mode:normal;color-interpolation:sRGB;color-interpolation-filters:linearRGB;solid-color:#000000;solid-opacity:1;vector-effect:none;fill:#a730b8;fill-opacity:1;fill-rule:nonzero;stroke:none;stroke-width:41.5748024;stroke-linecap:butt;stroke-linejoin:miter;stroke-miterlimit:4;stroke-dasharray:none;stroke-dashoffset:0;stroke-opacity:1;color-rendering:auto;image-rendering:auto;shape-rendering:auto;text-rendering:auto;enable-background:accumulate" d="m181.13086 275.13672a68.892408 68.892408.0 01-29.46484 29.32812l161.75781 162.38868 38.99805-19.76368zm213.36328 214.1875-38.99805 19.76367 81.96289 82.2832a68.892409 68.892409.0 0129.47071-29.33203z" transform="matrix(0.26458333,0,0,0.26458333,-6.6789703,32.495842)" id="path9722" inkscape:connector-curvature="0"></path><path style="color:#000;font-style:normal;font-variant:normal;font-weight:400;font-stretch:normal;font-size:medium;line-height:normal;font-family:sans-serif;font-variant-ligatures:normal;font-variant-position:normal;font-variant-caps:normal;font-variant-numeric:normal;font-variant-alternates:normal;font-feature-settings:normal;text-indent:0;text-align:start;text-decoration:none;text-decoration-line:none;text-decoration-style:solid;text-decoration-color:#000;letter-spacing:normal;word-spacing:normal;text-transform:none;writing-mode:lr-tb;direction:ltr;text-orientation:mixed;dominant-baseline:auto;baseline-shift:baseline;text-anchor:start;white-space:normal;shape-padding:0;clip-rule:nonzero;display:inline;overflow:visible;visibility:visible;opacity:1;isolation:auto;mix-blend-mode:normal;color-interpolation:sRGB;color-interpolation-filters:linearRGB;solid-color:#000000;solid-opacity:1;vector-effect:none;fill:#5496be;fill-opacity:1;fill-rule:nonzero;stroke:none;stroke-width:41.5748024;stroke-linecap:butt;stroke-linejoin:miter;stroke-miterlimit:4;stroke-dasharray:none;stroke-dashoffset:0;stroke-opacity:1;color-rendering:auto;image-rendering:auto;shape-rendering:auto;text-rendering:auto;enable-background:accumulate" d="m581.64648 339.39062-91.57617 46.41016 6.75196 43.18945 103.61523-52.51367A68.892409 68.892409.0 01581.64648 339.39062zM436.9082 412.74219 220.38281 522.47656a68.892408 68.892408.0 0118.79492 37.08985L443.66016 455.93359z" transform="matrix(0.26458333,0,0,0.26458333,-6.6789703,32.495842)" id="path9729" inkscape:connector-curvature="0"></path><path style="color:#000;font-style:normal;font-variant:normal;font-weight:400;font-stretch:normal;font-size:medium;line-height:normal;font-family:sans-serif;font-variant-ligatures:normal;font-variant-position:normal;font-variant-caps:normal;font-variant-numeric:normal;font-variant-alternates:normal;font-feature-settings:normal;text-indent:0;text-align:start;text-decoration:none;text-decoration-line:none;text-decoration-style:solid;text-decoration-color:#000;letter-spacing:normal;word-spacing:normal;text-transform:none;writing-mode:lr-tb;direction:ltr;text-orientation:mixed;dominant-baseline:auto;baseline-shift:baseline;text-anchor:start;white-space:normal;shape-padding:0;clip-rule:nonzero;display:inline;overflow:visible;visibility:visible;opacity:1;isolation:auto;mix-blend-mode:normal;color-interpolation:sRGB;color-interpolation-filters:linearRGB;solid-color:#000000;solid-opacity:1;vector-effect:none;fill:#ce3d1a;fill-opacity:1;fill-rule:nonzero;stroke:none;stroke-width:41.5748024;stroke-linecap:butt;stroke-linejoin:miter;stroke-miterlimit:4;stroke-dasharray:none;stroke-dashoffset:0;stroke-opacity:1;color-rendering:auto;image-rendering:auto;shape-rendering:auto;text-rendering:auto;enable-background:accumulate" d="M367.27539 142.4375 262.79492 346.4082l30.84766 30.9668L404.26562 161.41797A68.892408 68.892408.0 01367.27539 142.4375zm-131.6543 257.02148-52.92187 103.31446a68.892409 68.892409.0 0136.98633 18.97851l46.78125-91.32812z" transform="matrix(0.26458333,0,0,0.26458333,-6.6789703,32.495842)" id="path9713" inkscape:connector-curvature="0"></path><path style="color:#000;font-style:normal;font-variant:normal;font-weight:400;font-stretch:normal;font-size:medium;line-height:normal;font-family:sans-serif;font-variant-ligatures:normal;font-variant-position:normal;font-variant-caps:normal;font-variant-numeric:normal;font-variant-alternates:normal;font-feature-settings:normal;text-indent:0;text-align:start;text-decoration:none;text-decoration-line:none;text-decoration-style:solid;text-decoration-color:#000;letter-spacing:normal;word-spacing:normal;text-transform:none;writing-mode:lr-tb;direction:ltr;text-orientation:mixed;dominant-baseline:auto;baseline-shift:baseline;text-anchor:start;white-space:normal;shape-padding:0;clip-rule:nonzero;display:inline;overflow:visible;visibility:visible;opacity:1;isolation:auto;mix-blend-mode:normal;color-interpolation:sRGB;color-interpolation-filters:linearRGB;solid-color:#000000;solid-opacity:1;vector-effect:none;fill:#d0188f;fill-opacity:1;fill-rule:nonzero;stroke:none;stroke-width:41.5748024;stroke-linecap:butt;stroke-linejoin:miter;stroke-miterlimit:4;stroke-dasharray:none;stroke-dashoffset:0;stroke-opacity:1;color-rendering:auto;image-rendering:auto;shape-rendering:auto;text-rendering:auto;enable-background:accumulate" d="m150.76758 304.91797a68.892408 68.892408.0 01-34.41602 7.19531 68.892408 68.892408.0 01-6.65039-.69531l30.90235 197.66211a68.892409 68.892409.0 0134.41601-7.19531 68.892409 68.892409.0 016.64649.69531z" transform="matrix(0.26458333,0,0,0.26458333,-6.6789703,32.495842)" id="path1015" inkscape:connector-curvature="0"></path><path style="color:#000;font-style:normal;font-variant:normal;font-weight:400;font-stretch:normal;font-size:medium;line-height:normal;font-family:sans-serif;font-variant-ligatures:normal;font-variant-position:normal;font-variant-caps:normal;font-variant-numeric:normal;font-variant-alternates:normal;font-feature-settings:normal;text-indent:0;text-align:start;text-decoration:none;text-decoration-line:none;text-decoration-style:solid;text-decoration-color:#000;letter-spacing:normal;word-spacing:normal;text-transform:none;writing-mode:lr-tb;direction:ltr;text-orientation:mixed;dominant-baseline:auto;baseline-shift:baseline;text-anchor:start;white-space:normal;shape-padding:0;clip-rule:nonzero;display:inline;overflow:visible;visibility:visible;opacity:1;isolation:auto;mix-blend-mode:normal;color-interpolation:sRGB;color-interpolation-filters:linearRGB;solid-color:#000000;solid-opacity:1;vector-effect:none;fill:#5b36e9;fill-opacity:1;fill-rule:nonzero;stroke:none;stroke-width:41.5748024;stroke-linecap:butt;stroke-linejoin:miter;stroke-miterlimit:4;stroke-dasharray:none;stroke-dashoffset:0;stroke-opacity:1;color-rendering:auto;image-rendering:auto;shape-rendering:auto;text-rendering:auto;enable-background:accumulate" d="m239.3418 560.54492a68.892408 68.892408.0 01.7207 13.87696 68.892408 68.892408.0 01-7.26758 27.17968l197.62891 31.71289a68.892409 68.892409.0 01-.72266-13.8789 68.892409 68.892409.0 017.26953-27.17774z" transform="matrix(0.26458333,0,0,0.26458333,-6.6789703,32.495842)" id="path1674" inkscape:connector-curvature="0"></path><path style="color:#000;font-style:normal;font-variant:normal;font-weight:400;font-stretch:normal;font-size:medium;line-height:normal;font-family:sans-serif;font-variant-ligatures:normal;font-variant-position:normal;font-variant-caps:normal;font-variant-numeric:normal;font-variant-alternates:normal;font-feature-settings:normal;text-indent:0;text-align:start;text-decoration:none;text-decoration-line:none;text-decoration-style:solid;text-decoration-color:#000;letter-spacing:normal;word-spacing:normal;text-transform:none;writing-mode:lr-tb;direction:ltr;text-orientation:mixed;dominant-baseline:auto;baseline-shift:baseline;text-anchor:start;white-space:normal;shape-padding:0;clip-rule:nonzero;display:inline;overflow:visible;visibility:visible;opacity:1;isolation:auto;mix-blend-mode:normal;color-interpolation:sRGB;color-interpolation-filters:linearRGB;solid-color:#000000;solid-opacity:1;vector-effect:none;fill:#30b873;fill-opacity:1;fill-rule:nonzero;stroke:none;stroke-width:41.5748024;stroke-linecap:butt;stroke-linejoin:miter;stroke-miterlimit:4;stroke-dasharray:none;stroke-dashoffset:0;stroke-opacity:1;color-rendering:auto;image-rendering:auto;shape-rendering:auto;text-rendering:auto;enable-background:accumulate" d="m601.13281 377.19922-91.21875 178.08203a68.892408 68.892408.0 0136.99414 18.98242L638.125 396.18359a68.892409 68.892409.0 01-36.99219-18.98437z" transform="matrix(0.26458333,0,0,0.26458333,-6.6789703,32.495842)" id="path1676" inkscape:connector-curvature="0"></path><path style="color:#000;font-style:normal;font-variant:normal;font-weight:400;font-stretch:normal;font-size:medium;line-height:normal;font-family:sans-serif;font-variant-ligatures:normal;font-variant-position:normal;font-variant-caps:normal;font-variant-numeric:normal;font-variant-alternates:normal;font-feature-settings:normal;text-indent:0;text-align:start;text-decoration:none;text-decoration-line:none;text-decoration-style:solid;text-decoration-color:#000;letter-spacing:normal;word-spacing:normal;text-transform:none;writing-mode:lr-tb;direction:ltr;text-orientation:mixed;dominant-baseline:auto;baseline-shift:baseline;text-anchor:start;white-space:normal;shape-padding:0;clip-rule:nonzero;display:inline;overflow:visible;visibility:visible;opacity:1;isolation:auto;mix-blend-mode:normal;color-interpolation:sRGB;color-interpolation-filters:linearRGB;solid-color:#000000;solid-opacity:1;vector-effect:none;fill:#ebe305;fill-opacity:1;fill-rule:nonzero;stroke:none;stroke-width:41.5748024;stroke-linecap:butt;stroke-linejoin:miter;stroke-miterlimit:4;stroke-dasharray:none;stroke-dashoffset:0;stroke-opacity:1;color-rendering:auto;image-rendering:auto;shape-rendering:auto;text-rendering:auto;enable-background:accumulate" d="m476.72266 125.33008a68.892408 68.892408.0 01-29.47071 29.33203l141.26563 141.81055a68.892409 68.892409.0 0129.46875-29.33204z" transform="matrix(0.26458333,0,0,0.26458333,-6.6789703,32.495842)" id="path1678" inkscape:connector-curvature="0"></path><path style="color:#000;font-style:normal;font-variant:normal;font-weight:400;font-stretch:normal;font-size:medium;line-height:normal;font-family:sans-serif;font-variant-ligatures:normal;font-variant-position:normal;font-variant-caps:normal;font-variant-numeric:normal;font-variant-alternates:normal;font-feature-settings:normal;text-indent:0;text-align:start;text-decoration:none;text-decoration-line:none;text-decoration-style:solid;text-decoration-color:#000;letter-spacing:normal;word-spacing:normal;text-transform:none;writing-mode:lr-tb;direction:ltr;text-orientation:mixed;dominant-baseline:auto;baseline-shift:baseline;text-anchor:start;white-space:normal;shape-padding:0;clip-rule:nonzero;display:inline;overflow:visible;visibility:visible;opacity:1;isolation:auto;mix-blend-mode:normal;color-interpolation:sRGB;color-interpolation-filters:linearRGB;solid-color:#000000;solid-opacity:1;vector-effect:none;fill:#f47601;fill-opacity:1;fill-rule:nonzero;stroke:none;stroke-width:41.5748024;stroke-linecap:butt;stroke-linejoin:miter;stroke-miterlimit:4;stroke-dasharray:none;stroke-dashoffset:0;stroke-opacity:1;color-rendering:auto;image-rendering:auto;shape-rendering:auto;text-rendering:auto;enable-background:accumulate" d="m347.78711 104.63086-178.57617 90.49805a68.892409 68.892409.0 0118.79297 37.08593l178.57421-90.50195a68.892408 68.892408.0 01-18.79101-37.08203z" transform="matrix(0.26458333,0,0,0.26458333,-6.6789703,32.495842)" id="path1680" inkscape:connector-curvature="0"></path><path style="color:#000;font-style:normal;font-variant:normal;font-weight:400;font-stretch:normal;font-size:medium;line-height:normal;font-family:sans-serif;font-variant-ligatures:normal;font-variant-position:normal;font-variant-caps:normal;font-variant-numeric:normal;font-variant-alternates:normal;font-feature-settings:normal;text-indent:0;text-align:start;text-decoration:none;text-decoration-line:none;text-decoration-style:solid;text-decoration-color:#000;letter-spacing:normal;word-spacing:normal;text-transform:none;writing-mode:lr-tb;direction:ltr;text-orientation:mixed;dominant-baseline:auto;baseline-shift:baseline;text-anchor:start;white-space:normal;shape-padding:0;clip-rule:nonzero;display:inline;overflow:visible;visibility:visible;opacity:1;isolation:auto;mix-blend-mode:normal;color-interpolation:sRGB;color-interpolation-filters:linearRGB;solid-color:#000000;solid-opacity:1;vector-effect:none;fill:#57c115;fill-opacity:1;fill-rule:nonzero;stroke:none;stroke-width:41.5748024;stroke-linecap:butt;stroke-linejoin:miter;stroke-miterlimit:4;stroke-dasharray:none;stroke-dashoffset:0;stroke-opacity:1;color-rendering:auto;image-rendering:auto;shape-rendering:auto;text-rendering:auto;enable-background:accumulate" d="m446.92578 154.82617a68.892408 68.892408.0 01-34.98242 7.48242 68.892408 68.892408.0 01-6.0293-.63281l15.81836 101.29102 43.16211 6.92578zm-16 167.02735 37.40039 239.48242a68.892409 68.892409.0 0133.91406-6.94336 68.892409 68.892409.0 017.20704.79101L474.08984 328.77734z" transform="matrix(0.26458333,0,0,0.26458333,-6.6789703,32.495842)" id="path9758" inkscape:connector-curvature="0"></path><path style="color:#000;font-style:normal;font-variant:normal;font-weight:400;font-stretch:normal;font-size:medium;line-height:normal;font-family:sans-serif;font-variant-ligatures:normal;font-variant-position:normal;font-variant-caps:normal;font-variant-numeric:normal;font-variant-alternates:normal;font-feature-settings:normal;text-indent:0;text-align:start;text-decoration:none;text-decoration-line:none;text-decoration-style:solid;text-decoration-color:#000;letter-spacing:normal;word-spacing:normal;text-transform:none;writing-mode:lr-tb;direction:ltr;text-orientation:mixed;dominant-baseline:auto;baseline-shift:baseline;text-anchor:start;white-space:normal;shape-padding:0;clip-rule:nonzero;display:inline;overflow:visible;visibility:visible;opacity:1;isolation:auto;mix-blend-mode:normal;color-interpolation:sRGB;color-interpolation-filters:linearRGB;solid-color:#000000;solid-opacity:1;vector-effect:none;fill:#dbb210;fill-opacity:1;fill-rule:nonzero;stroke:none;stroke-width:41.5748024;stroke-linecap:butt;stroke-linejoin:miter;stroke-miterlimit:4;stroke-dasharray:none;stroke-dashoffset:0;stroke-opacity:1;color-rendering:auto;image-rendering:auto;shape-rendering:auto;text-rendering:auto;enable-background:accumulate" d="m188.13086 232.97461a68.892408 68.892408.0 01.75781 14.0957 68.892408 68.892408.0 01-7.16015 26.98242l101.36914 16.28125 19.92382-38.9082zM361.86719 260.875l-19.92578 38.91211 239.51367 38.4668a68.892409 68.892409.0 01-.69531-13.71875 68.892409 68.892409.0 017.34961-27.32422z" transform="matrix(0.26458333,0,0,0.26458333,-6.6789703,32.495842)" id="path9760" inkscape:connector-curvature="0"></path></g><g inkscape:groupmode="layer" id="layer3" inkscape:label="Nodes" style="display:inline;opacity:1" transform="translate(6.6789703,-32.495842)"><circle style="fill:#ffca00;fill-opacity:.99596773;stroke:none;stroke-width:.26458332;stroke-opacity:.96078431" id="path817" cx="106.26596" cy="51.535553" r="16.570711" transform="rotate(3.1178174)"></circle><circle id="path819" style="fill:#64ff00;fill-opacity:.99596773;stroke:none;stroke-width:.26458332;stroke-opacity:.96078431" cx="171.42836" cy="110.19328" r="16.570711" transform="rotate(3.1178174)"></circle><circle id="path823" style="fill:#00a3ff;fill-opacity:.99596773;stroke:none;stroke-width:.26458332;stroke-opacity:.96078431" cx="135.76379" cy="190.27704" r="16.570711" transform="rotate(3.1178174)"></circle><circle style="fill:#9500ff;fill-opacity:.99596773;stroke:none;stroke-width:.26458332;stroke-opacity:.96078431" id="path825" cx="48.559471" cy="181.1138" r="16.570711" transform="rotate(3.1178174)"></circle><circle id="path827" style="fill:red;fill-opacity:.99596773;stroke:none;stroke-width:.26458332;stroke-opacity:.96078431" cx="30.328812" cy="95.366837" r="16.570711" transform="rotate(3.1178174)"></circle></g></svg></span><span>Discuss this post on the Fediverse</span></a></article></div>]]>
@@ -7529,6 +7529,334 @@ January 17, 2023 | https://blog.chiselstrike.com/sqlite-based-databases-on-the-p
             <link>https://blog.chiselstrike.com/sqlite-based-databases-on-the-postgres-protocol-yes-we-can-358e61171d65</link>
             <guid isPermaLink="false">hacker-news-small-sites-34411904</guid>
             <pubDate>Tue, 17 Jan 2023 13:02:46 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Microtron Under the Vítkov Hill (2021)]]>
+            </title>
+            <description>
+<![CDATA[
+Score 14 | Comments 0 (<a href="https://news.ycombinator.com/item?id=34411688">thread link</a>) | @petodo
+<br/>
+January 17, 2023 | http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill.html | <a href="https://web.archive.org/web/*/http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+      <p id="1258c8ae-6434-4119-8ea0-d72fb27a79e9"><time>@2021/06/26</time></p>
+      <p id="f5ebf89b-0ee2-41ae-9245-8d934618b5ae">The <a href="https://www.praguecityline.com/prague-monuments/vitkov-hill">Vítkov Hill</a> in the center of Prague hides a pedestrian tunnel under it, in addition to several old tunnels for trains. But only few people know what lies behind completely inconspicuous spray-painted metal doors.</p>
+      <figure id="8573699a-87a8-4879-b556-749032aa796d">
+        <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/vstup_do_tunelu.jpg" title="vstup_do_tunelu.jpg"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/vstup_do_tunelu_thumb.jpg"></a>
+      </figure>
+      
+      <figure id="7b2f8e64-ccd7-4117-9877-230b10279f70">
+        <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/otevrene_dvere.jpg" title="otevrene_dvere.jpg"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/otevrene_dvere_thumb.jpg"></a>
+      </figure>
+      <p id="ea609234-a5cf-488e-8c72-eacbf44a237a">Just outside the door, you can see a 22kV transformer station, which supplies the necessary power for all the equipment inside. It was originally intended for Karlín district.</p>
+      <figure id="3cfdc0a1-ff10-40f3-8039-dceff004f636">
+        <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_13.37.52.jpg" title="2019-12-18_13.37.52.jpg"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_13.37.52_thumb.jpg"></a>
+      </figure>
+      <p id="6f970af2-5778-4149-af65-eb8a588fdb73">To the left, you can walk through narrow concrete corridors. These lead to a small room with several doors.</p>
+      
+      <p id="7e000e5f-0fed-4706-ae14-547914939428">Behind the blue door on the left is a warehouse and a huge concrete lens that was once movable, allowing the tunnel to be closed to increase its resistance to atomic explosion.</p>
+      <figure id="240e5b95-f31e-45c4-987e-be2e484adefb">
+        <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/betonova_cocka.jpg" title="betonova_cocka.jpg"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/betonova_cocka_thumb.jpg"></a>
+      </figure>
+      <figure id="b6944170-17fc-4681-b137-d6a129730a77">
+        <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_11.56.48.jpg" title="2019-12-18_11.56.48.jpg"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_11.56.48_thumb.jpg"></a>
+      </figure>
+      <p id="9a1837a4-efbd-4316-8771-0c7e1676ec63">The door on the right feel considerably more interesting thanks to the pictograms:</p>
+      <figure id="330368f1-db30-4e06-a04d-41823b478cd0">
+        <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/pozor_radiace.jpg" title="pozor_radiace.jpg"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/pozor_radiace_thumb.jpg"></a>
+      </figure>
+      <p id="0fefdcec-100c-417d-92dc-55a7e111cae9">The first narrow room behind the door hides a mechanical workshop.</p>
+      
+      <figure id="c668034e-94f5-4e82-b2f7-e1f28218b902">
+        <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/dilna_2.jpg" title="dilna_2.jpg"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/dilna_2_thumb.jpg"></a>
+      </figure>
+      <p id="18944fc9-73be-4f6c-bdff-2ff709781ce3">The next room is an electronic laboratory:</p>
+      <figure id="eb4052f9-4df7-492a-b9a1-70a6fea1950c">
+        <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_12.00.15.jpg" title="2019-12-18_12.00.15.jpg"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_12.00.15_thumb.jpg"></a>
+      </figure>
+      
+      <div id="99fcadb3-2df0-4484-b6c0-ad2795b94486">
+        <div id="97e71f2f-72af-4060-9613-90e3f64f6506">
+          <figure id="2c5a5905-aa2b-4f24-a33e-89a1c28e7e8d">
+            <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_12.00.39.jpg" title="2019-12-18_12.00.39.jpg"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_12.00.39_thumb.jpg"></a>
+          </figure>
+        </div>
+        
+      </div>
+      <p id="8f856ace-f9d7-4717-a59b-d6fea6608c51">The penultimate room forms a kind of crossroad, in which there are two other rooms besides the doors through which we entered. One huge, armored, one normal. Behind those two tons of lead-filled, hydraulic-operated doors, is a microtron.</p>
+      <figure id="86be3763-c666-43d9-b63d-17ee58111687">
+        <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_12.10.33.jpg" title="2019-12-18_12.10.33.jpg"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_12.10.33_thumb.jpg"></a>
+      </figure>
+      <p id="f66e1cda-e87a-45af-ab17-6026368f1470">Behind&nbsp;the&nbsp;normal&nbsp;ones on the left is&nbsp;the&nbsp;spectrometer&nbsp;where&nbsp;the&nbsp;samples&nbsp;are&nbsp;analyzed. On the right, there a&nbsp;control&nbsp;panel,&nbsp;which&nbsp;has&nbsp;hardly&nbsp;changed&nbsp;since&nbsp;1981:</p>
+      <figure id="31af8494-08c8-4a18-8d93-f5fd424b1655">
+        <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/kontrolni_panel.jpg" title="kontrolni_panel.jpg"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/kontrolni_panel_thumb.jpg"></a>
+        <figcaption>
+          (The plaquette with the schema diagram roughly in the middle is worthy of note.)
+        </figcaption>
+      </figure>
+      
+      <p id="02554d84-72c9-4cdf-a17e-31adf11a13b8">The gray box in the picture on the right is an electromagnetic wave modulator, like the kind used in RADARs. It is a one-off production from St. Petersburg, Russia. The resulting wave is routed through the wave-guide to the last and most important room, hidden behind an airlock consisting of a pair of huge lead doors. Those provide shielding equivalent to three meters of concrete:</p>
+      <figure id="81b60d77-115b-40ae-b85a-e032e152c5ad">
+        <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_12.14.13.jpg" title="2019-12-18_12.14.13.jpg"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_12.14.13_thumb.jpg"></a>
+      </figure>
+      <p id="d78366a5-be7c-4908-88c0-86e42cb009d9">This is where the Microtron MT25 is placed.</p>
+      <figure id="6d4ab485-6c1f-4456-b0fb-4d36a4720822">
+        <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/mikrotron.jpg" title="mikrotron.jpg"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/mikrotron_thumb.jpg"></a>
+      </figure>
+      <figure id="80de550a-4523-4b5c-ac82-7a2751681a78">
+        <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_12.14.42.jpg" title="2019-12-18_12.14.42.jpg"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_12.14.42_thumb.jpg"></a>
+      </figure>
+      
+      <figure id="f3458870-2764-4942-9805-2f04b1d07b65">
+        <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_12.16.22.jpg" title="2019-12-18_12.16.22.jpg"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_12.16.22_thumb.jpg"></a>
+      </figure>
+      <figure id="3fb709cf-e80e-4997-9023-b3d21e42f485">
+        <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/microtron_render_with_schema_small.jpg" title="microtron_render_with_schema_small.jpg"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/microtron_render_with_schema_small_thumb.jpg"></a>
+      </figure>
+      
+      <p id="ee70dbac-bbf8-4657-87fe-fbd777dab7b7">A microtron is a particle accelerator accelerating a group of electrons into variable speed (=energy). Microwaves are fed into the red cylindrical chamber, where they interact with the hot voltage-induced crystal of the cavity resonator (?hexaboride?). This gives the electrons in the valence spheres of the crystal initial energy and pushes them out. The charged particles then make a circular movement in the magnetic field.</p>
+      <figure id="1bcbede0-b7f2-4deb-a4f9-f166032772b0">
+        <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/dutinov_rezontor.jpg" title="dutinov_rezontor.jpg"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/dutinov_rezontor.jpg"></a>
+        <figcaption>
+          (Cavity resonator component. There's a crystal in the crevice in the middle. Sorry about the blurry photo.)
+        </figcaption>
+      </figure>
+      <p id="73c6519e-42bc-4881-b612-32ff1ddb4fae">Electrons are accelerated in groups called "bunches" along circular paths, in which they stick because the entire chamber is one large magnet, affecting their trajectories.</p>
+      <p id="de563c5b-f3a0-4633-94b8-fe98b4586e73">The entire device is timed and calculated so that the length of the electron circulation along the circle is a multiple of the wavelength of incoming electromagnetic radiation. As a result, electrons are repeatedly given about 1 MeV of energy in each orbit, causing them to move to a higher orbit with a larger radius.</p>
+      <figure id="7c7037c7-d4cc-4927-b549-28a5305c3192">
+        <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/ClassicMicrotronSketch.svg" title="ClassicMicrotronSketch.svg"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/ClassicMicrotronSketch.svg"></a>
+        <figcaption>
+          <em>(Source:</em> <em><a href="https://commons.wikimedia.org/wiki/File:ClassicMicrotronSketch.svg">https://commons.wikimedia.org/wiki/File:ClassicMicrotronSketch.svg</a></em><em>)</em>
+        </figcaption>
+      </figure>
+      <p id="6b016ed5-97a3-458f-8d61-0e69f12405d7">This particular microtron allows to select several internal diameters of runways and thus also output energies scaled by 1MeV steps from 6 MeV to 25 MeV. The bunch of electrons is then at some point led out and directed through other magnets to a specific target.</p>
+      <p id="48a9a2fa-a854-4847-8098-825575135d30">The outlet channel is basically a sliding pipe that can be placed on a specific track. It must be set before switching on the device, which results in selecting the energy level of the bunch.</p>
+      <figure id="4c265db8-376c-463d-956d-36d00de52d50">
+        <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/microtron_schema_en.png" title="microtron_schema_en.png"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/microtron_schema_en_thumb.jpg"></a>
+        <figcaption>
+          (CHVÁTIL, David, Miroslav VOGNAR a Pavel KRIST. Mikrotron MT 25 - zdroj tvrdého záření gama [online]. , 1 [cit. 2020-04-01]. Available from: <a href="https://inis.iaea.org/collection/NCLCollectionStore/_Public/39/084/39084493.pdf">https://inis.iaea.org/collection/NCLCollectionStore/_Public/39/084/39084493.pdf</a>)
+        </figcaption>
+      </figure>
+      <p id="7af3b1d8-0e26-4c98-ae32-7948316e936d">Interestingly, thanks to the internal design, it is not possible to regulate the electron current under 13 MeV because the pipe cannot be shifted to the appropriate track. Change to lower energy states is done by replacing a cavity resonator by one, which produces an energy of only 0.5 MeV. This effectively divides the obtained energy levels of the particles by two.</p>
+      <p id="52b2ba23-2d7e-4e7e-b2ad-f90c4e5c7f71">Electrons are then brought into electron guides, which are basically pipes with electromagnets attached:</p>
+      <figure id="7740690a-f9ef-48a5-9419-a52f343ce3a2">
+        <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_13.31.01.jpg" title="2019-12-18_13.31.01.jpg"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_13.31.01_thumb.jpg"></a>
+      </figure>
+      <p id="6672c2df-d287-4a5f-992c-12046e88b085">Dipoles, which act as output selectors, allow you to select a specific electron tube by using the same rule as in the microtron - the charged particle curves its trajectory in an external magnetic field. The more energetic the particle, the stronger magnets are needed. In this way, a straight-flying particle can be led into one of several tubes.</p>
+      <figure id="88dfd0fb-83e7-469f-8bfa-76bf824c6165">
+        <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/dipoly.jpg" title="dipoly.jpg"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/dipoly_thumb.jpg"></a>
+      </figure>
+      <p id="4d8eb248-94f0-47e2-a307-1842ab4c1f80">You can see the electromagnets on the pipes, which our guide refers to as "quadruple duplets". These allow the bunch to be focused or defocused, from a few millimeters to about twelve centimeters. The principle is a bit similar to the focusing technique used in old CRT TVs.</p>
+      <figure id="a1431f4a-384f-4bf5-8500-d96eff0a707c">
+        <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_13.31.06.jpg" title="2019-12-18_13.31.06.jpg"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_13.31.06_thumb.jpg"></a>
+      </figure>
+      <p id="41bd6158-f1ac-4eac-a13a-378457574541">I tried to capture the principle in key details in the animation here:</p>
+      <figure id="985bec37-96e1-44b1-b473-832b35f0b76b">
+        <p>
+          <iframe width="100%" height="50%" frameborder="0" src="https://www.youtube.com/embed/Fgl6kIGX2TI" allow="accelerometer; autoplay; encrypted-media; gyroscope; picture-in-picture" allowfullscreen=""></iframe>
+        </p>
+      </figure>
+      <p id="d2d869f1-7fe9-42a3-b3e2-35557ee5e6a3">The output of the electron guide looks like this (middle of the image):</p>
+      <figure id="53bf0e78-47c1-4dd7-94e3-4f757193ba09">
+        <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_12.40.32.jpg" title="2019-12-18_12.40.32.jpg"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_12.40.32_thumb.jpg"></a>
+      </figure>
+      <p id="cdd0b152-e571-4683-b66a-6e6a601e6807">Basically, a pipe terminated with some material. On the photo above, it is a film with a luminophore layer, which causes it to shine where electrons pass through it. This light is monitored by a heavily shielded camera placed above the microtron, which is pointing at this film through the mirror.</p>
+      <p id="efe2d1d6-1572-4acb-b6e1-815cce394a4c">Additional filters can be placed behind the foil. A material with a large proton number causes electrons to break in the Coulomb field of filter particles. Some materials (tungsten, for example) are calculated to stop electrons completely by knocking an electron out of the nucleus, creating a hole that fills up with another electron while emitting gamma photon emissions. Other materials, such as lead or depleted uranium, cause gamma photons to convert into neutrons (the electron has such energy that a neutron comes out of the nucleus).</p>
+      <p id="156b167a-60fb-4a22-a974-cc6341193d2a">With this simple principle, it is possible to get a stream of electrons, gamma and neutron radiation from one device.</p>
+      <p id="fe6a2445-98a2-43fd-8f8f-dd0d0a5d2e54">Electrons are mono-energetic because all others are eliminated when they fall out of synchronization of the accelerated "bunch" in circular orbits. Emitted photons have a continuous energy spectrum.</p>
+      <figure id="8eb2e645-5749-429e-bae5-4a756fce1c91">
+        <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_13.31.14.jpg" title="2019-12-18_13.31.14.jpg"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_13.31.14_thumb.jpg"></a>
+      </figure>
+      <p id="af482f86-5e50-4fef-b13f-135bee8fd74f">Here, the electron ray is directed to a temporarily built wall of lead bricks, which is used to shield unwanted radiation, except for a small narrow space in the tube which you can see in the middle of the wall.</p>
+      <p id="59b8cf02-4eaa-45b5-8573-f16265c5a2e5">A rotating face with an engine on which the irradiated sample rotates is also often used. If we look at the end of the second electron guide, it looks like it leads into the void in front of a green box:</p>
+      <figure id="cb4ac17a-e61c-4eb0-9848-4a470c1b6728">
+        <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_12.53.13.jpg" title="2019-12-18_12.53.13.jpg"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_12.53.13.jpg"></a>
+      </figure>
+      <p id="b23575e1-8231-4175-80e2-2ef623dc9f93">It is worth noting the aluminum-looking tube to the left of the orange pillar. It is a pipe for <a href="https://en.wikipedia.org/wiki/Pneumatic_tube">pneumatic tube capsules</a>. These are irradiated through a narrow crack in the middle and then sucked out with a dark gray hose, which is at the moment disconnected in the photo above. The capsule pipeline goes to the room next door, where is a spectrograph that measures the spectrum of the irradiated sample, thus gaining, for example, information about its composition.</p>
+      <p id="271f5c26-7bb8-4ddb-8063-29c3474503ec">The pneumatic capsule system makes possible detection and analysis of samples with a very short half-life (seconds or less).</p>
+      <figure id="c3492b02-1a32-4168-b9a7-8547b06d37db">
+        <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_12.20.14.jpg" title="2019-12-18_12.20.14.jpg"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2019-12-18_12.20.14_thumb.jpg"></a>
+      </figure>
+      <p id="ac6bd924-d2eb-4b74-8ea1-a10f9def3642">To lift the lid, there is a small crane with a travel track above the microtron. It is used for maintenance, replacement of the cavity resonator and so on. The ingot forming the body of the microtron is used as a pole attachment of the magnet, which creates a homogeneous magnetic field. However, there are also correction coils that modify imperfect circular pathways affected by material inhomogeneities.</p>
+      
+      <p id="ee22c094-ca1e-4439-ae14-cb72d145a4f7">The electron is about 1000 times lighter than the proton, i.e. the acceleration of electrons is 1000 times easier than acceleration of protons. CERN's most famous particle accelerator has 7 TeV for protons. This gives energy differences about a billion times greater (6 orders of magnitude per tera +1,000 times more per proton) compared to the microtron. As our guide explains, you can't use a comparison to a snail and a Formula One because there's only a few orders of magnitude difference in speed.</p>
+      <p id="b0785c5d-2e5a-44e8-97a4-2771c6a3dc37">In theory, it might seem that the microtron does not have much use when there are instruments capable of achieving significantly greater energy all over the world. However, the microtron has a great advantage in the huge configurability of the bunch, energies and kinds of emitted particles. But also in the fact that it achieves small energies that can be used, for example, for chemical changes.</p>
+      <p id="69ee1dc1-0160-4d2b-85ca-082b2b11cc47">From the particle physic follows, that if the particle's energy is less than 10 MeV, the charged particles are unable to cross the <a href="https://en.wikipedia.org/wiki/Coulomb_barrier"><em>Coulomb barrier</em></a>, and thus there will be no nuclear reaction. In other words, all changes that take place are only on a chemical basis, supported by the energy of the microtron. As a result, there is no induced activity in the irradiated object when the irradiation is done (the sample is not radioactive).</p>
+      <p id="99430561-248f-458c-b4ec-317e453afc23">A lot of the uses are for biologists and food producers. For example, the Food Research Institute said it wanted to improve the material of the sausage casings, so they will crack less. According to our guide, this was actually achieved by low-energy irradiation, where after several attempts they were able to find a configuration causing networking at the material level. In this way, it is possible to get different physical and chemical behaviors from the same particles of material by reordering its structure.</p>
+      <p id="0e9b68bd-2b15-4fed-aaae-2a5741f8f512">To lighten the mood, we were told about an experiment with the aging of cognac by irradiation, which was eventually a success. The physical principle is based on releasing ester and ketone molecules from the end of chains of complex molecules that would otherwise have to be released by cosmic radiation, Brownian motion, heat, and generally the oscillation of molecules. Esters and ketones are said to make the best tastes and are bound at the ends of molecules by weak forces, from where they fall off on their own over time. The equivalent of 20 years of maturation is said to take about ninety seconds on microtron. It should be added that in this way it is not possible to create, for example, the taste of an oak barrel, only to release already present taste molecules.</p>
+      <p id="56e32185-0276-4bd3-a3b5-957e5dec0d16">Often, the microtron is used for medicine. Among the things that made it to the media was the development of <a href="https://www.businessinfo.cz/clanky/ceska-nanotechnologie-urychli-odhaleni-rakoviny-pomoci-diamantu/">diamond nano-technology</a>, which was also developed thanks to irradiation on the microtron. This technology allows for example to render cancer cell by cell, or even the processes inside cells.</p>
+      <p id="0a21e961-62f3-4fa8-a3b1-f57dd4b9a123">The irradiation of a special biological gelatine of animal origin was also interesting because they managed to create a solid and biocompatible material usable as bone substitutes. These replacements, for example, of titanium clavicle joints, do not cause the body's immune response.</p>
+      <p id="b08c4c43-835e-4ec4-970e-8e652278f440">Further, our guide lists the use for electronics testing and describes the verification of various particle detectors, as well as the radiation resistance of electronics used in the military or space industries. The lead-brick fence was used to verify the function of the sensitive detector a fortnight before our visit, and served to reduce radiation to a smaller level.</p>
+      <p id="bfb61b7b-f7da-491a-9479-d97af49cf5b0">As an example, he also mentions the ability to determine whether irradiated materials have changed, so, for example, different parts of <a href="https://en.wikipedia.org/wiki/Temel%C3%ADn_Nuclear_Power_Station">Temelín Nuclear Power Station</a> were examined here.</p>
+      <p id="21553ea6-3208-4ade-b527-8367741d6470">Irradiation of various crystals is also common, for example for the <a href="https://www.crytur.cz/">Crytur</a> company, which is said to be the only company outside Russia and China capable of <a href="https://www.dotyk.cz/byznys/i-mala-firma-muze-byt-svetovou-jednickou.html">producing crystals of the required quality</a>, so the Germans approached it about the construction of a <a href="https://www.crytur.cz/products/scintillation-detectors/">scintillation detector</a> for a newly built particle accelerator in Darmstadt.</p>
+      <p id="ff43a8a8-42f2-4fd4-928c-a4c06fd2c301">Furthermore, they help to prototype special electrode materials for new types of batteries because they can create different chemical or physical structures by irradiation that could not be produced by other processes. For example, irradiation can transfer molecules into a specific structure, cause them to be semi-permeable or to create small holes in them.</p>
+      <p id="86e75a38-d09b-4ec3-b8df-87d79f6d3ef6">This is probably the most interesting part of the work for David Chvátil because it is necessary to carry out interdisciplinary cooperation with chemists and material physicists. They often do not understand nuclear physics, so it is necessary to prepare tailor-made solutions for them and develop various creative procedures.</p>
+      <p id="d895550f-cb1c-44db-9900-c95edada55d7">However, the most common use is the so-called photon activation analysis. It works by an electron being knocked out of the nucleus of the target material by radiation. This makes the nucleus unstable, and β-decay turns it into an element that is to the left of it in the periodic table of elements. In doing so, characteristic photon radiation is emitted. This is specific to each element by its energy and spectrum. By measuring these photons and their spectrum, it is possible to find out exactly what elements, or even their isotopes, are present in the material.</p>
+      <p id="3867d1b3-743b-4abc-b6c9-a465ba1a15e8">This method has a very high sensitivity for some elements - they can be detected with a resolution of up to 1 ppm, i.e. detect one particle in a million of others. During the communist regime in the Czech Republic, the microtron was used in this way to search for gold, by measurement of percentage of gold in soil samples.</p>
+      <p id="6b43c457-1fb8-4e66-ab16-f2634c087c4f">Different elements need to be analyzed for different lengths of time, depending on the material, it can be up to hours. Photon analysis is interesting because the workplaces where it would be performed are few, unlike neutron analysis, which is widely practiced in the world.</p>
+      <p id="f15cffc1-2cfc-413a-83d2-b2a935441efd">More recently, the microtron made headlines, for example, when it was involved in analyzing <a href="https://en.wikipedia.org/wiki/Tycho_Brahe">Tycho de Brahe's</a> beard after <a href="https://newsfeed.time.com/2012/11/17/was-tycho-brahe-poisoned-according-to-new-evidence-probably-not/">historians speculated about his poisoning</a>. And also when it was used to <a href="https://www.osel.cz/9818-fotony-produkovane-mikrotronem-prispely-k-objasneni-puvodu-pravekeho-naramku.html">analyze</a> the bracelet that archaeologists found on a prehistoric man.</p>
+      <p id="3a5af8b3-0260-45a6-90ed-ed9e173528f4">The role of microtron is mainly in research and prototyping, not in production. Once a process is fine-tuned and explored, a radioactive source such as <a href="https://en.wikipedia.org/wiki/Cobalt-60">Cobalt 60</a> is typically used. These are also used for example for sterilizing all spices and dressing materials in the European Union, but also irradiating furniture against worms and so on.</p>
+      
+      <p id="dd2dfc3f-cb53-44d5-bae3-79b60c1fec6a">The Czech Republic is the only post-Soviet country to build its own microtron, thanks to Professor <a href="http://www.worldcat.org/identities/lccn-n80159915/">Čestmír Šimáně</a>. Here is a translation from Czech wikipedia:</p>
+      <blockquote id="9d81e9c8-2ce7-4135-93f7-a7cc354e858e">
+        After studying at the grammar school in Opava-Kateřinky and at the 3rd Grammar School in Brno, he graduated from the Technical University of Dr. Edvard Beneš in Brno. After the war he worked as an assistant at the Faculty of Science of <a href="https://en.wikipedia.org/wiki/Masaryk_University">Masaryk University</a>. In 1947 he succeeded in applying for a scholarship to study in France. There he studied for two years at the Collège de France under the leadership of Professor Frédéric Joliot-Curie. He worked, among other things, in a scientific group dealing with cyclotrons and also on the accelerator in Ivry. In Paris, he had the opportunity to attend lectures by the best scientists of the time, such as Louis de Broglie.<p>
+        
+        After returning from France, he became the first employee of the Institute for Atomic Physics. He built a laboratory of nuclear physics in Hostivař, Prague. In 1954 he was director of the Institute of Physics of the Czechoslovak Academy of Sciences and then the first director of the Institute of Nuclear Physics in Řež, which he has a great deal of credit for building. In 1964 he began to lecture at the Faculty of Nuclear Sciences and Physics engineering of the Czech Technical University in Prague, and from 1967 to 1972 he was dean there. He worked at this faculty for a total of forty years.</p><p>
+        
+        From 1961 to 1964 he was director of the Technical Supply and Nuclear Materials Division of the International Atomic Energy Commission in Vienna. At that time, he also worked as an interpreter in the negotiations of Russian and American scientists. In 1956 he became a long-time member of the Scientific Board of the Joint Institute for Nuclear Research (SÚJV) in Dubna near Moscow, where he served as deputy director from 1973 to 1977.
+      </p></blockquote>
+      <div id="2fc3a87b-2964-4c70-bdc7-cf2b0bc0db91">
+        
+        <div id="61b26e8c-4f5d-4426-9e19-0172ca862ab6">
+          <p id="acbfc0ac-e62a-4fe9-9199-b9c6c2081bec">Professor Šimáně was one of the absolutely key people who was behind the birth of all nuclear research in the Czech Republic. According to the story of our guide, it was he who realized during his time in Dubna, that the microtron was the ideal type of accelerator for the then <em>Czecho-Slovak Republic</em>. Thanks to him, a design was created in our country and subsequently the construction of the microtron was realized.</p>
+          <p id="3d71c5a0-ed2a-46ac-8789-b1c2eca5e2c8">This required the <a href="http://www.vitkovice.cz/en/blast-furnaces">blast furnace</a> to stop in <a href="http://www.vitkovice.cz/">Vítkovice</a> and pour iron ingot specially for the microtron, which was then machined in <a href="https://en.wikipedia.org/wiki/%C5%A0koda_Works">Pilsen Skoda</a> to the desired shape. All other equipment except a few pieces was then made directly in the premises under Vítkov.</p>
+        </div>
+      </div>
+      <p id="bc14db16-42d9-4fb4-8ef8-e1fb620374da">The Czech microtron, unlike the Russian ones, is in the shape of a roughly three-ton pot with a one-ton lid on it. The Russians then use a design where the lid is removable from above and below. To this day, they say, there are disputes about which design is better. Ours doesn't bend as much from below when an operating vacuum of 10^-4 pascal is produced in the microtron.</p>
+      
+      <p id="c637632c-deba-4fc9-a497-92c2a26eb875">According to the story of our guide, historically there was a Russian and Swedish branch of development. The Swedes used an electron gun to inject electrons, which is why their microtrons were very expensive. The electron gun itself, for energy levels in mega-electron-volts (MeV), could cost more than the rest of the microtron. In contrast, the Russians developed a method with a cavity resonator, where the crystal costs a few dollars.</p>
+      <p id="c046d096-c723-4b84-8ae2-4907219ea2dd">There are generally few microtrons left in the world. In the west, there are practically no microtrons of the classical type. Most microtrons of the Swedish type have been converted into a so-called racetrack, which can reach higher energy levels. Racetrack is a combination with a linear accelerator, where the microtron seems to be cut in two, and linear accelerators are inserted between them. It is generally estimated that there are only a few dozen, maybe only about a dozen still working microtrons in the world.</p>
+      <figure id="4c90e60f-495a-40f0-9115-eba34712eab6">
+        <a href="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2560px-RacetrackMicrotronSketch.svg.png" title="2560px-RacetrackMicrotronSketch.svg.png"><img src="http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill/2560px-RacetrackMicrotronSketch.svg_thumb.jpg"></a>
+        <figcaption>
+          <em>(Obrázek pochází z wikipedie:</em> <em><a href="https://en.wikipedia.org/wiki/Microtron#/media/File:RacetrackMicrotronSketch.svg">https://en.wikipedia.org/wiki/Microtron#/media/File:RacetrackMicrotronSketch.svg</a></em><em>)</em>
+        </figcaption>
+      </figure>
+      <p id="7f63c899-85fc-45b7-86d0-bc514eca3855">Today, linear accelerators are mostly used instead of microtrons. For comparison, it is estimated, that there are about fifteen thousand of them in the world. Just in Prague, there is at least ten. The vast majority is used in medicine, specifically in oncology centers. Linear accelerators are manufactured by about two or three companies in the world, doctors have experience with them, and they are basically as user-friendly as possible. You can just press a few buttons and it works as expected.</p>
+      <p id="a58dd6ef-47f7-4eac-b874-462cb24253fe">Basically, all microtrons of the original type are of Russian origin because the Soviet Union equipped the <a href="https://en.wikipedia.org/wiki/Comecon">RVHP (Comecon) countries</a> with them. Microtrons remained, for example, in East Germany, Poland, Hungary, Romania, Bulgaria and Ukraine. The Vietnamese and Mongols also got their own microtrons. There is also a microtron in a hospital in Moscow, at the <a href="https://en.wikipedia.org/wiki/Joint_Institute_for_Nuclear_Research">Institute of Nuclear Joint Institute for Nuclear Research in Dubna</a>, one is said to be somewhere in Siberia and one in Canada.</p>
+      <p id="9c2066a0-35ab-4ad6-b2a9-38874d84620a">Thanks to the small number of pieces, there are no companies that provide commercial support for microtrons, so if someone operates it, they have to do everything by themselves. You could say that the people around the microtron have to understand everything to the last screw and wire, and they have to manufacture most of the components by themselves. This requires people with a mix of knowledge so broad that they can handle everything from particle to material physics, engineering and electronics. Mechanical and electronic workshops in the first two rooms, where students from several faculties participate in maintenance and development, are also used for this purpose.</p>
+      <p id="37ee0959-e9c8-4f5c-994a-5980850afcda">Interestingly, in virtually all countries of the former RVHP (Comecon), except for Ukraine, microtrons are no longer used due to complexity. For example, Poles, Hungarians, Romanians, and Bulgarians have gave up microtrons, and Vietnamese and Mongols use them only in a simplified mode.</p>
+      <p id="84b887ed-eaff-4243-bc43-030cba81826e">In addition to Russia, the Czech Republic is one of the few countries that has sufficient experts for its own research and further improvement of microtron technology and the resulting advantages (photon activation analysis) over high-energy accelerators.</p>
+      <p id="bd55f1d4-715b-45b5-84d5-ffbb1c99d3c0">It seems to me to be a remarkable trace of Professor Šimáně, who, like <a href="https://en.wikipedia.org/wiki/Emil_Kolben">Kolben</a>, has raised our small republic to equal to world powers, regarding nuclear technology.</p>
+      
+      <p id="665ae3fd-9662-4b48-b580-524a7e9c56e2">Of course, we had a lot of questions, here are some of the remaining ones that I have not been able to dissolve into the rest of the article;</p>
+      <h2 id="0cc1b2d5-08a0-4064-a3c9-09691a4545d2">How much does an hour of irradiation costs approximately</h2>
+      <p id="b7c1deef-f22e-44de-ba2a-24940eec5551">The microtron is said to have four different accounting modes:</p>
+      <ul id="bbc16f11-a879-4b8f-89e7-604c188c8e7d">
+        <li>For students, it is free as part of various dissertations and so on.</li>
+      </ul>
+      <ul id="c90db4f3-b8e2-41a5-a347-365c1050f6c7">
+        <li>For people from the <a href="https://www.fjfi.cvut.cz/en/">FJFI</a> (Faculty of Nuclear Sciences and Physical Engineering) it costs a low price in the order of hundreds of Czech crowns (~low tens of €/$), where they pay only for water and electricity.
+        </li>
+      </ul>
+      <ul id="6cdb1da6-d5ab-4d45-9423-3e941b99a5d0">
+        <li>Other scientific institutes in the country pay about two thousand per hour (~80€, 93$).</li>
+      </ul>
+      <ul id="c1ea0224-7c76-4e66-86eb-875d9f3531ca">
+        <li>Finally, commercial companies pay about four thousand (~160€, 190$).</li>
+      </ul>
+      <h2 id="3b8be1d6-0d4c-4f2c-b2bf-3fdf9ae8220b">Computer control</h2>
+      <p id="ce05847c-01c4-4f02-a290-ce15cb48565a">The microtron is not easy to control with a computer because the control theory is not fully described by a few equations. Work is currently underway to transfer the control to <a href="https://www.tecomat.com/">Tecomat PLCs</a>.</p>
+      <p id="e0d10139-68fd-45fb-86c9-a9028411912a">According to David Chvátil, he is currently the only one in Central Europe who can manually start, control with use of analog-electronic instruments, and calibrate the microtron by hand. It is expected that even after the computer control is put in place, the operation will still take place in semi-automatic mode, like the take-off of the aircraft. The operator will first start and calibrate the machine manually, and only after reaching the operating parameters will pass the control to the computer, which will maintain the operation.</p>
+      
+      <p id="4e2d7269-e510-4bfe-a4ea-3bd0adcf37d5">Huge thanks belong to our guide, <a href="http://www.ujf.cas.cz/cs/oddeleni/cv/accs/chvatil.html">Ing. David Chvátil</a> from the <a href="http://www.ujf.cas.cz/en/">Institute of Nuclear Physics of the Czech Academy of Sciences</a>. His guide and explanation skills are absolutely amazing. He answered all our questions to the last detail in a sophisticated technical way, but at the same time in such a way that everyone understood.</p>
+      <p id="513895f1-5310-4ad5-a90c-f05261d4ade4">I have to say, I wasn't the only one who was excited about the excursion, and I wouldn't be afraid to call it epic. Personally, it gave me so many stimuli and things to think about that even months later, I still think about the physics around the microtron. The enthusiasm even went so far that I wondered if I might want to profile myself in this direction in the future, and maybe go to remotely study some kind of associated field.</p>
+      <p id="5df2ba4b-6a1c-4a5f-b888-4833c0a4d239">What impressed me the most is the complete configurability of the whole machine. Absolutely everything can be set up and modified, from the biggest nonsense to the very primary functions. The people around the microtron know perfectly what they're doing at a level that I can only dream of. They are able to use Microtron in thousands of different ways, and play on it like you could play a musical instrument.</p>
+      <p id="36415c2c-3627-4615-9086-41240207c6e1">When I was on the excursion, I realized quite clearly that this is how science is supposed to be done and how a new generation of students should learn. Don't give them expensive toys bought somewhere abroad, but let them build a complex device from scratch. The network effect creates a huge benefit for the whole republic, which causes these people, and the people around them, to become experts, who then spread their expertise among others.</p>
+      <p id="428fcdb8-a36d-452f-bc6f-fc167fc27034">I got to the microtron through a colleague, whom I recommended an excursion to the LVR-15 nuclear reactor in Řež, where I went with a few <a href="https://brmlab.cz/">brmlab</a> guys. You can read about it here: <a href="http://blog.rfox.eu/en/Technological_marvels/LVR-15_research_reactor_near_Prague.html" title="LVR-15 research reactor near Prague">LVR-15 research reactor near Prague</a>.</p>
+      
+      <ul id="cdd713b1-9440-46ae-bf7e-fda72cd4c2c8">
+        <li>
+          <a href="http://hp.ujf.cas.cz/~wagner/popclan/historie_fyziky/Simane_mikrotron.htm">Co to je mikrotron a k čemu se hodí aneb vzpomínka na nestora české jaderné fyziky Čestmíra Šimáně</a> (cz)
+        </li>
+      </ul>
+      <ul id="1187b0bc-6338-4194-a875-ee55c1257ab2">
+        <li>
+          <a href="http://www.osel.cz/6403-co-to-je-mikrotron-aneb-podekovani-profesoru-estmiru-imane.html">Co to je mikrotron aneb poděkování profesoru Čestmíru Šimáně</a> (cz)
+        </li>
+      </ul>
+      <ul id="5713cbeb-7fed-41ec-b70e-02f4163210c6">
+        <li>
+          <a href="https://www.ctidoma.cz/zpravodajstvi/2019-05-31-tajemstv%C3%AD-prazskeho-vitkova-ceska-republika-ma-svuj-urychlovac-castic-v-atomovem">Tajemství pražského Vítkova. Česká republika má svůj urychlovač částic v atomovém krytu</a> (cz)
+        </li>
+      </ul>
+      <ul id="9562cd80-67f1-4305-b36d-697facb833fc">
+        <li>
+          <a href="https://archiv.ihned.cz/c1-65753620-jaderni-alchymiste-a-zlato-pod-vitkovem">Jaderní alchymisté a zlato pod Vítkovem</a> (cz)
+        </li>
+      </ul>
+      <ul id="9f1c1c51-8c9e-4e33-a0fd-e25b523d8d88">
+        <li>
+          <a href="https://www.idnes.cz/technet/veda/zemrel-cestmir-simane.A120824_110219_veda_mla">Čestmír Šimáně, otec prvního reaktoru u nás, rozuměl atomům i klasikům</a> (cz)
+        </li>
+      </ul>
+      <ul id="b93f7a0b-9239-4119-adf4-2a4280c6ee6b">
+        <li>
+          <a href="https://video.aktualne.cz/dvtv/melo-tu-byt-uloziste-mrtvol-pak-jsme-hledali-zlato-rika-oper/r~ff43b68e953f11e7aec7002590604f2e/">Mělo tu být úložiště mrtvol, pak jsme hledali zlato, říká operátor urychlovače částic pod Vítkovem</a> (video) (cz)
+        </li>
+      </ul>
+      <ul id="39671b64-9ad6-48b1-9f54-6966ee19bbf9">
+        <li>
+          <a href="https://inis.iaea.org/collection/NCLCollectionStore/_Public/39/084/39084493.pdf">Mikrotron MT 25 - zdroj tvrdého záření gama</a> (cz)
+        </li>
+      </ul>
+      <ul id="51b7c88d-c2d3-48fa-9b75-768697884f81">
+        <li>
+          <a href="https://inis.iaea.org/collection/NCLCollectionStore/_Public/45/076/45076657.pdf">Zařízení pro krátkodobou fotonovou aktivační analýzu na mikrotronu MT25</a> (cz)
+        </li>
+      </ul>
+      <ul id="a1525d83-5b87-461a-9858-7860ebc29660">
+        <li>
+          <a href="https://link.springer.com/article/10.1007/s10967-018-6257-7">Activation analysis in Czechoslovakia and in the Czech Republic: more than 50 years of activities</a> (en)
+        </li>
+      </ul>
+      
+    </div></div>]]>
+            </description>
+            <link>http://blog.rfox.eu/en/Technological_marvels/Microtron_under_the_Vitkov_Hill.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-34411688</guid>
+            <pubDate>Tue, 17 Jan 2023 12:30:13 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Palindromic Rolling Hash (2016)]]>
+            </title>
+            <description>
+<![CDATA[
+Score 20 | Comments 5 (<a href="https://news.ycombinator.com/item?id=34411500">thread link</a>) | @weird_user
+<br/>
+January 17, 2023 | http://aleclownes.com/2016/10/03/palindromic-rolling-hash.html | <a href="https://web.archive.org/web/*/http://aleclownes.com/2016/10/03/palindromic-rolling-hash.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+  
+  <p>In the world of interview algorithms, interviewees often come across a problem similar to the following:</p>
+
+<p><code>Given a string, find the longest palindrome contained in that string</code></p>
+
+<p>This is known as the <code>longest palindromic substring</code> problem, and has well documented solutions for several algorithmic complexities. The best algorithm is called <code>Manacher's algorithm</code> and is guaranteed to run in O(n) time.</p>
+
+<p>While not as good as Manacher’s Algorithm, I wanted to float a novel approach to the problem, which I call <code>Palindromic Rolling Hash</code>, which solves the problem in average O(n) time. Assuming you have a rolling hash algorithm that can add a character or remove a character from the front or back in O(1) time and can produce a hash in O(1) time, the Palindromic Rolling Hash object would consist of two rolling hashes, each containing one half of the word, that are flipped versions of each other (and an additional unhashed character for odd length words). A palindrome check on this object will take O(1) time for false and O(n) time for true.</p>
+
+<p>For the word <code>ticket</code>, the object would look like this:</p>
+
+<p>Rolling Hash 1 contents: <code>tic</code></p>
+
+<p>Rolling Hash 2 contents: <code>tek</code></p>
+
+<p>Once you have this object, and the internal logic which allows you to add a character to the overall length of the Palindromic Rolling Hash, or subtract it, and have the internal hashes recompute in O(1) time, the following steps can be used to find the largest palindrome. I will start partway into the process, as there are some weirdnesses at the beginning and end of the string that require extra logic.</p>
+
+<ol>
+  <li>Check to see if the selection is currently a palindrome</li>
+  <li>If it is, add the next character and the preceeding character to the rolling hash and go to step&nbsp;1.</li>
+  <li>If it is not, add the next character to the rolling hash. Check to see if this is a palindrome. If it is, go to step&nbsp;2. If not, remove the first character from the rolling hash, thus moving it’s center and keeping it the same length. Go to step&nbsp;1.</li>
+</ol>
+
+<p>This solution relies on the fact that we are only looking for the largest palindrome, so we can skip all palindromes smaller than the largest seen one.</p>
+
+<p>This algorithm’s weakness is similar to all hash-based algorithms’ weaknesses, that their runtime cannot be guaranteed. In fact, it is trivial to think of an example where the runtime of this would be O(n^2): a string of all the same character. However, for random strings, the runtime averages out to O(n).</p>
+
+<p>You can see an implementation of this algorithm in the repository <a href="https://github.com/cakenggt/palindromic-rolling-string-hash">here</a>.</p>
+
+  
+  
+  
+  
+  
+  </div></div>]]>
+            </description>
+            <link>http://aleclownes.com/2016/10/03/palindromic-rolling-hash.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-34411500</guid>
+            <pubDate>Tue, 17 Jan 2023 12:01:46 GMT</pubDate>
         </item>
         <item>
             <title>
