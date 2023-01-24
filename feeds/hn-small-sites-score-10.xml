@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Tue, 24 Jan 2023 08:31:42 GMT</lastBuildDate>
+        <lastBuildDate>Tue, 24 Jan 2023 12:48:27 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-10.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Tue, 24 Jan 2023 08:31:42 GMT</pubDate>
+        <pubDate>Tue, 24 Jan 2023 12:48:27 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,499 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Linear-log bucketing: fast, versatile, simple (2015)]]>
+            </title>
+            <description>
+<![CDATA[
+Score 12 | Comments 1 (<a href="https://news.ycombinator.com/item?id=34501459">thread link</a>) | @signa11
+<br/>
+January 24, 2023 | https://pvk.ca/Blog/2015/06/27/linear-log-bucketing-fast-versatile-simple/ | <a href="https://web.archive.org/web/*/https://pvk.ca/Blog/2015/06/27/linear-log-bucketing-fast-versatile-simple/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p><em>There’s a couple code snippets in this post (lb.lisp, bucket.lisp, bucket-down.lisp, bin.c). They’re all <a href="https://creativecommons.org/publicdomain/zero/1.0/">CC0</a>.</em></p>
+<p>What do memory allocation, histograms, and event scheduling have in
+common? They all benefit from rounding values to predetermined
+buckets, and the same bucketing strategy combines acceptable precision
+with reasonable space usage for a wide range of values. I don’t know
+if it has a real name; I had to come up with the (confusing) term
+“linear-log bucketing” for this post! I also used it twice last
+week, in otherwise unrelated contexts, so I figure it deserves more
+publicity.</p>
+<p>I’m sure the idea is old, but I first came across this strategy in
+<a href="https://github.com/jemalloc/jemalloc">jemalloc</a>’s binning scheme for
+allocation sizes. The general idea is to simplify allocation and reduce
+external fragmentation by rounding allocations up to one of a few bin
+sizes. The simplest scheme would round up to the next power of two,
+but experience shows that’s extremely wasteful: in the worst case, an
+allocation for \(k\) bytes can be rounded up to \(2k - 2\) bytes,
+for almost 100% space overhead! Jemalloc further divides each
+power-of-two range into 4 bins, reducing the worst-case space overhead
+to 25%.</p>
+<p>This sub-power-of-two binning covers medium and large allocations. We
+still have to deal with small ones: the ABI forces alignment on every
+allocation, regardless of their size, and we don’t want to have too
+many small bins (e.g., 1 byte, 2 bytes, 3 bytes, …, 8 bytes).
+Jemalloc adds another constraint: bins are always multiples of the
+allocation quantum (usually 16 bytes).</p>
+<p>The sequence for bin sizes thus looks like: 16, 32, 48, 64, 80, 96,
+112, 128, 160, 192, 224, 256, 320, 384, … (0 is special because malloc must
+either return NULL [bad for error checking] or treat it as a full
+blown allocation).</p>
+<p>I like to think of this sequence as a special initial range with 4
+linearly spaced subbins (0 to 63), followed by power-of-two ranges
+that are again split in 4 subbins (i.e., almost logarithmic binning).
+There are thus two parameters: the size of the initial linear range,
+and the number of subbins per range. We’re working with integers, so
+we also know that the linear range is at least as large as the number
+of subbins (it’s hard to subdivide 8 integers in 16 bins).</p>
+<p>Assuming both parameters are powers of two, we can find the bucket for
+any value with only a couple x86 instructions, and no conditional jump or
+lookup in memory. That’s a lot simpler than jemalloc’s
+implementation; if you’re into Java,
+<a href="http://hdrhistogram.org/">HdrHistogram</a>’s binning code is nearly
+identical to mine.</p>
+<h2 id="common-lisp-my-favourite-programmers-calculator">Common Lisp: my favourite programmer’s calculator</h2>
+<p>As always when working with bits, I first doodled in SLIME/SBCL: CL’s
+bit manipulation functions are more expressive than C’s, and a
+REPL helps exploration.</p>
+<p>Let <code>linear</code> be the \(\log\sb{2}\) of the linear range, and <code>subbin</code>
+the \(\log\sb{2}\) of the number of subbin per range, with
+<code>linear &gt;= subbin</code>.</p>
+<p>The key idea is that we can easily find the power of two range (with a
+<code>BSR</code>), and that we can determine the subbin in that range by shifting
+the value right to only keep its <code>subbin</code> most significant (nonzero)
+bits.</p>
+<p>I clearly need something like \(\lfloor\log\sb{2} x\rfloor\):</p>
+<div><notextile><figure><figcaption><span>"lb.lisp" </span></figcaption>
+<div><table><tbody><tr><td><pre><span>1</span>
+<span>2</span>
+</pre></td><td><pre><code><span><span></span><span>(</span><span>defun</span> <span>lb</span> <span>(</span><span>x</span><span>)</span>
+</span><span>  <span>(</span><span>1-</span> <span>(</span><span>integer-length</span> <span>x</span><span>)))</span>
+</span></code></pre></td></tr></tbody></table></div></figure></notextile></div>
+<p>I’ll also want to treat values smaller than <code>2**linear</code> as
+though they were about <code>2**linear</code> in size. We’ll do that with</p>
+<pre><code>n-bits := (lb (logior x (ash 1 linear))) === (max linear (lb x))
+</code></pre>
+<p>We now want to shift away all but the top <code>subbin</code> bits of <code>x</code></p>
+<pre><code>shift := (- n-bits subbin)
+sub-index := (ash x (- shift))
+</code></pre>
+<p>For a memory allocator, the problem is that the last rightward shift
+rounds <em>down</em>! Let’s add a small mask to round things up:</p>
+<pre><code>mask := (ldb (byte shift 0) -1) ; that's `shift` 1 bits
+rounded := (+ x mask)
+sub-index := (ash rounded (- shift))
+</code></pre>
+<p>We have the top <code>subbin</code> bits (after rounding) in <code>sub-index</code>. We
+only need to find the range index</p>
+<pre><code>range := (- n-bits linear) ; n-bits &gt;= linear
+</code></pre>
+<p>Finally, we combine these two together by shifting <code>index</code> by
+<code>subbin</code> bits</p>
+<pre><code>index := (+ (ash range subbin) sub-index)
+</code></pre>
+<p>Extra! Extra! We can also find the maximum value for the bin with</p>
+<pre><code>size := (logandc2 rounded mask)
+</code></pre>
+<p>Assembling all this yields</p>
+<div><notextile><figure><figcaption><span>"bucket.lisp" </span></figcaption>
+<div><table><tbody><tr><td><pre><span>1</span>
+<span>2</span>
+<span>3</span>
+<span>4</span>
+<span>5</span>
+<span>6</span>
+<span>7</span>
+<span>8</span>
+<span>9</span>
+<span>10</span>
+</pre></td><td><pre><code><span><span></span><span>(</span><span>defun</span> <span>bucket</span> <span>(</span><span>x</span> <span>linear</span> <span>subbin</span><span>)</span>
+</span><span>  <span>(</span><span>let*</span> <span>((</span><span>n-bits</span> <span>(</span><span>lb</span> <span>(</span><span>logior</span> <span>x</span> <span>(</span><span>ash</span> <span>1</span> <span>linear</span><span>))))</span>
+</span><span>         <span>(</span><span>shift</span> <span>(</span><span>-</span> <span>n-bits</span> <span>subbin</span><span>))</span>
+</span><span>         <span>(</span><span>mask</span> <span>(</span><span>ldb</span> <span>(</span><span>byte</span> <span>shift</span> <span>0</span><span>)</span> <span>-1</span><span>))</span>
+</span><span>         <span>(</span><span>rounded</span> <span>(</span><span>+</span> <span>x</span> <span>mask</span><span>))</span>
+</span><span>         <span>(</span><span>sub-index</span> <span>(</span><span>ash</span> <span>rounded</span> <span>(</span><span>-</span> <span>shift</span><span>)))</span>
+</span><span>         <span>(</span><span>range</span> <span>(</span><span>-</span> <span>n-bits</span> <span>linear</span><span>))</span>
+</span><span>         <span>(</span><span>index</span> <span>(</span><span>+</span> <span>(</span><span>ash</span> <span>range</span> <span>subbin</span><span>)</span> <span>sub-index</span><span>))</span>
+</span><span>         <span>(</span><span>size</span> <span>(</span><span>logandc2</span> <span>rounded</span> <span>mask</span><span>)))</span>
+</span><span>    <span>(</span><span>values</span> <span>index</span> <span>size</span><span>)))</span>
+</span></code></pre></td></tr></tbody></table></div></figure></notextile></div>
+<p>Let’s look at what happens when we want \(2\sp{2} = 4\) subbin per
+range, and a linear progression over \([0, 2\sp{4} = 16)\).</p>
+<pre><code>CL-USER&gt; (bucket 0 4 2)
+0 ; 0 gets bucket 0 and rounds up to 0
+0
+CL-USER&gt; (bucket 1 4 2)
+1 ; 1 gets bucket 1 and rounds up to 4
+4
+CL-USER&gt; (bucket 4 4 2)
+1 ; so does 4
+4
+CL-USER&gt; (bucket 5 4 2)
+2 ; 5 gets the next bucket
+8
+CL-USER&gt; (bucket 9 4 2)
+3
+12
+CL-USER&gt; (bucket 15 4 2)
+4
+16
+CL-USER&gt; (bucket 17 4 2)
+5
+20
+CL-USER&gt; (bucket 34 4 2)
+9
+40
+</code></pre>
+<p>The sequence is exactly what we want: 0, 4, 8, 12, 16, 20, 24, 28, 32, 40, 48, …!</p>
+<p>The function is marginally simpler if we can round down instead of up.</p>
+<div><notextile><figure><figcaption><span>"bucket-down.lisp" </span></figcaption>
+<div><table><tbody><tr><td><pre><span>1</span>
+<span>2</span>
+<span>3</span>
+<span>4</span>
+<span>5</span>
+<span>6</span>
+<span>7</span>
+<span>8</span>
+</pre></td><td><pre><code><span><span></span><span>(</span><span>defun</span> <span>bucket-down</span> <span>(</span><span>x</span> <span>linear</span> <span>subbin</span><span>)</span>
+</span><span>  <span>(</span><span>let*</span> <span>((</span><span>n-bits</span> <span>(</span><span>lb</span> <span>(</span><span>logior</span> <span>x</span> <span>(</span><span>ash</span> <span>1</span> <span>linear</span><span>))))</span>
+</span><span>         <span>(</span><span>shift</span> <span>(</span><span>-</span> <span>n-bits</span> <span>subbin</span><span>))</span>
+</span><span>         <span>(</span><span>sub-index</span> <span>(</span><span>ash</span> <span>x</span> <span>(</span><span>-</span> <span>shift</span><span>)))</span>
+</span><span>         <span>(</span><span>range</span> <span>(</span><span>-</span> <span>n-bits</span> <span>linear</span><span>))</span>
+</span><span>         <span>(</span><span>index</span> <span>(</span><span>+</span> <span>(</span><span>ash</span> <span>range</span> <span>subbin</span><span>)</span> <span>sub-index</span><span>))</span>
+</span><span>         <span>(</span><span>size</span> <span>(</span><span>ash</span> <span>sub-index</span> <span>shift</span><span>)))</span>
+</span><span>     <span>(</span><span>values</span> <span>index</span> <span>size</span><span>)))</span>
+</span></code></pre></td></tr></tbody></table></div></figure></notextile></div>
+<pre><code>CL-USER&gt; (bucket-down 0 4 2)
+0 ; 0 still gets the 0th bucket 
+0 ; and rounds down to 0
+CL-USER&gt; (bucket-down 1 4 2)
+0 ; but now so does 1
+0
+CL-USER&gt; (bucket-down 3 4 2)
+0 ; and 3
+0
+CL-USER&gt; (bucket-down 4 4 2)
+1 ; 4 gets its bucket
+4
+CL-USER&gt; (bucket-down 7 4 2)
+1 ; and 7 shares it
+4
+CL-USER&gt; (bucket-down 15 4 2)
+3 ; 15 gets the 3rd bucket for [12, 15]
+12
+CL-USER&gt; (bucket-down 16 4 2)
+4
+16
+CL-USER&gt; (bucket-down 17 4 2)
+4
+16
+CL-USER&gt; (bucket-down 34 4 2)
+8
+32
+</code></pre>
+<p>That’s the same sequence of bucket sizes, but rounded down in size
+instead of up.</p>
+<h2 id="the-same-in-gcc">The same, in GCC</h2>
+<div><notextile><figure><figcaption><span>"bin.c" </span></figcaption>
+<div><table><tbody><tr><td><pre><span>1</span>
+<span>2</span>
+<span>3</span>
+<span>4</span>
+<span>5</span>
+<span>6</span>
+<span>7</span>
+<span>8</span>
+<span>9</span>
+<span>10</span>
+<span>11</span>
+<span>12</span>
+<span>13</span>
+<span>14</span>
+<span>15</span>
+<span>16</span>
+<span>17</span>
+<span>18</span>
+<span>19</span>
+<span>20</span>
+<span>21</span>
+<span>22</span>
+<span>23</span>
+<span>24</span>
+<span>25</span>
+<span>26</span>
+<span>27</span>
+<span>28</span>
+<span>29</span>
+<span>30</span>
+<span>31</span>
+<span>32</span>
+<span>33</span>
+<span>34</span>
+<span>35</span>
+<span>36</span>
+<span>37</span>
+<span>38</span>
+<span>39</span>
+<span>40</span>
+<span>41</span>
+<span>42</span>
+<span>43</span>
+<span>44</span>
+</pre></td><td><pre><code><span><span></span><span>static</span> <span>inline</span> <span>unsigned</span> <span>int</span>
+</span><span><span>lb</span><span>(</span><span>size_t</span> <span>x</span><span>)</span>
+</span><span><span>{</span>
+</span><span>        <span>/* I need an extension just for integer-length (: */</span>
+</span><span>        <span>return</span> <span>(</span><span>sizeof</span><span>(</span><span>long</span> <span>long</span><span>)</span> <span>*</span> <span>CHAR_BIT</span> <span>-</span> <span>1</span><span>)</span> <span>-</span> <span>__builtin_clzll</span><span>(</span><span>x</span><span>);</span>
+</span><span><span>}</span>
+</span><span>
+</span><span><span>/*</span>
+</span><span><span> * The following isn't exactly copy/pasted, so there might be</span>
+</span><span><span> * transcription bugs.</span>
+</span><span><span> */</span>
+</span><span><span>static</span> <span>inline</span> <span>size_t</span>
+</span><span><span>bin_of</span><span>(</span><span>size_t</span> <span>size</span><span>,</span> <span>size_t</span> <span>*</span><span>rounded_size</span><span>,</span>
+</span><span>    <span>unsigned</span> <span>int</span> <span>linear</span><span>,</span> <span>unsigned</span> <span>int</span> <span>subbin</span><span>)</span>
+</span><span><span>{</span>
+</span><span>        <span>size_t</span> <span>mask</span><span>,</span> <span>range</span><span>,</span> <span>rounded</span><span>,</span> <span>sub_index</span><span>;</span>
+</span><span>        <span>unsigned</span> <span>int</span> <span>n_bits</span><span>,</span> <span>shift</span><span>;</span>
+</span><span>
+</span><span>        <span>n_bits</span> <span>=</span> <span>lb</span><span>(</span><span>size</span> <span>|</span> <span>(</span><span>1ULL</span> <span>&lt;&lt;</span> <span>linear</span><span>));</span>
+</span><span>        <span>shift</span> <span>=</span> <span>n_bits</span> <span>-</span> <span>subbin</span><span>;</span>
+</span><span>        <span>mask</span> <span>=</span> <span>(</span><span>1ULL</span> <span>&lt;&lt;</span> <span>shift</span><span>)</span> <span>-</span> <span>1</span><span>;</span>
+</span><span>        <span>rounded</span> <span>=</span> <span>size</span> <span>+</span> <span>mask</span><span>;</span> <span>/* XXX: overflow. */</span>
+</span><span>        <span>sub_index</span> <span>=</span> <span>rounded</span> <span>&gt;&gt;</span> <span>shift</span><span>;</span>
+</span><span>        <span>range</span> <span>=</span> <span>n_bits</span> <span>-</span> <span>linear</span><span>;</span>
+</span><span>
+</span><span>        <span>*</span><span>rounded_size</span> <span>=</span> <span>rounded</span> <span>&amp;</span> <span>~</span><span>mask</span><span>;</span>
+</span><span>        <span>return</span> <span>(</span><span>range</span> <span>&lt;&lt;</span> <span>subbin</span><span>)</span> <span>+</span> <span>sub_index</span><span>;</span>
+</span><span><span>}</span>
+</span><span>
+</span><span><span>static</span> <span>inline</span> <span>size_t</span>
+</span><span><span>bin_down_of</span><span>(</span><span>size_t</span> <span>size</span><span>,</span> <span>size_t</span> <span>*</span><span>rounded_size</span><span>,</span>
+</span><span>    <span>unsigned</span> <span>int</span> <span>linear</span><span>,</span> <span>unsigned</span> <span>int</span> <span>subbin</span><span>)</span>
+</span><span><span>{</span>
+</span><span>        <span>size_t</span> <span>range</span><span>,</span> <span>sub_index</span><span>;</span>
+</span><span>        <span>unsigned</span> <span>int</span> <span>n_bits</span><span>,</span> <span>shift</span><span>;</span>
+</span><span>
+</span><span>        <span>n_bits</span> <span>=</span> <span>lb</span><span>(</span><span>size</span> <span>|</span> <span>(</span><span>1ULL</span> <span>&lt;&lt;</span> <span>linear</span><span>));</span>
+</span><span>        <span>shift</span> <span>=</span> <span>n_bits</span> <span>-</span> <span>subbin</span><span>;</span>
+</span><span>        <span>sub_index</span> <span>=</span> <span>size</span> <span>&gt;&gt;</span> <span>shift</span><span>;</span>
+</span><span>        <span>range</span> <span>=</span> <span>n_bits</span> <span>-</span> <span>linear</span><span>;</span>
+</span><span>
+</span><span>        <span>*</span><span>rounded_size</span> <span>=</span> <span>sub_index</span> <span>&lt;&lt;</span> <span>shift</span><span>;</span>
+</span><span>        <span>return</span> <span>(</span><span>range</span> <span>&lt;&lt;</span> <span>subbin</span><span>)</span> <span>+</span> <span>sub_index</span><span>;</span>
+</span><span><span>}</span>
+</span></code></pre></td></tr></tbody></table></div></figure></notextile></div>
+<h2 id="whats-it-good-for">What’s it good for?</h2>
+<p>I first implementated this code to mimic’s jemalloc binning scheme: in
+a memory allocator, a linear-logarithmic sequence give us
+alignment and bounded space overhead (bounded internal fragmentation),
+while keeping the number of size classes down (controlling external
+fragmentation).</p>
+<p><a href="http://hdrhistogram.org/">High dynamic range histograms</a> use the same
+class of sequences to bound the relative error introduced by binning,
+even when recording latencies that vary between microseconds and
+hours.</p>
+<p>I’m currently considering this binning strategy to handle a large
+number of timeout events, when an exact priority queue is overkill. A
+timer wheel would work, but tuning memory usage is annoying. Instead
+of going for a hashed or hierarchical timer wheel, I’m thinking of
+binning events by timeout, with one FIFO per bin: events may
+be late, but never by more than, e.g., 10% their timeout. I also
+don’t really care about sub millisecond precision, but wish to treat
+zero specially; that’s all taken care of by the “round up” linear-log
+binning code.</p>
+<p>In general, if you ever think to yourself that dispatching on the
+bitwidth of a number would mostly work, except that you need more
+granularity for large values, and perhaps less for small ones,
+linear-logarithmic binning sequences may be useful. They let you tune
+the granularity at both ends, and we know how to round values and map
+them to bins with simple functions that compile to fast and compact
+code!</p>
+<p>P.S. If a chip out there has fast int-&gt;FP conversion and slow bit
+scans(!?), there’s another approach: convert the integer to FP,
+scale by, e.g., \(1.0 / 16\), add 1, and shift/mask to extract
+the bottom of the exponent and the top of the significand. That’s not
+slow, but unlikely to be faster than a bit scan and a couple
+shifts/masks.</p>
+</div></div>]]>
+            </description>
+            <link>https://pvk.ca/Blog/2015/06/27/linear-log-bucketing-fast-versatile-simple/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-34501459</guid>
+            <pubDate>Tue, 24 Jan 2023 09:23:43 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[The current layoffs were orchestrated by hedge funds]]>
+            </title>
+            <description>
+<![CDATA[
+Score 29 | Comments 11 (<a href="https://news.ycombinator.com/item?id=34501085">thread link</a>) | @davidgerard
+<br/>
+January 24, 2023 | https://m6n.io/@fuzzychef/109740778756656452 | <a href="https://web.archive.org/web/*/https://m6n.io/@fuzzychef/109740778756656452">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
+            </description>
+            <link>https://m6n.io/@fuzzychef/109740778756656452</link>
+            <guid isPermaLink="false">hacker-news-small-sites-34501085</guid>
+            <pubDate>Tue, 24 Jan 2023 08:37:56 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Encrypting Data in the Browser Using WebAuthn]]>
+            </title>
+            <description>
+<![CDATA[
+Score 32 | Comments 2 (<a href="https://news.ycombinator.com/item?id=34498781">thread link</a>) | @IAmKale
+<br/>
+January 23, 2023 | https://blog.millerti.me/2023/01/22/encrypting-data-in-the-browser-using-webauthn/ | <a href="https://web.archive.org/web/*/https://blog.millerti.me/2023/01/22/encrypting-data-in-the-browser-using-webauthn/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content"><h2>Encrypting Data in the Browser Using WebAuthn</h2><p>When I discovered WebAuthn three years ago a quirky idea came to me: “what if you could <strong>also</strong> protect data with a security key?” The idea of a physical authenticator being used to encrypt and decrypt information stuck with me, even after I came to understand that WebAuthn couldn’t be used in that way.</p><p>Fast forward to 2023. The recent addition of <a href="https://w3c.github.io/webauthn/#prf-extension" target="_blank" rel="noopener">the <code>prf</code> extension to the WebAuthn L3 Draft spec</a> is introducing functionality to WebAuthn that makes my crazy idea possible! Imagine it: a quick tap to encrypt a super secret message, a short journey via <a href="https://en.wikipedia.org/wiki/Sneakernet" target="_blank" rel="noopener">sneakernet</a>, then a quick tap to decrypt the message…</p><p>I’m happy to report that my “crazy idea” has become a reality. And even better, it can all be done entirely in the browser 😏</p><blockquote><p>Disclaimer: for as in-depth as I can speak to the practical use of cryptographic concepts vis-a-vis WebAuthn, I am still early in my education of many other fundamentals of cryptography. This post represents my deepest dive yet into more complex concepts like HMACs, key derivation, and encryption. While I took steps to verify the content of this post, I apologize for any inaccuracies. Please feel free to <a href="https://blog.millerti.me/about/">contact me</a> if I’m off the mark on anything.</p></blockquote><h2 id="a-summary-of-the-prf-webauthn-extension"><a href="#a-summary-of-the-prf-webauthn-extension">##</a> A summary of the <code>prf</code> WebAuthn extension</h2><p>Briefly, <code>prf</code> passes bytes from the “Relying Party” (that’s you, using WebAuthn) to the authenticator during a WebAuthn authentication ceremony. The authenticator “hashes” (HMACs) these bytes with secret bytes internally associated with a previously registered credential (as per<a href="https://fidoalliance.org/specs/fido-v2.1-ps-20210615/fido-client-to-authenticator-protocol-v2.1-ps-20210615.html#sctn-hmac-secret-extension" target="_blank" rel="noopener"> CTAP’s <code>hmac-secret</code> extension</a>) and returns the resulting bytes to the browser in the output from <code>navigator.credentials.get()</code>.</p><p>The high-entropy bytes returned from the authenticator are perfect input key material for an “HMAC-based Key Derivation Function” (HKDF), which helps us generate a “key derivation key”. The key derivation key is then used to derive <em>another</em> symmetric key that’s used to perform the actual data encryption.</p><p>Something to remember is that output from the <code>prf</code> extension will be <strong>the same for every authentication ceremony</strong> so long as A) the same WebAuthn credential is used, and B) the bytes the RP passes to the authenticator are the same. These two come together to make it possible to <strong>deterministically recreate</strong> the symmetric encryption key protecting the data at any time. And even better, the secret bytes within the authenticator are origin-bound as well because of the origin-bound credential they are associated with!</p><h2 id="practical-use"><a href="#practical-use">##</a> Practical use</h2><p>You can follow along in just a few steps:</p><ol><li>Install Chrome Canary (at least Version 111.0.5548.0)</li><li>Navigate to <code>chrome://flags/#enable-experimental-web-platform-features</code> and enable it</li><li>Grab a FIDO2 security key manufactured in the last couple of years. <code>hmac-secret</code> exists in CTAP as early as 2018 so you shouldn’t need the latest and greatest. I used a <a href="https://www.yubico.com/products/security-key/" target="_blank" rel="noopener">YubiKey Security Key</a> for this.</li></ol><p>Let’s get down to brass tacks.</p><h3 id="step-1-register-to-prime-the-authenticator"><a href="#step-1-register-to-prime-the-authenticator">###</a> Step 1: Register to prime the authenticator</h3><p>Make a typical call to <code>navigator.credentials.create()</code> with the <code>prf</code> extension defined:</p><pre><code>/**
+ * This value is for sake of demonstration. Pick 32 random
+ * bytes. `salt` can be static for your site or unique per
+ * credential depending on your needs.
+ */
+const firstSalt = new Uint8Array(new Array(32).fill(1)).buffer;
+
+const regCredential = await navigator.credentials.create({
+  publicKey: {
+    challenge: new Uint8Array([1, 2, 3, 4]), // Example value
+    rp: {
+      name: "SimpleWebAuthn Example",
+      id: "dev.dontneeda.pw",
+    },
+    user: {
+      id: new Uint8Array([5, 6, 7, 8]),  // Example value
+      name: "<a href="https://blog.millerti.me/cdn-cgi/l/email-protection" data-cfemail="cebbbdabbc8eaaabb8e0aaa1a0baa0ababaaafe0beb9">[email&nbsp;protected]</a>",
+      displayName: "<a href="https://blog.millerti.me/cdn-cgi/l/email-protection" data-cfemail="5124223423113534277f353e3f253f343435307f2126">[email&nbsp;protected]</a>",
+    },
+    pubKeyCredParams: [
+      { alg: -8, type: "public-key" },   // Ed25519
+      { alg: -7, type: "public-key" },   // ES256
+      { alg: -257, type: "public-key" }, // RS256
+    ],
+    authenticatorSelection: {
+      userVerification: "required",
+    },
+    extensions: {
+      prf: {
+        eval: {
+          first: firstSalt,
+        },
+      },
+    },
+  },
+});
+</code></pre><blockquote><p>NOTE: The <code>first</code> passed in here isn’t currently used during registration, but the <code>prf</code> extension requires it to be set.</p></blockquote><p>Tap your security key, follow the browser prompts, then call <code>getClientExtensionResults()</code> afterwards and look for a <code>prf</code> entry:</p><pre><code>console.log(regCredential.getClientExtensionResults());
+// {
+//   prf: {
+//     enabled: true
+//   }
+// }
+</code></pre><p>If you see <code>enabled: true</code> then you’re good to continue. If you don’t then you’ll need to try it again with another security key until you find one that works.</p><h3 id="step-2-authenticate-to-encrypt"><a href="#step-2-authenticate-to-encrypt">###</a> Step 2: Authenticate to encrypt</h3><p>The next step is to call <code>navigator.credentials.get()</code> and pass in our <code>firstSalt</code>:</p><pre><code>const auth1Credential = await navigator.credentials.get({
+  publicKey: {
+    challenge: new Uint8Array([9, 0, 1, 2]), // Example value
+    allowCredentials: [
+      {
+        id: regCredential.rawId,
+        transports: regCredential.response.getTransports(),
+        type: "public-key",
+      },
+    ],
+    rpId: "dev.dontneeda.pw",
+    // This must always be either "discouraged" or "required".
+    // Pick one and stick with it.
+    userVerification: "required",
+    extensions: {
+      prf: {
+        eval: {
+          first: firstSalt,
+        },
+      },
+    },
+  },
+});
+</code></pre><p>Tap your security key again, then call <code>getClientExtensionResults()</code> afterwards and look for the <code>prf</code> entry:</p><pre><code>const auth1ExtensionResults = auth1Credential.getClientExtensionResults();
+console.log(auth1ExtensionResults);
+//   prf: {
+//     results: {
+//       first: ArrayBuffer(32),
+//     }
+//   }
+// }
+</code></pre><p>The <code>first</code> bytes returned here are the key (no pun intended) to the next steps involving <a href="https://developer.mozilla.org/en-US/docs/Web/API/SubtleCrypto" target="_blank" rel="noopener">WebCrypto’s SubtleCrypto</a> browser API:</p><h4 id="step-21-import-the-input-key-material"><a href="#step-21-import-the-input-key-material">####</a> Step 2.1: Import the input key material</h4><p>Create a key derivation key using <code>crypto.subtle.importKey()</code>:</p><pre><code>const inputKeyMaterial = new Uint8Array(
+  auth1ExtensionResults.prf.results.first,
+);
+const keyDerivationKey = await crypto.subtle.importKey(
+  "raw",
+  inputKeyMaterial,
+  "HKDF",
+  false,
+  ["deriveKey"],
+);
+</code></pre><h4 id="step-22-derive-the-encryption-key"><a href="#step-22-derive-the-encryption-key">####</a> Step 2.2: Derive the encryption key</h4><p>Next, create the symmetric key that we’ll use for encryption with <code>crypto.subtle.deriveKey()</code>:</p><pre><code>// Never forget what you set this value to or the key can't be
+// derived later
+const label = "encryption key";
+const info = textEncoder.encode(label);
+// `salt` is a required argument for `deriveKey()`, but should
+// be empty
+const salt = new Uint8Array();
+
+const encryptionKey = await crypto.subtle.deriveKey(
+  { name: "HKDF", info, salt, hash: "SHA-256" },
+  keyDerivationKey,
+  { name: "AES-GCM", length: 256 },
+  // No need for exportability because we can deterministically
+  // recreate this key
+  false,
+  ["encrypt", "decrypt"],
+);
+</code></pre><h4 id="step-23-encrypt-the-message"><a href="#step-23-encrypt-the-message">####</a> Step 2.3: Encrypt the message</h4><p>Now we can encrypt our message using the aptly named <code>crypto.subtle.encrypt()</code> method:</p><pre><code>// Keep track of this `nonce`, you'll need it to decrypt later!
+// FYI it's not a secret so you don't have to protect it.
+const nonce = crypto.getRandomValues(new Uint8Array(12));
+
+const encrypted = await crypto.subtle.encrypt(
+  { name: "AES-GCM", iv: nonce },
+  encryptionKey,
+  new TextEncoder().encode("hello readers 🥳"),
+);
+</code></pre><h3 id="step-3-authenticate-to-decrypt"><a href="#step-3-authenticate-to-decrypt">###</a> Step 3: Authenticate to decrypt</h3><p>Decrypting the message looks almost the same as everything in Step 2, except during the last step you’ll call <code>crypto.subtle.decrypt()</code> instead:</p><pre><code>const decrypted = await crypto.subtle.decrypt(
+  // `nonce` should be the same value from Step 2.3
+  { name: "AES-GCM", iv: nonce },
+  encryptionKey,
+  encrypted,
+);
+</code></pre><p>If you did everything right, you should see your super secret message:</p><pre><code>console.log((new TextDecoder()).decode(decrypted));
+// hello readers 🥳
+</code></pre><h2 id="proof"><a href="#proof">##</a> Proof</h2><p>Here’s a screenshot of Chrome Canary after I wired all of this up into my <a href="https://github.com/MasterKale/SimpleWebAuthn/tree/master/example" target="_blank" rel="noopener">SimpleWebAuthn example server</a>:</p><p><a href="https://blog.millerti.me/2023/01/22/encrypting-data-in-the-browser-using-webauthn/images/proof.png" target="_blank"><img src="https://blog.millerti.me/2023/01/22/encrypting-data-in-the-browser-using-webauthn/images/proof_hub00aa9fe582a39d97df295088231c12d_214720_900x600_fit_box_3.png" alt="A screenshot of Chrome with the SimpleWebAuthn example site loaded. The left side shows a successful authentication message, and raw JSON inputs and outputs into the WebAuthn authentication API method. The right half of the browser window shows the console with a sequence of cryptographic events ending in the output of the encrypted message, &amp;ldquo;hello readers&amp;rdquo;, after having been successfully decrypted." width="658" height="600" loading="lazy"></a></p><h2 id="things-to-remember"><a href="#things-to-remember">##</a> Things to remember</h2><ul><li>The <code>prf</code> extension is currently available in Chrome Canary 111. <del>According to the <a href="https://chromestatus.com/roadmap" target="_blank" rel="noopener">Chrome Roadmap</a> we can probably expect to see <code>prf</code> support roll out to everyone when Chrome 111 debuts around March 2023.</del> (Edit: I’ve been informed that there’s more work to be done before <code>prf</code> can make it into mainline Chrome so it will be a while yet.)</li><li>Even though the encryption key can be deterministically recreated, the bytes used to derive it are the result of a hash of <code>bytes within the authenticator || bytes provided by the RP</code> (see <a href="https://w3c.github.io/webauthn/#prf-extension" target="_blank" rel="noopener">here</a> for how the browser actually salts <code>bytes provided by the RP</code> before passing them to the authenticator). An attacker will easily see <code>bytes provided by the RP</code> as the inputs for the <code>prf</code> extension. However they shouldn’t ever be able to get to <code>bytes within the authenticator</code>, making it safer to perform the actual encryption and decryption in the browser.</li><li>This encryption scheme is largely protected from <strong>remote threats</strong> thanks to WebAuthn’s phishing resistance. This is because the authenticator associates its contribution to the input key material to a specific <strong>origin-bound</strong> credential.</li><li><strong>Local threats</strong> like JavaScript injection attacks could exfiltrate the value of <code>inputKeyMaterial</code> from Step 2.1 and store it away for later use. The <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/CSP" target="_blank" rel="noopener">Content Security Policy HTTP header</a> can help control what JavaScript executes on your site and reduce the possibility of this happening. Unfortunately it won’t protect against malicious browser extensions which are often able to ignore CSP headers.</li><li>User verification should always be <code>"required"</code>, or always be <code>"discouraged"</code>. The authenticator uses two sets of bytes with <code>hmac-secret</code>, and chooses which to use based on <a href="https://w3c.github.io/webauthn/#dom-publickeycredentialrequestoptions-userverification" target="_blank" rel="noopener">the <code>"userVerification"</code> argument passed into <code>navigator.credentials.get()</code></a>. See references to “CredRandomWithUV” and “CredRandomWithoutUV” in <a href="https://fidoalliance.org/specs/fido-v2.1-ps-20210615/fido-client-to-authenticator-protocol-v2.1-ps-20210615.html#sctn-hmac-secret-extension" target="_blank" rel="noopener">the CTAP spec</a> for more info.</li><li>I recommend you <strong>always require user verification</strong>. This protects your secret data with the security key’s PIN as well since the PIN will be needed to complete the WebAuthn authentication ceremonies.</li><li><strong>The <code>nonce</code> value must always be unique</strong> for any single encryption (and its corresponding decryption) when using AES-GCM encryption keys like in the code above. I’ve learned it’s not a secret, though, so it can be safely transported with the encrypted data for later decryption.</li><li>I protected a simple UTF-8 string in the example above, but the encryption and decryption <strong>should work fine over any arbitrary bytes.</strong></li><li>There isn’t anything preventing platform authenticators from supporting <code>prf</code>, but I haven’t found one that does yet. I’ll update this post if/when any start supporting it.</li></ul><h2 id="in-conclusion"><a href="#in-conclusion">##</a> In Conclusion</h2><p>So there you have it, data encryption using WebAuthn. I’m excited by the possibilities this brings to websites, and I know that it’s just a matter of time before others find novel ways to apply this technique to strongly protect your secrets.</p><p>And heck, now that I’ve written this I might just try creating something novel with <code>prf</code> myself…</p><p><em>(A huge thanks to <a href="https://cendyne.dev/" target="_blank" rel="noopener">Cendyne</a> for helping proof-read the cryptographic-heavy parts of this post!)</em></p>
+</div></div>]]>
+            </description>
+            <link>https://blog.millerti.me/2023/01/22/encrypting-data-in-the-browser-using-webauthn/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-34498781</guid>
+            <pubDate>Tue, 24 Jan 2023 03:28:15 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[High Variance Management]]>
+            </title>
+            <description>
+<![CDATA[
+Score 15 | Comments 0 (<a href="https://news.ycombinator.com/item?id=34498745">thread link</a>) | @Kinrany
+<br/>
+January 23, 2023 | https://blog.sbensu.com/posts/2023-01-18-high-variance-management/ | <a href="https://web.archive.org/web/*/https://blog.sbensu.com/posts/2023-01-18-high-variance-management/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+    <p> <em>There is a <a href="https://blog.sbensu.com/posts/2023-01-18-high-variance-management-math">math supplement</a> to this post where I build some intuition on the different probability distributions involved. If you are interested, read that later.</em></p><p>On Broadway, actors put on a great show eight times a week <em>consistenly</em>. If a dancer <a href="https://www.theguardian.com/stage/2012/mar/30/stage-actors-break-a-leg">actually breaks a leg</a> the play has to stop. So, when Sue, the best dancer in the play, suggests adding a risky-but-awesome jump, the choreographer says no. It doesn’t matter how impressive the jump is if she gets it wrong half of the time. Changes that improve the show but cause mistakes are not worth it. You want high consistency, low variance.</p><p>Later, Hollywood decides to make a movie based on the play. Sue is cast and she performs the original choreography perfectly in the first take. But the movie director asks: “What else do you have?”. Sue remembers the risky jump. She tries twice before she lands it, but when she does, it makes the scene that much better.</p><p>The movie and the play are working under very different constraints:</p><ul><li>The movie only needs one good take, which will be seen by every viewer.</li><li>The movie can discard any bad takes.</li></ul><p>In Hollywood, you should be trying to do the very best in every take (see the appendix), even if that means that you’ll make many mistakes. You want high variance, low consistency.</p><p>In <a href="https://www.amazon.com/Making-Movies-Sidney-Lumet/dp/0679756604/">Making Movies</a>, director Sydney Lumet recommends lying to actors so that they loosen up and give you better takes. He says that some actors only dare to try more interesting things after they feel they have an acceptable take. Lumet recommends that you lie to actors and tell them that you have a solid take so that they loosen up and go for more. Lumet is teaching us to elicit higher variance from actors.</p><p>But not every part of movie production warrants high variance. Lumet also recommends that you plan shooting days down to 15 minute intervals. He even recommends that you check on the actors' chauffeurs: the best a driver can do is be on time but the worst they can do is to ruin a day of production. Lumet is teaching us to reduce variance from other processes.</p><p>Like movies, software projects have parts that require high variance and parts that don't. For most projects, the logging system can be off-the-shelf and predictable. But core parts of the product that require novel design should be as good as they can be. I've found this best illustrated in Ken Kocienda's <a href="https://www.amazon.com/Creative-Selection-Inside-Apples-Process-ebook/dp/B079DVT6VP/">Creative Selection</a>. Kocienda gives us a week-by-week account of how the first iPhone's keyboard was designed and implemented:</p><ul><li>Multiple teams were asked to work on the keyboard in parallel</li><li>Each team made several prototypes</li><li>Prototypes were demoed publicly so that everybody could learn from them</li><li>This process was repeated until there was a winning prototype</li></ul><p>The virtual keyboard was not only the first of its kind but also one of the most important UI interactions users had to learn with the new iPhone. Despite its importance, the keyboard's design was not carefully scheduled and "managed". Instead, it was forged via "creative selection", a much more chaotic process. The iPhone managers elicited higher variance from the overall team with that setup.</p><p>Managers at software companies rarely think this way. Our intuition and vocabulary for management trace back to <a href="https://en.wikipedia.org/wiki/Scientific_management">Scientific Management</a>. This was developed for factory work and was aimed at dampening variance to make factory workers’ output more predictable. Books like  <a href="https://www.amazon.com/High-Output-Management/dp/B08Z8K64S2/">High Output Management</a> draw from that tradition.</p><p>When developing new software products this "reduce variance" approach is the opposite of what you need for key components. Instead, we need High Variance Management. </p><p>Feel free to stop reading here. What follows are some recipes to encourage high variance work from a short management career:</p><h2 id="1._gather_the_crew">1. Gather the crew</h2><h3 id="recognize_who_can_do_high_variance_work">Recognize who can do high variance work</h3><p>Here are a few markers that somebody is looking to do high variance work in a domain:</p><ul><li>They will surprise you with their opinions in that domain (you won’t always agree)</li><li>They are working on this domain for a reason</li><li>It is hard to get them interested in something else</li></ul><p>You only need one or two people in this category. The rest of the team needs to contribute with good, dependable work, and not get in the way with unproductive opinions.</p><h3 id="sell_them_on_it">Sell them on it</h3><p>Not everybody wants to work on something that may likely fail. When recruiting for high variance, make that very clear that you are expecting a wide range of outcomes:</p><blockquote><p> If this succeeds, it will be huge. But that is low probability. It will most likely fail. </p></blockquote><p>The right people for a high variance project will be thrilled by this proposition. And the rest will wisely choose something else.</p><h3 id="don’t_ask_a_high_variance_team_to_be_consistent">Don’t ask a high variance team to be consistent</h3><p>A high variance team can only surprise you a couple of times a year. Every time you ask them to work on a project that has an expected outcome, you'll waste half of your yearly surprise budget. If the job requires consistency, give it to a team that is happy with consistency and capable of it.</p><h3 id="don’t_ask_a_consistent_team_to_go_for_variance">Don’t ask a consistent team to go for variance</h3><p>Here are some signs that you’ve asked for variance from a team that’s not ready for it:</p><ul><li>They spend weeks on brainstorms.</li><li>Instead of rethinking the product, they’ll fix bugs in the existing product.</li><li>They spend their time philosophizing, i.e. “what does ‘good’ mean for this project?”. If the team doesn’t understand the goal from the get-go, they are unlikely to do a good job.</li></ul><h2 id="2._frame_the_problem">2. Frame the problem</h2><p>Once the team is ready for high variance work, help them frame their projects so that they have enough room for their range to show.</p><h3 id="ambition">Ambition</h3><p>Sometimes teams don’t understand that they could knock it out of the park, and instead they start by copying existing approaches. Snap them out of it:</p><ul><li>If you had to make the best X, how would you do it?</li><li>What are the weirdest examples of X? Why aren’t we doing that?</li><li>What is the state of the art? How does it suck?</li></ul><h3 id="make_a_variance_budget">Make a variance budget</h3><p>In software, like in movies, you don't need variance in <em>every</em> part of the process. Keep an eye out for digressions into interesting but actually misguided investigations. Novel databases and "interesting" architectures are often not where you want the variance but that is often where software engineers want to spend their budget. This is the insight behind <a href="https://mcfunley.com/choose-boring-technology">Choose Boring Technology</a> and the idea of innovation tokens<a href="#fn-1" id="fnref1"><sup>1</sup></a>.</p><h3 id="add_constraints">Add constraints</h3><p>Some open-ended problems are underconstrained. “Imagine the office of the future” is too broad to be useful. “Imagine the CRISPR lab of the future” or “Imagine the ideal software design studio of the future” might generate more ideas.</p><h3 id="drop_constraints">Drop constraints</h3><p>Sometimes the team is mentally blocked by a particular constraint: “we wanted to use GPS but it doesn’t work on desktop.” Drop constraints to unblock them: “Forget desktop, you can figure it out later”. Here are some canned phrases to lift the X constraint from their mind:</p><ul><li>Imagine you could ignore X, what would you do?</li><li>Is there any upside to X? What if X was not a problem but our main feature?</li><li>Are there any users for which X doesn’t matter?</li></ul><h2 id="3._dampen_the_dampeners">3. Dampen the dampeners</h2><p>Your job as a high variance manager is relatively boring: get rid of the dampeners<a href="#fn-2" id="fnref2"><sup>2</sup></a>. </p><h3 id="process">Process</h3><p>Rules like “you are expected to be in the office from 9-5” slow down night owls. Most rules reduce variance somewhere.</p><h3 id="focus">Focus</h3><p>As a project goes on, many ideas will pop up. Ideas shouldn't be automatically accepted, <em>or even fully considered</em>. Choose somebody that is both disagreeable (knows how to disagree) and has good taste to be the decision maker and hold them accountable for the final result.</p><h3 id="attention_and_trust">Attention and trust</h3><p>Executive attention often kills creativity. Ideally, the executives are not interested in the project.</p><p>If that fails, reward risk-taking whenever you see it to establish trust. Separate the feedback about the result (“I don’t like that color” or "The numbers are weak") from the feedback about their approach (“I like that you are trying more colors, try even more!”). Hopefully, that will let the team take risks without the corresponding fear.</p><h3 id="normalcy">Normalcy</h3><p>If one team member constantly points out things as “weird”, something great but weird will get cut out. The more people you have, the more likely one of them will call things weird. Three ways to help with this:</p><ul><li>Don’t add too many people to the team.</li><li>Reassign any team members that continue to doubt the project once it has started.</li><li>Ask people to be precise when they offer constructive feedback: “What parts specifically are weird? What problems will it cause?”</li></ul><h3 id="vacation">Vacation</h3><p>Check people’s energy before starting a project. Make sure they are excited and well rested. If they aren’t, offer them a vacation before the project starts. Exciting work is done in chunks and breaks usually kill a certain momentum (even if necessary).</p><h3 id="avoid_premature_deadlines">Avoid premature deadlines</h3><p>If you set a deadline before it is clear to the team what to build, they’ll do the obvious thing that fits within the deadline. Instead, give them time to discover what they should be doing.</p><p>I really don't know how much about the research phase but I do note that you shouldn't squeeze it into a calendar (see the appendix for Michael Nielsen's notes on that).</p><p>Only when the team has a plan, pick a deadline and focus them into executing. To tell if the team has a plan, you can ask individuals what they think the team should do next. Their answers will diverge when ideating and converge when they are ready to execute.</p><p><em>Thanks to Devon Zuegel, Michael Nielsen, Kanjun Qiu, and Jack Dent for reading drafts and offering valuable feedback.</em></p><h2 id="michael_nielsen's_notes_on_managing_creativity">Michael Nielsen's notes on managing creativity</h2><blockquote><p> Reflecting on creative work: the manager's or engineer's orientation is toward a list of tasks; the creative researcher's is toward a list of emotional provocations and half-baked hunches. </p><p> It seems almost that I don't want a task list. I want a long list of weird-ass provocations which I feel strongly about. </p><p> Strong might be with almost any valence. Fear or anger often work just as well as inspiration, oddly! </p><p> And you don't check 'em off. You just keep going back for fuel. (Well, sometimes they lose their emotionla valence.) </p></blockquote><p>Michael notes that one should manage a research agenda very differently than an engineering project. </p><h2 id="real_actors_on_variance_vs_consistency_in_off_camera">Real actors on variance vs consistency in Off Camera</h2><p>In the <a href="https://offcamera.com/issues/hank-azaria/listen/#archive">Off Camera episode with Hank Azaria</a>, Azaria explains how much “perfection and consistency” got in the way of a great performance. Around minute 55m, he talks about an actress that he admires:</p><blockquote><p> She never did it the same way twice, most of her takes are bad, she didn’t remember more than three lines at a time. She was all over the place. </p><p> I’m doing it as if I am in a Broadway stage, every time it is good, consistent, it is in there. Well done, crisp! </p><p> And then, in the editing room, she would wipe the floor with me. </p><p> In all those takes didn’t matter because there were two or three takes that were breathtaking. She knew what she was doing, it takes a lot of courage. </p></blockquote><p>In the <a href="https://offcamera.com/issues/edward-norton/listen/#archive">Off Camera episode with Edward Norton</a>, Norton talks about Motherless Brooklyn and how he managed to act and direct at the same time. Around 23m:</p><blockquote><p> [When acting and directing] ... my concern was for the thing that actors do for each other.  My hedge on that really was to get actors that were theater experienced, trade-craft pros. And by theater experience I mean people who, as part of their training and professional life,  come with the totality of their performance ready. Ready to play, ready to do things. But honestly, text-ready. Like off-book, no fucking around with "I may not know all the lines yet so you are going to cut around that". I had to have people who were ready to rock and who I knew didn’t need a lot from me to get going. </p></blockquote><p>My interpretation from that passage is that Norton knows how much work a director does for actors, and how much actors feed of each other during scenes. Given that it is his first time acting and directing, he can't really afford to work with actors that need a lot of help to produce good takes. In this case, he is looking for consistency, which he knows theater-trained actors can provide.</p><ol><li id="fn-1">Thank you Brian Cobb and Daniel Compton for the pointer!<a href="#fnref1">↩</a></li><li id="fn-2">Paul Graham enumerating dampeners in <a href="http://www.paulgraham.com/marginal.html">The power of the marginal</a>: "the selection of the wrong kind of people, the excessive scope, the inability to take risks, the need to seem serious, the weight of expectations, the power of vested interests, the undiscerning audience, and perhaps most dangerous, the tendency of such work to become a duty rather than a pleasure."<a href="#fnref2">↩</a></li></ol>
+</div></div>]]>
+            </description>
+            <link>https://blog.sbensu.com/posts/2023-01-18-high-variance-management/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-34498745</guid>
+            <pubDate>Tue, 24 Jan 2023 03:24:12 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[If you are using Cloudflare and Chrome, add custom header to see cache hit]]>
             </title>
             <description>
 <![CDATA[
-Score 37 | Comments 8 (<a href="https://news.ycombinator.com/item?id=34496089">thread link</a>) | @kiru_io
+Score 40 | Comments 9 (<a href="https://news.ycombinator.com/item?id=34496089">thread link</a>) | @kiru_io
 <br/>
 January 23, 2023 | https://kiru.io/blog/posts/2022/easily-detect-cloudflare-cache-hit/ | <a href="https://web.archive.org/web/*/https://kiru.io/blog/posts/2022/easily-detect-cloudflare-cache-hit/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -73,7 +561,7 @@ You can add custom columns to the Network tab. Simply add a custom column “Res
             </title>
             <description>
 <![CDATA[
-Score 19 | Comments 3 (<a href="https://news.ycombinator.com/item?id=34496022">thread link</a>) | @adrian_mrd
+Score 20 | Comments 3 (<a href="https://news.ycombinator.com/item?id=34496022">thread link</a>) | @adrian_mrd
 <br/>
 January 23, 2023 | https://www.kotaku.com.au/2023/01/pokmon-fan-says-us-customs-destroyed-us4000-5553-classic-game/ | <a href="https://web.archive.org/web/*/https://www.kotaku.com.au/2023/01/pokmon-fan-says-us-customs-destroyed-us4000-5553-classic-game/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -334,6 +822,8 @@ docker run <span>--rm</span> <span>-it</span> <span>-v</span> app-storage:/rails
 
 <p>In summary, this series on Rails 7.1 features highlights some of the most noteworthy updates coming in the new version of the framework. While it is not an exhaustive list, the features discussed were chosen for their significance and impact.</p>
 
+<p>This post made its way onto <a href="https://news.ycombinator.com/item?id=34494218" target="_blank" rel="noopener noreferrer">Hacker News</a> and generated some interesting perspectives and insights.</p>
+
 <p>That’s it! Thanks for taking the time to read the series. And to <a href="https://contributors.rubyonrails.org/contributors/in-time-window/20220101-20230122" target="_blank" rel="noopener noreferrer">all the 522 contributors</a> that made all these features possible, the Rails Community is truly grateful!</p>
 
 <p>If you want to stay updated on Ruby and Rails, you can subscribe to my newsletter below to receive occasional updates on related topics that may interest you.</p>
@@ -368,7 +858,7 @@ docker run <span>--rm</span> <span>-it</span> <span>-v</span> app-storage:/rails
             </title>
             <description>
 <![CDATA[
-Score 76 | Comments 82 (<a href="https://news.ycombinator.com/item?id=34493846">thread link</a>) | @freedsoftware
+Score 78 | Comments 84 (<a href="https://news.ycombinator.com/item?id=34493846">thread link</a>) | @freedsoftware
 <br/>
 January 23, 2023 | https://flux.community/matthew-sheffield/2023/01/richard-barbrook-californian-ideology-libertarianism-neoliberalism/ | <a href="https://web.archive.org/web/*/https://flux.community/matthew-sheffield/2023/01/richard-barbrook-californian-ideology-libertarianism-neoliberalism/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -680,7 +1170,7 @@ January 23, 2023 | https://blog.trunk.io/analytics-for-github-actions-6620ceccb0
             </title>
             <description>
 <![CDATA[
-Score 18 | Comments 1 (<a href="https://news.ycombinator.com/item?id=34489655">thread link</a>) | @nandalism
+Score 19 | Comments 1 (<a href="https://news.ycombinator.com/item?id=34489655">thread link</a>) | @nandalism
 <br/>
 January 23, 2023 | https://blog.deckc.hair/2023-01-22-nim-meta-programming.html | <a href="https://web.archive.org/web/*/https://blog.deckc.hair/2023-01-22-nim-meta-programming.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -934,7 +1424,7 @@ I preferred 'divv'.</p>
             </title>
             <description>
 <![CDATA[
-Score 17 | Comments 59 (<a href="https://news.ycombinator.com/item?id=34488475">thread link</a>) | @jimhi
+Score 18 | Comments 59 (<a href="https://news.ycombinator.com/item?id=34488475">thread link</a>) | @jimhi
 <br/>
 January 23, 2023 | https://mrsteinberg.com/what-can-you-do-when-you-get-rich/ | <a href="https://web.archive.org/web/*/https://mrsteinberg.com/what-can-you-do-when-you-get-rich/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1346,7 +1836,7 @@ January 23, 2023 | https://mrsteinberg.com/what-can-you-do-when-you-get-rich/ | 
             </title>
             <description>
 <![CDATA[
-Score 101 | Comments 242 (<a href="https://news.ycombinator.com/item?id=34487944">thread link</a>) | @lisper
+Score 101 | Comments 245 (<a href="https://news.ycombinator.com/item?id=34487944">thread link</a>) | @lisper
 <br/>
 January 23, 2023 | http://blog.rongarret.info/2023/01/an-intutive-counterexample-to-axiom-of.html | <a href="https://web.archive.org/web/*/http://blog.rongarret.info/2023/01/an-intutive-counterexample-to-axiom-of.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="post-body-558708398447570486" itemprop="description articleBody">
@@ -1364,7 +1854,7 @@ January 23, 2023 | http://blog.rongarret.info/2023/01/an-intutive-counterexample
             </title>
             <description>
 <![CDATA[
-Score 167 | Comments 100 (<a href="https://news.ycombinator.com/item?id=34487232">thread link</a>) | @Lior539
+Score 168 | Comments 101 (<a href="https://news.ycombinator.com/item?id=34487232">thread link</a>) | @Lior539
 <br/>
 January 23, 2023 | https://www.remoterocketship.com/companies-hiring-worldwide/software-engineers | <a href="https://web.archive.org/web/*/https://www.remoterocketship.com/companies-hiring-worldwide/software-engineers">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><p><img alt="" src="https://storage.googleapis.com/download/storage/v1/b/remote-rocket.appspot.com/o/10up.jpeg?generation=1670695653719392&amp;alt=media" width="80" height="80"></p><h3>10up</h3><p>We make the web better by finely crafting websites &amp; tools for content creators.</p><p>WordPress • PHP • jQuery • HTML / CSS • Strategy</p><div><div><p><span><span></span><img alt="" srcset="https://www.remoterocketship.com/_next/static/media/employees.2deb939e.svg 1x, https://www.remoterocketship.com/_next/static/media/employees.2deb939e.svg 2x" src="https://www.remoterocketship.com/_next/static/media/employees.2deb939e.svg" decoding="async" data-nimg="intrinsic" loading="lazy" data-old-src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"></span></p><p>201 - 500</p></div></div><div><p>Git</p><p>GitHub</p><p>Go</p><p>HTML</p><p>Java</p><p>JavaScript</p><p>React</p><p>WordPress</p><p>PHP</p></div><h4>Job Openings</h4></div><div><p><img alt="" src="https://storage.googleapis.com/download/storage/v1/b/remote-rocket.appspot.com/o/Academia.edu.jpeg?generation=1669367130638776&amp;alt=media" width="80" height="80"></p><h3>Academia.edu</h3><p>Accelerating the world's research</p><div><div><p><span><span></span><img alt="" srcset="https://www.remoterocketship.com/_next/static/media/employees.2deb939e.svg 1x, https://www.remoterocketship.com/_next/static/media/employees.2deb939e.svg 2x" src="https://www.remoterocketship.com/_next/static/media/employees.2deb939e.svg" decoding="async" data-nimg="intrinsic" loading="lazy" data-old-src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"></span></p><p>51 - 200</p></div><p>🔥 Funding within the last year</p><p>💰 23M Series D on 2022-02</p></div><div><p>Ansible</p><p>AWS</p><p>EC2</p><p>Go</p><p>Java</p><p>JavaScript</p><p>Jenkins</p><p>Jest</p><p>Linux </p><p>Optimization</p><p>Pyth</p><p>Python</p><p>React</p><p>Redis</p><p>RSpec</p><p>Ruby</p><p>Ruby on Rails</p><p>SQL</p><p>Terraform</p><p>Unix</p><p>TypeScript</p></div><h4>Job Openings</h4></div><div><p><img alt="" src="https://storage.googleapis.com/download/storage/v1/b/remote-rocket.appspot.com/o/Aragon.jpeg?generation=1673038779842180&amp;alt=media" width="80" height="80"></p><h3>Aragon</h3><p>Aragon is the DAO platform that grows with you. Mint tokens, set governance, and onboard members from one page.</p><p>Decentralized Autonomous Organizations • Ethereum • Organization Management • Business Management • Blockchain</p><div><div><p><span><span></span><img alt="" srcset="https://www.remoterocketship.com/_next/static/media/employees.2deb939e.svg 1x, https://www.remoterocketship.com/_next/static/media/employees.2deb939e.svg 2x" src="https://www.remoterocketship.com/_next/static/media/employees.2deb939e.svg" decoding="async" data-nimg="intrinsic" loading="lazy" data-old-src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"></span></p><p>11 - 50</p></div></div><div><p>Blockchain</p><p>Chai</p><p>Cypress</p><p>Git</p><p>GraphQL</p><p>Java</p><p>JavaScript</p><p>Jira</p><p>React</p></div><h4>Job Openings</h4></div><div><p><img alt="" src="https://storage.googleapis.com/download/storage/v1/b/remote-rocket.appspot.com/o/Bobtail.jpeg?generation=1672948911051579&amp;alt=media" width="80" height="80"></p><h3>Bobtail</h3><p>Delivering freedom from inefficiencies in the supply chain.</p><div><div><p><span><span></span><img alt="" srcset="https://www.remoterocketship.com/_next/static/media/employees.2deb939e.svg 1x, https://www.remoterocketship.com/_next/static/media/employees.2deb939e.svg 2x" src="https://www.remoterocketship.com/_next/static/media/employees.2deb939e.svg" decoding="async" data-nimg="intrinsic" loading="lazy" data-old-src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"></span></p><p>51 - 200</p></div><p>🔥 Funding within the last year</p><p>💰 61.5M Debt Financing on 2022-03</p></div><h4>Job Openings</h4></div><div><p><img alt="" src="https://storage.googleapis.com/download/storage/v1/b/remote-rocket.appspot.com/o/Canonical.jpeg?generation=1672075557979169&amp;alt=media" width="80" height="80"></p><h3>Canonical</h3><p>Enterprise open source, secured and delivered by the publisher of Ubuntu. </p><p>Open Source • Certification • OpenStack • Software Development • Containers</p><div><div><p><span><span></span><img alt="" srcset="https://www.remoterocketship.com/_next/static/media/employees.2deb939e.svg 1x, https://www.remoterocketship.com/_next/static/media/employees.2deb939e.svg 2x" src="https://www.remoterocketship.com/_next/static/media/employees.2deb939e.svg" decoding="async" data-nimg="intrinsic" loading="lazy" data-old-src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"></span></p><p>501 - 1000</p></div></div><h4>Job Openings</h4></div><div><p><img alt="" src="https://storage.googleapis.com/download/storage/v1/b/remote-rocket.appspot.com/o/Collabora.jpeg?generation=1670704742060307&amp;alt=media" width="80" height="80"></p><h3>Collabora</h3><p>Open Source, tailored for you. Whether it's the Linux kernel, web engines, graphics or multimedia, we can help.</p><p>Linux kernel • Panfrost • Device driver development • Build systems • Open Source</p><div><div><p><span><span></span><img alt="" srcset="https://www.remoterocketship.com/_next/static/media/employees.2deb939e.svg 1x, https://www.remoterocketship.com/_next/static/media/employees.2deb939e.svg 2x" src="https://www.remoterocketship.com/_next/static/media/employees.2deb939e.svg" decoding="async" data-nimg="intrinsic" loading="lazy" data-old-src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"></span></p><p>51 - 200</p></div></div><div><p>Git</p><p>GitLab</p><p>Go</p><p>Open Source</p><p>DevOps</p><p>Django</p><p>Docker</p><p>HTML</p><p>Java</p><p>JavaScript</p><p>Kubernetes</p><p>PHP</p><p>Pyth</p><p>Python</p><p>Redis</p><p>SQL</p><p>Chef</p><p>Grafana</p><p>Laravel</p><p>MariaDB</p><p>Ruby</p><p>Rust</p></div><h4>Job Openings</h4></div><div><p><img alt="" src="https://storage.googleapis.com/download/storage/v1/b/remote-rocket.appspot.com/o/Decentraland.jpeg?generation=1669332592615020&amp;alt=media" width="80" height="80"></p><h3>Decentraland</h3><p>Welcome to Decentraland.
@@ -1380,7 +1870,7 @@ A virtual world owned by its users.</p><p>Blockchain • Virtual Reality • Con
             </title>
             <description>
 <![CDATA[
-Score 181 | Comments 112 (<a href="https://news.ycombinator.com/item?id=34487201">thread link</a>) | @ingve
+Score 181 | Comments 113 (<a href="https://news.ycombinator.com/item?id=34487201">thread link</a>) | @ingve
 <br/>
 January 23, 2023 | https://myme.no/posts/2023-01-22-git-commands-you-do-not-need.html | <a href="https://web.archive.org/web/*/https://myme.no/posts/2023-01-22-git-commands-you-do-not-need.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section>
@@ -2331,7 +2821,7 @@ existing files.<a href="#fnref5" role="doc-backlink">↩︎</a></p></li>
             </title>
             <description>
 <![CDATA[
-Score 173 | Comments 169 (<a href="https://news.ycombinator.com/item?id=34487079">thread link</a>) | @clouddrover
+Score 175 | Comments 174 (<a href="https://news.ycombinator.com/item?id=34487079">thread link</a>) | @clouddrover
 <br/>
 January 23, 2023 | https://www.uq.edu.au/news/article/2023/01/magnetic-method-clean-pfas-contaminated-water | <a href="https://web.archive.org/web/*/https://www.uq.edu.au/news/article/2023/01/magnetic-method-clean-pfas-contaminated-water">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p><span><span><span><span>Researchers at The University of Queensland have pioneered a simple, fast and effective technique to remove PFAS chemicals from water. &nbsp;</span></span></span></span></p>
@@ -2436,7 +2926,7 @@ January 22, 2023 | https://www.philvenables.com/post/ceremonial-security-and-car
             </title>
             <description>
 <![CDATA[
-Score 233 | Comments 49 (<a href="https://news.ycombinator.com/item?id=34482836">thread link</a>) | @kiyanwang
+Score 234 | Comments 49 (<a href="https://news.ycombinator.com/item?id=34482836">thread link</a>) | @kiyanwang
 <br/>
 January 22, 2023 | https://www.workingsoftware.dev/software-architecture-documentation-the-ultimate-guide/ | <a href="https://web.archive.org/web/*/https://www.workingsoftware.dev/software-architecture-documentation-the-ultimate-guide/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section>
@@ -2834,7 +3324,7 @@ be my go-to place to write Tor boilerplates when needed.</p>
             </title>
             <description>
 <![CDATA[
-Score 52 | Comments 82 (<a href="https://news.ycombinator.com/item?id=34477901">thread link</a>) | @NicolaiS
+Score 52 | Comments 83 (<a href="https://news.ycombinator.com/item?id=34477901">thread link</a>) | @NicolaiS
 <br/>
 January 22, 2023 | https://rot256.dev/post/pass/ | <a href="https://web.archive.org/web/*/https://rot256.dev/post/pass/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section><p><img src="https://rot256.dev/post/pass/link.svg#center" alt="Pass" title="Pass provides no cryptographic binding between keys (services) and values (passwords)"></p><p>What is “Pass; the standard unix password manager”?</p><blockquote><p>Password management should be simple and follow Unix philosophy. With pass, each password lives inside of a gpg encrypted file whose filename is the title of the website or resource that requires the password. These encrypted files may be organized into meaningful folder hierarchies, copied from computer to computer, and, in general, manipulated using standard command line file management utilities.</p><p>– <a href="https://www.passwordstore.org/">https://www.passwordstore.org/</a></p></blockquote><p>The <a href="https://www.passwordstore.org/">Pass</a> password manager is often recommended,
@@ -3377,7 +3867,7 @@ January 21, 2023 | https://joostjansen.me/index | <a href="https://web.archive.o
             </title>
             <description>
 <![CDATA[
-Score 232 | Comments 671 (<a href="https://news.ycombinator.com/item?id=34469336">thread link</a>) | @ceohockey60
+Score 232 | Comments 672 (<a href="https://news.ycombinator.com/item?id=34469336">thread link</a>) | @ceohockey60
 <br/>
 January 21, 2023 | https://heathermeeker.com/2023/01/19/is-copyright-eating-ai/ | <a href="https://web.archive.org/web/*/https://heathermeeker.com/2023/01/19/is-copyright-eating-ai/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="post-4570">
@@ -3513,7 +4003,7 @@ January 21, 2023 | https://heathermeeker.com/2023/01/19/is-copyright-eating-ai/ 
             </title>
             <description>
 <![CDATA[
-Score 13 | Comments 13 (<a href="https://news.ycombinator.com/item?id=34468850">thread link</a>) | @capableweb
+Score 13 | Comments 14 (<a href="https://news.ycombinator.com/item?id=34468850">thread link</a>) | @capableweb
 <br/>
 January 21, 2023 | https://fil.org/blog/ff-x-lockheed-martin-mission-announcement/ | <a href="https://web.archive.org/web/*/https://fil.org/blog/ff-x-lockheed-martin-mission-announcement/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-push-left="off-1_md-2_mi-1_ti-1" data-v-5b336c84=""><div data-v-5b336c84=""><p data-v-5b336c84=""><em data-v-5b336c84="">Effort Will Use the Interplanetary File System (IPFS) to Speed Up Communications Across Long Distances</em></p>
@@ -3537,7 +4027,7 @@ January 21, 2023 | https://fil.org/blog/ff-x-lockheed-martin-mission-announcemen
             </title>
             <description>
 <![CDATA[
-Score 705 | Comments 335 (<a href="https://news.ycombinator.com/item?id=34468644">thread link</a>) | @for_i_in_range
+Score 706 | Comments 335 (<a href="https://news.ycombinator.com/item?id=34468644">thread link</a>) | @for_i_in_range
 <br/>
 January 21, 2023 | https://www.skyfi.com/pricing | <a href="https://web.archive.org/web/*/https://www.skyfi.com/pricing">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><div id="main"><div><section><div><div><div><p><h2><span>Pricing<!-- --> <!-- --></span></h2></p><p>In staying true to our mission to democratize satellite imagery, we are proud to offer lowest-in-market, transparent pricing.
@@ -4473,7 +4963,7 @@ Adrian Sampson for feedback and typo fixes after publication.</em></p>
             </title>
             <description>
 <![CDATA[
-Score 187 | Comments 227 (<a href="https://news.ycombinator.com/item?id=34467523">thread link</a>) | @matthewfcarlson
+Score 188 | Comments 227 (<a href="https://news.ycombinator.com/item?id=34467523">thread link</a>) | @matthewfcarlson
 <br/>
 January 21, 2023 | https://matthewc.dev/musings/unit-tests/ | <a href="https://web.archive.org/web/*/https://matthewc.dev/musings/unit-tests/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
