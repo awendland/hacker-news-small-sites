@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Tue, 28 Feb 2023 01:58:27 GMT</lastBuildDate>
+        <lastBuildDate>Tue, 28 Feb 2023 04:33:26 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-20.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Tue, 28 Feb 2023 01:58:27 GMT</pubDate>
+        <pubDate>Tue, 28 Feb 2023 04:33:26 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,695 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Firecracker internals: deep dive inside the technology powering AWS Lambda(2021)]]>
+            </title>
+            <description>
+<![CDATA[
+Score 88 | Comments 4 (<a href="https://news.ycombinator.com/item?id=34964197">thread link</a>) | @mattrighetti
+<br/>
+February 27, 2023 | https://www.talhoffman.com/2021/07/18/firecracker-internals/ | <a href="https://web.archive.org/web/*/https://www.talhoffman.com/2021/07/18/firecracker-internals/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+        <article>
+  
+  <time datetime="2021-07-18T00:00:00+00:00">18 Jul 2021</time>
+  <p>You are most likely familiar with AWS Lambda and Fargate — Amazon’s serverless computing engines. At its nature, serverless computing introduces quite a challenging task requiring both tight security and great performance. For exactly that matter Amazon came up with its microVM solution called <strong>Firecracker</strong>.</p>
+
+<h2 id="micro-what">Micro what?</h2>
+
+<p>MicroVMs are merely a fancy name for minimal, lightweight Virtual Machines. They are spawned by lightweight <strong>Virtual Machine Monitors</strong> (VMMs), stripped out of redundant &amp; nice-to-have features. Much like good-old fashioned VMs, they provide hardware-level virtualization for isolation &amp; security.</p>
+
+<p>MicroVM in regard to this blog post is basically a virtualization technology which is tailor-made for container workloads.</p>
+
+<h2 id="back-to-firecracker"><strong>Back to Firecracker</strong></h2>
+
+<p>Firecracker is a VMM which utilizes Linux Kernel-based Virtual Machine (KVM). It is created by Amazon to solve their container workloads needs. It is <a href="https://github.com/firecracker-microvm/firecracker">open source</a>, written in (the incredibly awesome) Rust, and used in production since 2018.</p>
+
+<p>Up until recently, Lambda was being run on top of regular Linux containers isolated inside separate virtual machines. Each container served a different Lambda function while each VM served a different tenant. Although highly effective in terms of security, this set-up meant limited performance and has proven to be hard to pack variable-size workloads onto fixed-size VMs.</p>
+
+<p>Amazon decided to come-up with a better solution for its serverless workloads requiring:</p>
+
+<ul>
+  <li>Consistent, close-to-native <strong>performance</strong>, which is also not being affected by other functions running on the same node</li>
+  <li>Functions must be strongly <strong>isolated</strong> and protected against information disclosure, privilege escalation, and other security risks</li>
+  <li>Full <strong>compatibility</strong> so functions are able to run arbitrary libraries and binaries without any re-compilation or code changes</li>
+  <li>High and flexible <strong>scalability</strong> allowing thousands of functions to run on a single machine</li>
+  <li>Functions must be able to <strong>over-commit</strong> resources, only using the minimal amount of resources they need</li>
+  <li><strong>Startup &amp; tear-down</strong> should be very quick so that functions’ cold-start times remain small</li>
+</ul>
+
+<p>And so, it was successfully able to do so achieving impressing boot-times of “as little as 125ms” and supporting creation rates of “up to 150 microVMs per second per host” (source: <a href="https://firecracker-microvm.github.io/">https://firecracker-microvm.github.io/</a>).</p>
+
+<h2 id="going-deeper">Going deeper…</h2>
+
+<p>Each Firecracker process is bound to a single MicroVM and is composed of the following threads: an API Server, a VMM, and vCPU(s) threads — one per each guest CPU core.</p>
+
+<p>Firecracker currently supports <code>x86_64</code> and <code>aarch64</code> architectures running kernel version 4.14 or later. Support for aarch64 is not feature complete yet and is considered an alpha stage release. All architecture-specific information in this post regards to the <code>x86_64</code> implementation.</p>
+
+<h3 id="api-server">API Server</h3>
+
+<p>The API Server is the control plane of each Firecracker process. It is, per the <a href="https://github.com/firecracker-microvm/firecracker/blob/main/docs/design.md">official docs</a>, “never in the fast path of the virtual machine”, and can be turned-off by passing the <code>no-api</code> flag given that a <code>config-file</code> is provided instead.</p>
+
+<p>It is started by an <code>ApiServerAdapter</code> in a dedicated thread and exposes a REST API running on top of a unix socket. Endpoints exist for configuring guest kernel, boot arguments, net configuration, block device configuration, guest machine configuration and <code>cpuid</code>, logging, metrics, rate limiting, and the metadata service. Operations can be sent to the API server pre-boot and post-boot.</p>
+
+<p>The communication between the API server thread and the VMM thread (discussed later) which runs &amp; controls the actual VM is done using Rust channels.</p>
+
+<p>Channels are notified about API requests arriving at the API server using an <code>epoll</code> event loop, which FC makes use of in various places to handle events:</p>
+
+<div><div><pre><code><span>// FD to notify of API events. This is a blocking eventfd by design.</span>
+<span>// It is used in the config/pre-boot loop which is a simple blocking loop</span>
+<span>// which only consumes API events.</span>
+<span>let</span> <span>api_event_fd</span> <span>=</span> <span>EventFd</span><span>::</span><span>new</span><span>(</span><span>0</span><span>)</span><span>.expect</span><span>(</span><span>"Cannot create API Eventfd."</span><span>);</span>
+
+<span>// Channels for both directions between Vmm and Api threads.</span>
+<span>let</span> <span>(</span><span>to_vmm</span><span>,</span> <span>from_api</span><span>)</span> <span>=</span> <span>channel</span><span>();</span>
+<span>let</span> <span>(</span><span>to_api</span><span>,</span> <span>from_vmm</span><span>)</span> <span>=</span> <span>channel</span><span>();</span>
+
+<span>thread</span><span>::</span><span>Builder</span><span>::</span><span>new</span><span>()</span>
+      <span>.name</span><span>(</span><span>"fc_api"</span><span>.to_owned</span><span>())</span>
+      <span>.spawn</span><span>(</span><span>move</span> <span>||</span> <span>{</span>
+            <span>match</span> <span>ApiServer</span><span>::</span><span>new</span><span>(</span><span>mmds_info</span><span>,</span> <span>to_vmm</span><span>,</span> <span>from_vmm</span><span>,</span> <span>to_vmm_event_fd</span><span>)</span><span>.bind_and_run</span><span>(</span>
+                <span>bind_path</span><span>,</span>
+                <span>process_time_reporter</span><span>,</span>
+                <span>&amp;</span><span>api_seccomp_filter</span><span>,</span>
+              <span>)</span> <span>{</span>
+                   <span>// ...</span>
+                  <span>}</span>
+    <span>})</span><span>.expect</span><span>(</span><span>"API thread spawn failed."</span><span>);</span>
+
+</code></pre></div></div>
+
+<p>Source: <a href="https://github.com/firecracker-microvm/firecracker/blob/1f697a61e1fde68e1abb2e2ef75f7bf9acbc3440/src/firecracker/src/api_server_adapter.rs#L119">firecracker/src/firecracker/src/api_server_adapter.rs</a></p>
+
+<p>Once the API server is spawned, the <code>ApiServerAdapter</code> would go on and call <code>build_microvm_from_requests()</code> which loops using successive API calls, in order to pre-boot the VM:</p>
+
+<div><div><pre><code> <span>pub</span> <span>fn</span> <span>build_microvm_from_requests</span><span>&lt;</span><span>F</span><span>,</span> <span>G</span><span>&gt;</span><span>(</span>
+        <span>seccomp_filters</span><span>:</span> <span>&amp;</span><span>BpfThreadMap</span><span>,</span>
+        <span>event_manager</span><span>:</span> <span>&amp;</span><span>mut</span> <span>EventManager</span><span>,</span>
+        <span>instance_info</span><span>:</span> <span>InstanceInfo</span><span>,</span>
+        <span>recv_req</span><span>:</span> <span>F</span><span>,</span>
+        <span>respond</span><span>:</span> <span>G</span><span>,</span>
+        <span>boot_timer_enabled</span><span>:</span> <span>bool</span><span>,</span>
+    <span>)</span> <span>-&gt;</span> <span>result</span><span>::</span><span>Result</span><span>&lt;</span><span>(</span><span>VmResources</span><span>,</span> <span>Arc</span><span>&lt;</span><span>Mutex</span><span>&lt;</span><span>Vmm</span><span>&gt;&gt;</span><span>),</span> <span>ExitCode</span><span>&gt;</span>
+    <span>where</span>
+        <span>F</span><span>:</span> <span>Fn</span><span>()</span> <span>-&gt;</span> <span>VmmAction</span><span>,</span>
+        <span>G</span><span>:</span> <span>Fn</span><span>(</span><span>ActionResult</span><span>),</span>
+    <span>{</span>
+        <span>//...</span>
+
+        <span>// Configure and start microVM through successive API calls.</span>
+        <span>// Iterate through API calls to configure microVm.</span>
+        <span>// The loop breaks when a microVM is successfully started, and a running Vmm is built.</span>
+        <span>while</span> <span>preboot_controller</span><span>.built_vmm</span><span>.is_none</span><span>()</span> <span>{</span>
+            <span>// Get request, process it, send back the response.</span>
+            <span>respond</span><span>(</span><span>preboot_controller</span><span>.handle_preboot_request</span><span>(</span><span>recv_req</span><span>()));</span>
+            <span>// If any fatal errors were encountered, break the loop.</span>
+            <span>if</span> <span>let</span> <span>Some</span><span>(</span><span>exit_code</span><span>)</span> <span>=</span> <span>preboot_controller</span><span>.fatal_error</span> <span>{</span>
+                <span>return</span> <span>Err</span><span>(</span><span>exit_code</span><span>);</span>
+            <span>}</span>
+        <span>}</span>
+
+        <span>// ...</span>
+<span>}</span>
+
+</code></pre></div></div>
+
+<p>Source: <a href="https://github.com/firecracker-microvm/firecracker/blob/38524062228f5f6bf2d7a6e1ec227f362589b290/src/vmm/src/rpc_interface.rs#L252">firecracker/src/vmm/src/rpc_interface.rs</a></p>
+
+<p>After successfully pre-booting the VM the <code>ApiServerAdapter</code> would run it calling <code>ApiServerAdapter::run_microvm()</code>.</p>
+
+<blockquote>
+  <p>FC’s API Server specification can be found <a href="https://github.com/firecracker-microvm/firecracker/blob/7edec888f8a4e496dffa55b75fab30836a122fad/src/api_server/swagger/firecracker.yaml">here</a></p>
+</blockquote>
+
+<h3 id="boot-sequence-and-linux-boot-protocol">Boot Sequence and Linux Boot Protocol</h3>
+
+<p>A traditional PC boot sequence with a BIOS is consisted of the following steps:</p>
+
+<p>Upon starting, the CPU  —  running in real mode  —  executes an instruction located at the hardware reset vector which jumps to a ROM location. That firmware code in turn loads the start-up program — BIOS in that case. The startup program executes a POST (power-on self test) integrity check to make sure that all hardware devices that it relies on are working properly.</p>
+
+<p>Afterwards, it starts looking for a bootable device (CD drive, HDD, NIC) — failing to boot if none found. In case of an HDD, the bootable device would be the Master Boot Record (MBR) whose responsibility is to search for an active partition and execute its boot sector code. The boot sector code is basically the first-stage boot loader which is responsible for loading the kernel onto physical memory and transferring control to the OS.</p>
+
+<p>Boot loader systems come in various forms. Different boot loaders implement a different number of stages, designed for dealing with various resource limitations, like the first-stage boot loader’s 512 bytes size limit. Grub, for instance, is a 3-layer boot loader.</p>
+
+<p>However, the Linux Kernel does not necessarily require loading with a BIOS and a boot loader. Instead Firecracker takes advantage of the 64-bit Linux Boot Protocol, which specifies how the kernel image should be loaded and run. FC directly boots the Kernel at the <code>protected-mode</code> entry point rather than starting off from the 16-bit <code>real mode</code>.</p>
+
+<p>As the official docs of the <a href="https://www.kernel.org/doc/Documentation/x86/boot.txt">Linux Boot Protocol</a> state, the entry for the protected-mode is located at <code>0x100000</code>, as seen in the following schema:</p>
+
+<div><div><pre><code>For a modern bzImage kernel with boot protocol version &gt;= 2.02, a
+memory layout like the following is suggested:
+
+    ~                        ~
+        |  Protected-mode kernel |
+100000  +------------------------+
+    |  I/O memory hole     |
+0A0000    +------------------------+
+    |  Reserved for BIOS     |    Leave as much as possible unused
+    ~                        ~
+    |  Command line         |    (Can also be below the X+10000 mark)
+X+10000    +------------------------+
+    |  Stack/heap         |    For use by the kernel real-mode code.
+X+08000    +------------------------+    
+    |  Kernel setup         |    The kernel real-mode code.
+    |  Kernel boot sector     |    The kernel legacy boot sector.
+X       +------------------------+
+    |  Boot loader         |    &lt;- Boot sector entry point 0000:7C00
+001000    +------------------------+
+    |  Reserved for MBR/BIOS |
+000800    +------------------------+
+    |  Typically used by MBR |
+000600    +------------------------+
+    |  BIOS use only     |
+000000    +------------------------+
+
+... where the address X is as low as the design of the boot loader
+permits.
+
+</code></pre></div></div>
+
+<p>Hence, Firecracker <a href="https://github.com/firecracker-microvm/firecracker/blob/a367796e66eeac42d9ce1294c0fbbca6191e9cf3/src/arch/src/x86_64/layout.rs#L19">sets</a> <code>HIMEM_START</code> to <code>0x0010_0000</code> and ultimately passes it as the <code>start_address</code> when calling <code>load_kernel()</code>. <code>load_kernel()</code> in turn runs sanity checks against the provided image, reads in its segments, and finally returns the guest memory’s entry point.</p>
+
+<div><div><pre><code><span>#[cfg(any(target_arch</span> <span>=</span> <span>"x86"</span><span>,</span> <span>target_arch</span> <span>=</span> <span>"x86_64"</span><span>))]</span>
+<span>pub</span> <span>fn</span> <span>load_kernel</span><span>&lt;</span><span>F</span><span>&gt;</span><span>(</span>
+    <span>guest_mem</span><span>:</span> <span>&amp;</span><span>GuestMemoryMmap</span><span>,</span>
+    <span>kernel_image</span><span>:</span> <span>&amp;</span><span>mut</span> <span>F</span><span>,</span>
+    <span>start_address</span><span>:</span> <span>u64</span><span>,</span>
+<span>)</span> <span>-&gt;</span> <span>Result</span><span>&lt;</span><span>GuestAddress</span><span>&gt;</span>
+<span>where</span>
+    <span>F</span><span>:</span> <span>Read</span> <span>+</span> <span>Seek</span><span>,</span>
+<span>{</span>
+    <span>kernel_image</span>
+        <span>.seek</span><span>(</span><span>SeekFrom</span><span>::</span><span>Start</span><span>(</span><span>0</span><span>))</span>
+        <span>.map_err</span><span>(|</span><span>_</span><span>|</span> <span>Error</span><span>::</span><span>SeekKernelImage</span><span>)</span><span>?</span><span>;</span>
+    <span>let</span> <span>mut</span> <span>ehdr</span> <span>=</span> <span>elf</span><span>::</span><span>Elf64_Ehdr</span><span>::</span><span>default</span><span>();</span>
+    <span>ehdr</span><span>.as_bytes</span><span>()</span>
+        <span>.read_from</span><span>(</span><span>0</span><span>,</span> <span>kernel_image</span><span>,</span> <span>mem</span><span>::</span><span>size_of</span><span>::</span><span>&lt;</span><span>elf</span><span>::</span><span>Elf64_Ehdr</span><span>&gt;</span><span>())</span>
+        <span>.map_err</span><span>(|</span><span>_</span><span>|</span> <span>Error</span><span>::</span><span>ReadKernelDataStruct</span><span>(</span><span>"Failed to read ELF header"</span><span>))</span><span>?</span><span>;</span>
+
+    <span>// Sanity checks</span>
+    <span>// ...</span>
+
+    <span>kernel_image</span>
+        <span>.seek</span><span>(</span><span>SeekFrom</span><span>::</span><span>Start</span><span>(</span><span>ehdr</span><span>.e_phoff</span><span>))</span>
+        <span>.map_err</span><span>(|</span><span>_</span><span>|</span> <span>Error</span><span>::</span><span>SeekProgramHeader</span><span>)</span><span>?</span><span>;</span>
+    <span>let</span> <span>phdr_sz</span> <span>=</span> <span>mem</span><span>::</span><span>size_of</span><span>::</span><span>&lt;</span><span>elf</span><span>::</span><span>Elf64_Phdr</span><span>&gt;</span><span>();</span>
+    <span>let</span> <span>mut</span> <span>phdrs</span><span>:</span> <span>Vec</span><span>&lt;</span><span>elf</span><span>::</span><span>Elf64_Phdr</span><span>&gt;</span> <span>=</span> <span>vec!</span><span>[];</span>
+    <span>for</span> <span>_</span> <span>in</span> <span>0u</span><span>size</span><span>..</span><span>ehdr</span><span>.e_phnum</span> <span>as</span> <span>usize</span> <span>{</span>
+        <span>let</span> <span>mut</span> <span>phdr</span> <span>=</span> <span>elf</span><span>::</span><span>Elf64_Phdr</span><span>::</span><span>default</span><span>();</span>
+        <span>phdr</span><span>.as_bytes</span><span>()</span>
+            <span>.read_from</span><span>(</span><span>0</span><span>,</span> <span>kernel_image</span><span>,</span> <span>phdr_sz</span><span>)</span>
+            <span>.map_err</span><span>(|</span><span>_</span><span>|</span> <span>Error</span><span>::</span><span>ReadKernelDataStruct</span><span>(</span><span>"Failed to read ELF program header"</span><span>))</span><span>?</span><span>;</span>
+        <span>phdrs</span><span>.push</span><span>(</span><span>phdr</span><span>);</span>
+    <span>}</span>
+
+    <span>// Read in each section pointed to by the program headers.</span>
+    <span>for</span> <span>phdr</span> <span>in</span> <span>&amp;</span><span>phdrs</span> <span>{</span>
+        <span>if</span> <span>(</span><span>phdr</span><span>.p_type</span> <span>&amp;</span> <span>elf</span><span>::</span><span>PT_LOAD</span><span>)</span> <span>==</span> <span>0</span> <span>||</span> <span>phdr</span><span>.p_filesz</span> <span>==</span> <span>0</span> <span>{</span>
+            <span>continue</span><span>;</span>
+        <span>}</span>
+
+        <span>kernel_image</span>
+            <span>.seek</span><span>(</span><span>SeekFrom</span><span>::</span><span>Start</span><span>(</span><span>phdr</span><span>.p_offset</span><span>))</span>
+            <span>.map_err</span><span>(|</span><span>_</span><span>|</span> <span>Error</span><span>::</span><span>SeekKernelStart</span><span>)</span><span>?</span><span>;</span>
+
+        <span>let</span> <span>mem_offset</span> <span>=</span> <span>GuestAddress</span><span>(</span><span>phdr</span><span>.p_paddr</span><span>);</span>
+        <span>if</span> <span>mem_offset</span><span>.raw_value</span><span>()</span> <span>&lt;</span> <span>start_address</span> <span>{</span>
+            <span>return</span> <span>Err</span><span>(</span><span>Error</span><span>::</span><span>InvalidProgramHeaderAddress</span><span>);</span>
+        <span>}</span>
+
+        <span>guest_mem</span>
+            <span>.read_from</span><span>(</span><span>mem_offset</span><span>,</span> <span>kernel_image</span><span>,</span> <span>phdr</span><span>.p_filesz</span> <span>as</span> <span>usize</span><span>)</span>
+            <span>.map_err</span><span>(|</span><span>_</span><span>|</span> <span>Error</span><span>::</span><span>ReadKernelImage</span><span>)</span><span>?</span><span>;</span>
+    <span>}</span>
+
+    <span>Ok</span><span>(</span><span>GuestAddress</span><span>(</span><span>ehdr</span><span>.e_entry</span><span>))</span>
+<span>}</span>
+
+</code></pre></div></div>
+
+<p>Source: <a href="https://github.com/firecracker-microvm/firecracker/blob/1f697a61e1fde68e1abb2e2ef75f7bf9acbc3440/src/kernel/src/loader/mod.rs#L78">firecracker/src/kernel/src/loader/mod.rs</a></p>
+
+<p>Firecracker directly uses the uncompressed kernel image <code>vmlinux</code>, saving additional costs of going through the traditional boot sequence in which the kernel decompresses itself at startup. All of this special FC boot sequence described above enables a major performance boost ultimately resulting in what AWS Lambda customer experience as fast cold starts.</p>
+
+<h3 id="device-model--virtio">Device model &amp; VirtIO</h3>
+
+<p>Virtio is a device virtualization standard written by Rusty Russell (the same genius who wrote <code>iptables</code>!) as part of his work on the x86 Linux para-virtualization hypervisor <code>lguest</code>. As opposed to full virtualization - where the guest is agnostic to the fact that it’s being run on a different host - para-virtualization technology requires the guest to implement drivers on its own and cooperate with its host. This ultimately helps gaining better performance since the guest speaks directly to the host, instead of being mediated by traps &amp; hardware emulation drivers. Obviously, this requires modifications in the guest OS in order for it to work. Firecracker is implemented using a para-virtualized KVM meaning better performance over a normal VM.</p>
+
+<p>Think of it as the difference between talking to a foreigner directly in her/his native tongue (para-virtualization) vs talking to them with the help of a translator (full virtualization).</p>
+
+<p>
+  <img src="https://i.imgur.com/AupOnSz.png" alt="Full Virtualization vs Para-Virtualization">
+</p>
+
+<p>The purpose of Virtio is to offer an abstraction and a unified standard for the front-end drivers (on the guest), for the backend device drivers (on the host), and for the transport layer between the two ends.</p>
+
+<p>The <a href="https://docs.oasis-open.org/virtio/virtio/v1.1/csprd01/virtio-v1.1-csprd01.html">specification</a> lays out the requirements needed for implementing virtio-compatible systems. Front-end drivers are shipped out-of-the-box with Linux &gt;= 2.6.25, while the backend drivers (hereinafter referred to as “devices”) must be implemented as per the docs.</p>
+
+<p>Interaction between the guest and the host for the purpose of accessing the data plane is based on a ring-buffer struct called <code>virtqueue</code> containing guest-allocated buffers. The host reads and writes to those guest memory regions. Each device can have more than one virtqueues, whereas each buffer can be either a read-only or a write-only - but not both. Each device holds a status field, feature bits, and configuration space in addition to the actual data written &amp; read by that specific device.</p>
+
+<p>Notifications between the two ends are used in order to notify the other end of:</p>
+
+<ol>
+  <li>a configuration change (device -&gt; driver)</li>
+  <li>a used buffer by the device (device -&gt; driver)</li>
+  <li>an available buffer by the guest (driver -&gt; device)</li>
+</ol>
+
+<p>A good case for the better performance para-virtualization provides over full virtualization is Virtio’s ‘available buffer’ notifications mechanism which saves us a lot of costly VMExits. For instance, given NIC emulation on a full virtualization solution, there will be a VMExit for each byte being written to the emulated device. With virtio, the entire buffer will be written first and only then will a single VMExit be dispatched for the purpose of notifying the host of an available buffer.</p>
+
+<p>Note that there’s an even better virtio backend implementation called vhost, which introduces in-kernel virtio devices for KVM featuring direct guest-kernel-to-host-kernel data plane, saving redundant host userspace to kernel space syscalls. Firecracker does not currently use this implementation.</p>
+
+<p>Virtio specifies 3 possible transport layers offering slightly different layouts &amp; implementations of those drivers &amp; devices:</p>
+
+<ol>
+  <li>PCI Bus based transport</li>
+  <li>Memory Mapped IO based transport (FC’s chosen transport)</li>
+  <li>Channel I/O based transport</li>
+</ol>
+
+<p>One difference between PCI based transport and a MMIO one is that unlike PCI, MMIO provides no generic device discovery mechanism. This means that for each device the guest OS will need to know the location of the registers and interrupts used.</p>
+
+<p>Generally, notifications from the guest to the host are just writes to a special register, which trigger a signal caught by the hypervisor (<code>ioeventfd</code> &amp; VMExits), whilst notifications from the host to the guest are basic <code>irqfd</code> interruptions. Both ‘used buffer’ notifications &amp; ‘available buffer’ notifications are suppressible since they can generally be very expensive operations.</p>
+
+<p>Back to Firecracker - each attached device (net, block, etc…) is being registered with its own MMIO transport instance, which is basically a struct implementing the <a href="http://docs.oasis-open.org/virtio/virtio/v1.0/cs04/virtio-v1.0-cs04.html#x1-1090002">MMIO</a> specification + a <code>BusDevice</code> trait responding to reads or writes in an arbitrary address space.</p>
+
+<p>When attaching a device, FC subscribes it to the general event loop. Each device is implementing a <code>MutEventSubscriber</code> trait which implements event handling for the device’s <code>queue_evts</code> (that is, ‘available buffer’ notifications). Those queue events hold the index of the relevant <code>virtqueue</code> buffer, so for a balloon driver for example those could be <code>inflateq</code>, <code>deflateq</code>, and <code>statsq</code> queues.</p>
+
+<p>FC registers each file descriptor in the device’s <code>queue_evts</code> (which are specific to that device) to be signaled by the <strong>KVM itself</strong> whenever address <code>0x050</code> (<code>virtio::NOTIFY_REG_OFFSET</code>) is written to inside the guest, using a <code>KVM_IOEVENTFD</code> ioctl. The <code>virtio::NOTIFY_REG_OFFSET</code> is called the Queue Notifier. As per the official MMIO spec “writing a value to this register notifies the device that there are new buffers to process in a queue”. In the event of MMIO/PMIO guest addresses which are not registered using the <code>KVM_IOEVENTFD</code> ioctl, a write will trigger a regular VMexit.</p>
+
+<blockquote>
+  <p><strong>KVM_IOEVENTFD</strong>
+This ioctl attaches or detaches an ioeventfd to a legal pio/mmio address within the guest.  A guest write in the registered address will signal the provided event instead of triggering an exit.
+<a href="https://www.kernel.org/doc/html/v5.10/virt/kvm/api.html#kvm-ioeventfd">Link</a></p>
+</blockquote>
+
+<p><strong>Overall, the flow of registering a MMIO-based device is as follows:</strong></p>
+
+<ol>
+  <li>FC allocates a new slot for the MMIO device</li>
+  <li>It subscribes to the guest-triggered ioevents</li>
+  <li>It registers an irqfd in order to be able to send interrupts to the guest</li>
+  <li>Inserts the device at the MMIO slot</li>
+  <li>And finally sets the kernel <a href="https://man7.org/linux/man-pages/man7/bootparam.7.html">bootparams</a> to include the guest driver:</li>
+</ol>
+
+<div><div><pre><code><span>pub</span> <span>fn</span> <span>register_mmio_virtio_for_boot</span><span>(</span>  
+    <span>&amp;</span><span>mut</span> <span>self</span><span>,</span>  
+    <span>vm</span><span>:</span> <span>&amp;</span><span>VmFd</span><span>,</span>  
+    <span>device_id</span><span>:</span> <span>String</span><span>,</span>  
+    <span>mmio_device</span><span>:</span> <span>MmioTransport</span><span>,</span>  
+    <span>_</span><span>cmdline</span><span>:</span> <span>&amp;</span><span>mut</span> <span>kernel_cmdline</span><span>::</span><span>Cmdline</span><span>,</span>  
+    <span>)</span> <span>-&gt;</span> <span>Result</span> <span>{</span>  
+            <span>let</span> <span>mmio_slot</span> <span>=</span> <span>self</span><span>.allocate_new_slot</span><span>(</span><span>1</span><span>)</span><span>?</span><span>;</span>  
+            <span>self</span><span>.register_mmio_virtio</span><span>(</span><span>vm</span><span>,</span> <span>device_id</span><span>,</span> <span>mmio_device</span><span>,</span> <span>&amp;</span><span>mmio_slot</span><span>)</span><span>?</span><span>;</span>  
+            <span>#[cfg(target_arch</span> <span>=</span> <span>“</span><span>x86_64</span><span>”</span><span>)]</span>  
+            <span>Self</span><span>::</span><span>add_virtio_device_to_cmdline</span><span>(</span><span>_</span><span>cmdline</span><span>,</span> <span>&amp;</span><span>mmio_slot</span><span>)</span><span>?</span><span>;</span>  
+            <span>Ok</span><span>(</span><span>mmio_slot</span><span>)</span>  
+    <span>}</span>
+</code></pre></div></div>
+<p>Source: <a href="https://github.com/firecracker-microvm/firecracker/blob/1f697a61e1fde68e1abb2e2ef75f7bf9acbc3440/src/vmm/src/device_manager/mmio.rs#L238">firecracker/src/vmm/src/device_manager/mmio.rs</a></p>
+
+<p>Being a minimal VMM, FC provides a rather limited set of emulated drivers: block storage (virtio-blk), network (virtio-net), vsock (virtio-vsock), balloon driver (virtio-balloon), a serial console, and a partial I8042 keyboard controller used only to stop the VM.</p>
+
+<p>In addition to the above devices, FC guests also see both Programmable Interrupt Controllers (PICs) &amp; the I/O Advanced Programmable Interrupt Controller (IOAPIC), and the KVM’s Programmable Interval Timer (PIT).</p>
+
+<p>Legacy devices such as the serial console and the I8042 controller are based on Port Mapped IO. Each started <code>vcpu</code> is being set with a MMIO bus for the virtio devices and a PMIO bus for the legacy devices:</p>
+<div><div><pre><code><span>pub</span> <span>fn</span> <span>start_vcpus</span><span>(</span>
+        <span>&amp;</span><span>mut</span> <span>self</span><span>,</span>
+        <span>mut</span> <span>vcpus</span><span>:</span> <span>Vec</span><span>&lt;</span><span>Vcpu</span><span>&gt;</span><span>,</span>
+        <span>vcpu_seccomp_filter</span><span>:</span> <span>Arc</span><span>&lt;</span><span>BpfProgram</span><span>&gt;</span><span>,</span>
+    <span>)</span> <span>-&gt;</span> <span>Result</span><span>&lt;</span><span>()</span><span>&gt;</span> <span>{</span>
+        <span>// ... redacted</span>
+
+        <span>for</span> <span>mut</span> <span>vcpu</span> <span>in</span> <span>vcpus</span><span>.drain</span><span>(</span><span>..</span><span>)</span> <span>{</span>
+                <span>vcpu</span><span>.set_mmio_bus</span><span>(</span><span>self</span><span>.mmio_device_manager.bus</span><span>.clone</span><span>());</span>
+                <span>#[cfg(target_arch</span> <span>=</span> <span>"x86_64"</span><span>)]</span>
+                <span>vcpu</span><span>.kvm_vcpu</span>
+                    <span>.set_pio_bus</span><span>(</span><span>self</span><span>.pio_device_manager.io_bus</span><span>.clone</span><span>());</span>
+
+                <span>// … redacted</span>
+        <span>}</span>
+
+        <span>// ... redacted</span>
+        
+        <span>Ok</span><span>(())</span>
+<span>}</span>
+</code></pre></div></div>
+<p>Source: <a href="https://github.com/firecracker-microvm/firecracker/blob/6b4a4b1c0490e006e02db7579831cbf14e05abae/src/vmm/src/lib.rs#L276">firecracker/src/vmm/src/lib.rs</a></p>
+
+<p>MMIO reads and writes trigger a VMExit which are handled, among other things, in a function named <code>run_emulation()</code> which runs the VCPU (will be discussed later on). Those VmExits are used for accessing the device’s control plane (i.e, its configuration space):</p>
+<div><div><pre><code><span>/// Runs the vCPU in KVM context and handles the kvm exit reason.</span>
+<span>///</span>
+<span>/// Returns error or enum specifying whether emulation was handled or interrupted.</span>
+<span>pub</span> <span>fn</span> <span>run_emulation</span><span>(</span><span>&amp;</span><span>self</span><span>)</span> <span>-&gt;</span> <span>Result</span><span>&lt;</span><span>VcpuEmulation</span><span>&gt;</span> <span>{</span>
+    <span>match</span> <span>self</span><span>.emulate</span><span>()</span> <span>{</span>
+        <span>VcpuExit</span><span>::</span><span>MmioRead</span><span>(</span><span>addr</span><span>,</span> <span>data</span><span>)</span> <span>=&gt;</span> <span>{</span>
+            <span>if</span> <span>let</span> <span>Some</span><span>(</span><span>mmio_bus</span><span>)</span> <span>=</span> <span>&amp;</span><span>self</span><span>.kvm_vcpu.mmio_bus</span> <span>{</span>
+                <span>mmio_bus</span><span>.read</span><span>(</span><span>addr</span><span>,</span> <span>data</span><span>);</span>
+                <span>METRICS</span><span>.vcpu.exit_mmio_read</span><span>.inc</span><span>();</span>
+            <span>}</span>
+            <span>Ok</span><span>(</span><span>VcpuEmulation</span><span>::</span><span>Handled</span><span>)</span>
+        <span>}</span>
+        <span>VcpuExit</span><span>::</span><span>MmioWrite</span><span>(</span><span>addr</span><span>,</span> <span>data</span><span>)</span> <span>=&gt;</span> <span>{</span>
+            <span>if</span> <span>let</span> <span>Some</span><span>(</span><span>mmio_bus</span><span>)</span> <span>=</span> <span>&amp;</span><span>self</span><span>.kvm_vcpu.mmio_bus</span> <span>{</span>
+                <span>mmio_bus</span><span>.write</span><span>(</span><span>addr</span><span>,</span> <span>data</span><span>);</span>
+                <span>METRICS</span><span>.vcpu.exit_mmio_write</span><span>.inc</span><span>();</span>
+            <span>}</span>
+            <span>Ok</span><span>(</span><span>VcpuEmulation</span><span>::</span><span>Handled</span><span>)</span>
+        <span>}</span>
+        <span>// ... redacted</span>
+        <span>arch_specific_reason</span> <span>=&gt;</span> <span>{</span>
+            <span>// run specific architecture emulation.</span>
+            <span>self</span><span>.kvm_vcpu</span><span>.run_arch_emulation</span><span>(</span><span>arch_specific_reason</span><span>)</span>
+        <span>}</span>
+        <span>// ... redacted</span>
+    <span>}</span>
+<span>}</span>
+</code></pre></div></div>
+<p>Source: <a href="https://github.com/firecracker-microvm/firecracker/blob/9a9f933775266c6c72a4a4400d78bfce43645409/src/vmm/src/vstate/vcpu/mod.rs#L455">firecracker/src/vmm/src/vstate/vcpu/mod.rs</a></p>
+
+<p>PMIO reads and writes are arch-specific and handled separately:</p>
+<div><div><pre><code><span>/// Runs the vCPU in KVM context and handles the kvm exit reason.</span>
+<span>///</span>
+<span>/// Returns error or enum specifying whether emulation was handled or interrupted.</span>
+<span>pub</span> <span>fn</span> <span>run_arch_emulation</span><span>(</span><span>&amp;</span><span>self</span><span>,</span> <span>exit</span><span>:</span> <span>VcpuExit</span><span>)</span> <span>-&gt;</span> <span>super</span><span>::</span><span>Result</span><span>&lt;</span><span>VcpuEmulation</span><span>&gt;</span> <span>{</span>
+    <span>match</span> <span>exit</span> <span>{</span>
+        <span>VcpuExit</span><span>::</span><span>IoIn</span><span>(</span><span>addr</span><span>,</span> <span>data</span><span>)</span> <span>=&gt;</span> <span>{</span>
+            <span>if</span> <span>let</span> <span>Some</span><span>(</span><span>pio_bus</span><span>)</span> <span>=</span> <span>&amp;</span><span>self</span><span>.pio_bus</span> <span>{</span>
+                <span>pio_bus</span><span>.read</span><span>(</span><span>u64</span><span>::</span><span>from</span><span>(</span><span>addr</span><span>),</span> <span>data</span><span>);</span>
+                <span>METRICS</span><span>.vcpu.exit_io_in</span><span>.inc</span><span>();</span>
+            <span>}</span>
+            <span>Ok</span><span>(</span><span>VcpuEmulation</span><span>::</span><span>Handled</span><span>)</span>
+        <span>}</span>
+        <span>VcpuExit</span><span>::</span><span>IoOut</span><span>(</span><span>addr</span><span>,</span> <span>data</span><span>)</span> <span>=&gt;</span> <span>{</span>
+            <span>if</span> <span>let</span> <span>Some</span><span>(</span><span>pio_bus</span><span>)</span> <span>=</span> <span>&amp;</span><span>self</span><span>.pio_bus</span> <span>{</span>
+                <span>pio_bus</span><span>.write</span><span>(</span><span>u64</span><span>::</span><span>from</span><span>(</span><span>addr</span><span>),</span> <span>data</span><span>);</span>
+                <span>METRICS</span><span>.vcpu.exit_io_out</span><span>.inc</span><span>();</span>
+            <span>}</span>
+            <span>Ok</span><span>(</span><span>VcpuEmulation</span><span>::</span><span>Handled</span><span>)</span>
+        <span>}</span>
+    <span>// ... redacted</span>
+<span>}</span>
+</code></pre></div></div>
+<p>Source: <a href="https://github.com/firecracker-microvm/firecracker/blob/7edec888f8a4e496dffa55b75fab30836a122fad/src/vmm/src/vstate/vcpu/x86_64.rs#L397">firecracker/src/vmm/src/vstate/vcpu/x86_64.rs</a></p>
+
+<h3 id="network">Network</h3>
+
+<p>Guests’ network devices are backed by <code>tap</code> devices on the host:</p>
+<div><div><pre><code><span>impl</span> <span>Net</span> <span>{</span>
+    <span>/// Create a new virtio network device with the given TAP interface.</span>
+    <span>pub</span> <span>fn</span> <span>new_with_tap</span><span>(</span>
+        <span>id</span><span>:</span> <span>String</span><span>,</span>
+        <span>tap_if_name</span><span>:</span> <span>String</span><span>,</span>
+        <span>guest_mac</span><span>:</span> <span>Option</span><span>&lt;&amp;</span><span>MacAddr</span><span>&gt;</span><span>,</span>
+        <span>rx_rate_limiter</span><span>:</span> <span>RateLimiter</span><span>,</span>
+        <span>tx_rate_limiter</span><span>:</span> <span>RateLimiter</span><span>,</span>
+        <span>allow_mmds_requests</span><span>:</span> <span>bool</span><span>,</span>
+    <span>)</span> <span>-&gt;</span> <span>Result</span><span>&lt;</span><span>Self</span><span>&gt;</span> <span>{</span>
+        <span>let</span> <span>tap</span> <span>=</span> <span>Tap</span><span>::</span><span>open_named</span><span>(</span><span>&amp;</span><span>tap_if_name</span><span>)</span><span>.map_err</span><span>(</span><span>Error</span><span>::</span><span>TapOpen</span><span>)</span><span>?</span><span>;</span>
+
+        <span>// Set offload flags to match the virtio features below.</span>
+        <span>tap</span><span>.set_offload</span><span>(</span>
+            <span>net_gen</span><span>::</span><span>TUN_F_CSUM</span> <span>|</span> <span>net_gen</span><span>::</span><span>TUN_F_UFO</span> <span>|</span> <span>net_gen</span><span>::</span><span>TUN_F_TSO4</span> <span>|</span> <span>net_gen</span><span>::</span><span>TUN_F_TSO6</span><span>,</span>
+        <span>)</span>
+        <span>.map_err</span><span>(</span><span>Error</span><span>::</span><span>TapSetOffload</span><span>)</span><span>?</span><span>;</span>
+
+        <span>let</span> <span>vnet_hdr_size</span> <span>=</span> <span>vnet_hdr_len</span><span>()</span> <span>as</span> <span>i32</span><span>;</span>
+        <span>tap</span><span>.set_vnet_hdr_size</span><span>(</span><span>vnet_hdr_size</span><span>)</span>
+            <span>.map_err</span><span>(</span><span>Error</span><span>::</span><span>TapSetVnetHdrSize</span><span>)</span><span>?</span><span>;</span>
+
+        <span>let</span> <span>mut</span> <span>avail_features</span> <span>=</span> <span>1</span> <span>&lt;&lt;</span> <span>VIRTIO_NET_F_GUEST_CSUM</span>
+            <span>|</span> <span>1</span> <span>&lt;&lt;</span> <span>VIRTIO_NET_F_CSUM</span>
+            <span>|</span> <span>1</span> <span>&lt;&lt;</span> <span>VIRTIO_NET_F_GUEST_TSO4</span>
+            <span>|</span> <span>1</span> <span>&lt;&lt;</span> <span>VIRTIO_NET_F_GUEST_UFO</span>
+            <span>|</span> <span>1</span> <span>&lt;&lt;</span> <span>VIRTIO_NET_F_HOST_TSO4</span>
+            <span>|</span> <span>1</span> <span>&lt;&lt;</span> <span>VIRTIO_NET_F_HOST_UFO</span>
+            <span>|</span> <span>1</span> <span>&lt;&lt;</span> <span>VIRTIO_F_VERSION_1</span><span>;</span>
+
+        <span>// … redacted</span>
+    <span>}</span>
+    
+    <span>// … redacted</span>
+<span>}</span>
+</code></pre></div></div>
+<p>Source: <a href="https://github.com/firecracker-microvm/firecracker/blob/9a9f933775266c6c72a4a4400d78bfce43645409/src/vmm/src/vstate/vcpu/mod.rs#L455">firecracker/src/devices/src/virtio/net/device.rs</a></p>
+
+<h3 id="vsock">Vsock</h3>
+<p>Vsock was introduced as a method for a bi-directional host/guest communication. 
+An alternative approach would be using virtio-console which provides such host/guest interaction but is rather limited. First of all, multiplexing N:1 connections over 1:1 serial ports is hard and ought to be handled at the application level. In addition, the API is based on a character device rather than on a sockets API and the semantics is stream semantics and does not fit well with datagram protocols. On top and above that, there is a quite small, hardcoded port limit on the host machine of around 512.</p>
+
+<p>On the other end, Vsock offers regular unix domain sockets API (connect(), bind(), accept(), read(), write(), etc…) and therefore supports both datagram and stream semantics. There’s a dedicated address family called <code>AF_VSOCK</code> for that purpose. Source and destination addresses are made of tuples of 32-bit context ids (cid’s) and 32-bit ports in a host byte order.</p>
+
+<p>Firecracker supports host-initiated vsock connections where the MicroVM must be started with a configured vsock driver. It also supports guest-initiated connections requiring the host to be listening on a destination port, sending a <code>VIRTIO_VSOCK_OP_RST</code> message to the guest otherwise.</p>
+
+<h3 id="storage">Storage</h3>
+
+<p>For storage Firecracker implements virtio-block devices backed by files on the host. It does not use a filesystem passthrough solution (virtio-fs) for the time being (perhaps due to security concerns?). Note that since there’s no hot-plug in FC, all of the VM’s block devices need to be attached prior to running the VM. In addition, in order to successfully mount such devices to the VM they should all be pre-formatted with a filesystem that the guest kernel supports.</p>
+
+<p>All read and write operations are served using a single <code>requestq</code> virtio queue. Out of the official supported operations by the virtio specification:</p>
+<div><div><pre><code><span>#define VIRTIO_BLK_T_IN           0
+#define VIRTIO_BLK_T_OUT          1
+#define VIRTIO_BLK_T_FLUSH        4
+#define VIRTIO_BLK_T_DISCARD      11
+#define VIRTIO_BLK_T_WRITE_ZEROES 13
+</span></code></pre></div></div>
+
+<p>Firecracker only supports IN, OUT, and FLUSH:</p>
+<div><div><pre><code><span>pub</span> <span>enum</span> <span>RequestType</span> <span>{</span>
+    <span>In</span><span>,</span>
+    <span>Out</span><span>,</span>
+    <span>Flush</span><span>,</span>
+    <span>GetDeviceID</span><span>,</span>
+    <span>Unsupported</span><span>(</span><span>u32</span><span>),</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>A rootfs block device must be configured prior to booting the VM, like so:</p>
+<div><div><pre><code><span>rootfs_path</span><span>=</span><span>$(</span><span>pwd</span><span>)</span><span>"/your-rootfs.ext4"</span>
+curl <span>--unix-socket</span> /tmp/firecracker.socket <span>-i</span> <span>\</span>
+  <span>-X</span> PUT <span>'http://localhost/drives/rootfs'</span> <span>\</span>
+  <span>-H</span> <span>'Accept: application/json'</span>           <span>\</span>
+  <span>-H</span> <span>'Content-Type: application/json'</span>     <span>\</span>
+  <span>-d</span> <span>"{
+        </span><span>\"</span><span>drive_id</span><span>\"</span><span>: </span><span>\"</span><span>rootfs</span><span>\"</span><span>,
+        </span><span>\"</span><span>path_on_host</span><span>\"</span><span>: </span><span>\"</span><span>${</span><span>rootfs_path</span><span>}</span><span>\"</span><span>,
+        </span><span>\"</span><span>is_root_device</span><span>\"</span><span>: true,
+        </span><span>\"</span><span>is_read_only</span><span>\"</span><span>: false
+   }"</span>
+</code></pre></div></div>
+
+<p>An example for how to create a minimal rootfs image can be found at Firecracker’s <a href="https://github.com/firecracker-microvm/firecracker/blob/7edec888f8a4e496dffa55b75fab30836a122fad/docs/rootfs-and-kernel-setup.md#creating-a-rootfs-image">official docs</a>.</p>
+
+<h3 id="ballooning">Ballooning</h3>
+<p>Ballooning is a concept which is meant to provide a solution for overcommitting memory. It allows for host-controlled, on-demand allocation and reclaiming of guest memory.</p>
+
+<p>A virtio-balloon device works so that the balloon guest driver allocates memory until reaching its target, specified by the host, and reports those new memory addresses back. Similarly the balloon driver frees memory back to the guest itself if it has more than the host device asks for. It is an independent “memory consumer/allocator” inside the guest kernel, which competes for memory with other processes, and operates within the pre-boot RAM limitations of the VM.</p>
+
+<p>The host can remove balloon memory pages at will and hand them over to other guests. This enables the host to control and fine-tune each of its guests’ memory resources based on its own available resources, therefore enabling overcommitting.</p>
+
+<p>
+  <img src="https://i.imgur.com/i925RhD.png" alt="Ballooning">
+</p>
+
+<p>Virtio-balloon holds three virtio queues: <code>inflateq</code>, <code>deflateq</code>, and <code>statsq</code>.  Inflateq is used by the guest driver to report about addresses it has supplied to the host device (hence the “balloon” is inflated), while deflateq is used for reports of memory addresses used by the guest (hence the “balloon” is deflated). Statsq is optional and can be used by the guest to send out memory statistics.</p>
+
+<p>Firecracker’s implementation operates on a best-effort basis and works so that if a given VM fails to allocate additional memory pages, it prompts an error, sleeps for 200ms, and then attempts again.</p>
+
+<p>FC supports two of the three feature bits stated in the official virtio specification:</p>
+<ol>
+  <li><code>deflate_on_oom</code> (aka <code>VIRTIO_BALLOON_F_DEFLATE_ON_OOM</code>) - deflates memory from the balloon when processes which are not needed for kernel’s activities go OOM instead of killing them by OOM killer</li>
+  <li><code>stats_polling_interval_s</code> (aka <code>VIRTIO_BALLOON_F_STATS_VQ</code>) - specifies how often in seconds to send out statistics; disabled if set to 0.</li>
+</ol>
+
+<p>The third (or first) feature bit, which FC doesn’t turn on, is <code>VIRTIO_BALLOON_F_MUST_TELL_HOST</code> meant for telling the driver that the host must be told before pages from the balloon are used.</p>
+
+<p>Please note that the host must be monitored for any memory pressure on its own end and then operate the balloon accordingly. This is not a practical thing to do manually and should be dealt with automatically yet carefully.</p>
+
+<p>There a few security concerns and pitfalls requiring extra caring as documented in FC’s <a href="https://github.com/firecracker-microvm/firecracker/blob/7edec888f8a4e496dffa55b75fab30836a122fad/docs/ballooning.md">Firecracker Ballooning documentation</a>.</p>
+
+<p>If you’re interested in the implementation of the guest balloon driver, which is pretty straight-forward, take a look <a href="https://github.com/torvalds/linux/blob/master/drivers/virtio/virtio_balloon.c">here</a> and <a href="https://github.com/torvalds/linux/blob/a48b0872e69428d3d02994dcfad3519f01def7fa/mm/balloon_compaction.c">here</a>.</p>
+
+<h3 id="io-throttling">IO Throttling</h3>
+
+<p>Firecracker provides I/O rate limiting for its virtio-net and virtio-block devices, allowing for both bandwidth (bytes/sec) and operations per second throttling. The implementation is based on token buckets, one per each rate-limiter type.</p>
+
+<p>It is configurable via the api server and can be (optionally) configured per drive and per network interface. The configurable values are the refill time, the bucket size, and an optional one-time burst.</p>
+
+<p>See: <a href="https://github.com/firecracker-microvm/firecracker/blob/HEAD/src/api_server/swagger/firecracker.yaml#L1086">src/api_server/swagger/firecracker.yaml#L1086</a></p>
+
+<h3 id="legacy-devices">Legacy devices</h3>
+
+<p>As already mentioned, Firecracker emulates a few legacy devices on top of a PIO bus. For one, Firecracker emulates serial COM ports commonly seen on x86 as I/O ports <code>0x3f8</code>/<code>0x2f8</code>/<code>0x3e8</code>/<code>0x2e8</code>. More specifically it uses port <code>0x3f8</code> while <code>0x2f8</code>, <code>0x3e8</code>, and <code>0x2e8</code> are used as sinks connected nowhere. In addition, it also exposes an I8052 keyboard controller registered at port <code>0x060</code> and used by FC to control shutdowns and issue ctrl+alt+delete sequences used for that purpose.</p>
+
+<div><div><pre><code><span>pub</span> <span>fn</span> <span>register_devices</span><span>(</span><span>&amp;</span><span>mut</span> <span>self</span><span>,</span> <span>vm_fd</span><span>:</span> <span>&amp;</span><span>VmFd</span><span>)</span> <span>-&gt;</span> <span>Result</span><span>&lt;</span><span>()</span><span>&gt;</span> <span>{</span>
+    <span>self</span><span>.io_bus</span>
+        <span>.insert</span><span>(</span><span>self</span><span>.stdio_serial</span><span>.clone</span><span>(),</span> <span>0x3f8</span><span>,</span> <span>0x8</span><span>)</span>
+        <span>.map_err</span><span>(</span><span>Error</span><span>::</span><span>BusError</span><span>)</span><span>?</span><span>;</span>
+    <span>self</span><span>.io_bus</span>
+        <span>.insert</span><span>(</span>
+            <span>Arc</span><span>::</span><span>new</span><span>(</span><span>Mutex</span><span>::</span><span>new</span><span>(</span><span>devices</span><span>::</span><span>legacy</span><span>::</span><span>Serial</span><span>::</span><span>new_sink</span><span>(</span>
+                <span>self</span><span>.com_evt_2_4</span><span>.try_clone</span><span>()</span><span>.map_err</span><span>(</span><span>Error</span><span>::</span><span>EventFd</span><span>)</span><span>?</span><span>,</span>
+            <span>))),</span>
+            <span>0x2f8</span><span>,</span>
+            <span>0x8</span><span>,</span>
+        <span>)</span>
+        <span>.map_err</span><span>(</span><span>Error</span><span>::</span><span>BusError</span><span>)</span><span>?</span><span>;</span>
+    <span>self</span><span>.io_bus</span>
+        <span>.insert</span><span>(</span>
+            <span>Arc</span><span>::</span><span>new</span><span>(</span><span>Mutex</span><span>::</span><span>new</span><span>(</span><span>devices</span><span>::</span><span>legacy</span><span>::</span><span>Serial</span><span>::</span><span>new_sink</span><span>(</span>
+                <span>self</span><span>.com_evt_1_3</span><span>.try_clone</span><span>()</span><span>.map_err</span><span>(</span><span>Error</span><span>::</span><span>EventFd</span><span>)</span><span>?</span><span>,</span>
+            <span>))),</span>
+            <span>0x3e8</span><span>,</span>
+            <span>0x8</span><span>,</span>
+        <span>)</span>
+        <span>.map_err</span><span>(</span><span>Error</span><span>::</span><span>BusError</span><span>)</span><span>?</span><span>;</span>
+    <span>self</span><span>.io_bus</span>
+        <span>.insert</span><span>(</span>
+            <span>Arc</span><span>::</span><span>new</span><span>(</span><span>Mutex</span><span>::</span><span>new</span><span>(</span><span>devices</span><span>::</span><span>legacy</span><span>::</span><span>Serial</span><span>::</span><span>new_sink</span><span>(</span>
+                <span>self</span><span>.com_evt_2_4</span><span>.try_clone</span><span>()</span><span>.map_err</span><span>(</span><span>Error</span><span>::</span><span>EventFd</span><span>)</span><span>?</span><span>,</span>
+            <span>))),</span>
+            <span>0x2e8</span><span>,</span>
+            <span>0x8</span><span>,</span>
+        <span>)</span>
+        <span>.map_err</span><span>(</span><span>Error</span><span>::</span><span>BusError</span><span>)</span><span>?</span><span>;</span>
+    <span>self</span><span>.io_bus</span>
+        <span>.insert</span><span>(</span><span>self</span><span>.i8042</span><span>.clone</span><span>(),</span> <span>0x060</span><span>,</span> <span>0x5</span><span>)</span>
+        <span>.map_err</span><span>(</span><span>Error</span><span>::</span><span>BusError</span><span>)</span><span>?</span><span>;</span>
+
+    <span>vm_fd</span>
+        <span>.register_irqfd</span><span>(</span><span>&amp;</span><span>self</span><span>.com_evt_1_3</span><span>,</span> <span>4</span><span>)</span>
+        <span>.map_err</span><span>(|</span><span>e</span><span>|</span> <span>Error</span><span>::</span><span>EventFd</span><span>(</span><span>std</span><span>::</span><span>io</span><span>::</span><span>Error</span><span>::</span><span>from_raw_os_error</span><span>(</span><span>e</span><span>.errno</span><span>())))</span><span>?</span><span>;</span>
+    <span>vm_fd</span>
+        <span>.register_irqfd</span><span>(</span><span>&amp;</span><span>self</span><span>.com_evt_2_4</span><span>,</span> <span>3</span><span>)</span>
+        <span>.map_err</span><span>(|</span><span>e</span><span>|</span> <span>Error</span><span>::</span><span>EventFd</span><span>(</span><span>std</span><span>::</span><span>io</span><span>::</span><span>Error</span><span>::</span><span>from_raw_os_error</span><span>(</span><span>e</span><span>.errno</span><span>())))</span><span>?</span><span>;</span>
+    <span>vm_fd</span>
+        <span>.register_irqfd</span><span>(</span><span>&amp;</span><span>self</span><span>.kbd_evt</span><span>,</span> <span>1</span><span>)</span>
+        <span>.map_err</span><span>(|</span><span>e</span><span>|</span> <span>Error</span><span>::</span><span>EventFd</span><span>(</span><span>std</span><span>::</span><span>io</span><span>::</span><span>Error</span><span>::</span><span>from_raw_os_error</span><span>(</span><span>e</span><span>.errno</span><span>())))</span><span>?</span><span>;</span>
+
+    <span>Ok</span><span>(())</span>
+<span>}</span>
+</code></pre></div></div>
+<p>Source: <a href="https://github.com/firecracker-microvm/firecracker/blob/a367796e66eeac42d9ce1294c0fbbca6191e9cf3/src/vmm/src/device_manager/legacy.rs#L82">firecracker/src/vmm/src/device_manager/legacy.rs</a></p>
+
+<h3 id="vcpu-threads-and-vcpuid">VCPU threads and VCPUID</h3>
+
+<p>Firecracker spawns and manages each KVM vCPU emulation in a separate POSIX thread. Each such vCPU is neither an OS thread nor a process, but rather an execution mode supported by hardware. Intel VT-x, for instance, is a technology meant for assisting with running virtualized guests natively without requiring any software emulation. Intel’s technology offers two running modes: a. VMX root mode used for the host VMM, and b. VMX non-root mode used for executing guest instructions. It is assisted by a per-guest structure named Virtual Machine Control Structure, which is responsible for saving all context information both host &amp; guest modes need. This technology is used by KVM and thus by Firecracker to run vCPU.</p>
+
+<p>
+  <img src="https://i.imgur.com/MUj6Aon.png" alt="Firecracker execution model">
+</p>
+
+<p>Firecracker monitors each vCPU state, including VMExits and ioeventfd interrupts, and handles them accordingly in a state machine.</p>
+
+<p>Have a look here: <a href="https://github.com/firecracker-microvm/firecracker/blob/HEAD/src/vmm/src/vstate/vcpu/mod.rs">https://github.com/firecracker-microvm/firecracker/blob/HEAD/src/vmm/src/vstate/vcpu/mod.rs</a>.</p>
+
+<p>Another feature provided by Firecracker is CPUID feature masking. On x86 the <code>CPUID</code> instruction lets you query the processor for its capabilities, a much needed capability for some workloads. When running inside a VM this instruction won’t work well and requires emulation. KVM supports emulating <code>CPUID</code> using the <code>KVM_SET_CPUID2</code> ioctl which FC leverages.</p>
+
+<h3 id="microvm-metadata-service-mmds">MicroVM Metadata Service (MMDS)</h3>
+
+<p>The MMDS is a Firecracker mutable data store which lets the guest access host-provided JSON metadata. A possible use case of this feature is a credential rotation needed inside the guest, controlled by the host.</p>
+
+<p>This feature is consisted of three components:</p>
+<ol>
+  <li>The backend which is simply an API server endpoint allowing (pre-boot) configuration of the MMDS, and insertion &amp; retrieval of data from it</li>
+  <li>An in-memory data store holding JSON objects</li>
+  <li>A minimal, custom made HTTP/TCP/IPv4 stack handling guest requests heading to the MMDS IPv4 address named “Dumbo”</li>
+</ol>
+
+<p>Each frame coming at the virtio-net device from the guest is tested for its destination. If it’s found to be designated at the Metadata Service (and it’s turned on) then it will be forwarded to Dumbo. Afterwards it’ll get checked for a response which will be sent back to the guest given that there is enough room in the device’s ring buffer. If it is not designated at MMDS, it will be sent to the tap device instead.</p>
+
+<div><div><pre><code><span>// Tries to detour the frame to MMDS and if MMDS doesn't accept it, sends it on the host TAP.</span>
+<span>//</span>
+<span>// `frame_buf` should contain the frame bytes in a slice of exact length.</span>
+<span>// Returns whether MMDS consumed the frame.</span>
+<span>fn</span> <span>write_to_mmds_or_tap</span><span>(</span>
+    <span>mmds_ns</span><span>:</span> <span>Option</span><span>&lt;&amp;</span><span>mut</span> <span>MmdsNetworkStack</span><span>&gt;</span><span>,</span>
+    <span>rate_limiter</span><span>:</span> <span>&amp;</span><span>mut</span> <span>RateLimiter</span><span>,</span>
+    <span>frame_buf</span><span>:</span> <span>&amp;</span><span>[</span><span>u8</span><span>],</span>
+    <span>tap</span><span>:</span> <span>&amp;</span><span>mut</span> <span>Tap</span><span>,</span>
+    <span>guest_mac</span><span>:</span> <span>Option</span><span>&lt;</span><span>MacAddr</span><span>&gt;</span><span>,</span>
+<span>)</span> <span>-&gt;</span> <span>Result</span><span>&lt;</span><span>bool</span><span>&gt;</span> <span>{</span>
+    <span>let</span> <span>checked_frame</span> <span>=</span> <span>|</span><span>frame_buf</span><span>|</span> <span>{</span>
+        <span>frame_bytes_from_buf</span><span>(</span><span>frame_buf</span><span>)</span><span>.map_err</span><span>(|</span><span>e</span><span>|</span> <span>{</span>
+            <span>error!</span><span>(</span><span>"VNET header missing in the TX frame."</span><span>);</span>
+            <span>METRICS</span><span>.net.tx_malformed_frames</span><span>.inc</span><span>();</span>
+            <span>e</span>
+        <span>})</span>
+    <span>};</span>
+    <span>if</span> <span>let</span> <span>Some</span><span>(</span><span>ns</span><span>)</span> <span>=</span> <span>mmds_ns</span> <span>{</span>
+        <span>if</span> <span>ns</span><span>.detour_frame</span><span>(</span><span>checked_frame</span><span>(</span><span>frame_buf</span><span>)</span><span>?</span><span>)</span> <span>{</span>
+            <span>METRICS</span><span>.mmds.rx_accepted</span><span>.inc</span><span>();</span>
+
+            <span>// MMDS frames are not accounted by the rate limiter.</span>
+            <span>rate_limiter</span><span>.manual_replenish</span><span>(</span><span>frame_buf</span><span>.len</span><span>()</span> <span>as</span> <span>u64</span><span>,</span> <span>TokenType</span><span>::</span><span>Bytes</span><span>);</span>
+            <span>rate_limiter</span><span>.manual_replenish</span><span>(</span><span>1</span><span>,</span> <span>TokenType</span><span>::</span><span>Ops</span><span>);</span>
+
+            <span>// MMDS consumed the frame.</span>
+            <span>return</span> <span>Ok</span><span>(</span><span>true</span><span>);</span>
+        <span>}</span>
+    <span>}</span>
+
+    <span>// This frame goes to the TAP.</span>
+
+    <span>// Check for guest MAC spoofing.</span>
+    <span>if</span> <span>let</span> <span>Some</span><span>(</span><span>mac</span><span>)</span> <span>=</span> <span>guest_mac</span> <span>{</span>
+        <span>let</span> <span>_</span> <span>=</span> <span>EthernetFrame</span><span>::</span><span>from_bytes</span><span>(</span><span>checked_frame</span><span>(</span><span>frame_buf</span><span>)</span><span>?</span><span>)</span><span>.map</span><span>(|</span><span>eth_frame</span><span>|</span> <span>{</span>
+            <span>if</span> <span>mac</span> <span>!=</span> <span>eth_frame</span><span>.src_mac</span><span>()</span> <span>{</span>
+                <span>METRICS</span><span>.net.tx_spoofed_mac_count</span><span>.inc</span><span>();</span>
+            <span>}</span>
+        <span>});</span>
+    <span>}</span>
+
+    <span>match</span> <span>tap</span><span>.write</span><span>(</span><span>frame_buf</span><span>)</span> <span>{</span>
+        <span>Ok</span><span>(</span><span>_</span><span>)</span> <span>=&gt;</span> <span>{</span>
+            <span>METRICS</span><span>.net.tx_bytes_count</span><span>.add</span><span>(</span><span>frame_buf</span><span>.len</span><span>());</span>
+            <span>METRICS</span><span>.net.tx_packets_count</span><span>.inc</span><span>();</span>
+            <span>METRICS</span><span>.net.tx_count</span><span>.inc</span><span>();</span>
+        <span>}</span>
+        <span>Err</span><span>(</span><span>e</span><span>)</span> <span>=&gt;</span> <span>{</span>
+            <span>error!</span><span>(</span><span>"Failed to write to tap: {:?}"</span><span>,</span> <span>e</span><span>);</span>
+            <span>METRICS</span><span>.net.tap_write_fails</span><span>.inc</span><span>();</span>
+        <span>}</span>
+    <span>};</span>
+    <span>Ok</span><span>(</span><span>false</span><span>)</span>
+<span>}</span>
+</code></pre></div></div>
+<p>Source: <a href="https://github.com/firecracker-microvm/firecracker/blob/3f1c98c4ba2a50836eab0d50c1adc738180bf56e/src/devices/src/virtio/net/device.rs#L395">firecracker/src/devices/src/virtio/net/device.rs#L395</a></p>
+
+<p>For more info about the design of MMDS and Dumbo checkout these <a href="https://github.com/firecracker-microvm/firecracker/blob/HEAD/docs/mmds/mmds-design.md">design docs</a>.</p>
+
+<h3 id="jailer-seccomp-and-cgrouping">Jailer, Seccomp, and cgrouping</h3>
+
+<p>Additional sandboxing is added by Firecracker for even better security &amp; performance assurances:</p>
+<ol>
+  <li>Seccomp filters are applied by default to limit syscalls for the host per each of its threads (VMM, API servers, VCPUs). The default ones are the most restrictive, only allowing a minimum set of syscalls and parameters. The other options are having a custom filterset for advanced users, and having no seccomp filters at all which is highly not recommended. Take a look <a href="https://github.com/firecracker-microvm/firecracker/blob/main/resources/seccomp/x86_64-unknown-linux-musl.json">here</a> for the complete list of default filters.</li>
+  <li>A Jailer process which sets-up all required system resources: creating namespaces, calling <code>pivot_root()</code> &amp; <code>chroot()</code>, cgrouping, <code>mknod()</code>ing special paths like <code>/dev/kvm</code> inside the jail, and more. Afterwards it drops privileges and <code>exec()</code>’s into the Firecracker image.</li>
+  <li>The jailer provides support for using cgroups using the <code>--cgroup</code> flag.</li>
+  <li>It also supports using a dedicated netns and/or pid namespace.</li>
+</ol>
+
+<p>And Voila. That’s it for now.</p>
+
+<p>It is highly recommended to read the source code of this amazing project and explore it yourselves - <a href="https://github1s.com/firecracker-microvm/firecracker">https://github1s.com/firecracker-microvm/firecracker</a>.</p>
+
+</article>
+
+
+
+
+
+      </div></div>]]>
+            </description>
+            <link>https://www.talhoffman.com/2021/07/18/firecracker-internals/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-34964197</guid>
+            <pubDate>Tue, 28 Feb 2023 00:37:11 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Why CMake sucks (2021)]]>
             </title>
             <description>
 <![CDATA[
-Score 51 | Comments 55 (<a href="https://news.ycombinator.com/item?id=34964152">thread link</a>) | @deviantbit
+Score 55 | Comments 61 (<a href="https://news.ycombinator.com/item?id=34964152">thread link</a>) | @deviantbit
 <br/>
 February 27, 2023 | https://twdev.blog/2021/08/cmake/ | <a href="https://web.archive.org/web/*/https://twdev.blog/2021/08/cmake/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content"><p>CMake has become a de facto industry standard as a natural ancestor superseding autotools.  But is it actually an improvement?  Personally, after spending signifficant amount of time with CMake projects, I’m inclined to conclude that no, not really.  Below, I present why CMake sucks and why you shouldn’t use it for any of your projects.</p>
@@ -687,11 +1371,62 @@ February 27, 2023 | https://twdev.blog/2021/08/cmake/ | <a href="https://web.arc
         </item>
         <item>
             <title>
+<![CDATA[GTA: San Andreas-styled supermarket in Lviv, Ukraine (2020)]]>
+            </title>
+            <description>
+<![CDATA[
+Score 22 | Comments 7 (<a href="https://news.ycombinator.com/item?id=34961880">thread link</a>) | @botulidze
+<br/>
+February 27, 2023 | https://cubinskyi.club/2020/11/gta-san-andreas-supermarket-in-lviv-ukraine/ | <a href="https://web.archive.org/web/*/https://cubinskyi.club/2020/11/gta-san-andreas-supermarket-in-lviv-ukraine/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="gh-main">
+    <article>
+
+        <header>
+            <span>
+                3 min read
+                —
+                By <a href="https://cubinskyi.club/author/botulidze/">Serhiy Botulidze</a>
+                    in
+                    <a href="https://cubinskyi.club/tag/fun/">fun</a>
+                —
+                <time datetime="2020-11-07">Nov 7, 2020</time>
+            </span>
+
+            
+
+                <p>In Lviv (Ukraine), a new supermarket of the "Silpo" chain opened in the style of Venice Beach.</p>
+
+                <figure>
+        <img srcset="https://cubinskyi.club/content/images/size/w300/2023/02/123046389_3777511552259726_7078111466559942579_n.jpg 300w,
+                    https://cubinskyi.club/content/images/size/w720/2023/02/123046389_3777511552259726_7078111466559942579_n.jpg 720w,
+                    https://cubinskyi.club/content/images/size/w960/2023/02/123046389_3777511552259726_7078111466559942579_n.jpg 960w,
+                    https://cubinskyi.club/content/images/size/w1200/2023/02/123046389_3777511552259726_7078111466559942579_n.jpg 1200w,
+                    https://cubinskyi.club/content/images/size/w2000/2023/02/123046389_3777511552259726_7078111466559942579_n.jpg 2000w" sizes="(max-width: 1200px) 100vw, 1200px" src="https://cubinskyi.club/content/images/size/w1200/2023/02/123046389_3777511552259726_7078111466559942579_n.jpg" alt="GTA: San Andreas-themed supermarket in Lviv, Ukraine">
+    </figure>
+        </header>
+
+        <div>
+            <p>From their official Facebook <a href="https://www.facebook.com/media/set/?vanity=silpo&amp;set=a.3777510952259786">page</a>:</p><blockquote>This supermarket is about limitless creativity and self-expression. Street musicians, creative freedom, an entertainment pier with a roller coaster, Malibu lifeguards and palm trees - everything is ready, and everyone is waiting. Who was passing by got tanned, maybe even collected shells.</blockquote><figure><div><div><p><img src="https://cubinskyi.club/content/images/2023/02/123312139_3777511375593077_4407365738455997678_n.jpg" width="2000" height="1333" loading="lazy" alt="" srcset="https://cubinskyi.club/content/images/size/w600/2023/02/123312139_3777511375593077_4407365738455997678_n.jpg 600w, https://cubinskyi.club/content/images/size/w1000/2023/02/123312139_3777511375593077_4407365738455997678_n.jpg 1000w, https://cubinskyi.club/content/images/size/w1600/2023/02/123312139_3777511375593077_4407365738455997678_n.jpg 1600w, https://cubinskyi.club/content/images/2023/02/123312139_3777511375593077_4407365738455997678_n.jpg 2048w" sizes="(min-width: 720px) 720px"></p><p><img src="https://cubinskyi.club/content/images/2023/02/123026485_3777511558926392_7280799095757014417_n.jpg" width="2000" height="1333" loading="lazy" alt="" srcset="https://cubinskyi.club/content/images/size/w600/2023/02/123026485_3777511558926392_7280799095757014417_n.jpg 600w, https://cubinskyi.club/content/images/size/w1000/2023/02/123026485_3777511558926392_7280799095757014417_n.jpg 1000w, https://cubinskyi.club/content/images/size/w1600/2023/02/123026485_3777511558926392_7280799095757014417_n.jpg 1600w, https://cubinskyi.club/content/images/2023/02/123026485_3777511558926392_7280799095757014417_n.jpg 2048w" sizes="(min-width: 720px) 720px"></p><p><img src="https://cubinskyi.club/content/images/2023/02/123044901_3777511238926424_7598843387027112228_n.jpg" width="2000" height="1333" loading="lazy" alt="" srcset="https://cubinskyi.club/content/images/size/w600/2023/02/123044901_3777511238926424_7598843387027112228_n.jpg 600w, https://cubinskyi.club/content/images/size/w1000/2023/02/123044901_3777511238926424_7598843387027112228_n.jpg 1000w, https://cubinskyi.club/content/images/size/w1600/2023/02/123044901_3777511238926424_7598843387027112228_n.jpg 1600w, https://cubinskyi.club/content/images/2023/02/123044901_3777511238926424_7598843387027112228_n.jpg 2048w" sizes="(min-width: 720px) 720px"></p></div><div><p><img src="https://cubinskyi.club/content/images/2023/02/123389862_3777511782259703_9126695150557774731_n.jpg" width="2000" height="1333" loading="lazy" alt="" srcset="https://cubinskyi.club/content/images/size/w600/2023/02/123389862_3777511782259703_9126695150557774731_n.jpg 600w, https://cubinskyi.club/content/images/size/w1000/2023/02/123389862_3777511782259703_9126695150557774731_n.jpg 1000w, https://cubinskyi.club/content/images/size/w1600/2023/02/123389862_3777511782259703_9126695150557774731_n.jpg 1600w, https://cubinskyi.club/content/images/2023/02/123389862_3777511782259703_9126695150557774731_n.jpg 2048w" sizes="(min-width: 720px) 720px"></p><p><img src="https://cubinskyi.club/content/images/2023/02/123037822_3777511028926445_3831616143456270476_n.jpg" width="2000" height="1333" loading="lazy" alt="" srcset="https://cubinskyi.club/content/images/size/w600/2023/02/123037822_3777511028926445_3831616143456270476_n.jpg 600w, https://cubinskyi.club/content/images/size/w1000/2023/02/123037822_3777511028926445_3831616143456270476_n.jpg 1000w, https://cubinskyi.club/content/images/size/w1600/2023/02/123037822_3777511028926445_3831616143456270476_n.jpg 1600w, https://cubinskyi.club/content/images/2023/02/123037822_3777511028926445_3831616143456270476_n.jpg 2048w" sizes="(min-width: 720px) 720px"></p></div><div><p><img src="https://cubinskyi.club/content/images/2023/02/123175429_3777511728926375_265875289969543573_n.jpg" width="2000" height="1333" loading="lazy" alt="" srcset="https://cubinskyi.club/content/images/size/w600/2023/02/123175429_3777511728926375_265875289969543573_n.jpg 600w, https://cubinskyi.club/content/images/size/w1000/2023/02/123175429_3777511728926375_265875289969543573_n.jpg 1000w, https://cubinskyi.club/content/images/size/w1600/2023/02/123175429_3777511728926375_265875289969543573_n.jpg 1600w, https://cubinskyi.club/content/images/2023/02/123175429_3777511728926375_265875289969543573_n.jpg 2048w" sizes="(min-width: 720px) 720px"></p><p><img src="https://cubinskyi.club/content/images/2023/02/123027839_3777511885593026_6271322662600671115_n.jpg" width="2000" height="1851" loading="lazy" alt="" srcset="https://cubinskyi.club/content/images/size/w600/2023/02/123027839_3777511885593026_6271322662600671115_n.jpg 600w, https://cubinskyi.club/content/images/size/w1000/2023/02/123027839_3777511885593026_6271322662600671115_n.jpg 1000w, https://cubinskyi.club/content/images/size/w1600/2023/02/123027839_3777511885593026_6271322662600671115_n.jpg 1600w, https://cubinskyi.club/content/images/2023/02/123027839_3777511885593026_6271322662600671115_n.jpg 2048w" sizes="(min-width: 720px) 720px"></p></div></div></figure><p>Indoors area of 925 square meters, where visitors can find an entertainment pier, roller coasters, Venetian canals, surfboards, paint cans, palm trees, sand and ocean waves on the ceiling.</p><p>Fruits and vegetables were placed in "kiosks on wheels" - in the best beach traditions. In the murals, the designers encoded allusions to famous TV shows and a computer game from the City of Angels.</p><figure><div><div><p><img src="https://cubinskyi.club/content/images/2023/02/123140326_3777511602259721_3474721306558680975_n.jpg" width="2000" height="1333" loading="lazy" alt="" srcset="https://cubinskyi.club/content/images/size/w600/2023/02/123140326_3777511602259721_3474721306558680975_n.jpg 600w, https://cubinskyi.club/content/images/size/w1000/2023/02/123140326_3777511602259721_3474721306558680975_n.jpg 1000w, https://cubinskyi.club/content/images/size/w1600/2023/02/123140326_3777511602259721_3474721306558680975_n.jpg 1600w, https://cubinskyi.club/content/images/2023/02/123140326_3777511602259721_3474721306558680975_n.jpg 2048w" sizes="(min-width: 720px) 720px"></p><p><img src="https://cubinskyi.club/content/images/2023/02/123365947_3777863135557901_4488890728592967659_n.jpg" width="2000" height="1333" loading="lazy" alt="" srcset="https://cubinskyi.club/content/images/size/w600/2023/02/123365947_3777863135557901_4488890728592967659_n.jpg 600w, https://cubinskyi.club/content/images/size/w1000/2023/02/123365947_3777863135557901_4488890728592967659_n.jpg 1000w, https://cubinskyi.club/content/images/size/w1600/2023/02/123365947_3777863135557901_4488890728592967659_n.jpg 1600w, https://cubinskyi.club/content/images/2023/02/123365947_3777863135557901_4488890728592967659_n.jpg 2048w" sizes="(min-width: 720px) 720px"></p><p><img src="https://cubinskyi.club/content/images/2023/02/123304972_3777863085557906_9045894558112853044_n.jpg" width="2000" height="1333" loading="lazy" alt="" srcset="https://cubinskyi.club/content/images/size/w600/2023/02/123304972_3777863085557906_9045894558112853044_n.jpg 600w, https://cubinskyi.club/content/images/size/w1000/2023/02/123304972_3777863085557906_9045894558112853044_n.jpg 1000w, https://cubinskyi.club/content/images/size/w1600/2023/02/123304972_3777863085557906_9045894558112853044_n.jpg 1600w, https://cubinskyi.club/content/images/2023/02/123304972_3777863085557906_9045894558112853044_n.jpg 2048w" sizes="(min-width: 720px) 720px"></p></div><div><p><img src="https://cubinskyi.club/content/images/2023/02/123042264_3777511258926422_3905425045264984190_n.jpg" width="2000" height="1333" loading="lazy" alt="" srcset="https://cubinskyi.club/content/images/size/w600/2023/02/123042264_3777511258926422_3905425045264984190_n.jpg 600w, https://cubinskyi.club/content/images/size/w1000/2023/02/123042264_3777511258926422_3905425045264984190_n.jpg 1000w, https://cubinskyi.club/content/images/size/w1600/2023/02/123042264_3777511258926422_3905425045264984190_n.jpg 1600w, https://cubinskyi.club/content/images/2023/02/123042264_3777511258926422_3905425045264984190_n.jpg 2048w" sizes="(min-width: 720px) 720px"></p><p><img src="https://cubinskyi.club/content/images/2023/02/123360839_3777862188891329_550687745984604429_n.jpg" width="1365" height="2048" loading="lazy" alt="" srcset="https://cubinskyi.club/content/images/size/w600/2023/02/123360839_3777862188891329_550687745984604429_n.jpg 600w, https://cubinskyi.club/content/images/size/w1000/2023/02/123360839_3777862188891329_550687745984604429_n.jpg 1000w, https://cubinskyi.club/content/images/2023/02/123360839_3777862188891329_550687745984604429_n.jpg 1365w" sizes="(min-width: 720px) 720px"></p><p><img src="https://cubinskyi.club/content/images/2023/02/123423704_3777862412224640_4908029803129987128_n.jpg" width="1365" height="2048" loading="lazy" alt="" srcset="https://cubinskyi.club/content/images/size/w600/2023/02/123423704_3777862412224640_4908029803129987128_n.jpg 600w, https://cubinskyi.club/content/images/size/w1000/2023/02/123423704_3777862412224640_4908029803129987128_n.jpg 1000w, https://cubinskyi.club/content/images/2023/02/123423704_3777862412224640_4908029803129987128_n.jpg 1365w" sizes="(min-width: 720px) 720px"></p></div><div><p><img src="https://cubinskyi.club/content/images/2023/02/123322803_3777862208891327_6731628857577191085_n.jpg" width="2000" height="1333" loading="lazy" alt="" srcset="https://cubinskyi.club/content/images/size/w600/2023/02/123322803_3777862208891327_6731628857577191085_n.jpg 600w, https://cubinskyi.club/content/images/size/w1000/2023/02/123322803_3777862208891327_6731628857577191085_n.jpg 1000w, https://cubinskyi.club/content/images/size/w1600/2023/02/123322803_3777862208891327_6731628857577191085_n.jpg 1600w, https://cubinskyi.club/content/images/2023/02/123322803_3777862208891327_6731628857577191085_n.jpg 2048w" sizes="(min-width: 720px) 720px"></p><p><img src="https://cubinskyi.club/content/images/2023/02/123119828_3777862868891261_2793747938868174223_n.jpg" width="2000" height="1333" loading="lazy" alt="" srcset="https://cubinskyi.club/content/images/size/w600/2023/02/123119828_3777862868891261_2793747938868174223_n.jpg 600w, https://cubinskyi.club/content/images/size/w1000/2023/02/123119828_3777862868891261_2793747938868174223_n.jpg 1000w, https://cubinskyi.club/content/images/size/w1600/2023/02/123119828_3777862868891261_2793747938868174223_n.jpg 1600w, https://cubinskyi.club/content/images/2023/02/123119828_3777862868891261_2793747938868174223_n.jpg 2048w" sizes="(min-width: 720px) 720px"></p><p><img src="https://cubinskyi.club/content/images/2023/02/123189414_3777862212224660_5648323242744367491_n.jpg" width="2000" height="1333" loading="lazy" alt="" srcset="https://cubinskyi.club/content/images/size/w600/2023/02/123189414_3777862212224660_5648323242744367491_n.jpg 600w, https://cubinskyi.club/content/images/size/w1000/2023/02/123189414_3777862212224660_5648323242744367491_n.jpg 1000w, https://cubinskyi.club/content/images/size/w1600/2023/02/123189414_3777862212224660_5648323242744367491_n.jpg 1600w, https://cubinskyi.club/content/images/2023/02/123189414_3777862212224660_5648323242744367491_n.jpg 2048w" sizes="(min-width: 720px) 720px"></p></div></div></figure><p>The opening party – back in November 2020 – included a live DJ, a photo booth and some non-alcohol cocktails for the best shopping experience.</p><figure><div><div><p><img src="https://cubinskyi.club/content/images/2023/02/123413614_3777862618891286_3107809566026071529_n.jpg" width="2000" height="1333" loading="lazy" alt="" srcset="https://cubinskyi.club/content/images/size/w600/2023/02/123413614_3777862618891286_3107809566026071529_n.jpg 600w, https://cubinskyi.club/content/images/size/w1000/2023/02/123413614_3777862618891286_3107809566026071529_n.jpg 1000w, https://cubinskyi.club/content/images/size/w1600/2023/02/123413614_3777862618891286_3107809566026071529_n.jpg 1600w, https://cubinskyi.club/content/images/2023/02/123413614_3777862618891286_3107809566026071529_n.jpg 2048w" sizes="(min-width: 720px) 720px"></p><p><img src="https://cubinskyi.club/content/images/2023/02/123360346_3777862418891306_7392372895730689553_n.jpg" width="2000" height="1333" loading="lazy" alt="" srcset="https://cubinskyi.club/content/images/size/w600/2023/02/123360346_3777862418891306_7392372895730689553_n.jpg 600w, https://cubinskyi.club/content/images/size/w1000/2023/02/123360346_3777862418891306_7392372895730689553_n.jpg 1000w, https://cubinskyi.club/content/images/size/w1600/2023/02/123360346_3777862418891306_7392372895730689553_n.jpg 1600w, https://cubinskyi.club/content/images/2023/02/123360346_3777862418891306_7392372895730689553_n.jpg 2048w" sizes="(min-width: 720px) 720px"></p><p><img src="https://cubinskyi.club/content/images/2023/02/123346964_3777863342224547_4084014564931908339_n.jpg" width="1365" height="2048" loading="lazy" alt="" srcset="https://cubinskyi.club/content/images/size/w600/2023/02/123346964_3777863342224547_4084014564931908339_n.jpg 600w, https://cubinskyi.club/content/images/size/w1000/2023/02/123346964_3777863342224547_4084014564931908339_n.jpg 1000w, https://cubinskyi.club/content/images/2023/02/123346964_3777863342224547_4084014564931908339_n.jpg 1365w" sizes="(min-width: 720px) 720px"></p></div><div><p><img src="https://cubinskyi.club/content/images/2023/02/123137028_3777863158891232_8902073204115645043_n.jpg" width="2000" height="1333" loading="lazy" alt="" srcset="https://cubinskyi.club/content/images/size/w600/2023/02/123137028_3777863158891232_8902073204115645043_n.jpg 600w, https://cubinskyi.club/content/images/size/w1000/2023/02/123137028_3777863158891232_8902073204115645043_n.jpg 1000w, https://cubinskyi.club/content/images/size/w1600/2023/02/123137028_3777863158891232_8902073204115645043_n.jpg 1600w, https://cubinskyi.club/content/images/2023/02/123137028_3777863158891232_8902073204115645043_n.jpg 2048w" sizes="(min-width: 720px) 720px"></p><p><img src="https://cubinskyi.club/content/images/2023/02/123336170_3777862555557959_9112829172870857184_n.jpg" width="1365" height="2048" loading="lazy" alt="" srcset="https://cubinskyi.club/content/images/size/w600/2023/02/123336170_3777862555557959_9112829172870857184_n.jpg 600w, https://cubinskyi.club/content/images/size/w1000/2023/02/123336170_3777862555557959_9112829172870857184_n.jpg 1000w, https://cubinskyi.club/content/images/2023/02/123336170_3777862555557959_9112829172870857184_n.jpg 1365w" sizes="(min-width: 720px) 720px"></p><p><img src="https://cubinskyi.club/content/images/2023/02/123333964_3777863375557877_4915700276311735060_n.jpg" width="1365" height="2048" loading="lazy" alt="" srcset="https://cubinskyi.club/content/images/size/w600/2023/02/123333964_3777863375557877_4915700276311735060_n.jpg 600w, https://cubinskyi.club/content/images/size/w1000/2023/02/123333964_3777863375557877_4915700276311735060_n.jpg 1000w, https://cubinskyi.club/content/images/2023/02/123333964_3777863375557877_4915700276311735060_n.jpg 1365w" sizes="(min-width: 720px) 720px"></p></div><div><p><img src="https://cubinskyi.club/content/images/2023/02/123122027_3777862835557931_1125471800486309254_n.jpg" width="2000" height="1333" loading="lazy" alt="" srcset="https://cubinskyi.club/content/images/size/w600/2023/02/123122027_3777862835557931_1125471800486309254_n.jpg 600w, https://cubinskyi.club/content/images/size/w1000/2023/02/123122027_3777862835557931_1125471800486309254_n.jpg 1000w, https://cubinskyi.club/content/images/size/w1600/2023/02/123122027_3777862835557931_1125471800486309254_n.jpg 1600w, https://cubinskyi.club/content/images/2023/02/123122027_3777862835557931_1125471800486309254_n.jpg 2048w" sizes="(min-width: 720px) 720px"></p><p><img src="https://cubinskyi.club/content/images/2023/02/123351079_3777862795557935_744496328749567167_n.jpg" width="2000" height="1333" loading="lazy" alt="" srcset="https://cubinskyi.club/content/images/size/w600/2023/02/123351079_3777862795557935_744496328749567167_n.jpg 600w, https://cubinskyi.club/content/images/size/w1000/2023/02/123351079_3777862795557935_744496328749567167_n.jpg 1000w, https://cubinskyi.club/content/images/size/w1600/2023/02/123351079_3777862795557935_744496328749567167_n.jpg 1600w, https://cubinskyi.club/content/images/2023/02/123351079_3777862795557935_744496328749567167_n.jpg 2048w" sizes="(min-width: 720px) 720px"></p><p><img src="https://cubinskyi.club/content/images/2023/02/123338454_3777862612224620_1898822254299661002_n.jpg" width="2000" height="1333" loading="lazy" alt="" srcset="https://cubinskyi.club/content/images/size/w600/2023/02/123338454_3777862612224620_1898822254299661002_n.jpg 600w, https://cubinskyi.club/content/images/size/w1000/2023/02/123338454_3777862612224620_1898822254299661002_n.jpg 1000w, https://cubinskyi.club/content/images/size/w1600/2023/02/123338454_3777862612224620_1898822254299661002_n.jpg 1600w, https://cubinskyi.club/content/images/2023/02/123338454_3777862612224620_1898822254299661002_n.jpg 2048w" sizes="(min-width: 720px) 720px"></p></div></div></figure>
+        </div>
+
+            
+
+        
+
+    </article>
+</div></div>]]>
+            </description>
+            <link>https://cubinskyi.club/2020/11/gta-san-andreas-supermarket-in-lviv-ukraine/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-34961880</guid>
+            <pubDate>Mon, 27 Feb 2023 21:08:34 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Unidentified Halo, an anti-surveillance wearable project]]>
             </title>
             <description>
 <![CDATA[
-Score 61 | Comments 14 (<a href="https://news.ycombinator.com/item?id=34960965">thread link</a>) | @interweb
+Score 87 | Comments 27 (<a href="https://news.ycombinator.com/item?id=34960965">thread link</a>) | @interweb
 <br/>
 February 27, 2023 | https://beccaricks.space/Unidentified-Halo | <a href="https://web.archive.org/web/*/https://beccaricks.space/Unidentified-Halo">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -721,7 +1456,7 @@ February 27, 2023 | https://www.abc.net.au/news/2023-02-26/why-do-we-stop-explor
             </title>
             <description>
 <![CDATA[
-Score 117 | Comments 135 (<a href="https://news.ycombinator.com/item?id=34960465">thread link</a>) | @warrenm
+Score 142 | Comments 172 (<a href="https://news.ycombinator.com/item?id=34960465">thread link</a>) | @warrenm
 <br/>
 February 27, 2023 | https://anglish.org/wiki/Anglish | <a href="https://web.archive.org/web/*/https://anglish.org/wiki/Anglish">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="mw-content-text" lang="en" dir="ltr"><div><p><span data-nosnippet=""><strong>What is Anglish?</strong></span>
@@ -808,7 +1543,7 @@ Transclusion expansion time report (%,ms,calls,template)
             </title>
             <description>
 <![CDATA[
-Score 22 | Comments 2 (<a href="https://news.ycombinator.com/item?id=34960001">thread link</a>) | @chromakode
+Score 35 | Comments 3 (<a href="https://news.ycombinator.com/item?id=34960001">thread link</a>) | @chromakode
 <br/>
 February 27, 2023 | https://chromakode.com/post/the-rise-of-self-hosted-apps/ | <a href="https://web.archive.org/web/*/https://chromakode.com/post/the-rise-of-self-hosted-apps/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>Here’s a sleeper prediction: a new crop of killer consumer apps are coming: <a href="https://www.reddit.com/r/selfhosted">self-hosted</a> <a href="https://web.dev/progressive-web-apps">PWAs</a>, and they will replace cloud services for <a href="https://github.com/Haxxnet/Compose-Examples">many uses</a>.</p><p>To name a few:</p><ul><li><p><strong><a href="https://www.home-assistant.io/">Home Assistant</a></strong> is a universal personal automation system, combining every smart device and data source available into dashboards, plots, and <a href="https://ifttt.com/">IFTTT</a>-like automations.</p></li><li><p><strong><a href="https://frigate.video/">Frigate</a></strong> monitors security cameras with private realtime AI object recognition.</p></li><li><p><strong><a href="https://docs.paperless-ngx.com/">Paperless</a></strong> indexes scanned documents with OCR and neural net based categorization.</p></li><li><p><strong><a href="https://www.photoprism.app/">PhotoPrism</a></strong> is an AI-powered private photo organizer with auto labeling and face recognition.</p></li><li><p><strong><a href="https://github.com/coder/code-server">code-server</a></strong> is <a href="https://code.visualstudio.com/">VSCode</a>, the <a href="https://survey.stackoverflow.co/2022/#section-most-popular-technologies-integrated-development-environment">most popular code editor</a>, with self-hosted remote access.</p></li></ul><p>There’s a <em>buzz</em> building around apps like <a href="https://www.home-assistant.io/">Home Assistant</a>, which casts a large shadow over the smart home industry. You may not have heard of most of these apps before — that’s not unexpected. The technical knowledge required to set them up mostly relegates them to nerds running <a href="https://www.reddit.com/r/homelab">homelabs</a>.</p><p>Thanks to favorable market conditions, home turf advantages of open source software, and a raft of enabling technologies from the past few years, there’s never been a better time for a few leading self-hosted apps to explode in popularity. Let’s dive into this phenomenon.</p><h2 id="users-want-to-own-their-data">Users want to own their data</h2><p>Recently, <a href="https://www.theverge.com/2022/11/30/23486753/anker-eufy-security-camera-cloud-private-encryption-authentication-storage">Eufy cameras were found to be uploading footage to their cloud</a>. Notably, these cameras were <a href="https://www.theverge.com/2022/12/16/23512952/anker-eufy-delete-promises-camera-privacy-encryption-authentication">marketed with claims of private, local-only storage</a>. In the same month, home air quality monitor <a href="https://www.reddit.com/r/Awair/comments/y7i5ku/awair_discontinues_support_for_v1_devices">Awair junked their first generation of connected devices</a> by discontinuing the cloud services on short notice. Through unaudited design faults and a business model which treats hosting as a cost center, IoT manufacturers are failing to deliver on privacy or longevity.</p><p>In a <a href="https://www.cisco.com/c/dam/en_us/about/doing_business/trust-center/docs/cisco-consumer-privacy-survey-2022.pdf">survey by Cisco in June 2022</a>, 76% of respondents said they would not buy from a company they do not trust with their data. The study classified 32% as “privacy actives”, who identified as: caring about data privacy, willing to invest time and money in it, and had actually <em>switched providers</em> based on their data policies. In a 2021 US survey, <a href="https://advisory.kpmg.us/articles/2021/bridging-the-trust-chasm.html">KPMG found 86% say data privacy is a growing concern</a>, with 30% responding that under no circumstances would they be willing to share personal info with businesses.</p><p>This is the sweet spot for open source self-hosted apps. Self-hosted apps have a home field advantage where data is private and sensitive: the sensors in your home, security cameras, paperwork, passwords, personal photos, and health data. There is latent unserved demand for apps which offer users confidence their data is <em>truly</em> private.</p><h2 id="local--fast">Local = fast</h2><p>Another major benefit of local apps is latency. This is something you immediately feel when interacting with them. Every operation is nearly instant. The effect is magnified for users with slow or unreliable internet, or those without an always-on connection. Even with the shift towards edge computing to bring servers as close as possible to metro areas, for realtime automation and recognition tasks, you can’t beat physics: local apps will win.</p><h2 id="self-hosted-ai-has-a-bright-future">Self-hosted AI has a bright future</h2><p>Local AI is a notable feature of the majority of apps I listed above. Historically, large firms have had an advantage here. They have larger data sets to work with and off-the-shelf alternatives were generations behind. While <a href="https://blogs.nvidia.com/blog/2023/01/26/what-are-large-language-models-used-for">LLMs</a> currently require impractically expensive hardware to run, thanks to projects like <a href="https://github.com/openai/whisper">Whisper</a>, <a href="https://github.com/mozilla/DeepSpeech">DeepSpeech</a>, and <a href="https://huggingface.co/">Hugging Face</a>, an increasingly large class of cutting edge AI tools have become accessible to run locally.</p><p>An interesting scaling property of machine learning is that while vast amounts of compute are required to train models, the models themselves require orders of magnitude less time and energy to run. As it becomes cheaper to run models locally, inference in private spaces like speech and cameras are seeing a push towards local processing, both for speed and privacy.</p><h2 id="successful-communities-outcompete-big-tech">Successful communities outcompete big tech</h2><p>Let’s take another look at Home Assistant. One of its key successes is its <a href="https://www.home-assistant.io/integrations">massive library of integrations</a> with any device imaginable. The smart home industry faltered when it became a <a href="https://en.wikipedia.org/wiki/Cross_product">cross product</a> of individual hardware makers supporting Google, Apple, and Amazon’s disparate home automation systems. Product companies are bandwidth-limited by how they form partnerships. Planned two-way handshakes are slow vs. permissionless integrations built on APIs or hacks.</p><p>An army of nerds are now using Home Assistant to solve their specific problems and sharing how they did it. If you search for any particular home automation challenge, you’ll probably find one of the first results is on the <a href="https://community.home-assistant.io/">Home Assistant forum</a>.</p><p>Why have products like Google Home plateaued, while Home Assistant has taken off? To its part, Google Home has its own huge list of device integrations, but the controls it provides are too simplistic. An expensive, top-heavy product development team like Google or Apple has to focus on solving bounded problems. This makes them uncompetitive when the problem space is sparse and a community of devs are expanding the space for free.</p><h2 id="the-web-is-good-enough">The web is good enough</h2><p>The future of apps will not be installed individually on each device. Apps are becoming services you interact with across <em>all</em> your devices. Self-hosted web apps are uniquely well positioned for this, though there’s still a few pieces missing (particularly discovery of available local web-apps).</p><p><a href="https://web.dev/progressive-web-apps">Progressive Web Apps</a> have been around for a while, but have never had their day in the sun. One reason was the lack of <a href="https://webkit.org/blog/13877/web-push-for-web-apps-on-ios-and-ipados">push notifications on Mobile Safari</a>, which was recently announced to be added in iOS 16.4. It’s no coincidence that the apps I listed above are all PWAs: the web is easiest to develop for, works everywhere, and has the largest pool of developers.</p><p>A common critique is that web apps yield clunky user experiences. This will be debated endlessly in developer circles, but native feeling UI is not necessary for mass adoption; the bar is <a href="https://www.uxforthemasses.com/good-enough-design">“good enough”</a>. Component libraries have closed that gap. <a href="https://mui.com/">MUI</a>, <a href="https://chakra-ui.com/">Chakra</a>, and <a href="https://tailwindcss.com/">Tailwind</a> make it easy to create a UI which feels cohesive and adapts well to any sized device. Looking back across my 15 year professional history building apps, PWAs + an off the shelf component library are the fastest path to “good enough” that has ever been available.</p><h2 id="the-last-mile-is-a-huge-opportunity">The last mile is a huge opportunity</h2><p>It’s never been easier to self-host apps: <a href="https://letsencrypt.org/">Let’s Encrypt</a> made securing apps instant and automatic. <a href="https://www.docker.com/">Docker</a> made them easy to install. Aside from <a href="https://www.raspberrypi.org/">Raspberry Pis</a> becoming <a href="https://rpilocator.com/">unobtanium</a> over the past year, there are <a href="https://pine64.com/">many</a> <a href="https://rockpi.org/">available</a> small low power computers in the $30-50 dollar range.</p><p>However, let’s be real: <strong>the biggest thing holding self-hosted apps back is they’re <em>still</em> too difficult to install</strong>.</p><p>A potential user must be able to:</p><ul><li>Set up Linux on a device and get it onto their network.</li><li>Follow installation instructions specific to their chosen apps and distro.</li><li>Configure subtleties like DNS and HTTPS, then open the right address in their browser.</li></ul><p>These steps are hindered by there being multiple ways to accomplish them, yet no best way.</p><p>For self-hosted apps to succeed, 5 minutes must be all it takes to get up and running. It must be trivial to discover and install new apps, and the apps themselves must be immediately locatable on all of your devices.</p><p>One promising approach would be a physical device which tunnels to the internet for external access. Such a tunnel could simplify user setup greatly by providing an easy to remember URL and automated certificate management. This is what <a href="https://www.home-assistant.io/yellow">Home Assistant Yellow</a> is doing, complete with an <a href="https://www.home-assistant.io/addons">add-on browser</a> where you can install containers packaging other apps.</p><p>The future of self-hosted apps looks bright, but to have a shot at disrupting the past decade’s markets dominated by cloud hosting, they must solve this adoption problem. There is a chicken-and-egg problem here, but all that’s remaining is a foot in the door. As more <a href="https://github.com/Haxxnet/Compose-Examples">awesome self-hosted apps</a> appear, the incentive to ease adoption grows. Once you’ve solved it for one app, you’ve opened the door for others.</p><p>I think it will take vision and creative thinking, but eventually this dam will break. We’ve seen this story play out many times before in the history of computing. When free apps are trustworthy, solve a problem well, <em>and</em> become easy to adopt, they take off explosively.</p></div></div>]]>
@@ -823,7 +1558,7 @@ February 27, 2023 | https://chromakode.com/post/the-rise-of-self-hosted-apps/ | 
             </title>
             <description>
 <![CDATA[
-Score 91 | Comments 9 (<a href="https://news.ycombinator.com/item?id=34959895">thread link</a>) | @semihsalihoglu
+Score 110 | Comments 11 (<a href="https://news.ycombinator.com/item?id=34959895">thread link</a>) | @semihsalihoglu
 <br/>
 February 27, 2023 | https://kuzudb.com/blog/wcoj.html | <a href="https://web.archive.org/web/*/https://kuzudb.com/blog/wcoj.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="main-content" role="main"> <p> <a href="https://github.com/kuzudb/kuzu"><img src="https://kuzudb.com/kuzu-logo.png" width="300"></a> </p>  <p>by Semih Salihoğlu, Feb 22nd, 2023</p>  <p>Joins of a sets of records is objectively the most expensive operation in DBMSs. In my previous post on <a href="https://kuzudb.com/blog/factorization.html">factorization</a>, I said that in the field of databases, once in a while you run into a very simple idea that deviates from the norm that gets you very excited. Today, I will discuss another such idea, worst-case optimal join (wcoj) algorithms. Wcoj algorithms and the theory around it in one sentence says this:</p> <ul> <li>Queries involving complex “cyclic joins” over many-to-many relationships should be evaluated column at a time instead of table at a time, which is the norm. Wcoj algorithms find their best applications when finding cyclic patterns on graphs, such as cliques or cycles, which is common in the workloads of fraud detection and recommendation applications. As such, they should be integrated into every graph DBMS (and possibly to RDBMSs) and I am convinced that they eventually will.</li> </ul> <blockquote> <p><strong>Tldr: The key takeaways are:</strong></p> <ul> <li><strong>History of Wcoj Algorithms:</strong> Research on wcoj algorithms started with a solution to open question about the maximum sizes of join queries. This result made researchers realize this: the traditional “binary join plans” paradigm of generating query plans that join 2 tables a time until all of the tables in the query are joined is provably suboptimal for some queries. Specifically, when join queries are cyclic, which in graph terms means when the searched graph pattern has cycles in it, and the relationships between records are many-to-many, then this paradigm can generate unnecessarily large amounts of intermediate results.</li> <li><strong>Core Algorithmic Step of Wcoj Algorithms:</strong> Wcoj algorithms fix this sub-optimality by performing the joins one column at a time (instead of 2 tables at a time) using multiway intersections.</li> <li><strong>How Kùzu Integrates Wcoj Algorithms:</strong> Kùzu generates plans that seamlessly mix binary joins and wcoj-style multiway intersections. Multiway intersections are performed by an operator called “multiway HashJoin”, which has one or more build phases that creates one or more hash tables that stores sorted adjacency lists; and a probe phase that performs multi-way intersections using the sorted lists.</li> <li><strong>Yes, the Term “Worst-case Optimal” Is Confusing Even to Don Knuth:</strong> I know, Don Knuth also found the term “worst-case optimal” a bit confusing. See my <a href="#a-thank-you--an-anecdote-about-knuths-reaction-to-the-term-worst-case-optimal">anecdote on this</a>. It basically means that the worst-case runtimes of these algorithms are asymptotically optimal.</li> </ul> </blockquote> <h2 id="joins-running-example--traditional-table-at-a-time-joins"> <a href="#joins-running-example--traditional-table-at-a-time-joins" aria-labelledby="joins-running-example--traditional-table-at-a-time-joins"></a> Joins, Running Example &amp; Traditional Table-at-a-time Joins </h2> <p>Joins are objectively the most expensive and powerful operation in DBMSs. In SQL, you indicate them in the FROM clause by listing a set of table names, in Cypher in the MATCH clause, where you draw a graph pattern to describe how to join node records with each other. As a running example, consider a simple social network of users and followers, whose node-link diagram is shown below. I am also showing the table that contains these records in a <code>User</code> (ignore the <code>name</code> property for now) and <code>Follows</code> tables.</p> <p> <img src="https://kuzudb.com/img/wcoj-running-ex-data.png" width="800"> </p> <p>Consider finding triangles, which is one of the simplest forms of cycles and cliques, in this network. The SQL and Cypher versions of this query are shown below.</p> <div><div><pre><code>SQL:
@@ -862,7 +1597,7 @@ kuzu&gt; COPY Links FROM 'web-edge.csv';
             </title>
             <description>
 <![CDATA[
-Score 103 | Comments 25 (<a href="https://news.ycombinator.com/item?id=34959639">thread link</a>) | @siraben
+Score 114 | Comments 26 (<a href="https://news.ycombinator.com/item?id=34959639">thread link</a>) | @siraben
 <br/>
 February 27, 2023 | https://www.crosslabs.org//blog/diffusion-with-offset-noise | <a href="https://web.archive.org/web/*/https://www.crosslabs.org//blog/diffusion-with-offset-noise">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><p>Fine-tuning against a modified noise, enables Stable Diffusion to generate very dark or light images easily.</p><div><p><a href="https://proceedings.neurips.cc/paper/2020/file/4c5bcfec8584af0d967f1ab10179ca4b-Paper.pdf" target="_blank">Denoising Diffusion Probabilistic Models</a> are a relatively new form of generative neural network model - models which produce samples from a high-dimensional probability distribution learned from data. Other approaches to the same class of problem include Generative Adversarial Networks, Normalizing Flows, and various forms of autoregressive models that sample dimensions one at a time or in blocks. One of the major applications of this kind of modelling is in image synthesis, and diffusion models have recently been very competitive with regards to image quality, particularly with regards to producing globally coherent composition across the image.&nbsp;</p><p><a href="https://stability.ai/blog/stable-diffusion-public-release" target="_blank">Stable Diffusion</a> is a pre-trained, publicly available model that can use this technique to produce some stunning results. However, it has an interesting limitation that seems to have mostly gone unnoticed. If you try to ask it to generate images that should be particularly dark or light, it almost always generates images whose average value is relatively close to 0.5 (with an entirely black image being 0, and an entirely white image being 1). For example:</p><figure><p><img src="https://uploads-ssl.webflow.com/5e338abdcf951ffb0e1fadb1/63d4b445644ead435a37a928_1080x1080-4x4-grid-basemodel1.jpg" loading="lazy" alt=""></p><figcaption>Top left: A dark alleyway in a rainstorm (0.301); Top right: Monochrome line-art logo on a white background (0.709); Bottom left: A snow-covered ski slope on a sunny day (0.641); Bottom right: A town square lit only by torchlight (0.452)</figcaption></figure><p><br>For the most part these images are still plausible. But the sort of soft constraint to have average value around 0.5 can lead to things being washed out, areas of bright fog to counteract other dark areas, high-frequency textures (in the logos) rather than empty areas, grey backgrounds rather than white or black, etc. While some of these can be corrected or adjusted by hand with post-processing, there’s also a larger potential limit here in that the overall palette of a scene can correlate with other aspects of presentation and composition in a way that the diffusion model can’t explore as freely as might be possible with other approaches.</p><p>But why is it doing this? Am I just imagining the effect and these results are ‘correct’? Is it just a matter of the training data, something about the architecture, <strong>or something about diffusion models in general?</strong> (It was the last).</p><p>First, though, to make sure I wasn’t just imagining things, I tried fine-tuning Stable Diffusion against a single solid black image. Generally fine-tuning Stable Diffusion (SD) works pretty well - there’s a technique called Dreambooth to teach SD new, specific concepts like a particular person’s face or a particular cat, and a few dozen images and a few thousand gradient updates are enough for the model to learn what that particular subject looks like. Extend that to ten thousand steps and it can start to memorize specific images.</p><p>But when I fine-tuned against this single, solid black image, even after 3000 steps I was still getting results like this for “A solid black image”:</p><figure><p><img src="https://uploads-ssl.webflow.com/5e338abdcf951ffb0e1fadb1/63d35f2d19e3bc9f34b8f59f_YZq5t9PWHMg529mQVsnkxPa1Xrpqqtfzmndj0t9v9RI40wM104EGBbLsMpx3LtxzdngAW7SW7No_VlX_E4tDPJSOqCsL0qbq1HwvhiSW3JtplIuyf5R1md835T0o2oP9eDWbhemSUshyTsXyF9sySRilGRYpJuZyYWFo4ojcmeFRio3UwuHxeFUaGla1Qw.png" alt=""></p><figcaption>Using the prompt: "A solid black image"</figcaption></figure><p><br>So it seems like not only does SD not have the ability to produce overly dark or light images out of the box, but it also <strong>can’t even learn to do it</strong>.</p><p>Well, not without changing one thing about it.</p><p>To understand what’s going on, it helps to example what exactly a diffusion model is learning to reverse. The usual way diffusion models are formulated is as the inverse of a particular forward stochastic process - repeated addition of small amounts of ‘independently and identically distributed’ (iid) Gaussian noise. That is to say, each pixel in the latent space receives its own random sample at each step. The diffusion model learns to take, say, an image after some number of these steps have been performed, and to figure out the direction to go in to follow that trajectory back to the original image. Given this model that can ‘step backwards towards a real image’, you start with pure noise and reverse the noising process to get a novel image.</p><p>The issue turns out to be that you don’t ever <strong>completely</strong> erase the original image during the forward process, so in turn the reverse model starting from pure noise doesn’t exactly get back to the complete true distribution of images. Instead, those things which noise destroys <strong>last</strong> are in turn most <strong>weakly </strong>altered by the reverse process - those things are instead inherited from the latent noise sample that is used to start to process.&nbsp;</p><p>It might not be obvious at first glance, but if you look at the forward process and how it disrupts an image, the longer wavelength features take longer for the noise to destroy:</p><figure><p><iframe allowfullscreen="true" frameborder="0" scrolling="no" src="https://www.youtube.com/embed/3C6yEYXDijM" title="Noise process"></iframe></p></figure><p>‍</p><figure><p><img src="https://uploads-ssl.webflow.com/5e338abdcf951ffb0e1fadb1/63d3601ff8a046255cf86b16_noise_graph3.png" loading="lazy" alt=""></p></figure><p>That’s why for example using the same latent noise seed but different prompts tends to give images that are related to each-other at the level of overall composition, but not at the level of individual textures or small-scale patterns. The diffusion process doesn’t know how to change those long-wavelength features. And the longest wavelength feature is the average value of the image as a whole, which is <strong>also</strong> the feature that is least likely to vary between independent samples of the latent noise.&nbsp;</p><p>This problem gets worse the higher the dimensionality of the target object is, because the standard deviation of a set of independent noise samples scales like 1/N. So if you’re generating a 4d vector this might not be much of a problem - you just need twice as many samples to get the lowest-frequency component as for the highest frequency component. But in Stable Diffusion at 512x512 resolution, you’re generating a 3 x 64^2 = 12288 dimensional object. So the longest wavelengths change about a factor of 100 slower than the shortest ones, meaning you’d need to be considering hundreds or thousands of steps of the process to capture that, when the default is around 50 (or for some sophisticated samplers, as low as 20).</p><figure><p><img src="https://uploads-ssl.webflow.com/5e338abdcf951ffb0e1fadb1/63d3c49ba6b96f54fae8def9_1020-graphs.jpg" loading="lazy" alt=""></p></figure><p>It does seem like increasing the number of sampling steps does help SD make more extreme images, but we can do a bit better and make a drop-in solution.</p><p>The trick has to do with the structure of the noise that we teach a diffusion model to reverse. Because we’re using iid samples, we have this 1/N. But what if we use noise that looks like an iid sample per pixel added to a single iid sample that is the same over the entire image instead?&nbsp;</p><p>In code terms, the current training loop uses noise that looks like:&nbsp;</p><h6>noise = torch.randn_like(latents)</h6><p><br>But instead, I could use something like this:</p><h6>noise = torch.randn_like(latents) + 0.1 * torch.randn(latents.shape[0], latents.shape[1], 1, 1)</h6><p><br>This would make it so that the model learns to change the zero-frequency of the component freely, because that component is now being randomized ~10 times faster than for the base distribution (the choice of 0.1 there worked well for me given my limited data and training time - if I made it too large it’d tend to dominate too much of the model’s existing behavior, but much smaller and I wouldn’t see an improvement).</p><p>Fine-tuning with noise like this for a thousand steps or so on just 40 hand-labeled images is enough to significantly change the behavior of Stable Diffusion, without making it get any worse at the things it could previously generate. Here are the results of the four prompts higher up in the article for comparison:</p><figure><p><img src="https://uploads-ssl.webflow.com/5e338abdcf951ffb0e1fadb1/63d4b4792108fe7f6b4ebe5c_1080x1080-4x4-grid-offset1.jpg" loading="lazy" alt=""></p><figcaption>Top right: A dark alleyway in a rainstorm (0.032); Top left: Monochrome line-art logo on a white background (0.974); Bottom left: Snow-covered ski slope on a sunny day (0.858); Bottom right: A town square lit only by torchlight. (0.031)</figcaption></figure><figure><p><img src="https://uploads-ssl.webflow.com/5e338abdcf951ffb0e1fadb1/63d3ce86df6ef1b3e1e58fe8_1080-additional-starry.jpg" loading="lazy" alt=""></p><figcaption>A starry sky before and after offset noise.</figcaption></figure><figure><p><img src="https://uploads-ssl.webflow.com/5e338abdcf951ffb0e1fadb1/63d3ce985fed08ce7da4651b_1080-additional-dark.jpg" loading="lazy" alt=""></p><figcaption>Superheroes fighting plant monsters in a dark alley before and after offset noise.</figcaption></figure><p>‍</p><p>There are a number of papers talking about changing the noise schedule of denoising diffusion models, as well as using <a href="https://arxiv.org/pdf/2106.07582.pdf" target="_blank">different distributions</a> than Gaussian for the noise, or even <a href="https://arxiv.org/pdf/2208.09392.pdf" target="_blank">removing noise altogether</a> and instead using other destructive operations like blurring or masking. However, most of the focus seems to be on accelerating the process of inference - being able to use fewer steps, basically. There doesn’t seem to be as much attention on how design decisions about the noise (or image-destroying operation) could constrain the types of images that can easily be synthesized. However, it’s quite relevant for the aesthetic and artistic uses of these models.&nbsp;</p><p>For an individual artist who is digging a bit into customizing these models and doing their own fine-tuning, adjusting to use this offset noise for one project or another wouldn’t be so difficult. You could just use <a href="https://drive.google.com/file/d/1Ah0RDr2RmPwaDmZOZz5LA2Wx_u7-NPgb/view?usp=share_link">our checkpoint</a> if you like (please read the note at the end before accessing this file) , for that matter. But with fine-tuning on a small number of images like this, the results aren’t ever going to be quite as general or quite as good as large projects could achieve.</p><p>So I’d like to conclude this with a request to those involved in training these large models: please incorporate a little bit of offset noise like this into the training process the next time you do a big run. It should significantly increase the expressive range of the models, allowing much better results for things like logos, cut-out figures, naturally bright and dark scenes, scenes with strongly colored lighting, etc. It’s a very easy trick!</p><p>‍</p><p>NOTE: We wanted to acknowledge that we were recently made aware of a trojan virus in the original file we uploaded. In an abundance of caution, we made the file private until we fully investigated the issue. After testing on multiple devices and with multiple anti-virus software programs, we were not able to replicate the finding of the trojan.</p><p>However, in light of the event, we have taken additional steps to enhance the security of our file and community. We are now posting a new file which uses SafeTensors for added security, as well as providing a checksum for our file a5d6ee70bf9edf1527a1659900eb1248 (md5sum), as we have also discovered that third-party sites are hosting the original checkpoint with Offset Noise and we would like to maintain the integrity of the file.The resources used for this checkpoint were Stable Diffusion's 1.5 model from runwayml on huggingface and royalty free images from Pexels. Finally, we provide this file as is, please use it under your own risk and considerations regarding your device's safety.</p></div></div>]]>
@@ -877,7 +1612,7 @@ February 27, 2023 | https://www.crosslabs.org//blog/diffusion-with-offset-noise 
             </title>
             <description>
 <![CDATA[
-Score 549 | Comments 215 (<a href="https://news.ycombinator.com/item?id=34958153">thread link</a>) | @alwaysbeconsing
+Score 613 | Comments 235 (<a href="https://news.ycombinator.com/item?id=34958153">thread link</a>) | @alwaysbeconsing
 <br/>
 February 27, 2023 | https://www.macpierce.com/the-camera-shy-hoodie | <a href="https://web.archive.org/web/*/https://www.macpierce.com/the-camera-shy-hoodie">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-block-type="2" id="block-76e00c926e554f7bd258"><div>
@@ -902,7 +1637,7 @@ February 27, 2023 | https://www.macpierce.com/the-camera-shy-hoodie | <a href="h
             </title>
             <description>
 <![CDATA[
-Score 193 | Comments 60 (<a href="https://news.ycombinator.com/item?id=34957953">thread link</a>) | @popey
+Score 208 | Comments 63 (<a href="https://news.ycombinator.com/item?id=34957953">thread link</a>) | @popey
 <br/>
 February 27, 2023 | https://determinate.systems/posts/determinate-nix-installer | <a href="https://web.archive.org/web/*/https://determinate.systems/posts/determinate-nix-installer">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-block-type="2" id="block-a1a3df26d5c9154ced59"><p>We at Determinate Systems are extremely excited to announce the release of the <a href="https://github.com/DeterminateSystems/nix-installer" target="_blank">Determinate Nix Installer</a>, a brand-new installer for <a href="https://nixos.org/" target="_blank">Nix</a>. You can run the installer on a <a href="https://github.com/determinateSystems/nix-installer#the-determinate-nix-installer" target="_blank">variety of systems</a>, including macOS, Linux, Windows via WSL2, and more, with this command:</p></div><div data-block-type="2" id="block-yui_3_17_2_1_1677507611471_3261"><div>
@@ -922,7 +1657,7 @@ February 27, 2023 | https://determinate.systems/posts/determinate-nix-installer 
             </title>
             <description>
 <![CDATA[
-Score 66 | Comments 31 (<a href="https://news.ycombinator.com/item?id=34957271">thread link</a>) | @Brajeshwar
+Score 72 | Comments 33 (<a href="https://news.ycombinator.com/item?id=34957271">thread link</a>) | @Brajeshwar
 <br/>
 February 27, 2023 | https://tlpnetwork.com/news/2023/02/first-image-from-sony-star-sphere-released | <a href="https://web.archive.org/web/*/https://tlpnetwork.com/news/2023/02/first-image-from-sony-star-sphere-released">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>Sony has released the first test picture from their new <a target="_blank" rel="noopener noreferrer nofollow" href="https://tlpnetwork.com/news/2023/01/sony-announces-star-sphere-project">Star Sphere satellite camera</a>.</p><p>In a groundbreaking achievement, the first space photograph has been successfully taken by EYE, using a test radio wave. The photograph captured by Sony's Star Sphere satellite shows the Chinese mainland from the sky over the Sea of Japan.</p><p><img src="https://cdn.tlpnetwork.com/uploads/1677363295436.jpeg"></p><h6><em>First Image Captured By Star Sphere EYE Camera | Credit: SONY</em></h6><p>Although the image was slightly overexposed, the Star Sphere EYE camera was confirmed to be working, marking a significant milestone in space photography. Now Sony will work to optimize the EYE camera parameters and fine tune it specifically for space photography. With these improvements, more stunning and breathtaking images from space are expected to follow soon.</p><p>This achievement marks a significant step forward in space exploration and opens up new opportunities for studying our planet and the universe beyond as Sony prepares to <a target="_blank" rel="noopener noreferrer nofollow" href="https://tlpnetwork.com/news/2023/01/sony-announces-star-sphere-project">give anyone the opportunity to take a picture from space, from their home</a>. "The possibilities for space photography are endless, and we can only imagine the incredible images that will be captured in the future"</p><h6><img src="https://cdn.tlpnetwork.com/uploads/1677363209787.png"><em>Image Planning Program Customers Will Use | Credit: SONY</em></h6><h2><strong>What is Star Sphere?</strong></h2><p>Sony's Star Sphere Inspiration Project aims to be the world first satellite that "anyone can freely operate and use to take pictures" from space. Star Sphere will offer 2 different services.</p><p><img src="https://cdn.tlpnetwork.com/uploads/1677363671462.jpg"></p><p>The Star Sphere satellite is set to orbit at an altitude range of 500-600 km above Earth, offering an unprecedented opportunity for users to select one of 16 possible orbits, each of which can be completed in approximately 90 minutes.</p><p>The satellite is equipped with a top-of-the-line Sony full-frame camera paired with a 28-135 mm f/4 lens, providing high-quality images from space. Users are given the freedom to customize the camera's settings, including ISO, aperture, and shutter speed, giving them complete control over their photography experience.</p><p>Learn More : <a target="_blank" rel="noopener noreferrer nofollow" href="https://tlpnetwork.com/news/2023/01/sony-announces-star-sphere-project">https://tlpnetwork.com/news/2023/01/sony-announces-star-sphere-project</a></p></div></div>]]>
@@ -937,7 +1672,7 @@ February 27, 2023 | https://tlpnetwork.com/news/2023/02/first-image-from-sony-st
             </title>
             <description>
 <![CDATA[
-Score 228 | Comments 247 (<a href="https://news.ycombinator.com/item?id=34956407">thread link</a>) | @kristoff_it
+Score 238 | Comments 256 (<a href="https://news.ycombinator.com/item?id=34956407">thread link</a>) | @kristoff_it
 <br/>
 February 27, 2023 | https://kristoff.it/blog/zig-multi-sequence-for-loops/ | <a href="https://web.archive.org/web/*/https://kristoff.it/blog/zig-multi-sequence-for-loops/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="post-body"><p>Zig has just gained new for loop syntax that allows
@@ -1163,7 +1898,7 @@ performance nor compromising on compilation times.</p><p>If you like where we’
             </title>
             <description>
 <![CDATA[
-Score 44 | Comments 75 (<a href="https://news.ycombinator.com/item?id=34956338">thread link</a>) | @qudat
+Score 46 | Comments 75 (<a href="https://news.ycombinator.com/item?id=34956338">thread link</a>) | @qudat
 <br/>
 February 27, 2023 | https://bower.sh/anti-pattern | <a href="https://web.archive.org/web/*/https://bower.sh/anti-pattern">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1253,7 +1988,7 @@ time writing them.</p>
             </title>
             <description>
 <![CDATA[
-Score 69 | Comments 89 (<a href="https://news.ycombinator.com/item?id=34956310">thread link</a>) | @genericlemon24
+Score 71 | Comments 91 (<a href="https://news.ycombinator.com/item?id=34956310">thread link</a>) | @genericlemon24
 <br/>
 February 27, 2023 | https://threeofwands.com/python-is-two-languages-now-and-thats-actually-great/ | <a href="https://web.archive.org/web/*/https://threeofwands.com/python-is-two-languages-now-and-thats-actually-great/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1293,7 +2028,7 @@ reply
             </title>
             <description>
 <![CDATA[
-Score 33 | Comments 2 (<a href="https://news.ycombinator.com/item?id=34953102">thread link</a>) | @azhenley
+Score 34 | Comments 2 (<a href="https://news.ycombinator.com/item?id=34953102">thread link</a>) | @azhenley
 <br/>
 February 26, 2023 | https://www.geoffreylitt.com/2023/02/26/llm-as-muse-not-oracle.html | <a href="https://web.archive.org/web/*/https://www.geoffreylitt.com/2023/02/26/llm-as-muse-not-oracle.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><p>What if we thought of LLMs as tools for inspiring human creativity, not giving us answers? A meta-conversation with ChatGPT</p><div><p>Recently lots of people have been trying very hard to make large language models like ChatGPT into better <em>oracles</em>—when we ask them questions, we want the perfect answer. As an example, in my <a href="https://www.geoffreylitt.com/2023/01/29/fun-with-compositional-llms-querying-basketball-stats-with-gpt-3-statmuse-langchain.html">last post</a>, I explored some techniques for helping LLMs answer complex questions more reliably by coordinating multiple steps with external tools.</p>
@@ -1559,11 +2294,11 @@ February 26, 2023 | https://www.geoffreylitt.com/2023/02/26/llm-as-muse-not-orac
             </title>
             <description>
 <![CDATA[
-Score 582 | Comments 302 (<a href="https://news.ycombinator.com/item?id=34953053">thread link</a>) | @Wagthesam
+Score 594 | Comments 305 (<a href="https://news.ycombinator.com/item?id=34953053">thread link</a>) | @Wagthesam
 <br/>
 February 26, 2023 | https://writing.samsonhu.com/how-poor-sleep-drove-me-insane-and-my-long-path-to-recovery/ | <a href="https://web.archive.org/web/*/https://writing.samsonhu.com/how-poor-sleep-drove-me-insane-and-my-long-path-to-recovery/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
-            <p>I'm sharing my experience dealing with what might be the most underdiagnosed and under-treated health disorder today.</p><p>I recently read Susannah Cahalan's <a href="https://www.amazon.com/Brain-Fire-My-Month-Madness/dp/1451621388">Brain on Fire</a>, an account of the young journalist's descent into madness in mere weeks from a brain infection. I read about how hard it was to diagnose, her subsequent months-long hospital admission, and her eventual recovery.</p><p>It resonated with me. I had just spent the previous several years in progressively worse mental shape suffering from an unknown condition. My own experience shared with hers in the ambiguity of a diagnosis until I realized I had a sleep disorder called sleep apnea. And like Susannah's story, there was a lot of suffering until I could go from diagnosis to recovery.</p><p>Sleep apnea came close to ruining my life and gave me endless trouble and pain. But, astonishingly, I learned that it's one of the most common illnesses in the general population—<a href="https://pubmed.ncbi.nlm.nih.gov/19186102/">up to 20% of US adults will eventually get it, and it is untreated or undiagnosed in up to 90% of cases</a>. I also learned that it's a syndrome-type illness with many causes that can be physiologically challenging to diagnose and treat. And I realized that if you have it, no sleep hygiene, cooling covers, optimized sunlight, &nbsp;or exercise will help until you deal with the root cause.</p><p>I want to talk about my own story and hope it provides insight to others about the nature of sleep-disordered breathing. And share tips on dealing with and diagnosing chronic illness, coping with a mental health crisis, and working within the US medical system.</p><p>I'll start from the beginning.</p><p>In my early 20s, life was good. I had finished college and moved to downtown Toronto, surrounded by friends. I was making money. I was debt free. I didn't have anything tying me down. And my goals in life were to live it to the fullest, accordingly to my early male brain. Go out every night. Go party. Do it for the story. Repeat.</p><p>When I was 25, I decided to move to the Bay Area. Toronto felt small in terms of the tech industry. Luckily, I knew people working on a high-growth, well-funded startup called Wish in downtown SF and decided to join and make a move. It was time to get serious, make something of myself, and step it up to the big leagues.</p><p>My time at Wish was intense and stressful. We under hired by several orders of magnitude. We generated billions in yearly sales with under 30 engineers on staff. It was firefighting daily.</p><p>I was holding in more and more stress. It felt natural. Startups were hard. To cope, I reduced my identity outside work. I stopped going out, quit drinking, and deleted social media. I embraced the grind and did not see failure as an option. Over time, I became a more aggravated version of myself. I absorbed more of the aggressive side of the culture at Wish.</p><p>Inwardly my emotions became numb. I was disconnected from others emotionally. Outwardly my entire vibe shifted from chill to aggressive. I became more argumentative at home. I was looking to dominate others in my interactions.</p><p>It was easy to blame my personality shift on work, and that's what I did at the time. Years later, looking back, this was when my symptoms started. But for now, the story continues.</p><p>I left Wish two and a half years later, burnt out and ready for a break.</p><p>I took several months off to recover. I watched a lot of TV while resting on a couch. My visit home for a few months in the quiet suburbs of Victoria, Canada, added to the tranquility. With time, a significant amount of my previous anxiety dissipated. And I felt ready for my next adventure.</p><p>Unfortunately, work became a slow linear progression to disaster for the next few years. Within months of starting my next gig, I started feeling distracted and disconnected from the work. It took longer to get things done.</p><p>Then joining Pinterest, my distraction became even more pronounced. Although I joined a great team with glowing recommendations from my past colleagues, I soon wasn't meeting my own or anyone else's expectations. I found it hard to pay attention. I was a zombie in meetings. I also found it hard to think beyond the immediate present. The anxiety also returned and was getting worse by the day.</p><p>My brain got cloudy with persistent brain fog. The anxiety worsened until I felt I wasn't even present in my body. I later learned this was called depersonalization, a severe form of anxiety where you begin to experience your existence like watching a movie--one where someone else is performing the actions.</p><p>At home, I was a tinderbox. I would shout with rage at the slightest provocation. I was looking to dominate. I had reached a stage of mental illness. One that is not aesthetic and talked about to spread awareness. But one where people would avert their eyes. This period was a dark era in my life.</p><p>I learned to cope.</p><p>I found that my behavior with anxiety was like a racehorse. Although it was easy for me to procrastinate, once I started working on something, I executed projects like I was in a race. I had blinders on and a goal. And I ran as fast as possible as if spurs jabbed me until I got to completion.</p><p>I was surviving. But the situation was bleak. How much longer could I keep this up? I asked myself if I would one day lose it and begin a life as a vagrant on the streets--wandering alone and shouting at random passersby.</p><p>I talked to doctors about my issues. All they did was give me blood tests, which showed I was healthy. I also worked with a therapist on my anger issues. She gave me tips on de-escalation and was an outlet to vent about what was going on.</p><p>But these were all bandaids. And I continued sinking.</p><p>I found my first bit of salvation through chance. I purchased air purifiers in preparation for the upcoming wildfire season. And strangely, after I turned one on, my body immediately felt like it was coming out of a deeply relaxing massage. Knots and tension that I didn't even realize existed began to loosen. I sank into my couch with a feeling of euphoria.</p><p>I immediately remembered taking an allergy test a few years before, with positives on grass, trees, and dust mites. Of course, a dust mites allergy was the most likely explanation because I was indoors. I didn't make the connection to my symptoms before because I had no idea that allergies were anything beyond seasonal sneezing.</p><p>I accepted the connection. Over the next few months, I made considerable changes to my environment to accommodate. I changed our carpeting to hardwood floors. I used allergy covers for bedding. I kept the house clean and sterile. And I started taking antihistamines daily.</p><p>Each change was a stepwise improvement in my symptoms. My anxiety subsided. I was physically more relaxed. I could concentrate better. But I never reached a full recovery. Ultimately, I still had some anxiety, and my brain was somewhat cloudy. But this was a steady state I could live with, and I declared victory.</p><p>As time went on, however, things were still getting worse. This time, however, it wasn't anxiety but brain fog worsening. I became more zombie-like. Absent. I would lose things constantly. I lost track of everything except the immediate present. I could only focus on one thing at a time. I was experiencing cognitive decline.</p><p>Things were bad. I didn't think I could hold down a job like this. So I was reconsidering my life path and plans for the future. But thankfully for me, I was not doomed and would soon figure out the root cause of all my issues.</p><p>For the final diagnosis, I thought I had some form of adult attention-deficit/hyperactivity disorder. I watched some TikTok shorts on ADHD advocates discussing what it was like to have ADHD, and many of the symptoms resonated with me. But when talking to a doctor about getting treated, she casually mentioned that poor sleep could also cause ADHD symptoms—a phrase that stuck out to me and made more sense than having ADHD. So I started researching sleep.</p><p>I learned about obstructive sleep apnea and its diagnosis and symptoms. Although I previously knew about it, I thought it was defined by obesity and snoring. I knew you could die from it, but I thought it mainly impacted the heart.</p><p>But sleep apnea is a far more complex disease with many symptoms and causes. For example, I didn't realize that it also impacted the brain--enough to cause brain damage observable in an MRI. And it can occur in a &nbsp;subpopulation of people that don't snore. And that chronic poor sleep due to airway issues seemed to be linked with countless problems within the body--mental, digestive, reflux, and cardiovascular.</p><p>As I did my research, I became convinced I had it. And when I did a take-home sleep test, I was not surprised by the positive result. The test showed I had positional sleep apnea. My apnea-hypopnea index was 19 when laying on my back, meaning I had an average of 19 wake-ups an hour due to lack of breathing, where my blood oxygen levels also dropped below a threshold.</p><p>I was beyond excited. The treatment for me was a CPAP machine, a device you use during sleep that blows continuous positive pressure into your nose and mouth. This positive pressure keeps your airway open between inhalation and exhalation, making sure you don't have an airway collapse and stop breathing. It promised a cure.</p><p>But it didn't work for me. I tried this device for several weeks but always took it off after sleeping with it for an hour or two. I tried on almost every mask available, but it didn't make a difference.</p><p>But I wasn't discouraged. I knew what was wrong, and there had to be a solution. So researching this further, I learned that there was a subpopulation of sleep apnea called Upper Airway Respiratory Syndrome (UARS). UARS used to be a separate disease but was similar enough to Obstructive Sleep Apnea that the American Academy of Sleep Medicine (AASM) merged the two illnesses under one name. UARS sufferers still have restricted breathing events during sleep that cause disruptions, but these events don't cause blood oxygen levels to drop. The AASM considers UARS a milder form of sleep apnea, one that is harder to diagnose as it requires a lab sleep study that monitors brain waves with an ECG. But it describes UARS as correlated with younger, thinner patients and nasal congestion.</p><p>I was young, fit, and had nasal congestion. The symptoms seem to match. UARS symptoms correlate more with mental distress. Most importantly, UARS sufferers are likely to reject CPAP. The reason for this is unknown, but some specialists believe <a href="https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4608900/">UARS causes an overactivation of the nervous system</a> and that this over-activation makes UARS suffers likely to reject CPAP as they are too sensitive to the positive pressure.</p><p>Although my sleep study showed sleep apnea when lying on my back, I conjectured that I also had UARS while sleeping on my side. So I decided to follow standard UARS treatment guidelines, reduce nasal congestion, and see if things improved.</p><p>Just like before, when I learned my dust mite allergy was the cause of my symptoms, I made changes to try to improve my sleep.</p><p>I improved my nasal breathing using drugs, devices, and surgery. I used Flonase (Fluticasone), a corticosteroid that reduced inflammation inside the nose. I also used Astepro (Azelasine), a nasal spray antihistamine. On the surgical side, I worked with an otolaryngologist to do a turbinate reduction and septoplasty to surgery open the nasal airway. And I used <a href="https://halebreathing.com/">nasal dilators</a> to physically open the nasal passages.</p><p>I started practicing mouth taping during sleep. Mouth taping is controversial as scientific studies do not back it up. But anecdotally, people report a significant improvement in this practice which forces nasal breathing. My own experience reflects this.</p><p>I also started positional sleep therapy. I went to sleep wearing a <a href="https://www.zzomaosa.com/">bumper belt</a> that prevented me from sleeping on my back, where my sleep apnea scores were the most severe.</p><p>I also explored the connection between sleep apnea and acid reflux. <a href="https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2879818/">There is a hypothesis that nasal congestion and negative pressure in the breathing passages cause acid reflux from the esophagus</a>. This reflux can come up into the nose and <a href="https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2725251/">cause increased turbinate inflammation, and make sleep apnea worse</a>. I started using Gaviscon Advance at night and kept my bed at a six-inch incline.</p><p>And finally, I started getting allergy shots. These were regular injections twice a week to hopefully desensitize me to my allergies and reduce my nasal congestion permanently.</p><p>These changes took place over months of trial and error. But the result was that they worked. My sleep improved, my brain fog miraculously disappeared, and I began functioning normally. My memory returned. And I am back to being curious, eager to learn more about the world and share my learnings with others.</p><p>One huge change was my memory. While suffering from sleep apnea, I had almost no long-term memory. I would lose track of relationships and people as quickly as they left the room. But after treatment, my memories returned, and it was almost as if I was reliving the life moment by moment as they resurfaced.</p><p>And while I began this story in my mid-20s, after talking to sleep specialists who evaluated me physiologically, I believe my sleep apnea has been a lifelong issue. I've had nasal congestion since childhood along with risk factors such as a long soft palette and large tongue, and some previous periods of my life mirrored my symptoms--albeit with less intensity. Because of this, I often wonder which aspects of my personality and existence are rooted in this illness. I don't see this as a purely bad thing--perhaps my latent anxiety gave me the drive to push new boundaries in my field, and being at ease with discomfort gave me countless opportunities both personally, both as a student and subsequently in my early career.</p><p>I also wonder if this had impacted the previous major health issue that I overcame in my life, <a href="https://writing.samsonhu.com/the-year-i-lost-everything/">my experience with wrist pain and repetitive strain injury</a>. I had debilitating wrist pain when I was in my early 20s, and I cured it by treating it from a psychosomatic perspective, treating it believing stress to be the root cause. Did I have sleep apnea during this time? Did it contribute to increased stress, creating a physical issue I eventually had to resolve psychologically? I believe today that the answer is yes.</p><p>I will end this with some advice for those diagnosing complex chronic issues.</p><p>I will first discuss the issues diagnosing this illness and why it took so long to find the root cause. First, sleep apnea has no clear causal relationship with the symptoms that I experienced. By the time the mental aspects are an issue, I had slept poorly for so long I had forgotten what normal sleep felt like. Family doctors are also limited in their knowledge of sleep apnea and either don't know or won't jump to the nuances of the mental symptoms associated with the illness.</p><p>General practitioners also are limited in their time with patients. Insurance companies dictate time constraints. In TV and movies, there is often the trope of the overeducated patient that knows "too much" about medicine and tries to overrule doctors. But the reality is that doctors do not have time to root cause you, and you must take ownership of your diagnosis and treatment.</p><p>Even specialists, whose time is even more constrained, need help fully educating you. This reality is especially true for a syndrome like illnesses like sleep apnea, which has multiple structural and physiological causes that vary between patients. The lesson is that patients must be highly educated about their issues and seek information from various sources. Patients must also be able to filter information critically, as only some things online are trustworthy and relevant.</p><p>One major mistake I made with treatment was using a different doctor every time I went to see one. I use One Medical, which provides higher-end concierge medical services on demand. I am lucky that I can usually see a doctor within a day or two if I want one. However, I typically pick different ones due to scheduling. However, seeing a different doctor every time is terrible for chronic conditions, where you need a relationship with the doctor built and the same person looking at you over time.</p><p>One thing I learned about modern medicine is that it mostly looks at groups and treatment in aggregate. Due to funding, most studies lack statistical power to drill down into each subpopulation and causal factors. Doctors use these studies as the source of truth, but these studies are incomplete. Specialists augment this with experience, and the consequence is that not all specialists are created equal and can properly diagnose and treat a patient.</p><p>One of the biggest challenges that make chronic illnesses hard to diagnose is that they progress over a long period of time. Because of this, many confounding factors can hide the real issue. In my story, job stress and environment were confounding factors. Leaving Wish, my situation improved, leading me to think my symptoms were purely related to job stress. However, things improved because I moved back home to my family home, which had hardwood floors and was a much better environment for my allergies.</p><p>Muscle tension was another confounding factor. I was tense all the time. Treating muscle tension improved my symptoms, but it was only a band-aid.</p><p>In addition, allergies were one cause of my sleep apnea, but it was not the only one. Therefore, I was incorrect in believing that resolving my allergy issues would fully cure me. Ultimately, I needed stricter regimens, other treatments, and surgery.</p><p>Even my lifestyle in my early 20s was a confounding issue. Did I party too hard? Did that era of my life alter my brain chemistry in a way that made me irreparably damaged. This was one of my first guesses and it lingered in my mind for a long time. But now post treatment I ultimately don't think this was a factor.</p><p>I have to root cause complex issues frequently in my work in tech. But root causing self issues requires a high level of disciplined self-analysis. The factors are slow changes over long periods that may interact with each other. It's a challenging skill. One that I did not have at the beginning of this journey. But one that I developed over many years of trial and error.</p><p>Lastly, toughing it out has short-term limits. You can tough out a physical injury. But with chronic illnesses, no matter how much you believe you can hold things together, your emotions will leak and impact everyone around you. Unfortunately, people often tough it out rather than dedicate more time to finding treatment. I hope to advocate for more people to spend time experimenting and doing the difficult work of figuring things out.</p><p>Sleep apnea is an illness that massively altered my life. I was surprised to find many others like me online with similar stories, having spent years trying to figure out their issues. Its prevalence and under-diagnosis starkly contrast the gurus and products touted online about improving sleep. I hope to become an advocate for this illness, and thank you for reading my story.</p>
+            <p>I'm sharing my experience dealing with what might be the most underdiagnosed and under-treated health disorder today.</p><p>I recently read Susannah Cahalan's <a href="https://www.amazon.com/Brain-Fire-My-Month-Madness/dp/1451621388">Brain on Fire</a>, an account of the young journalist's descent into madness in mere weeks from a brain infection. I read about how hard it was to diagnose, her subsequent months-long hospital admission, and her eventual recovery.</p><p>It resonated with me. I had just spent the previous several years in progressively worse mental shape suffering from an unknown condition. My own experience shared with hers in the ambiguity of a diagnosis until I realized I had a sleep disorder called sleep apnea. And like Susannah's story, there was a lot of suffering until I could go from diagnosis to recovery.</p><p>Sleep apnea came close to ruining my life and gave me endless trouble and pain. But, astonishingly, I learned that it's one of the most common medical conditions in the general population—<a href="https://pubmed.ncbi.nlm.nih.gov/19186102/">up to 20% of US adults will eventually get it, and it is untreated or undiagnosed in up to 90% of cases</a>. I also learned that it's a syndrome with many causes that can be physiologically challenging to diagnose and treat. And I realized that if you have it, no sleep hygiene, cooling covers, optimized sunlight, &nbsp;or exercise will help until you deal with the root cause.</p><p>I want to talk about my own story and hope it provides insight to others about the nature of sleep-disordered breathing. And share tips on dealing with and diagnosing chronic health issues, coping with a mental health crisis, and working within the US medical system.</p><p>I'll start from the beginning.</p><p>In my early 20s, life was good. I had finished college and moved to downtown Toronto, surrounded by friends. I was making money. I was debt free. I didn't have anything tying me down. And my goals in life were to live it to the fullest, accordingly to my early male brain. Go out every night. Go party. Do it for the story. Repeat.</p><p>When I was 25, I decided to move to the Bay Area. Toronto felt small in terms of the tech industry. Luckily, I knew people working on a high-growth, well-funded startup called Wish in downtown SF and decided to join and make a move. It was time to get serious, make something of myself, and step it up to the big leagues.</p><p>My time at Wish was intense and stressful. We under hired by several orders of magnitude. We generated billions in yearly sales with under 30 engineers on staff. It was firefighting daily.</p><p>I was holding in more and more stress. It felt natural. Startups were hard. To cope, I reduced my identity outside work. I stopped going out, quit drinking, and deleted social media. I embraced the grind and did not see failure as an option. Over time, I became a more aggravated version of myself. I absorbed more of the aggressive side of the culture at Wish.</p><p>Inwardly my emotions became numb. I was disconnected from others emotionally. Outwardly my entire vibe shifted from chill to aggressive. I became more argumentative at home. I was looking to dominate others in my interactions.</p><p>It was easy to blame my personality shift on work, and that's what I did at the time. Years later, looking back, this was when my symptoms started. But for now, the story continues.</p><p>I left Wish two and a half years later, burnt out and ready for a break.</p><p>I took several months off to recover. I watched a lot of TV while resting on a couch. My visit home for a few months in the quiet suburbs of Victoria, Canada, added to the tranquility. With time, a significant amount of my previous anxiety dissipated. And I felt ready for my next adventure.</p><p>Unfortunately, work became a slow linear progression to disaster for the next few years. Within months of starting my next gig, I started feeling distracted and disconnected from the work. It took longer to get things done.</p><p>Then joining Pinterest, my distraction became even more pronounced. Although I joined a great team with glowing recommendations from my past colleagues, I soon wasn't meeting my own or anyone else's expectations. I found it hard to pay attention. I was a zombie in meetings. I also found it hard to think beyond the immediate present. The anxiety also returned and was getting worse by the day.</p><p>My brain got cloudy with persistent brain fog. The anxiety worsened until I felt I wasn't even present in my body. I later learned this was called depersonalization, a severe form of anxiety where you begin to experience your existence like watching a movie--one where someone else is performing the actions.</p><p>At home, I was a tinderbox. I would shout with rage at the slightest provocation. I was looking to dominate. I had reached a stage of mental illness. One that is not aesthetic and talked about to spread awareness. But one where people would avert their eyes. This period was a dark era in my life.</p><p>I learned to cope.</p><p>I found that my behavior with anxiety was like a racehorse. Although it was easy for me to procrastinate, once I started working on something, I executed projects like I was in a race. I had blinders on and a goal. And I ran as fast as possible as if spurs jabbed me until I got to completion.</p><p>I was surviving. But the situation was bleak. How much longer could I keep this up? I asked myself if I would one day lose it and begin a life as a vagrant on the streets--wandering alone and shouting at random passersby.</p><p>I talked to doctors about my issues. All they did was give me blood tests, which showed I was healthy. I also worked with a therapist on my anger issues. She gave me tips on de-escalation and was an outlet to vent about what was going on.</p><p>But these were all bandaids. And I continued sinking.</p><p>I found my first bit of salvation through chance. I purchased air purifiers in preparation for the upcoming wildfire season. And strangely, after I turned one on, my body immediately felt like it was coming out of a deeply relaxing massage. Knots and tension that I didn't even realize existed began to loosen. I sank into my couch with a feeling of euphoria.</p><p>I immediately remembered taking an allergy test a few years before, with positives on grass, trees, and dust mites. Of course, a dust mites allergy was the most likely explanation because I was indoors. I didn't make the connection to my symptoms before because I had no idea that allergies were anything beyond seasonal sneezing.</p><p>I accepted the connection. Over the next few months, I made considerable changes to my environment to accommodate. I changed our carpeting to hardwood floors. I used allergy covers for bedding. I kept the house clean and sterile. And I started taking antihistamines daily.</p><p>Each change was a stepwise improvement in my symptoms. My anxiety subsided. I was physically more relaxed. I could concentrate better. But I never reached a full recovery. Ultimately, I still had some anxiety, and my brain was somewhat cloudy. But this was a steady state I could live with, and I declared victory.</p><p>As time went on, however, things were still getting worse. This time, however, it wasn't anxiety but brain fog worsening. I became more zombie-like. Absent. I would lose things constantly. I lost track of everything except the immediate present. I could only focus on one thing at a time. I was experiencing cognitive decline.</p><p>Things were bad. I didn't think I could hold down a job like this. So I was reconsidering my life path and plans for the future. But thankfully for me, I was not doomed and would soon figure out the root cause of all my issues.</p><p>For the final diagnosis, I thought I had some form of adult attention-deficit/hyperactivity disorder. I watched some TikTok shorts on ADHD advocates discussing what it was like to have ADHD, and many of the symptoms resonated with me. But when talking to a doctor about getting treated, she casually mentioned that poor sleep could also cause ADHD symptoms—a phrase that stuck out to me and made more sense than having ADHD. So I started researching sleep.</p><p>I learned about obstructive sleep apnea and its diagnosis and symptoms. Although I previously knew about it, I thought it was defined by obesity and snoring. I knew you could die from it, but I thought it mainly impacted the heart.</p><p>But sleep apnea is a far more complex disease with many symptoms and causes. For example, I didn't realize that it also impacted the brain--enough to cause brain damage observable in an MRI. And it can occur in a &nbsp;subpopulation of people that don't snore. And that chronic poor sleep due to airway issues seemed to be linked with countless problems within the body--mental, digestive, reflux, and cardiovascular.</p><p>As I did my research, I became convinced I had it. And when I did a take-home sleep test, I was not surprised by the positive result. The test showed I had positional sleep apnea. My apnea-hypopnea index was 19 when laying on my back, meaning I had an average of 19 wake-ups an hour due to lack of breathing, where my blood oxygen levels also dropped below a threshold.</p><p>I was beyond excited. The treatment for me was a CPAP machine, a device you use during sleep that blows continuous positive pressure into your nose and mouth. This positive pressure keeps your airway open between inhalation and exhalation, making sure you don't have an airway collapse and stop breathing. It promised a cure.</p><p>But it didn't work for me. I tried this device for several weeks but always took it off after sleeping with it for an hour or two. I tried on almost every mask available, but it didn't make a difference.</p><p>But I wasn't discouraged. I knew what was wrong, and there had to be a solution. So researching this further, I learned that there was a subpopulation of sleep apnea called Upper Airway Respiratory Syndrome (UARS). UARS used to be a separate disease but was similar enough to Obstructive Sleep Apnea that the American Academy of Sleep Medicine (AASM) merged the two conditions under one name. UARS sufferers still have restricted breathing events during sleep that cause disruptions, but these events don't cause blood oxygen levels to drop. The AASM considers UARS a milder form of sleep apnea, one that is harder to diagnose as it requires a lab sleep study that monitors brain waves with an ECG. But it describes UARS as correlated with younger, thinner patients and nasal congestion.</p><p>I was young, fit, and had nasal congestion. The symptoms seem to match. UARS symptoms correlate more with mental distress. Most importantly, UARS sufferers are likely to reject CPAP. The reason for this is unknown, but some specialists believe <a href="https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4608900/">UARS causes an overactivation of the nervous system</a> and that this over-activation makes UARS suffers likely to reject CPAP as they are too sensitive to the positive pressure.</p><p>Although my sleep study showed sleep apnea when lying on my back, I conjectured that I also had UARS while sleeping on my side. So I decided to follow standard UARS treatment guidelines, reduce nasal congestion, and see if things improved.</p><p>Just like before, when I learned my dust mite allergy was the cause of my symptoms, I made changes to try to improve my sleep.</p><p>I improved my nasal breathing using drugs, devices, and surgery. I used Flonase (Fluticasone), a corticosteroid that reduced inflammation inside the nose. I also used Astepro (Azelasine), a nasal spray antihistamine. On the surgical side, I worked with an otolaryngologist to do a turbinate reduction and septoplasty to surgery open the nasal airway. And I used <a href="https://halebreathing.com/">nasal dilators</a> to physically open the nasal passages.</p><p>I started practicing mouth taping during sleep. Mouth taping is controversial as scientific studies do not back it up. But anecdotally, people report a significant improvement in this practice which forces nasal breathing. My own experience reflects this.</p><p>I also started positional sleep therapy. I went to sleep wearing a <a href="https://www.zzomaosa.com/">bumper belt</a> that prevented me from sleeping on my back, where my sleep apnea scores were the most severe.</p><p>I also explored the connection between sleep apnea and acid reflux. <a href="https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2879818/">There is a hypothesis that nasal congestion and negative pressure in the breathing passages cause acid reflux from the esophagus</a>. This reflux can come up into the nose and <a href="https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2725251/">cause increased turbinate inflammation, and make sleep apnea worse</a>. I started using Gaviscon Advance at night and kept my bed at a six-inch incline.</p><p>And finally, I started getting allergy shots. These were regular injections twice a week to hopefully desensitize me to my allergies and reduce my nasal congestion permanently.</p><p>These changes took place over months of trial and error. But the result was that they worked. My sleep improved, my brain fog miraculously disappeared, and I began functioning normally. My memory returned. And I am back to being curious, eager to learn more about the world and share my learnings with others.</p><p>One huge change was my memory. While suffering from sleep apnea, I had almost no long-term memory. I would lose track of relationships and people as quickly as they left the room. But after treatment, my memories returned, and it was almost as if I was reliving the life moment by moment as they resurfaced.</p><p>And while I began this story in my mid-20s, after talking to sleep specialists who evaluated me physiologically, I believe my sleep apnea has been a lifelong issue. I've had nasal congestion since childhood along with risk factors such as a long soft palette and large tongue, and some previous periods of my life mirrored my symptoms--albeit with less intensity. Because of this, I often wonder which aspects of my personality and existence are rooted in this condition. I don't see this as a purely bad thing--perhaps my latent anxiety gave me the drive to push new boundaries in my field, and being at ease with discomfort gave me countless opportunities both personally, both as a student and subsequently in my early career.</p><p>I also wonder if this had impacted the previous major health issue that I overcame in my life, <a href="https://writing.samsonhu.com/the-year-i-lost-everything/">my experience with wrist pain and repetitive strain injury</a>. I had debilitating wrist pain when I was in my early 20s, and I cured it by treating it from a psychosomatic perspective, treating it believing stress to be the root cause. Did I have sleep apnea during this time? Did it contribute to increased stress, creating a physical issue I eventually had to resolve psychologically? I believe today that the answer is yes.</p><p>I will end this with some advice for those diagnosing complex chronic issues.</p><p>I will first discuss the issues diagnosing this medical condition and why it took so long to find the root cause. First, sleep apnea has no clear causal relationship with the symptoms that I experienced. By the time the mental aspects are an issue, I had slept poorly for so long I had forgotten what normal sleep felt like. Family doctors are also limited in their knowledge of sleep apnea and either don't know or won't jump to the nuances of the mental symptoms associated with the condition.</p><p>General practitioners also are limited in their time with patients. Insurance companies dictate time constraints. In TV and movies, there is often the trope of the overeducated patient that knows "too much" about medicine and tries to overrule doctors. But the reality is that doctors do not have time to root cause you, and you must take ownership of your diagnosis and treatment.</p><p>Even specialists, whose time is even more constrained, need help fully educating you. This reality is especially true for a syndrome like sleep apnea, which has multiple structural and physiological causes that vary between patients. The lesson is that patients must be highly educated about their issues and seek information from various sources. Patients must also be able to filter information critically, as only some things online are trustworthy and relevant.</p><p>One major mistake I made with treatment was using a different doctor every time I went to see one. I use One Medical, which provides higher-end concierge medical services on demand. I am lucky that I can usually see a doctor within a day or two if I want one. However, I typically pick different ones due to scheduling. However, seeing a different doctor every time is terrible for chronic health problems, where you need a relationship with the doctor built and the same person looking at you over time.</p><p>One thing I learned about modern medicine is that it mostly looks at groups and treatment in aggregate. Due to funding, most studies lack statistical power to drill down into each subpopulation and causal factors. Doctors use these studies as the source of truth, but these studies are incomplete. Specialists augment this with experience, and the consequence is that not all specialists are created equal and can properly diagnose and treat a patient.</p><p>One of the biggest challenges that make chronic health problems hard to diagnose is that they progress over a long period of time. Because of this, many confounding factors can hide the real issue. In my story, job stress and environment were confounding factors. Leaving Wish, my situation improved, leading me to think my symptoms were purely related to job stress. However, things improved because I moved back home to my family home, which had hardwood floors and was a much better environment for my allergies.</p><p>Muscle tension was another confounding factor. I was tense all the time. Treating muscle tension improved my symptoms, but it was only a band-aid.</p><p>In addition, allergies were one cause of my sleep apnea, but it was not the only one. Therefore, I was incorrect in believing that resolving my allergy issues would fully cure me. Ultimately, I needed stricter regimens, other treatments, and surgery.</p><p>Even my lifestyle in my early 20s was a confounding issue. Did I party too hard? Did that era of my life alter my brain chemistry in a way that made me irreparably damaged. This was one of my first guesses and it lingered in my mind for a long time. But now post treatment I ultimately don't think this was a factor.</p><p>I have to root cause complex issues frequently in my work in tech. But root causing self issues requires a high level of disciplined self-analysis. The factors are slow changes over long periods that may interact with each other. It's a challenging skill. One that I did not have at the beginning of this journey. But one that I developed over many years of trial and error.</p><p>Lastly, toughing it out has short-term limits. You can tough out a physical injury. But with chronic health problems, no matter how much you believe you can hold things together, your emotions will leak and impact everyone around you. Unfortunately, people often tough it out rather than dedicate more time to finding treatment. I hope to advocate for more people to spend time experimenting and doing the difficult work of figuring things out.</p><p>Sleep apnea is a medical condition that massively altered my life. I was surprised to find many others like me online with similar stories, having spent years trying to figure out their issues. Its prevalence and under-diagnosis starkly contrast the gurus and products touted online about improving sleep. I hope to become an advocate for this condition, and thank you for reading my story.</p>
         </div></div>]]>
             </description>
             <link>https://writing.samsonhu.com/how-poor-sleep-drove-me-insane-and-my-long-path-to-recovery/</link>
@@ -1576,7 +2311,7 @@ February 26, 2023 | https://writing.samsonhu.com/how-poor-sleep-drove-me-insane-
             </title>
             <description>
 <![CDATA[
-Score 118 | Comments 20 (<a href="https://news.ycombinator.com/item?id=34952221">thread link</a>) | @sohkamyung
+Score 120 | Comments 21 (<a href="https://news.ycombinator.com/item?id=34952221">thread link</a>) | @sohkamyung
 <br/>
 February 26, 2023 | https://newsletter.shifthappens.site/archive/the-cursed-universes-of-dana-sibera/ | <a href="https://web.archive.org/web/*/https://newsletter.shifthappens.site/archive/the-cursed-universes-of-dana-sibera/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1833,7 +2568,7 @@ February 26, 2023 | https://newsletter.shifthappens.site/archive/the-cursed-univ
 Score 73 | Comments 21 (<a href="https://news.ycombinator.com/item?id=34949642">thread link</a>) | @clircle
 <br/>
 February 26, 2023 | http://feedbase.org/about/ | <a href="https://web.archive.org/web/*/http://feedbase.org/about/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><h2>What is it?</h2><p>Feedbase is an <a href="https://en.wikipedia.org/wiki/Atom_(standard)">Atom</a>/<a href="https://en.wikipedia.org/wiki/RSS">RSS</a>-feed to <a href="https://en.wikipedia.org/wiki/Network_News_Transfer_Protocol">nntp</a> gateway.</p><p>What this means is that Feedbase regularly fetches Atom/RSS-feeds and exposes the items using the nntp protocol, allowing you to follow the feeds using an nntp client (news reader).</p><p>This is quite convenient in a number of ways:</p><ul><li>Unified interface to all the feeds you care about</li><li>Only see items that are aggregated into multiple planets once (crossposting)</li><li>Skip uninteresting items with nntp client (news reader) scoring/killfiles</li><li>See updates to items (Supersedes: with <del>differences</del> <ins>changes</ins> highlighted)</li></ul><h2>Motivation</h2><p>I have been using a very similar service, <a href="http://gwene.org/">Gwene</a>, since it was created.</p><p>Gwene has a couple of drawbacks: items with content in XHTML get horribly mangled - compare <a href="http://feedbase.org/image/gwene1.png">Gwene's</a> <a href="http://feedbase.org/image/gwene2.png">display</a> of this item to <a href="http://feedbase.org/image/feedbase1.png">Feedbase's</a> <a href="http://feedbase.org/image/feedbase2.png">display.</a>(I tried to fix this, but the underlying library used, <a href="https://metacpan.org/pod/XML::FeedPP">XML::FeedPP</a>, is too complicated for me to comprehend, and when I contacted the author his reply was that it can't be fixed).</p><p>The other drawback is that Gwene never grew the <a href="http://thread.gmane.org/gmane.discuss/15120/focus=15939">ability to allow comments</a>, it is read-only. I would like to make it possible to discuss, locally, the various items in the feeds. On Feedbase, you can.</p><p>Another problem is that items have a tendency to be aggregated into multiple feeds (planets), and if you follow a couple of them, you see the same item many times. Feedbase detects this and uses crossposting to allow you to skip the article easily when you encounter it multiple times.</p><p>Finally people tend to update their posts, and while Gwene ignores this, Feedbase uses the nntp supersede functionality to present the <del>correct</del> <ins>updated</ins> article to the reader.</p></div>]]>
             </description>
             <link>http://feedbase.org/about/</link>
             <guid isPermaLink="false">hacker-news-small-sites-34949642</guid>
@@ -4217,7 +4952,7 @@ channels.</p>
             </title>
             <description>
 <![CDATA[
-Score 280 | Comments 68 (<a href="https://news.ycombinator.com/item?id=34946877">thread link</a>) | @KqAmJQ7
+Score 281 | Comments 68 (<a href="https://news.ycombinator.com/item?id=34946877">thread link</a>) | @KqAmJQ7
 <br/>
 February 26, 2023 | http://www.jgallant.com/2d-liquid-simulator-with-cellular-automaton-in-unity/ | <a href="https://web.archive.org/web/*/http://www.jgallant.com/2d-liquid-simulator-with-cellular-automaton-in-unity/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -6149,7 +6884,7 @@ channels.</p>
             </title>
             <description>
 <![CDATA[
-Score 105 | Comments 84 (<a href="https://news.ycombinator.com/item?id=34941650">thread link</a>) | @swyx
+Score 105 | Comments 85 (<a href="https://news.ycombinator.com/item?id=34941650">thread link</a>) | @swyx
 <br/>
 February 25, 2023 | https://dx.tips/oops-database | <a href="https://web.archive.org/web/*/https://dx.tips/oops-database">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><section><div><div id="post-content-parent"><div id="post-content-wrapper"><p>Dear Sir,</p>
@@ -6361,7 +7096,7 @@ If you’re facing a thorny problem that seems like it could be stated in terms 
             </title>
             <description>
 <![CDATA[
-Score 318 | Comments 86 (<a href="https://news.ycombinator.com/item?id=34940505">thread link</a>) | @okaleniuk
+Score 319 | Comments 86 (<a href="https://news.ycombinator.com/item?id=34940505">thread link</a>) | @okaleniuk
 <br/>
 February 25, 2023 | https://wordsandbuttons.online/sympy_makes_math_fun_again.html | <a href="https://web.archive.org/web/*/https://wordsandbuttons.online/sympy_makes_math_fun_again.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -7267,7 +8002,7 @@ branch prediction works on a CPU</li>
 <p>I am not aware of any empirical studies on the efficacy of CPU's branch predictors
 vs their branch target predictors<span><label for="branch-predictor-cf"></label></span><span>Though,
 there is <a href="https://blog.cloudflare.com/branch-predictor/">this nice analysis by Cloudflare</a>.</span> -
-<a href="https://ayazhafiz.com/cdn-cgi/l/email-protection#76170f170c581e17101f0c58475d1519291a1536111b171f1a5815191b490503141c1315024b3310101f1517150f534446191053444614041718151e534446021704111302534446060413121f1502190405534446000553444614041718151e534446060413121f1502190405">please let me know</a> if you know of any!</p>
+<a href="https://ayazhafiz.com/cdn-cgi/l/email-protection#a5c4dcc4df8bcdc4c3ccdf8b948ec6cafac9c6e5c2c8c4ccc98bc6cac89ad6d0c7cfc0c6d198e0c3c3ccc6c4c6dc809795cac3809795c7d7c4cbc6cd809795d1c4d7c2c0d1809795d5d7c0c1ccc6d1cad7d6809795d3d6809795c7d7c4cbc6cd809795d5d7c0c1ccc6d1cad7d6">please let me know</a> if you know of any!</p>
 <h4 id="eliminating-heap-allocated-captures" tabindex="-1">Eliminating heap-allocated captures</h4>
 <p>Lambda sets also enable a natural way to eliminate heap
 allocation of closure captures. This is pretty nice, especially in functional
@@ -7462,7 +8197,7 @@ language, embdded again below.</p>
 <h2 id="ad%3A-are-you-interested-in-compiling-structural-subtypes%3F" tabindex="-1">Ad: Are you interested in compiling structural subtypes?</h2>
 <p>If you know of ways, or are interested in, compiling languages based on
 structural subtyping to non-uniform representations,
-please <a href="https://ayazhafiz.com/cdn-cgi/l/email-protection#cfaeb6aeb5e1a7aea9a6b5e1fee4aca090a3ac8fa8a2aea6a3e1aca0a2f0bcbaada5aaacbbf28ca0a2bfa6a3a6a1a8eafdffbcbbbdbaacbbbabdaea3eafdffbcbaadbbb6bfa6a1a8eafdffbba0eafdffa1a0a1e2baa1a6a9a0bda2eafdffbdaabfbdaabcaaa1bbaebba6a0a1bc">email me</a>! This has been an ongoing project of mine
+please <a href="https://ayazhafiz.com/cdn-cgi/l/email-protection#28495149520640494e41520619034b4777444b684f45494144064b4745175b5d4a424d4b5c156b474558414441464f0d1a185b5c5a5d4b5c5d5a49440d1a185b5d4a5c515841464f0d1a185c470d1a18464746055d46414e475a450d1a185a4d585a4d5b4d465c495c4147465b">email me</a>! This has been an ongoing project of mine
 and I hope to write about it soon, and would love to chat through with others
 interested.</p>
 <p>In particular, the idea here is to combine</p>
@@ -7598,7 +8333,49 @@ February 25, 2023 | https://www.cs.york.ac.uk/plasma/publications/pdf/Plump.CAI.
 Score 149 | Comments 61 (<a href="https://news.ycombinator.com/item?id=34936729">thread link</a>) | @ingve
 <br/>
 February 25, 2023 | https://pointersgonewild.com/2023/02/24/building-a-minimalistic-virtual-machine/ | <a href="https://web.archive.org/web/*/https://pointersgonewild.com/2023/02/24/building-a-minimalistic-virtual-machine/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+				<p><img width="250" height="202" src="https://pointersgonewild.files.wordpress.com/2023/02/screen-shot-2023-02-18-at-4.00.45-pm.png?w=250" alt="" decoding="async" srcset="https://pointersgonewild.files.wordpress.com/2023/02/screen-shot-2023-02-18-at-4.00.45-pm.png?w=250 250w, https://pointersgonewild.files.wordpress.com/2023/02/screen-shot-2023-02-18-at-4.00.45-pm.png?w=500 500w, https://pointersgonewild.files.wordpress.com/2023/02/screen-shot-2023-02-18-at-4.00.45-pm.png?w=150 150w, https://pointersgonewild.files.wordpress.com/2023/02/screen-shot-2023-02-18-at-4.00.45-pm.png?w=300 300w" sizes="(max-width: 250px) 100vw, 250px" data-attachment-id="5423" data-permalink="https://pointersgonewild.com/2023/02/24/building-a-minimalistic-virtual-machine/screen-shot-2023-02-18-at-4-00-45-pm/" data-orig-file="https://pointersgonewild.files.wordpress.com/2023/02/screen-shot-2023-02-18-at-4.00.45-pm.png" data-orig-size="1285,1037" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="Screen Shot 2023-02-18 at 4.00.45 PM" data-image-description="" data-image-caption="" data-medium-file="https://pointersgonewild.files.wordpress.com/2023/02/screen-shot-2023-02-18-at-4.00.45-pm.png?w=300" data-large-file="https://pointersgonewild.files.wordpress.com/2023/02/screen-shot-2023-02-18-at-4.00.45-pm.png?w=497"></p><p>Just over a year ago, I wrote a <a href="https://pointersgonewild.com/2022/02/11/code-that-doesnt-rot/">blog post</a> about a topic that’s very important to me, which is the problem of code rot, of software constantly breaking because of shifting foundations, and the toll it takes on programmers, and on society at large. We’re no doubt collectively wasting billions of dollars and millions of human hours every year because of broken software that should never have been broken in the first place My own belief is that stability is undervalued. In order to build robust, reliable software, it’s important to be able to build such software on <a href="https://pointersgonewild.com/2020/09/22/the-need-for-stable-foundations-in-software-development/">stable foundations</a>.</p>
+
+
+
+<p>One of the potential solutions I outlined last year is that if we could build a simple Virtual Machine (VM) with no dynamic linking and a small set of minimalistic APIs that remain stable over time, it would make it a lot easier to build software without worrying about becoming randomly broken by changing APIs or dependencies. Such a VM wouldn’t necessarily meet everyone’s needs for every possible use case, but it could help a lot of us build software for the long term.</p>
+
+
+
+<p>This is something I’ve been thinking about for at least two years, but in all honesty, I didn’t really dare even get started on this project, because I felt scared of the amount of work it represented. I was also scared of potentially getting a fairly negative reception with lots of criticism and cynicism. Last December though, I decided that, well, fuck it, I’m really interested in working on this project, I keep thinking about it, so I’m doing it. I’m well aware that the concept of a VM is not a new idea, and I’m sure that some people are going to tell me that I’m basically reinventing WASM, or that I should base my system on an existing processor architecture and work on something like Justine Tunney’s <a href="https://github.com/jart/blink">blink</a> instead. I’ll elaborate a bit on why I’m taking a different approach.</p>
+
+
+
+<p>WASM is trying to be a universal binary format and satisfy many different use cases in very different areas. Because it has so many stakeholders, it evolves very slowly. For instance, we were promised that WASM would have support for JIT compilers and include a garbage collectors 5 years ago, but this support still isn’t here today. At the same time, even though WASM is evolving relatively slowly, there are a ton of new features in the works, and it will surely become a very complex system. With so many stakeholders, the risk of massive feature creep is real.</p>
+
+
+
+<p>In my opinion, the focus on minimalism is crucial for guaranteeing the longevity of both the VM itself and the software running on it. Exposing large, complex APIs to software running on the VM can become a liability. One of the biggest issue with modern web browsers, in my opinion, is that they’ve become so complex, it’s basically impossible to guarantee that your web app will behave the same on different browsers.</p>
+
+
+
+<p>Working on my own web-based <a href="https://noisecraft.app/browse">music app</a>, I discovered that there are major differences in the way the <a href="https://developer.mozilla.org/en-US/docs/Web/API/Pointer_events">pointer events API</a> behaves on Chrome, Firefox and Safari. That’s kind of insane to even think about, because handling mouse clicks is something basic and fundamental that so many web apps rely on, and this API has been around at least <a href="https://developer.chrome.com/blog/pointer-events/">as far back</a> as 2016. Why can’t it behave the same in every browser? In my opinion, it’s in part because browsers are such hugely complex beasts that are growing in complexity so fast, that even tech giants can’t manage to have enough developers to implement all the APIs properly. If you don’t believe me, just take a look at <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=1572644">this audio API bug</a> that I ran into two years ago, that was reported 4 years ago, and still isn’t fixed at the time of this writing.</p>
+
+
+
+<p>UVM has a fairly strict focus on minimalism, which will help keep the VM portable and maintainable. It’s also a lot smaller than other systems. It’s a simple <a href="https://pointersgonewild.com/2022/06/08/typed-vs-untyped-virtual-machines/">untyped</a> stack-machine. I made that choice because I want the VM to be both intuitive and easy to target. It’s not based on emulating an existing Instruction Set Architecture (ISA), because in my opinion, existing ISAs have a lot of quirks and a broad surface area (the ISA itself is a large, complex API). There’s also a phenomenon where if I said, for example, that UVM emulates an x86 CPU and Linux system calls, then people would expect UVM to support more and more x86 instructions, as well as more and more system calls. In order for the VM to maintain its strict focus on minimalism and simplicity, it has to be its own thing.</p>
+
+
+
+<p>At this stage, UVM is just an interpreter with a tiny set of APIs. It’s still very immature and should be considered hobbyist-grade at best. That being said, some of its strengths is that it’s a small system that’s designed to be easy to understand. It’s important to me that software be approachable. It can run <a href="https://github.com/maximecb/uvm/tree/main/vm/examples">programs</a> written in its own assembler syntax, but unlike other systems, the assembler doesn’t use some weird esoteric syntax, it uses a simple syntax based on NASM/YASM. If you’ve programmed in assembler before, and you understand how a stack machine works, then the syntax of UVM’s assembler should seem fairly intuitive to you.</p>
+
+
+
+<p>I’m also in the process of building a <a href="https://github.com/maximecb/uvm/tree/main/ncc">toy C compiler</a> that targets UVM. It’s currently lacking several features, but it already supports macros and enough C to be able to write something like a simple paint program, a snake game, and a few other simple graphics programs. UVM provides a frame buffer API that’s really easy to use. Just two function calls and you can <a href="https://github.com/maximecb/uvm/blob/7217a3a5e7d4959dbab117d58365ff0b6c814108/ncc/examples/ball.c#L77">plot pixels</a> into a window, which makes the system fun to develop for as you can write a simple 2D game in something like <a href="https://github.com/maximecb/uvm/blob/main/ncc/examples/snake.c">200 lines of C code</a> without any boilerplate.</p>
+
+
+
+<p>So here it is, UVM is currently in very early stages, and I don’t expect everyone to understand the purpose of this project, but I would really like to connect with people who share the vision, and find potential collaborators. If you’d like to know more, I recorded a <a href="https://www.youtube.com/watch?v=q9-o45B_qsA">short video demo</a> and wrote a decent amount of documentation <a href="https://github.com/maximecb/uvm">on GitHub</a>, including some notes to explain the various <a href="https://github.com/maximecb/uvm/blob/main/doc/design.md">technical decisions</a> made in the design of UVM. There’s also automatically-generated documentation for the <a href="https://github.com/maximecb/uvm/blob/main/doc/syscalls.md">system calls</a> that UVM exposes to software running on the VM. I’m also happy to answer any questions and to accept pull requests to improve the documentation.</p>
+
+
+
+<p>In terms of what’s coming next, I want to improve the C compiler and I’d like to add an audio API. I could use some input on how to best design a simple file IO and networking API. Longer-term, I would also like to design a simple and safe parallelism model for UVM. Probably something based on actors, with or without the possibility of sharing memory, but parallel computation is not my area of expertise. I could honestly use some input. If UVM is something that’s interesting to you, feel free to reach out via GitHub <a href="https://github.com/maximecb/uvm/issues">issues</a> and <a href="https://github.com/maximecb/uvm/discussions">discussions</a> or <a href="https://twitter.com/Love2Code">via twitter</a>.</p>
+											</div></div>]]>
             </description>
             <link>https://pointersgonewild.com/2023/02/24/building-a-minimalistic-virtual-machine/</link>
             <guid isPermaLink="false">hacker-news-small-sites-34936729</guid>
@@ -7613,7 +8390,7 @@ February 25, 2023 | https://pointersgonewild.com/2023/02/24/building-a-minimalis
 Score 68 | Comments 20 (<a href="https://news.ycombinator.com/item?id=34936414">thread link</a>) | @vvladi
 <br/>
 February 25, 2023 | https://social.edu.nl/@wlaatje/109865262060573901 | <a href="https://web.archive.org/web/*/https://social.edu.nl/@wlaatje/109865262060573901">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
+<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
             </description>
             <link>https://social.edu.nl/@wlaatje/109865262060573901</link>
             <guid isPermaLink="false">hacker-news-small-sites-34936414</guid>
@@ -7625,7 +8402,7 @@ February 25, 2023 | https://social.edu.nl/@wlaatje/109865262060573901 | <a href=
             </title>
             <description>
 <![CDATA[
-Score 282 | Comments 185 (<a href="https://news.ycombinator.com/item?id=34934620">thread link</a>) | @EntICOnc
+Score 282 | Comments 187 (<a href="https://news.ycombinator.com/item?id=34934620">thread link</a>) | @EntICOnc
 <br/>
 February 24, 2023 | https://hibox.live/elixir-for-humans-who-know-python | <a href="https://web.archive.org/web/*/https://hibox.live/elixir-for-humans-who-know-python">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="root-main"><nav></nav><section><div><p><i>This article has nothing to do with <b><a href="https://hibox.live/">Hibox</a></b>, a service that lets you video chat with visitors to your website so you can make more sales and get better feedback. Yes, Hibox is written in Elixir.</i></p><p>
