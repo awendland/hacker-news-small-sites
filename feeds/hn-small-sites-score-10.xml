@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Mon, 27 Mar 2023 08:32:04 GMT</lastBuildDate>
+        <lastBuildDate>Mon, 27 Mar 2023 13:53:21 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-10.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Mon, 27 Mar 2023 08:32:04 GMT</pubDate>
+        <pubDate>Mon, 27 Mar 2023 13:53:21 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,14 +20,735 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Qdrant Scalar Quantization: up to 2x faster, 4x less memory]]>
+            </title>
+            <description>
+<![CDATA[
+Score 12 | Comments 1 (<a href="https://news.ycombinator.com/item?id=35324997">thread link</a>) | @kacperlukawski
+<br/>
+March 27, 2023 | https://qdrant.tech/articles/scalar-quantization/ | <a href="https://web.archive.org/web/*/https://qdrant.tech/articles/scalar-quantization/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+<div>
+<section>
+<article>
+<div>
+<picture>
+<source srcset="https://qdrant.tech/articles_data/scalar-quantization/preview/title.webp" type="image/webp">
+<img src="https://qdrant.tech/articles_data/scalar-quantization/preview/title.jpg">
+</picture>
+</div><p>High-dimensional vector embeddings can be memory-intensive, especially when working with
+large datasets consisting of millions of vectors. Memory footprint really starts being
+a concern when we scale things up. A simple choice of the data type used to store a single
+number impacts even billions of numbers and can drive the memory requirements crazy. The
+higher the precision of your type, the more accurately you can represent the numbers.
+The more accurate your vectors, the more precise is the distance calculation. But the
+advantages stop paying off when you need to order more and more memory.</p><p>Qdrant chose <code>float32</code> as a default type used to store the numbers of your embeddings.
+So a single number needs 4 bytes of the memory and a 512-dimensional vector occupies
+2 kB. That’s only the memory used to store the vector. There is also an overhead of the
+HNSW graph, so as a rule of thumb we estimate the memory size with the following formula:</p><pre tabindex="0"><code>memory_size = 1.5 * number_of_vectors * vector_dimension * 4 bytes
+</code></pre><p>While Qdrant offers various options to store some parts of the data on disk, starting
+from version 1.1.0, you can also optimize your memory by compressing the embeddings.
+We’ve implemented the mechanism of <strong>Scalar Quantization</strong>! It turns out to have not
+only a positive impact on memory but also on the performance.</p><h2 id="scalar-quantization">Scalar Quantization</h2><p>Scalar quantization is a data compression technique that converts floating point values
+into integers. In case of Qdrant <code>float32</code> gets converted into <code>int8</code>, so a single number
+needs 75% less memory. It’s not a simple rounding though! It’s a process that makes that
+transformation partially reversible, so we can also revert integers back to floats with
+a small loss of precision.</p><h3 id="theoretical-background">Theoretical background</h3><p>Assume we have a collection of <code>float32</code> vectors and denote a single value as <code>f32</code>.
+In reality neural embeddings do not cover a whole range represented by the floating
+point numbers, but rather a small subrange. Since we know all the other vectors, we can
+establish some statistics of all the numbers. For example, the distribution of the values
+will be typically normal:</p><p><img src="https://qdrant.tech/articles_data/scalar-quantization/float32-distribution.png" alt="A distribution of the vector values"></p><p>Our example shows that 99% of the values come from a <code>[-2.0, 5.0]</code> range. And the
+conversion to <code>int8</code> will surely lose some precision, so we rather prefer keeping the
+representation accuracy within the range of 99% of the most probable values and ignoring
+the precision of the outliers. There might be a different choice of the range width,
+actually, any value from a range <code>[0, 1]</code>, where <code>0</code> means empty range, and <code>1</code> would
+keep all the values. That’s a hyperparameter of the procedure called <code>quantile</code>. A value
+of <code>0.95</code> or <code>0.99</code> is typically a reasonable choice, but in general <code>quantile ∈ [0, 1]</code>.</p><h4 id="conversion-to-integers">Conversion to integers</h4><p>Let’s talk about the conversion to <code>int8</code>. Integers also have a finite set of values that
+might be represented. Within a single byte they may represent up to 256 different values,
+either from <code>[-128, 127]</code> or <code>[0, 255]</code>.</p><p><img src="https://qdrant.tech/articles_data/scalar-quantization/int8-value-range.png" alt="Value ranges represented by int8"></p><p>Since we put some boundaries on the numbers that might be represented by the <code>f32</code>, and
+<code>i8</code> has some natural boundaries, the process of converting the values between those
+two ranges is quite natural:</p><p>$$ f32 = \alpha \times i8 + offset $$</p><p>$$ i8 = \frac{f32 - offset}{\alpha} $$</p><p>The parameters $ \alpha $ and $ offset $ has to be calculated for a given set of vectors,
+but that comes easily by putting the minimum and maximum of the represented range for
+both <code>f32</code> and <code>i8</code>.</p><p><img src="https://qdrant.tech/articles_data/scalar-quantization/float32-to-int8-conversion.png" alt="Float32 to int8 conversion"></p><p>For the unsigned <code>int8</code> it will go as following:</p><p>$$ \begin{equation}
+\begin{cases} -2 = \alpha \times 0 + offset \\ 5 = \alpha \times 255 + offset \end{cases}
+\end{equation} $$</p><p>In case of signed <code>int8</code>, we’ll just change the represented range boundaries:</p><p>$$ \begin{equation}
+\begin{cases} -2 = \alpha \times (-128) + offset \\ 5 = \alpha \times 127 + offset \end{cases}
+\end{equation} $$</p><p>For any set of vector values we can simply calculate the $ \alpha $ and $ offset $ and
+those values have to be stored along with the collection to enable to conversion between
+the types.</p><h4 id="distance-calculation">Distance calculation</h4><p>We do not store the vectors in the collections represented by <code>int8</code> instead of <code>float32</code>
+just for the sake of compressing the memory. But the coordinates are being used while we
+calculate the distance between the vectors. Both dot product and cosine distance requires
+multiplying the corresponding coordinates of two vectors, so that’s the operation we
+perform quite often on <code>float32</code>. Here is how it would look like if we perform the
+conversion to <code>int8</code>:</p><p>$$ f32 \times f32’ = $$
+$$ = (\alpha \times i8 + offset) \times (\alpha \times i8’ + offset) = $$
+$$ = \alpha^{2} \times i8 \times i8’ + \underbrace{offset \times \alpha \times i8’ + offset \times \alpha \times i8 + offset^{2}}_\text{pre-compute} $$</p><p>The first term, $ \alpha^{2} \times i8 \times i8’ $ has to be calculated when we measure the
+distance as it depends on both vectors. However, both the second and the third term
+($ offset \times \alpha \times i8’ $ and $ offset \times \alpha \times i8 $ respectively),
+depend only on a single vector and those might be precomputed and kept for each vector.
+The last term, $ offset^{2} $ does not depend on any of the values, so it might be even
+computed once and reused.</p><p>If we had to calculate all the terms to measure the distance, the performance could have
+been even worse than without the conversion. But thanks for the fact we can precompute
+the majority of the terms, things are getting simpler. And in turns out the scalar
+quantization has a positive impact not only on the memory usage, but also on the
+performance. As usual, we performed some benchmarks to support this statement!</p><h2 id="benchmarks">Benchmarks</h2><p>We simply used the same approach as we use in all <a href="https://qdrant.tech/benchmarks">the other benchmarks we publish</a>.
+Both <a href="https://github.com/qdrant/ann-filtering-benchmark-datasets">Arxiv-titles-384-angular-no-filters</a>
+and <a href="https://github.com/erikbern/ann-benchmarks/">Gist-960</a> datasets were chosen to make
+the comparison between non-quantized and quantized vectors. The results are summarized
+in the tables:</p><h4 id="arxiv-titles-384-angular-no-filters">Arxiv-titles-384-angular-no-filters</h4><table>
+<thead>
+<tr>
+<th colspan="2"></th><th colspan="2">ef = 128</th><th colspan="2">ef = 256</th><th colspan="2">ef = 512</th></tr><tr>
+<th></th><th><small>Upload and indexing time</small></th><th><small>Mean search precision</small></th><th><small>Mean search time</small></th><th><small>Mean search precision</small></th><th><small>Mean search time</small></th><th><small>Mean search precision</small></th><th><small>Mean search time</small></th></tr></thead><tbody>
+<tr>
+<th>Non-quantized vectors</th><td>649 s</td><td>0.989</td><td>0.0094</td><td>0.994</td><td>0.0932</td><td>0.996</td><td>0.161</td></tr><tr>
+<th>Scalar Quantization</th><td>496 s</td><td>0.986</td><td>0.0037</td><td>0.993</td><td>0.060</td><td>0.996</td><td>0.115</td></tr><tr>
+<td>Difference</td><td><span>-23.57%</span></td><td><span>-0.3%</span></td><td><span>-60.64%</span></td><td><span>-0.1%</span></td><td><span>-35.62%</span></td><td>0%</td><td><span>-28.57%</span></td></tr></tbody></table><p>A slight decrease in search precision results in a considerable improvement in the
+latency. Unless you aim for the highest precision possible, you should not notice the
+difference in your search quality.</p><h4 id="gist-960">Gist-960</h4><table>
+<thead>
+<tr>
+<th colspan="2"></th><th colspan="2">ef = 128</th><th colspan="2">ef = 256</th><th colspan="2">ef = 512</th></tr><tr>
+<th></th><th><small>Upload and indexing time</small></th><th><small>Mean search precision</small></th><th><small>Mean search time</small></th><th><small>Mean search precision</small></th><th><small>Mean search time</small></th><th><small>Mean search precision</small></th><th><small>Mean search time</small></th></tr></thead><tbody>
+<tr>
+<th>Non-quantized vectors</th><td>452</td><td>0.802</td><td>0.077</td><td>0.887</td><td>0.135</td><td>0.941</td><td>0.231</td></tr><tr>
+<th>Scalar Quantization</th><td>312</td><td>0.802</td><td>0.043</td><td>0.888</td><td>0.077</td><td>0.941</td><td>0.135</td></tr><tr>
+<td>Difference</td><td><span>-30.79%</span></td><td>0%</td><td><span>-44,16%</span></td><td><span>+0.11%</span></td><td><span>-42.96%</span></td><td>0%</td><td><span>-41,56%</span></td></tr></tbody></table><p>In all the cases, the decrease in search precision is negligible, but we keep a latency
+reduction of at least 28.57%, even up to 60,64%, while searching. As a rule of thumb,
+the higher the dimensionality of the vectors, the lower the precision loss.</p><h3 id="oversampling-and-rescoring">Oversampling and Rescoring</h3><p>A distinctive feature of the Qdrant architecture is the ability to combine the search for quantized and original vectors in a single query.
+This enables the best combination of speed, accuracy, and RAM usage.</p><p>Qdrant stores the original vectors, so it is possible to rescore the top-k results with
+the original vectors after doing the neighbours search in quantized space. That obviously
+has some impact on the performance, but in order to measure how big it is, we made the
+comparison in different search scenarios.
+We used a machine with a very slow network-mounted disk and tested the following scenarios with different amounts of allowed RAM:</p><table>
+<thead>
+<tr>
+<th>Setup</th><th>RPS</th><th>Precision</th></tr></thead><tbody>
+<tr>
+<td>4.5Gb memory</td><td>600</td><td>0.99</td></tr><tr>
+<td>4.5Gb memory + SQ + rescore</td><td>1000</td><td>0.989</td></tr></tbody></table><p>And another group with more strict memory limits:</p><table>
+<thead>
+<tr>
+<th>Setup</th><th>RPS</th><th>Precision</th></tr></thead><tbody>
+<tr>
+<td>2Gb memory</td><td>2</td><td>0.99</td></tr><tr>
+<td>2Gb memory + SQ + rescore</td><td>30</td><td>0.989</td></tr><tr>
+<td>2Gb memory + SQ + no rescore</td><td>1200</td><td>0.974</td></tr></tbody></table><p>In those experiments, throughput was mainly defined by the number of disk reads, and quantization efficiently reduces it by allowing more vectors in RAM.
+Read more about on-disk storage in Qdrant and how we measure its performance in our article: <a href="https://qdrant.tech/articles/memory-consumption/">Minimal RAM you need to serve a million vectors
+</a>.</p><p>The mechanism of Scalar Quantization with rescoring disabled pushes the limits of low-end
+machines even further. It seems like handling lots of requests does not require an
+expensive setup if you can agree to a small decrease in the search precision.</p><h3 id="good-practices">Good practices</h3><p>Qdrant documentation on <a href="https://qdrant.tech/documentation/quantization/#setting-up-quantization-in-qdrant">Scalar Quantization</a>
+is a great resource describing different scenarios and strategies to achieve up to 4x
+lower memory footprint and even up to 2x performance increase.</p></article></section></div></div></div>]]>
+            </description>
+            <link>https://qdrant.tech/articles/scalar-quantization/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-35324997</guid>
+            <pubDate>Mon, 27 Mar 2023 10:40:56 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Setting up a packaging environment for Alpine Linux (introducing alpkg)]]>
+            </title>
+            <description>
+<![CDATA[
+Score 22 | Comments 1 (<a href="https://news.ycombinator.com/item?id=35324938">thread link</a>) | @todsacerdoti
+<br/>
+March 27, 2023 | https://blog.orhun.dev/alpine-packaging-setup/ | <a href="https://web.archive.org/web/*/https://blog.orhun.dev/alpine-packaging-setup/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div itemprop="articleBody">
+      <p>Recently I have been interested in <a href="https://www.alpinelinux.org/">Alpine Linux</a> and thought it would be nice to maintain some Rust packages in their repositories. In this post, I will share my notes/adventures on setting up a packaging environment and a tool called "<strong>alpkg</strong>" for automating this process.</p>
+<p><img src="https://blog.orhun.dev/mountain-view.jpg" alt="mountain view"></p>
+<p>My first interest in Alpine Linux began when I first started to containerize my open source projects using lightweight Alpine containers. I especially like to follow this approach for Rust applications because the sizes of traditional (<a href="https://en.wikipedia.org/wiki/Glibc"><code>glibc</code></a>) distro containers like Debian/Ubuntu can go up to 200-300MB due to <em>bloat</em> whereas Alpine (<a href="https://www.musl-libc.org/"><code>musl</code></a>) containers can stay so minimal such as only 3 MB!</p>
+<p>Here is an example Dockerfile from <a href="https://github.com/orhun/rustypaste">rustypaste</a> that results in a <a href="https://hub.docker.com/r/orhunp/rustypaste">3MB image</a> when built/compressed:</p>
+<pre data-lang="dockerfile"><code data-lang="dockerfile"><span>FROM</span><span> rust:1.67.0-alpine3.17 </span><span>as </span><span>builder
+</span><span>WORKDIR </span><span>/app
+</span><span>RUN </span><span>apk update
+</span><span>RUN </span><span>apk add --no-cache musl-dev
+</span><span>COPY</span><span> . .
+</span><span>RUN </span><span>cargo build --locked --release
+</span><span>RUN </span><span>mkdir -p build-out/
+</span><span>RUN </span><span>cp target/release/rustypaste build-out/
+</span><span>
+</span><span>FROM</span><span> scratch
+</span><span>WORKDIR </span><span>/app
+</span><span>COPY</span><span> --from=builder /app/build-out/rustypaste .
+</span><span>ENV </span><span>SERVER__ADDRESS=0.0.0.0:8000
+</span><span>EXPOSE </span><span>8000
+</span><span>USER </span><span>1000:1000
+</span><span>CMD </span><span>[</span><span>"./rustypaste"</span><span>]
+</span></code></pre>
+<p>One thing to note here, I especially choose <a href="https://hub.docker.com/_/scratch"><code>scratch</code></a> image as the runner since it is super minimal. You can get similar results with images like <a href="https://github.com/GoogleContainerTools/distroless"><code>distroless</code></a> as well.</p>
+<p>Although you need to deal with compiling with <code>musl</code> sometimes, it is worth the hassle when the result is that satisfying. Other things that are different in Alpine are the following:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>glibc               ➔  musl
+</span><span>systemd             ➔  OpenRC
+</span><span>GNU Core Utilities  ➔  BusyBox
+</span></code></pre>
+<p>For more information about Alpine, check out <a href="https://blog.brixit.nl/alpine-linux-is-pretty-neat/">this post</a> which goes into detail about why it's neat.</p>
+<p>Now, let's talk about how to set up a packaging environment for Alpine Linux.</p>
+<hr>
+<h3 id="overview">Overview</h3>
+<p>In my specific case, I would like to keep using my Arch Linux system and also package for Alpine Linux. There are a couple of options for doing that:</p>
+<ul>
+<li>Run Alpine Linux on a <a href="https://wiki.alpinelinux.org/wiki/Install_Alpine_on_VirtualBox">virtual machine</a></li>
+<li>Run Alpine Linux in a <a href="https://en.wikipedia.org/wiki/Chroot">chroot</a></li>
+<li>Use a Docker/Podman container with persistent storage</li>
+</ul>
+<p>I immediately eliminated the first option since I didn't want to deal with VM software and thought it would add extra complexity to my setup.</p>
+<p>Then I spun up a Docker container that runs Alpine and tried to make the storage persistent. After coming across <a href="https://stackoverflow.com/questions/67546583/creating-persistent-durable-worker-box-docker-container">this StackOverflow post</a>, it turned out to be something harder than I expected and I started to feel like I was re-inventing VMs due to all those mount-binds and permissions. Unsurprisingly enough, I ditched that idea as well.</p>
+<p>Later on, I came across <a href="https://wiki.alpinelinux.org/wiki/Alpine_Linux_in_a_chroot">this great article</a> on Alpine Wiki about creating a chroot:</p>
+<blockquote>
+<p>Inside the chroot environment, you can build, debug, and run Alpine packages or develop things. It's the most known way to do so without replacing your system or using a Virtual Machine.</p>
+</blockquote>
+<p>This is exactly what I needed!</p>
+<p>After settling on what to use, I had a plan in mind and came up with this diagram:</p>
+<center>
+<img src="https://blog.orhun.dev/alpine-packaging-diagram.png" width="80%">
+</center>
+<p>Let's break it down:</p>
+<ul>
+<li>Everything is running inside Arch Linux.</li>
+<li>There is a chroot container that holds the package sources and Alpine SDK tools needed.
+<ul>
+<li>In Alpine, packages are <a href="https://wiki.alpinelinux.org/wiki/APKBUILD_Reference">APKBUILD</a> scripts that contain the build instructions for <a href="https://wiki.alpinelinux.org/wiki/Include:Abuild">abuild</a> tool.</li>
+</ul>
+</li>
+<li>There is a Git repository set up <em>outside</em> the chroot for adding/updating/deleting packages.
+<ul>
+<li>For interacting with the repositories, we can simply send a patch (i.e. merge request) to <code>aports</code> repositories which reside in <a href="https://gitlab.alpinelinux.org/alpine/aports">gitlab.alpinelinux.org/alpine/aports</a>.</li>
+<li>We only need to create a GitLab account and fork the repository, no special role is needed!</li>
+</ul>
+</li>
+</ul>
+<hr>
+<h3 id="setting-up-the-chroot">Setting up the chroot</h3>
+<p><a href="https://github.com/alpinelinux/alpine-chroot-install">alpine-chroot-install</a> is a tool that automates the manual steps of creating a chroot. We can use it as follows:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ alpine-chroot-install \
+</span><span>	-a</span><span> x86_64 \      </span><span># architecture
+</span><span>	-d alpine \      </span><span># directory
+</span><span>	-p build-base \  </span><span># install build-base
+</span><span>	-p alpine-sdk    </span><span># install alpine-sdk
+</span></code></pre>
+<p>In a couple of seconds, it will create a chroot and we can easily switch to it with the following script:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ alpine/enter-chroot</span><span> -u </span><span>"$USER" </span><span>&lt;</span><span>CMD</span><span>&gt;
+</span></code></pre>
+<center>
+<p><img src="https://blog.orhun.dev/alpine-chroot.gif" alt="alpine chroot"></p>
+<p>And here we have Alpine Linux running inside Arch Linux!</p>
+</center>
+<hr>
+<h4 id="story-time">Story Time</h4>
+<p>After I created the Alpine chroot, I played around a bit and tried out different features of <code>apk</code> package manager. I installed some of my favorite Rust tools and everything was working smoothly.</p>
+<p>Then I got an idea: I should try installing those tools during the chroot installation. Luckily, <code>alpine-chroot-install</code> has an option for it and you can simply use <code>-p &lt;pkg&gt;</code> for installing packages.</p>
+<p>Of course, I wanted to remove the chroot directory I just created before creating another chroot. For a second I thought chroot was just a simple directory and tried to delete it with <code>rm -rf</code>.</p>
+<p>Ouch.</p>
+<p>However, chroot was not a regular directory. It has a bunch of things mounted to it:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ alpine-chroot-install
+</span><span>
+</span><span># ...
+</span><span>&gt;</span><span> Binding filesystems into chroot
+</span><span>mount: none mounted on /alpine/proc.
+</span><span>mount: /sys bound on /alpine/sys.
+</span><span>mount: /dev bound on /alpine/dev.
+</span></code></pre>
+<p>So when I deleted chroot, I also deleted <code>/dev</code> x_x</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ rm</span><span> -rf</span><span> /chroot
+</span><span>
+</span><span>rm: WARNING: Circular directory structure.
+</span><span>This almost certainly means that you have a corrupted file system.
+</span><span>NOTIFY YOUR SYSTEM MANAGER.
+</span></code></pre>
+<p>Then everything started to fail:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ ls
+</span><span>
+</span><span>Failed to open file to remap file descriptor (No such file or directory)
+</span></code></pre>
+<p><code>/dev/null</code> was also gone and I got errors like "permission denied: /dev/null" as well. Fun.</p>
+<p>Luckily a simple reboot fixes this issue. The scariest part was when everything started to throw errors left and right, I panicked and realized what I did. I was afraid I <code>rm -rf</code>'d my whole system but luckily it was just the mount points.</p>
+<p>Lesson learned, I used the removal script for deleting the chroot next time: <code>/chroot/destroy --remove</code>.</p>
+<hr>
+<h3 id="setting-up-the-packaging-environment">Setting up the packaging environment</h3>
+<p>Let's install the necessary packages for packaging/development on Alpine:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ apk add alpine-sdk atools
+</span></code></pre>
+<p>After that, we need to configure the build defaults in <code>/etc/abuild.conf</code>, especially the packager information:</p>
+<pre data-lang="sh"><code data-lang="sh"><span># PACKAGER and MAINTAINER are used by newapkbuild when creating new aports for
+</span><span># the APKBUILD's "Contributor:" and "Maintainer:" comments, respectively.
+</span><span>PACKAGER</span><span>=</span><span>"Your Name &lt;your@email.address&gt;"
+</span><span>MAINTAINER</span><span>=</span><span>"$PACKAGER"
+</span></code></pre>
+<p>Next, we can configure the security keys:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ abuild-keygen</span><span> --append --install
+</span></code></pre>
+<p>After this step, we are now ready for preparing <code>APKBUILDs</code> according to <a href="https://wiki.alpinelinux.org/wiki/Creating_an_Alpine_package">this guide</a> and build them via <code>abuild -r</code>.</p>
+<hr>
+<h3 id="setting-up-the-repository">Setting up the repository</h3>
+<p>After forking the <a href="https://gitlab.alpinelinux.org/alpine/aports">aports</a> repository on GitLab, we can clone it somewhere on our main system and configure Git according to the packager information we have provided earlier in <code>/etc/abuild.conf</code>:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ git clone https://gitlab.alpinelinux.org/</span><span>&lt;</span><span>user</span><span>&gt;</span><span>/aports
+</span><span>$ git config</span><span> --global</span><span> user.name </span><span>"Your Name"
+</span><span>$ git config</span><span> --global</span><span> user.email </span><span>"your@email.address"
+</span></code></pre>
+<p>Official documentation <a href="https://wiki.alpinelinux.org/wiki/Creating_an_Alpine_package#Commit_your_work">recommends</a> adding the following Git hook for automatically generating the commit message based on the package that is being committed:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ cat </span><span>&lt;&lt;-</span><span>'</span><span>_EOF_</span><span>' </span><span>&gt;</span><span>".git/hooks/prepare-commit-msg"
+</span><span>  #!/bin/sh
+</span><span>  case "$2,$3" in
+</span><span>    ,|template,)
+</span><span>      if git diff-index --diff-filter=A --name-only --cached HEAD \
+</span><span>          | grep -q '/APKBUILD$'; then
+</span><span>        meta() { git diff --staged | grep "^+$1" | sed 's/.*="\?//;s/"$//';}
+</span><span>        printf 'testing/%s: new aport\n\n%s\n%s\n' "$(meta pkgname)" \
+</span><span>          "$(meta url)" "$(meta pkgdesc)" "$(cat $1)" &gt; "$1"
+</span><span>      else
+</span><span>        printf '%s\n\n%s' `git diff-index --name-only --cached HEAD \
+</span><span>          | sed -n 's/\/APKBUILD$//p;q'` "$(cat $1)" &gt; "$1"
+</span><span>      fi;;
+</span><span>  esac
+</span><span>_EOF_
+</span><span>chmod +x </span><span>".git/hooks/prepare-commit-msg"
+</span></code></pre>
+<p>This hook will result in generating commit messages such as:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>testing/git-cliff: new aport
+</span><span>
+</span><span>https://github.com/orhun/git-cliff
+</span><span>A highly customizable changelog generator
+</span><span>testing/
+</span></code></pre>
+<p>Nice.</p>
+<hr>
+<h3 id="creating-packages">Creating packages</h3>
+<p>Alpine Linux has a convenient tool called <code>newapkbuild</code> for generating <code>APKBUILD</code> prototypes based on the given parameters:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ newapkbuild</span><span> -h
+</span><span>
+</span><span>newapkbuild 3.10.0-r0 - generate a new APKBUILD
+</span><span>Usage: newapkbuild </span><span>[</span><span>-n PKGNAME</span><span>] [</span><span>-d PKGDESC</span><span>] [</span><span>-l LICENSE</span><span>] [</span><span>-u URL</span><span>]
+</span><span>       [-a </span><span>| </span><span>-C </span><span>| </span><span>-m </span><span>| </span><span>-p </span><span>| </span><span>-y </span><span>| </span><span>-r] </span><span>[</span><span>-s</span><span>] [</span><span>-c</span><span>] [</span><span>-f</span><span>] [</span><span>-h</span><span>]
+</span><span>       PKGNAME[-PKGVER] </span><span>| </span><span>SRCURL
+</span><span>Options:
+</span><span>  -n  Set package name to PKGNAME (only use with SRCURL)
+</span><span>  -d  Set package description to PKGDESC
+</span><span>  -l  Set package license to LICENSE, use identifiers from:
+</span><span>      </span><span>&lt;</span><span>https://spdx.org/licenses/</span><span>&gt;
+</span><span>  -u  Set package URL
+</span><span>  -a  Create autotools package (use ./configure ...)
+</span><span>  -C  Create CMake package (Assume cmake/ is there)
+</span><span>  -m  Create meson package (Assume meson.build is there)
+</span><span>  -p  Create perl package (Assume Makefile.PL is there)
+</span><span>  -y  Create python package (Assume setup.py is there)
+</span><span>  -r  Create rust package (Assume Cargo.toml is there)
+</span><span>  -s  Use sourceforge source URL
+</span><span>  -c  Copy a sample init.d, conf.d, and install script
+</span><span>  -f  Force even if directory already exists
+</span><span>  -h  Show this help
+</span></code></pre>
+<p>It is especially useful if you don't want to write the same boilerplate functions over and over again.</p>
+<p>It can be used for Rust packages as follows:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ newapkbuild</span><span> -r </span><span>\
+</span><span>              -u </span><span>"https://github.com/orhun/git-cliff" </span><span>\
+</span><span>              -d </span><span>"A highly customizable changelog generator" </span><span>\
+</span><span>              -l </span><span>"GPL-3.0-only" </span><span>\
+</span><span>              </span><span>"git-cliff"
+</span></code></pre>
+<p>This will generate the following <code>APKBUILD</code> in <code>git-cliff</code> directory:</p>
+<pre data-lang="sh"><code data-lang="sh"><span># Contributor: Your Name &lt;your@email.address&gt;
+</span><span># Maintainer: Your Name &lt;your@email.address&gt;
+</span><span>pkgname</span><span>=</span><span>git-cliff
+</span><span>pkgver</span><span>=
+</span><span>pkgrel</span><span>=</span><span>0
+</span><span>pkgdesc</span><span>=</span><span>"A highly customizable changelog generator"
+</span><span>url</span><span>=</span><span>"https://github.com/orhun/git-cliff"
+</span><span>arch</span><span>=</span><span>"all"
+</span><span>license</span><span>=</span><span>"GPL-3.0-only"
+</span><span>depends</span><span>=</span><span>""
+</span><span>makedepends</span><span>=</span><span>"cargo"
+</span><span>checkdepends</span><span>=</span><span>""
+</span><span>install</span><span>=</span><span>""
+</span><span>subpackages</span><span>=</span><span>"$pkgname-dev $pkgname-doc"
+</span><span>source</span><span>=</span><span>""
+</span><span>builddir</span><span>=</span><span>"$srcdir/"
+</span><span>
+</span><span>prepare</span><span>() {
+</span><span>	default_prepare
+</span><span>
+</span><span>	cargo fetch</span><span> --locked
+</span><span>}
+</span><span>
+</span><span>build</span><span>() {
+</span><span>	cargo build</span><span> --frozen --release
+</span><span>}
+</span><span>
+</span><span>check</span><span>() {
+</span><span>	cargo test</span><span> --frozen
+</span><span>}
+</span><span>
+</span><span>package</span><span>() {
+</span><span>	cargo install</span><span> --frozen --offline --path</span><span> .</span><span> --root</span><span>=</span><span>"$pkgdir/usr"
+</span><span>	rm </span><span>"$pkgdir"</span><span>/usr/.crates</span><span>*
+</span><span>}
+</span></code></pre>
+<p>You can read more about <code>APKBUILD</code> functions/variables in the <a href="https://wiki.alpinelinux.org/wiki/APKBUILD_Reference">official reference</a>. With some edits, we can fit our project into this template easily. Here is the final <code>APKBUILD</code>:</p>
+<pre data-lang="sh"><code data-lang="sh"><span># Contributor: Orhun Parmaksız &lt;orhunparmaksiz@gmail.com&gt;
+</span><span># Maintainer: Orhun Parmaksız &lt;orhunparmaksiz@gmail.com&gt;
+</span><span>pkgname</span><span>=</span><span>git-cliff
+</span><span>pkgver</span><span>=</span><span>1.1.2
+</span><span>pkgrel</span><span>=</span><span>0
+</span><span>pkgdesc</span><span>=</span><span>"A highly customizable changelog generator"
+</span><span>url</span><span>=</span><span>"https://github.com/orhun/git-cliff"
+</span><span># s390x, ppc64le, riscv64: blocked by ring crate
+</span><span>arch</span><span>=</span><span>"all !s390x !ppc64le !riscv64"
+</span><span>license</span><span>=</span><span>"GPL-3.0-or-later"
+</span><span>makedepends</span><span>=</span><span>"
+</span><span>	cargo
+</span><span>	libgit2-dev
+</span><span>	"
+</span><span>subpackages</span><span>=</span><span>"
+</span><span>	$pkgname-doc
+</span><span>	$pkgname-bash-completion
+</span><span>	$pkgname-zsh-completion
+</span><span>	$pkgname-fish-completion
+</span><span>	"
+</span><span>options</span><span>=</span><span>"net"
+</span><span>source</span><span>=</span><span>"$pkgname-$pkgver.tar.gz::https://github.com/orhun/git-cliff/archive/v$pkgver.tar.gz"
+</span><span>
+</span><span>prepare</span><span>() {
+</span><span>	default_prepare
+</span><span>
+</span><span>	cargo fetch</span><span> --target</span><span>=</span><span>"$CTARGET"</span><span> --locked
+</span><span>}
+</span><span>
+</span><span>build</span><span>() {
+</span><span>	cargo build</span><span> --frozen --release
+</span><span>	mkdir</span><span> -p</span><span> man
+</span><span>	OUT_DIR</span><span>=</span><span>man/ "./target/release/$pkgname-mangen"
+</span><span>	mkdir</span><span> -p</span><span> completions
+</span><span>	OUT_DIR</span><span>=</span><span>completions/ "./target/release/$pkgname-completions"
+</span><span>}
+</span><span>
+</span><span>check</span><span>() {
+</span><span>	cargo test</span><span> --frozen</span><span> --</span><span> --skip </span><span>"git_log"
+</span><span>}
+</span><span>
+</span><span>package</span><span>() {
+</span><span>	install</span><span> -Dm</span><span> 755 </span><span>"target/release/$pkgname"</span><span> -t </span><span>"$pkgdir/usr/bin"
+</span><span>	install</span><span> -Dm</span><span> 644 README.md</span><span> -t </span><span>"$pkgdir/usr/share/doc/$pkgname"
+</span><span>	install</span><span> -Dm</span><span> 644 </span><span>"man/$pkgname.1"</span><span> -t </span><span>"$pkgdir/usr/share/man/man1"
+</span><span>	install</span><span> -Dm</span><span> 644 </span><span>"completions/$pkgname.bash" "$pkgdir/usr/share/bash-completion/completions/$pkgname"
+</span><span>	install</span><span> -Dm</span><span> 644 </span><span>"completions/$pkgname.fish"</span><span> -t </span><span>"$pkgdir/usr/share/fish/completions"
+</span><span>	install</span><span> -Dm</span><span> 644 </span><span>"completions/_$pkgname"</span><span> -t </span><span>"$pkgdir/usr/share/zsh/site-functions"
+</span><span>}
+</span><span>
+</span><span>sha512sums</span><span>=</span><span>"
+</span><span>f5564f1d6d492ea6527f2ac10eaa1dc90aa1846fb9b090224ff7a2c1cad78d8850a13364c5e4beae987c4ebf65891e804e0677fd9ab193e56d9565292d6cf2ba  git-cliff-1.1.2.tar.gz
+</span><span>"
+</span></code></pre>
+<p>After we have the <code>APKBUILD</code>, we can use the following commands.</p>
+<p>To generate checksums:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ abuild checksum
+</span></code></pre>
+<p>To build:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ abuild</span><span> -r
+</span></code></pre>
+<p>To lint:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ apkbuild-lint APKBUILD
+</span></code></pre>
+<p>After the package is successfully built, there will be an <code>apk</code> file in the <code>$HOME/packages</code> directory. It is possible to list the <code>apk</code> contents with the following command:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ tar tvvf git-cliff-1.1.2-r0.apk
+</span><span>-rw-r--r-- 0/0             512 2023-03-22 19:08 .SIGN.RSA.orhunparmaksiz@gmail.com-641b3a67.rsa.pub
+</span><span>-rw-r--r-- root/root       754 2023-03-22 19:08 .PKGINFO
+</span><span>drwxr-xr-x root/root         0 2023-03-22 19:08 usr/
+</span><span>drwxr-xr-x root/root         0 2023-03-22 19:08 usr/bin/
+</span><span>-rwxr-xr-x root/root   7064056 2023-03-22 19:08 usr/bin/git-cliff
+</span><span>-rwxr-xr-x root/root    469160 2023-03-22 19:08 usr/bin/git-cliff-completions
+</span><span>-rwxr-xr-x root/root    440488 2023-03-22 19:08 usr/bin/git-cliff-mangen
+</span></code></pre>
+<p>To install the locally built package, we can update the repository index (<code>/etc/apk/repositories</code>) to point to the local directory and install it via <code>apk</code>:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ cat /etc/apk/repositories
+</span><span>
+</span><span>/home/orhun/packages/orhun/
+</span><span>http://dl-cdn.alpinelinux.org/alpine/latest-stable/main
+</span><span>http://dl-cdn.alpinelinux.org/alpine/latest-stable/community
+</span><span>
+</span><span>$ apk add git-cliff
+</span></code></pre>
+<p>If everything works fine, then congratulations, you just built your first Alpine package!</p>
+<hr>
+<h3 id="submitting-patches">Submitting patches</h3>
+<p>Alpine Linux has 3 repositories:</p>
+<ol>
+<li><code>main</code>: Directly supported official packages which are maintained by the Alpine core team.</li>
+</ol>
+<ul>
+<li>Similar to <code>core</code>/<code>extra</code> repositories in Arch Linux.</li>
+</ul>
+<ol start="2">
+<li><code>community</code>: Packages that are created by the contributors and developers. Not fully supported, maintenance is dependent on the contributor activity.</li>
+</ol>
+<ul>
+<li>Same as <code>community</code> repository on Arch Linux.</li>
+</ul>
+<ol start="3">
+<li><code>testing</code>: New packages that are added by contributors. Packages from this repository are accepted into the <code>community</code> repository. This repository is only available on <a href="https://wiki.alpinelinux.org/wiki/Edge">edge</a> (development) branch of Alpine.</li>
+</ol>
+<ul>
+<li>Similar to the AUR / <code>testing</code> repositories on Arch Linux.</li>
+</ul>
+<p>Since we have just created a <em>new</em> package, it will go to the <code>testing</code> repository. We can simply commit <code>testing/&lt;package&gt;/APKBUILD</code> and then create a merge request on GitLab.</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ cd aports/
+</span><span>$ git pull
+</span><span>$ git checkout</span><span> -b</span><span> aport/git-cliff
+</span><span>$ mkdir</span><span> -p</span><span> testing/git-cliff
+</span><span>$ cp /chroot/home/orhun/git-cliff/APKBUILD testing/git-cliff/
+</span><span>$ git add testing/git-cliff
+</span><span>$ git commit
+</span><span>$ git push
+</span></code></pre>
+<p>And there we go: <a href="https://gitlab.alpinelinux.org/alpine/aports/-/merge_requests/45319"><strong>https://gitlab.alpinelinux.org/alpine/aports/-/merge_requests/45319</strong></a></p>
+<p>After the merge request is approved/merged, our package will show up on <a href="https://pkgs.alpinelinux.org/">https://pkgs.alpinelinux.org</a>:</p>
+<p><img src="https://blog.orhun.dev/alpine-pkg.png" alt="alpine package"></p>
+<center>
+<p>Yay! <a href="https://github.com/orhun/git-cliff"><code>git-cliff</code></a> is now available for Alpine Linux!</p>
+</center>
+<hr>
+<h3 id="automating-mostly-everything-with-alpkg">Automating (mostly) everything with <a href="https://github.com/orhun/alpkg"><strong>alpkg</strong></a> 🏔️</h3>
+<p>⭐ GitHub: <a href="https://github.com/orhun/alpkg"><strong>https://github.com/orhun/alpkg</strong></a></p>
+<blockquote>
+<p><code>alpkg</code> can create a chroot with preinstalled tools in a matter of seconds, set up <a href="https://gitlab.alpinelinux.org/alpine/aports">aports repository</a>, and fetch/update packages. Most importantly, it provides a split layout via <a href="https://github.com/zellij-org/zellij">Zellij</a> for easy editing/building <a href="https://wiki.alpinelinux.org/wiki/APKBUILD_Reference"><code>APKBUILD</code></a> files.</p>
+</blockquote>
+<p><img src="https://raw.githubusercontent.com/orhun/alpkg/main/assets/demo.gif" alt="alpkg demo"></p>
+<p><code>alpkg</code> does everything that is mentioned earlier in this post and more. For example, in the GIF above:</p>
+<ul>
+<li>an Alpine chroot is created. (<code>alpkg init</code>)</li>
+<li>an existing <code>APKBUILD</code> is fetched. (<code>alpkg fetch</code>)</li>
+<li><code>APKBUILD</code> is edited and built. (<code>alpkg edit</code>)</li>
+<li>changes are committed to <code>aports</code>. (<code>alpkg update</code>)</li>
+</ul>
+<p>Let's go over these features.</p>
+<p>Creating a chroot is as easy as running <code>alpkg init</code>. It also installs the SDK tools that we need and sets up the <code>aports</code> repository for us.</p>
+<p><img src="https://raw.githubusercontent.com/orhun/alpkg/main/assets/init.gif" alt="alpkg init"></p>
+<p>We can fetch and edit a <code>APKBUILD</code> via <code>alpkg fetch</code>. It will provide a split layout for both editing and other operations such as running <code>abuild -r</code>.</p>
+<p><img src="https://raw.githubusercontent.com/orhun/alpkg/main/assets/fetch.gif" alt="alpkg fetch"></p>
+<p>To create a new <code>APKBUILD</code>, we can simply use <code>alpkg edit</code>.</p>
+<p><img src="https://raw.githubusercontent.com/orhun/alpkg/main/assets/edit-1.gif" alt="alpkg edit"></p>
+<p>Lastly, if we want to commit the changes to <code>aports</code>, we can run <code>alpkg update</code>.</p>
+<p><img src="https://raw.githubusercontent.com/orhun/alpkg/main/assets/update.gif" alt="alpkg update"></p>
+<p>You can get more information about the tool and see detailed usage examples in the <a href="https://github.com/orhun/alpkg">repository</a>.</p>
+<hr>
+<h3 id="endnote">Endnote</h3>
+<p>Alpine Linux is neat. I'm really looking forward to oxidizing it (add more Rust packages to their repositories) and learning more about their implementation choices to eventually do more development. I'm glad how <code>alpkg</code> turned out and I'm planning to improve it based on my needs and the feedback from the Alpine community. I like automating things.</p>
+<p>Hope you enjoyed reading and see you in the next one!</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ docker run alpine echo </span><span>"안녕히 가세요"
+</span></code></pre>
+
+    </div></div>]]>
+            </description>
+            <link>https://blog.orhun.dev/alpine-packaging-setup/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-35324938</guid>
+            <pubDate>Mon, 27 Mar 2023 10:31:10 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Thoughts on Svelte]]>
+            </title>
+            <description>
+<![CDATA[
+Score 130 | Comments 54 (<a href="https://news.ycombinator.com/item?id=35324430">thread link</a>) | @naansequitur
+<br/>
+March 27, 2023 | https://tyhopp.com/notes/thoughts-on-svelte | <a href="https://web.archive.org/web/*/https://tyhopp.com/notes/thoughts-on-svelte">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+        
+        <time datetime="2023-03-27">2023-03-27</time>
+        <p>Over the span of a month I built a <a href="https://github.com/tyhopp/t-rss-reader">personal RSS reader</a>.</p>
+<p>For the web client I used <a href="https://svelte.dev/">Svelte</a> and <a href="https://kit.svelte.dev/">SvelteKit</a>, mostly as a way to evaluate whether I'd use the tools in larger projects.</p>
+<p>Here are my thoughts on Svelte.</p>
+<h2 id="tldr">TL;DR</h2>
+<p>I enjoyed the Svelte experience on the whole. Highlights are the component format, built-in stores, and the event dispatcher API. Lowlights are reactive statements (<code>$</code>), <code>await</code> blocks, and built-in transition and animation APIs.</p>
+<h2 id="component-format">Component format</h2>
+<p>Svelte's component format is my favorite thing about it. When you write <code>.svelte</code> files, your default context is the same as the browser's: HTML.</p>
+<p>This snippet from the <a href="https://svelte.dev/docs#component-format">Svelte docs</a> (with some example markup, JS and CSS added) is illustrative:</p>
+<pre><code><span>&lt;<span>script</span>&gt;</span><span>
+  
+  <span>function</span> <span>add</span>(<span>a, b</span>) {
+    <span>return</span> a + b;
+  }
+</span><span>&lt;/<span>script</span>&gt;</span>
+
+
+<span>&lt;<span>p</span>&gt;</span>1 + 2 is: {add(1, 2)}<span>&lt;/<span>p</span>&gt;</span>
+
+<span>&lt;<span>style</span>&gt;</span>
+  /* styles go here */
+  p {
+    color: blue;
+  }
+<span>&lt;/<span>style</span>&gt;</span></code></pre><p>Contrast this with React, where JavaScript is the default context and HTML is interleaved via JSX:</p>
+<pre><code><span>import</span> <span>'../some-styles.css'</span>; 
+
+<span>export</span> <span>function</span> <span>SomeComponent</span>(<span></span>) {
+  
+  <span>function</span> <span>add</span>(<span>a, b</span>) {
+    <span>return</span> a + b;
+  }
+
+  
+  <span>return</span> <span><span>&lt;<span>p</span> <span>className</span>=<span>"some-class"</span>&gt;</span>{`1 + 2 is: ${add(1, 2)}`}<span>&lt;/<span>p</span>&gt;</span></span>;
+}</code></pre><p>It's hard to pin down why this approach is great in real terms. You can't really say "Svelte's component format makes our team X times faster when building components than with Y framework" with any certainty.</p>
+<p>I think that the component format is a big part of why people say they enjoy working with Svelte. There's a temptation to explain it as there's less context switching since the browser thinks about HTML first too, but I'm not sure that holds water. Either way, I like it.</p>
+<h2 id="built-in-stores">Built-in stores</h2>
+<p>Svelte comes with built-in <a href="https://svelte.dev/docs#run-time-svelte-store">stores</a> as an option for state management.</p>
+<p>What should and should not be the concern of a user interface library/framework is a contested topic. I like that Svelte acknowledges that state management is a problem you will probably have and gives you a solution you can use or extend if you want to.</p>
+<p>It's also nice that this solution isn't strongly linked to the component tree like React context is.</p>
+<h2 id="event-dispatcher-api">Event dispatcher API</h2>
+<p>Svelte has <a href="https://svelte.dev/docs#run-time-svelte-createeventdispatcher">a built-in API</a> that lets you create a <a href="https://developer.mozilla.org/en-US/docs/Web/API/CustomEvent/CustomEvent"><code>CustomEvent</code></a>, dispatch it, and listen for it on parent elements.</p>
+<p>It's difficult to have an answer for the web's event model in systems that are built on the concept of a unidirectional data flow. By nature, the web's event model lets data flow upwards.</p>
+<p>Svelte acknowledges that you might need to send data up the tree and gives you an API that uses web platform primitives. Thumbs up from me.</p>
+<h2 id="reactive-statements">Reactive statements</h2>
+<p>I found Svelte's <a href="https://svelte.dev/docs#component-format-script-3-$-marks-a-statement-as-reactive">reactive statements</a> confusing.</p>
+<p>Svelte's basic reactivity is <a href="https://svelte.dev/docs#component-format-script-2-assignments-are-reactive">based on variable assignments</a>. That I understand. The docs give this example:</p>
+<pre><code><span>&lt;<span>script</span>&gt;</span><span>
+  <span>let</span> count = <span>0</span>;
+
+  <span>function</span> <span>handleClick</span>(<span></span>) {
+    
+    
+    count = count + <span>1</span>;
+  }
+</span><span>&lt;/<span>script</span>&gt;</span></code></pre><p>Makes sense to me.</p>
+<p>Now, introducing the reactive <code>$</code> label, the docs give this example:</p>
+<pre><code><span>&lt;<span>script</span>&gt;</span><span>
+  <span>export</span> <span>let</span> title;
+  <span>export</span> <span>let</span> person;
+
+  
+  
+  <span>$</span>: <span>document</span>.<span>title</span> = title;
+
+  <span>$</span>: {
+    <span>console</span>.<span>log</span>(<span>`multiple statements can be combined`</span>);
+    <span>console</span>.<span>log</span>(<span>`the current title is <span>${title}</span>`</span>);
+  }
+
+  
+  <span>$</span>: ({ name } = person);
+
+  
+  <span>let</span> name2 = name;
+</span><span>&lt;/<span>script</span>&gt;</span></code></pre><p>There is a lot going on here, and this is the doc's first example introducing the topic. Still, if you stare at it for a while it makes sense.</p>
+<p>Add to that this gotcha from the <a href="https://svelte.dev/docs#component-format-script-3-$-marks-a-statement-as-reactive">Svelte docs</a>:</p>
+<blockquote>
+<p>It is important to note that the reactive blocks are ordered via simple static analysis at compile time, and all the compiler looks at are the variables that are assigned to and used within the block itself, not in any functions called by them. This means that yDependent will not be updated when x is updated in the following example:</p>
+</blockquote>
+<pre><code><span>&lt;<span>script</span>&gt;</span><span>
+  <span>let</span> x = <span>0</span>;
+  <span>let</span> y = <span>0</span>;
+
+  <span>const</span> <span>setY</span> = (<span>value</span>) =&gt; {
+    y = value;
+  };
+
+  <span>$</span>: yDependent = y;
+  <span>$</span>: <span>setY</span>(x);
+</span><span>&lt;/<span>script</span>&gt;</span></code></pre><p>This subtlety led to more than one case where I didn't understand why a component didn't update.</p>
+<p>In the end I found it was difficult to determine reliably when to reach for the <code>$</code> label. I'd use it in one scenario and it seemed to work like I expect, then throw it at another scenario and it didn't work like I expect.</p>
+<p>So I avoided it altogether. One exception is I did use it to <a href="https://svelte.dev/docs#component-format-script-4-prefix-stores-with-$-to-access-their-values">access store values</a>. Unfortunately, it's also another use case that overloads <code>$</code>.</p>
+<p>The <code>$</code> label is one technical reason why I would be hesitant to adopt Svelte for larger projects. It's a core part of Svelte that you can't always avoid, and I think the potential for introducing bugs through it is high to start and very high at scale.</p>
+<h2 id="await-blocks">Await blocks</h2>
+<p>Svelte gives you <code>{#if ...}</code> and <code>{#each ...}</code> syntax as the primary control flow methods for markup rendering. It also has <code>{#await ...}</code> for <a href="https://svelte.dev/docs#template-syntax-await">deciding what to render based on the state of a Promise</a>.</p>
+<p>I like the idea, but in practice I always ended up refactoring it out. There was always something else I needed to do after the Promise resolved or rejected prior to rendering, and I didn't want to run that logic every time I used the service.</p>
+<p>The logic also didn't belong inline in the rendering code, though. So where does it go?</p>
+<p>Rip out <code>{#await ...}</code> and put it in the <code>&lt;script&gt;</code> logic, then use local variables when rendering.</p>
+<p>I think it's not a bad thing that <code>{#await ...}</code> exists in Svelte core, I was just disappointed to find that the elegant use case in the docs is somewhat of a mirage.</p>
+<h2 id="transition-and-animation-apis">Transition and animation APIs</h2>
+<p>My gripe with Svelte's <a href="https://svelte.dev/docs#run-time-svelte-transition">transition</a> and <a href="https://svelte.dev/docs#template-syntax-element-directives-animate-fn">animation</a> APIs is that I think they should be a concern of CSS and not Svelte.</p>
+<p>Svelte gives you an elegant way to use CSS in your components with <code>&lt;style&gt;</code> tags, why not implement transitions and animations in CSS there?</p>
+<p>I very well could have just not found a use case where I was glad for these APIs to exist, fair enough. Until I do, I will question why these not insignificantly complex APIs exist in Svelte's core.</p>
+<h2 id="wrapping-up">Wrapping up</h2>
+<p>Well, these are my thoughts on my experience using <a href="https://svelte.dev/">Svelte</a>!</p>
+<p>I'd use it again for personal projects, maybe not for large company projects if I was the architect.</p>
+<p>I also have thoughts on <a href="https://kit.svelte.dev/">SvelteKit</a>, but I don't have as much to say since I built an SPA, and so much of SvelteKit seems to be about server-side rendering.</p>
+<p>Until next time!</p>
+
+        <hr>
+        <p>Thanks for reading! Go <a href="https://tyhopp.com/">home</a> for more notes.</p>
+      </div></div>]]>
+            </description>
+            <link>https://tyhopp.com/notes/thoughts-on-svelte</link>
+            <guid isPermaLink="false">hacker-news-small-sites-35324430</guid>
+            <pubDate>Mon, 27 Mar 2023 08:56:56 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Deployments Not Releases – Get Good at Delivering Software]]>
+            </title>
+            <description>
+<![CDATA[
+Score 21 | Comments 12 (<a href="https://news.ycombinator.com/item?id=35323484">thread link</a>) | @kiyanwang
+<br/>
+March 26, 2023 | https://blog.mangoteque.com//blog/2023/03/13/deployments-not-releases/ | <a href="https://web.archive.org/web/*/https://blog.mangoteque.com//blog/2023/03/13/deployments-not-releases/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+      
+
+
+
+<div id="main" role="main">
+  
+  
+
+
+
+  <div>
+    
+      
+    
+    <p><em>“Dave, we can’t release more often, our customers wouldn’t tolerate it.”</em>  Having been an architect in Infrastructure Engineering at Salesforce, I’m very familiar with customers being intolerant of continual changes to UI or features. However, there is simply more to shipping than UI tweaks and features.</p>
+
+<p>In his book, <a href="https://itrevolution.com/project-to-product-by-mik-kersten/">Project to Product</a> , Dr. Mik Kersten describes four different “flow items” that can move through the system and that should be adjusted to different proportions based on the changing needs of the business. They are:</p>
+
+<ul>
+  <li>Features - new functionality, changing that button from orange to purple</li>
+  <li>Defects - bugs.  Broken functionality that gives the user a bad/wrong experience.</li>
+  <li>Risks - security and compliance problems.  Things that will cost your business <em>money</em> if they are not fixed.</li>
+  <li>Debt - Things that are a burden on the business objectives.  Things that slow down the speed or quality of delivery.</li>
+</ul>
+
+<p>A horribly incomplete list of things that can be released that are not Features: Rails upgrades, updated Amazon Machine Images (AMIs)/container images, algorithmic optimization, user behavior collection, blog posts, observability improvements, database upgrades, redeploying infrastructure with IaC, dogfood features, replacing credentials with a proper secrets store…</p>
+
+<p>Of course, we still want to release features, but in order to release often we need to…</p>
+
+<h2 id="make-it-safe">Make it Safe</h2>
+
+<p>Some of these things can be released by developers, some by operations, and some by marketing!  But how can it be safe for marketing to release?</p>
+
+<p>Feature flags.  Feature flags allow those teams to deploy software more safely.   Being able to deploy more safely means we deploy more often, which means we get better at deploying (because: practice, practice, practice).</p>
+
+<p>When deployments go out behind a robust feature flagging mechanism (slice by group, by percentage, by customerid, etc) , companies don’t need to worry about “releases” anymore.  When you do this, releases are no longer an engineering term, but rather a marketing term.  They describe a collection of deployments that are considered a “release” even though each of those deployments was pushed to production at a different time.  They may be activated individually or as a group, but they are no longer collected into a big batch release. We want to do this because the science is clear that small batch deployment is safer and better for rapidly achieving desired business outcomes.</p>
+
+<p>Sometimes portfolio companies do feature flagging in customer database records, sometimes they push all changes to a staging environment and then release them at once.  Make the leap.  Move to robust feature flagging, deploy to production behind a flag that can be instantly turned on or off.</p>
+
+<p>With this in place, Marketing can make noise in the marketplace with features they know have been tested and work well.  The business can retain talent with more modern software, retain customers with infrastructure that is continually kept secure and performant, and win in the marketplace without feature releases.</p>
+
+
+
+
+
+
+
+
+
+  </div>
+</div>
+    </div></div>]]>
+            </description>
+            <link>https://blog.mangoteque.com//blog/2023/03/13/deployments-not-releases/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-35323484</guid>
+            <pubDate>Mon, 27 Mar 2023 06:23:26 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[The Vesuvius Challenge]]>
             </title>
             <description>
 <![CDATA[
-Score 21 | Comments 2 (<a href="https://news.ycombinator.com/item?id=35322809">thread link</a>) | @benbreen
+Score 110 | Comments 11 (<a href="https://news.ycombinator.com/item?id=35322809">thread link</a>) | @benbreen
 <br/>
 March 26, 2023 | https://scrollprize.org/overview | <a href="https://web.archive.org/web/*/https://scrollprize.org/overview">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><main><div><div><div><div><article><div><header></header><p>The objective of the Vesuvius Challenge is to make history by reading an unopened Herculaneum scroll for the very first time. We believe that an open competition will accelerate progress and enable us to achieve this goal in 2023.</p><p>We are providing all contestants with the following resources:</p><ul><li><strong><a href="https://scrollprize.org/overview#grand-prize-150000">Prizes</a></strong>: $1,000,000+ in prizes, including a $700,000 Grand Prize and the rest in <a href="https://scrollprize.org/overview#progress-prizes-100000">Progress Prizes</a>. The first progress prize is a $100,000 ink detection competition on <a href="https://www.kaggle.com/competitions/vesuvius-challenge-ink-detection" target="_blank" rel="noopener noreferrer">Kaggle</a>. We also have some smaller <a href="https://scrollprize.org/overview#open-source-prizes-3x-2000">Open Source Prizes</a>.</li><li><strong><a href="https://scrollprize.org/data">Data</a></strong>: 3D X-ray scans of two unopened scrolls from Herculaneum, and scans and images of three papyrus fragments</li><li><strong><a href="https://scrollprize.org/tutorial1">Tutorials and tools</a></strong>: the current best tools and techniques for virtually unwrapping papyrus scrolls</li><li><strong><a href="https://scrollprize.org/participate">Community</a></strong>: a Discord server where you can connect with other contestants and the Vesuvius Challenge team</li></ul><ul><li>Join our <a href="https://discord.gg/6FgWYNjb4N" target="_blank" rel="noopener noreferrer">Discord server</a> to ask questions, learn about what is going on, hang out with fellow contestants and interested onlookers, and perhaps find teammates.</li><li>Receive updates every 1-2 weeks from our <a href="https://scrollprize.substack.com/" target="_blank" rel="noopener noreferrer">mailing list on Substack</a>.</li><li>Follow <a href="https://twitter.com/scrollprize" target="_blank" rel="noopener noreferrer">@scrollprize</a> on Twitter.</li></ul><p>Our team is available for any questions and feedback on Discord. You can also email us at <a href="https://scrollprize.org/cdn-cgi/l/email-protection#fe8a9b9f93be8d9d8c9192928e8c97849bd0918c99" target="_blank" rel="noopener noreferrer"><span data-cfemail="d1a5b4b0bc91a2b2a3bebdbda1a3b8abb4ffbea3b6">[email&nbsp;protected]</span></a>.</p><h3 id="grand-prize-700000">Grand Prize ($700,000)<a href="#grand-prize-700000" title="Direct link to heading">​</a></h3><p>The Grand Prize will go to the first team to read four passages of text from the inside of the two intact scrolls. More details on the qualifying criteria are available <a href="https://scrollprize.org/participate">here</a>.</p><p>Here are the scrolls in question:</p><div><div><p><img loading="lazy" src="https://scrollprize.org/img/overview/scroll1-small.jpg"></p><figcaption>Scroll 1</figcaption></div><div><p><img loading="lazy" src="https://scrollprize.org/img/overview/scroll2-small.jpg"></p><figcaption>Scroll 2</figcaption></div></div><p>We have provided you with 8µm 3D X-ray scans of each of these scrolls, which you can find <a href="https://scrollprize.org/data">here</a>. Your job is to extract the text from these scans.</p><p>You can approach this challenge through any means necessary: machine learning, computer vision, or machine-assisted tools operated by humans.</p><figure><video autoplay="" playsinline="" loop="" muted="" poster="https://scrollprize.org/img/overview/scroll-inside-animation-4.jpg"><source src="https://scrollprize.org/img/overview/scroll-inside-animation-4.webm" type="video/webm"><source src="https://scrollprize.org/img/overview/scroll-inside-animation-4.mp4" type="video/mp4"></video><figcaption>3D X-ray scan of a scroll <a href="https://www.youtube.com/watch?v=PpNq2cFotyY" target="_blank" rel="noopener noreferrer">(source)</a></figcaption></figure><h4 id="why-is-this-difficult">Why is this difficult?<a href="#why-is-this-difficult" title="Direct link to heading">​</a></h4><p>As you will read in the <a href="https://scrollprize.org/tutorial1">tutorials</a>, advanced tools and techniques exist for virtually unwrapping papyrus scrolls. This was demonstrated in 2015 when Dr. Seales's team <a href="https://www2.cs.uky.edu/dri/the-scroll-from-en-gedi/" target="_blank" rel="noopener noreferrer">unwrapped the En-Gedi scroll</a>, and in their recent result <a href="https://raw.githubusercontent.com/educelab/EduceLab-Scrolls/main/paper/EduceLab-Scrolls.pdf" target="_blank" rel="noopener noreferrer">identifying ink from 3D X-ray scans in the Herculaneum scrolls</a>.</p><p>But the Herculaneum scrolls have proved more challenging. The remaining challenges include:</p><ul><li>Segmenting the scrolls. The Herculaneum scrolls are especially long, tightly wrapped, damaged, and distorted. To date, no one has successfully done a large-scale segmentation of these scrolls to identify the surfaces of all the rolled layers.</li><li>Finding the ink. The ink used in the Herculaneum scrolls is <a href="https://en.wikipedia.org/wiki/Radiodensity" target="_blank" rel="noopener noreferrer">radiolucent</a>, making it difficult to see in the scans. Recently, Dr. Seales's team has trained a machine learning model which can detect the ink from subtle patterns in the 3D X-rays. This works in the fragments, but these models are not yet perfect and will probably need to be improved to work at the scale of an entire scroll.</li><li>Putting it all together. Applying the ink detection models to the segmented scroll has not yet been successfully demonstrated.</li></ul><p>Based on the <a href="https://raw.githubusercontent.com/educelab/EduceLab-Scrolls/main/paper/EduceLab-Scrolls.pdf" target="_blank" rel="noopener noreferrer">landmark results</a> that Dr. Seales and his team have recently produced, we believe that it is possible to read the Herculaneum scrolls using the <a href="https://scrollprize.org/data">scans</a> that we already have and the tools and tecniques that they have developed. And that is the Vesuvius Challenge!</p><p>The Grand Prize deadline is 11:59pm Pacific, December 31st, 2023.</p><h2 id="progress-prizes">Progress prizes<a href="#progress-prizes" title="Direct link to heading">​</a></h2><p>The purpose of progress prizes is to encourage contestants to solve important subproblems and release their work. We also hope that they attract more participants who are interested in starting with a narrower task, and then go on to try to win the Grand Prize.</p><p>Progress prizes are optional! You can choose to skip them and work directly on the Grand Prize.</p><h3 id="ink-detection-on-kaggle-100000-total">Ink Detection on Kaggle ($100,000 total)<a href="#ink-detection-on-kaggle-100000-total" title="Direct link to heading">​</a></h3><p>As you will learn in the <a href="https://scrollprize.org/tutorial1">tutorials</a>, one of the big challenges of reading the Herculaneum Papyri is detecting the ink in the 3D X-ray scans.</p><figure><video autoplay="" playsinline="" loop="" muted="" poster="https://scrollprize.org/img/tutorials/ink-detection-anim2-dark.jpg"><source src="https://scrollprize.org/img/tutorials/ink-detection-anim2-dark.webm" type="video/webm"><source src="https://scrollprize.org/img/tutorials/ink-detection-anim2-dark.mp4" type="video/mp4"></video></figure><p>For this important subproblem, we are offering a $100,000 <a href="https://www.kaggle.com/competitions/vesuvius-challenge-ink-detection/" target="_blank" rel="noopener noreferrer">Ink Detection Progress Prize</a>. This progress prize is hosted on Kaggle, and the final submission deadline is June 14th, 2023.</p><h3 id="open-source-prizes-3x-2000">Open Source Prizes (3x $2,000)<a href="#open-source-prizes-3x-2000" title="Direct link to heading">​</a></h3><p>All of us organizing the Vesuvius Challenge are big believers in open source and  incremental progress. We want to encourage building in the open and benefiting the whole community — something that is typically disincentivized in a competition format.</p><p>That’s why we are introducing “open source prizes”. These are small prizes that may be awarded for any open source or publicly available contributions: software, documentation, research notes, Kaggle notebooks, anything goes.</p><ul><li><strong>Anything that you release in public</strong> can qualify for an open source prize. You need to publicly release your work before you can win an open source prize.</li><li>It has to be accessible and usable by other contestants (e.g. licensed under MIT, Apache, GPL, Creative Commons, etc).</li><li>You may make multiple submissions. Please edit the form when doing so. We may award a single prize to a set of multiple submissions by one person or team.</li><li>Your submission will be judged subjectively: the Technical Team (Dr. Brent Seales, Nat Friedman, Stephen Parsons, Seth Parker, JP Posma, and Daniel Havíř) will decide what they think are the best open source contributions.</li><li>The first batch of prizes will be <strong>3 prizes of $2,000 each</strong> (plus a fun surprise!), which you must submit for by <strong>April 11th 11:59pm PT</strong>.</li><li>If you are submitting as a team, the team leader should make the submission, and is responsible for distributing the prize money (and fun surprise) among the team.</li><li>Make your submissions <a href="https://forms.gle/4qiDBW4uxKET87oh8" target="_blank" rel="noopener noreferrer">here</a>.</li></ul><h3 id="future-progress-prizes">Future Progress Prizes<a href="#future-progress-prizes" title="Direct link to heading">​</a></h3><p>We have some ideas of what future progress prizes might best accelerate overall progress on the Vesuvius Challenge, but we’re also keeping an open mind. If you have suggestions, please let us know!</p></div></article></div></div></div></div></main></div></div>]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><main><div><div><div><div><article><div><header></header><p>The objective of the Vesuvius Challenge is to make history by reading an unopened Herculaneum scroll for the very first time. We believe that an open competition will accelerate progress and enable us to achieve this goal in 2023.</p><p>We are providing all contestants with the following resources:</p><ul><li><strong><a href="https://scrollprize.org/overview#grand-prize-150000">Prizes</a></strong>: $1,000,000+ in prizes, including a $700,000 Grand Prize and the rest in <a href="https://scrollprize.org/overview#progress-prizes-100000">Progress Prizes</a>. The first progress prize is a $100,000 ink detection competition on <a href="https://www.kaggle.com/competitions/vesuvius-challenge-ink-detection" target="_blank" rel="noopener noreferrer">Kaggle</a>. We also have some smaller <a href="https://scrollprize.org/overview#open-source-prizes-3x-2000">Open Source Prizes</a>.</li><li><strong><a href="https://scrollprize.org/data">Data</a></strong>: 3D X-ray scans of two unopened scrolls from Herculaneum, and scans and images of three papyrus fragments</li><li><strong><a href="https://scrollprize.org/tutorial1">Tutorials and tools</a></strong>: the current best tools and techniques for virtually unwrapping papyrus scrolls</li><li><strong><a href="https://scrollprize.org/participate">Community</a></strong>: a Discord server where you can connect with other contestants and the Vesuvius Challenge team</li></ul><ul><li>Join our <a href="https://discord.gg/6FgWYNjb4N" target="_blank" rel="noopener noreferrer">Discord server</a> to ask questions, learn about what is going on, hang out with fellow contestants and interested onlookers, and perhaps find teammates.</li><li>Receive updates every 1-2 weeks from our <a href="https://scrollprize.substack.com/" target="_blank" rel="noopener noreferrer">mailing list on Substack</a>.</li><li>Follow <a href="https://twitter.com/scrollprize" target="_blank" rel="noopener noreferrer">@scrollprize</a> on Twitter.</li></ul><p>Our team is available for any questions and feedback on Discord. You can also email us at <a href="https://scrollprize.org/cdn-cgi/l/email-protection#6c18090d012c1f0f1e0300001c1e05160942031e0b" target="_blank" rel="noopener noreferrer"><span data-cfemail="295d4c4844695a4a5b464545595b40534c07465b4e">[email&nbsp;protected]</span></a>.</p><h3 id="grand-prize-700000">Grand Prize ($700,000)<a href="#grand-prize-700000" title="Direct link to heading">​</a></h3><p>The Grand Prize will go to the first team to read four passages of text from the inside of the two intact scrolls. More details on the qualifying criteria are available <a href="https://scrollprize.org/participate">here</a>.</p><p>Here are the scrolls in question:</p><div><div><p><img loading="lazy" src="https://scrollprize.org/img/overview/scroll1-small.jpg"></p><figcaption>Scroll 1</figcaption></div><div><p><img loading="lazy" src="https://scrollprize.org/img/overview/scroll2-small.jpg"></p><figcaption>Scroll 2</figcaption></div></div><p>We have provided you with 8µm 3D X-ray scans of each of these scrolls, which you can find <a href="https://scrollprize.org/data">here</a>. Your job is to extract the text from these scans.</p><p>You can approach this challenge through any means necessary: machine learning, computer vision, or machine-assisted tools operated by humans.</p><figure><video autoplay="" playsinline="" loop="" muted="" poster="https://scrollprize.org/img/overview/scroll-inside-animation-4.jpg"><source src="https://scrollprize.org/img/overview/scroll-inside-animation-4.webm" type="video/webm"><source src="https://scrollprize.org/img/overview/scroll-inside-animation-4.mp4" type="video/mp4"></video><figcaption>3D X-ray scan of a scroll <a href="https://www.youtube.com/watch?v=PpNq2cFotyY" target="_blank" rel="noopener noreferrer">(source)</a></figcaption></figure><h4 id="why-is-this-difficult">Why is this difficult?<a href="#why-is-this-difficult" title="Direct link to heading">​</a></h4><p>As you will read in the <a href="https://scrollprize.org/tutorial1">tutorials</a>, advanced tools and techniques exist for virtually unwrapping papyrus scrolls. This was demonstrated in 2015 when Dr. Seales's team <a href="https://www2.cs.uky.edu/dri/the-scroll-from-en-gedi/" target="_blank" rel="noopener noreferrer">unwrapped the En-Gedi scroll</a>, and in their recent result <a href="https://raw.githubusercontent.com/educelab/EduceLab-Scrolls/main/paper/EduceLab-Scrolls.pdf" target="_blank" rel="noopener noreferrer">identifying ink from 3D X-ray scans in the Herculaneum scrolls</a>.</p><p>But the Herculaneum scrolls have proved more challenging. The remaining challenges include:</p><ul><li>Segmenting the scrolls. The Herculaneum scrolls are especially long, tightly wrapped, damaged, and distorted. To date, no one has successfully done a large-scale segmentation of these scrolls to identify the surfaces of all the rolled layers.</li><li>Finding the ink. The ink used in the Herculaneum scrolls is <a href="https://en.wikipedia.org/wiki/Radiodensity" target="_blank" rel="noopener noreferrer">radiolucent</a>, making it difficult to see in the scans. Recently, Dr. Seales's team has trained a machine learning model which can detect the ink from subtle patterns in the 3D X-rays. This works in the fragments, but these models are not yet perfect and will probably need to be improved to work at the scale of an entire scroll.</li><li>Putting it all together. Applying the ink detection models to the segmented scroll has not yet been successfully demonstrated.</li></ul><p>Based on the <a href="https://raw.githubusercontent.com/educelab/EduceLab-Scrolls/main/paper/EduceLab-Scrolls.pdf" target="_blank" rel="noopener noreferrer">landmark results</a> that Dr. Seales and his team have recently produced, we believe that it is possible to read the Herculaneum scrolls using the <a href="https://scrollprize.org/data">scans</a> that we already have and the tools and tecniques that they have developed. And that is the Vesuvius Challenge!</p><p>The Grand Prize deadline is 11:59pm Pacific, December 31st, 2023.</p><h2 id="progress-prizes">Progress prizes<a href="#progress-prizes" title="Direct link to heading">​</a></h2><p>The purpose of progress prizes is to encourage contestants to solve important subproblems and release their work. We also hope that they attract more participants who are interested in starting with a narrower task, and then go on to try to win the Grand Prize.</p><p>Progress prizes are optional! You can choose to skip them and work directly on the Grand Prize.</p><h3 id="ink-detection-on-kaggle-100000-total">Ink Detection on Kaggle ($100,000 total)<a href="#ink-detection-on-kaggle-100000-total" title="Direct link to heading">​</a></h3><p>As you will learn in the <a href="https://scrollprize.org/tutorial1">tutorials</a>, one of the big challenges of reading the Herculaneum Papyri is detecting the ink in the 3D X-ray scans.</p><figure><video autoplay="" playsinline="" loop="" muted="" poster="https://scrollprize.org/img/tutorials/ink-detection-anim2-dark.jpg"><source src="https://scrollprize.org/img/tutorials/ink-detection-anim2-dark.webm" type="video/webm"><source src="https://scrollprize.org/img/tutorials/ink-detection-anim2-dark.mp4" type="video/mp4"></video></figure><p>For this important subproblem, we are offering a $100,000 <a href="https://www.kaggle.com/competitions/vesuvius-challenge-ink-detection/" target="_blank" rel="noopener noreferrer">Ink Detection Progress Prize</a>. This progress prize is hosted on Kaggle, and the final submission deadline is June 14th, 2023.</p><h3 id="open-source-prizes-3x-2000">Open Source Prizes (3x $2,000)<a href="#open-source-prizes-3x-2000" title="Direct link to heading">​</a></h3><p>All of us organizing the Vesuvius Challenge are big believers in open source and  incremental progress. We want to encourage building in the open and benefiting the whole community — something that is typically disincentivized in a competition format.</p><p>That’s why we are introducing “open source prizes”. These are small prizes that may be awarded for any open source or publicly available contributions: software, documentation, research notes, Kaggle notebooks, anything goes.</p><ul><li><strong>Anything that you release in public</strong> can qualify for an open source prize. You need to publicly release your work before you can win an open source prize.</li><li>It has to be accessible and usable by other contestants (e.g. licensed under MIT, Apache, GPL, Creative Commons, etc).</li><li>You may make multiple submissions. Please edit the form when doing so. We may award a single prize to a set of multiple submissions by one person or team.</li><li>Your submission will be judged subjectively: the Technical Team (Dr. Brent Seales, Nat Friedman, Stephen Parsons, Seth Parker, JP Posma, and Daniel Havíř) will decide what they think are the best open source contributions.</li><li>The first batch of prizes will be <strong>3 prizes of $2,000 each</strong> (plus a fun surprise!), which you must submit for by <strong>April 11th 11:59pm PT</strong>.</li><li>If you are submitting as a team, the team leader should make the submission, and is responsible for distributing the prize money (and fun surprise) among the team.</li><li>Make your submissions <a href="https://forms.gle/4qiDBW4uxKET87oh8" target="_blank" rel="noopener noreferrer">here</a>.</li></ul><h3 id="future-progress-prizes">Future Progress Prizes<a href="#future-progress-prizes" title="Direct link to heading">​</a></h3><p>We have some ideas of what future progress prizes might best accelerate overall progress on the Vesuvius Challenge, but we’re also keeping an open mind. If you have suggestions, please let us know!</p></div></article></div></div></div></div></main></div></div>]]>
             </description>
             <link>https://scrollprize.org/overview</link>
             <guid isPermaLink="false">hacker-news-small-sites-35322809</guid>
@@ -39,7 +760,7 @@ March 26, 2023 | https://scrollprize.org/overview | <a href="https://web.archive
             </title>
             <description>
 <![CDATA[
-Score 23 | Comments 26 (<a href="https://news.ycombinator.com/item?id=35322214">thread link</a>) | @fahhem
+Score 32 | Comments 47 (<a href="https://news.ycombinator.com/item?id=35322214">thread link</a>) | @fahhem
 <br/>
 March 26, 2023 | https://blog.fahhem.com/2023/03/free-solution-uber-eats-swapped-orders/ | <a href="https://web.archive.org/web/*/https://blog.fahhem.com/2023/03/free-solution-uber-eats-swapped-orders/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div> <p>While at a restaurant recently, I noticed they had multiple shelves of pickup orders. It's a popular local restaurant, so they had orders from all the major food delivery companies, Doordash, Uber Eats, Grubhub, and they all had little receipts on them.</p> <p>Each receipt had one line printed really large, and it was different for each of these companies. Here, we'll focus on Uber Eats because it was the most problematic one. For Uber Eats, it says "UBER_EATS #F35DF NO Utensils Courier-powered Delivery - Samuel M (#1423)".</p> <h2>What's the problem?</h2> <p>Firstly, let's go over the problems. There are two numbers here, both seem to be unique to this order. It also puts the originator, the originator's "ID", whether they want utensils or not, and that it has an originator, as well as the orderer's name all at the same level of importance.</p> <p>Now, one might think these are all very important. But if you actually stand in that restaurant for more than a couple minutes, you'll notice something. All of the delivery drivers follow the same efficient pattern. They come in, read from their app "Uber eats 5DF", then the restaurant worker will go back to the rack, read the receipts in a random order, grab the first one that matches, hand that to the driver, and the driver will run off in a hurry. Notice the driver doesn't double check the receipt. None of them did.</p> <p>And I don't blame them, what are the chances that "5DF" is repeated? 16<sup>3</sup>, which is "only" 4,096. That means the chances are 0.02%. Note: I used 16 as the base, not 36, because they're only used hexadecimal (0-9 and A-F), which will come up later.</p> <p>If we were talking about 1 restaurant, or even 100, that would mean that 1 in 4,096 orders (or 1 every 40 days) are getting swapped due to this efficiency. However, we're talking about Uber Eats, which does at least millions of orders a month, which is over 33 thousand a day (on average), or about 10 swaps a day.</p> <p>This is all assuming drivers pronounce and restaurant workers hear every letter correctly, and no other mistake is made in the selection of an order. If you take that into account, you'll likely see a much higher rate of swaps.</p> <h2>Why does it matter?</h2> <p>I just explained the scope of the problem, but at Uber Eats' scale, 10 swaps a day isn't even an hour of a customer support person's time.</p> <p>However, if you poll everyone you know that uses these delivery services, there's a consistent theme. If this was truly so rare, why does everyone have a story? As someone who's used these services only in rare circumstances (under 10 times, though I never thought to count), I have 2 such cases. I might be a statistical outlier though.</p> <p>Given the theoretical scale is small, the cost is likely small, why bother? Because it affects the perception of your service. Perception of a service costs much more than the immediate customer support bill, it affects the business through the customer-acquisition cost (the famous "free" word of mouth), the customer retention rate, and generally the bottom-line.</p> <h2>Okay, so what's the solution?</h2> <p>You might think I've written this much so far and I'm about to write a complicated solution out. Or that it might cost Uber/Uber Eats days or weeks of engineering to write a new receipt format, or require new printers.</p> <p>No, the reason I believe in this solution is that it's simple. If the drivers are going to read out 3 letters, then give them more options. Make the math use bigger numbers.</p> <p>Instead of hexadecimal, use all the distinctly-named letters and numbers. Throw out C, D, E since they all sound like B, keeping only A, B, F from the first version. Then add in the other visually- and phonetically-distinct letters: H, I, L, M, Q, R, U, W, X, Y. Now we're up to 23 letters, so the probability is now 1 in 23<sup>3</sup>, or 12,167 or 0.008%, a 3x improvement.</p> <p>This solution makes no changes to the format of the receipt whatsoever, so it's just a simple transform. Here's some sample code in Python and then in Go, since I know most of Uber Eats is written in Go.</p> <div><pre><span></span><code><span>def</span> <span>hex_to_baseN</span><span>(</span><span>hex_string</span><span>,</span> <span>baseN_chars</span><span>):</span>
@@ -110,7 +831,7 @@ March 26, 2023 | https://blog.fahhem.com/2023/03/free-solution-uber-eats-swapped
             </title>
             <description>
 <![CDATA[
-Score 32 | Comments 8 (<a href="https://news.ycombinator.com/item?id=35321606">thread link</a>) | @fagnerbrack
+Score 40 | Comments 9 (<a href="https://news.ycombinator.com/item?id=35321606">thread link</a>) | @fagnerbrack
 <br/>
 March 26, 2023 | https://creatomate.com/blog/video-rendering-with-nodejs-and-ffmpeg | <a href="https://web.archive.org/web/*/https://creatomate.com/blog/video-rendering-with-nodejs-and-ffmpeg">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><h2>Introduction</h2>
@@ -721,7 +1442,7 @@ Once again, FFmpeg comes to the rescue. Let's make a utility function at <!-- --
             </title>
             <description>
 <![CDATA[
-Score 81 | Comments 83 (<a href="https://news.ycombinator.com/item?id=35320565">thread link</a>) | @vslira
+Score 86 | Comments 98 (<a href="https://news.ycombinator.com/item?id=35320565">thread link</a>) | @vslira
 <br/>
 March 26, 2023 | https://blog.vslira.net/2023/03/an-interview-with-steve-wozniak-by.html | <a href="https://web.archive.org/web/*/https://blog.vslira.net/2023/03/an-interview-with-steve-wozniak-by.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="post-body-4930482377232917237">
@@ -738,7 +1459,7 @@ March 26, 2023 | https://blog.vslira.net/2023/03/an-interview-with-steve-wozniak
             </title>
             <description>
 <![CDATA[
-Score 290 | Comments 135 (<a href="https://news.ycombinator.com/item?id=35315542">thread link</a>) | @Flux159
+Score 299 | Comments 137 (<a href="https://news.ycombinator.com/item?id=35315542">thread link</a>) | @Flux159
 <br/>
 March 26, 2023 | https://blog.lastmileai.dev/using-openais-retrieval-plugin-with-llama-d2e0b6732f14 | <a href="https://web.archive.org/web/*/https://blog.lastmileai.dev/using-openais-retrieval-plugin-with-llama-d2e0b6732f14">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section><div><div><p id="9371">OpenAI just released initial support for <a href="https://openai.com/blog/chatgpt-plugins" rel="noopener ugc nofollow" target="_blank">plugins to ChatGPT</a>, allowing the language model to act as agents and interact with the outside world using APIs. Here we show a proof of concept using OpenAI’s <a href="https://github.com/openai/chatgpt-retrieval-plugin" rel="noopener ugc nofollow" target="_blank">chatgpt-retrieval-plugin</a> with Meta’s <a href="https://arxiv.org/abs/2302.13971" rel="noopener ugc nofollow" target="_blank">LLaMA</a> language model.</p><p id="42ba">This is more than just a guide. It is a call-to-action to build an open protocol for foundation model plugins allowing us to share plugins across LLMs, and govern their interactions.</p><figure><div role="button" tabindex="0"></div><figcaption>LLaMA answering a question about the LLaMA paper with the chatgpt-retrieval-plugin. So Meta!</figcaption></figure><p id="70b3">OpenAI’s <a href="https://platform.openai.com/docs/plugins/introduction" rel="noopener ugc nofollow" target="_blank">documentation on plugins</a> explains that plugins are able to enhance ChatGPT’s capabilities by specifying a manifest &amp; an openapi specification.</p><p id="cd90">There are few details available about how the plugins are wired to ChatGPT, but OpenAI open-sourced the <a href="https://github.com/openai/chatgpt-retrieval-plugin" rel="noopener ugc nofollow" target="_blank">chatgpt-retrieval-plugin</a> for semantic search and retrieving custom data for additional context.</p><p id="b917">In this guide we will take that retrieval plugin, and add a script that integrates it with LLaMA 7B running on your local machine.</p><blockquote><p id="26ed">The code that glues the plugin to LLaMA is available in this repo (we welcome contributions):</p><p id="204a"><a href="https://github.com/lastmile-ai/llama-retrieval-plugin" rel="noopener ugc nofollow" target="_blank">lastmile-ai/llama-retrieval-plugin</a></p></blockquote><p id="0a6e">This approach successfully adds external context to LLaMA, albeit with gaps compared to OpenAI’s plugin approach:</p><ul><li id="e172"><strong>Limitations in the underlying model. </strong>LLaMA is far from ChatGPT in many ways. It requires significant additional fine-tuning (such as <a href="https://github.com/tatsu-lab/stanford_alpaca" rel="noopener ugc nofollow" target="_blank">Alpaca</a>).</li><li id="2172"><strong>Not generalizable to other plugins. </strong>The <a href="https://platform.openai.com/docs/plugins/introduction/plugin-flow" rel="noopener ugc nofollow" target="_blank">OpenAI documentation</a> suggests ChatGPT can read a plugin’s API schema, and dynamically construct the right API calls that satisfy the user’s request. By contrast, things didn’t go well when we tried to ask LLaMA to construct a cURL request given an OpenAPI schema. One solution to this would be fine-tuning a model specifically for OpenAPI schemas.</li></ul><p id="63b6">We first set up our data store and upload two PDFs to it — the LLaMA<a href="https://arxiv.org/pdf/2302.13971.pdf" rel="noopener ugc nofollow" target="_blank"> paper</a> and the <a href="https://docs.conda.io/projects/conda/en/4.6.0/_downloads/52a95608c49671267e40c689e0bc00ca/conda-cheatsheet.pdf" rel="noopener ugc nofollow" target="_blank">Conda cheatsheet</a>.</p><figure><div></div></figure><p id="8c3e">Then we can query this data, with the relevant embeddings pulled in to the prompt as additional context.</p><figure><div></div></figure><h2 id="c0de">Step 0: Clone the llama-retrieval-plugin repo</h2><h2 id="57aa"><strong>Step 1: </strong>Set up the data store</h2><p id="c7f9">This step is almost identical to setting up the OpenAI retrieval plugin, but simplified through the use of conda and using pinecone as the vector DB. Following the <a href="https://github.com/lastmile-ai/llama-retrieval-plugin/blob/main/README.md#quickstart" rel="noopener ugc nofollow" target="_blank">quickstart in the repo</a>:</p><p id="1fd5"><em>Set up the environment:</em></p><pre><span id="6b12">conda env create -f environment.yml<br>conda activate llama-retrieval-plugin<br>poetry install</span></pre><p id="adde"><em>Define the environment variables:</em></p><pre><span id="e1a2"># In production use-cases, make sure to set up the bearer token properly<br>export BEARER_TOKEN=test1234<br>export OPENAI_API_KEY=my_openai_api_key<p># We used pinecone for our vector database, but you can use a different one<br>export DATASTORE=pinecone<br>export PINECONE_API_KEY=my_pinecone_api_key<br>export PINECONE_ENVIRONMENT=us-east1-gcp<br>export PINECONE_INDEX=my_pinecone_index_name</p></span></pre><p id="5d93"><em>Start the server:</em></p><pre><span id="00eb">poetry run start</span></pre><h2 id="382c">Step 2: Upload files to the data store</h2><p id="ca77">For this step, we used the Swagger UI available locally at <a href="http://localhost:8000/docs" rel="noopener ugc nofollow" target="_blank">http://localhost:8000/docs</a></p><p id="112f"><em>Authorize:</em></p><figure><div role="button" tabindex="0"></div><figcaption>Authorize using the value of the BEARER_TOKEN you specified in Step 1</figcaption></figure><p id="9102"><em>Upsert File:</em></p><figure><div role="button" tabindex="0"></div><figcaption>Specify any PDF file that you would like to get chunked into embeddings</figcaption></figure><p id="b982"><em>Query the data store to test:</em></p><p id="f4f6">Take the id returned by the upsert, and construct a query in the Swagger UI to see what embeddings will be returned given a prompt:</p><pre><span id="18c2">{<br>  "queries": [<br>    {<br>      "query": "What is the title of the LLaMA paper?",<br>      "filter": {<br>        "document_id": "f443884b-d137-421e-aac2-9809113ad53d"<br>      },<br>      "top_k": 3<br>    }<br>  ]<br>}</span></pre><figure><div role="button" tabindex="0"></div><figcaption>The query API lets you test out the vector store, and configure the filters</figcaption></figure><h2 id="7cb0">Step 3: Set up LLaMA</h2><p id="0cd7">Our repo links to llama.cpp as a submodule, which is what we used for getting LLaMA 7B running locally.</p><p id="9853"><em>Follow the llama.cpp readme to get set up</em></p><h2 id="e5cf">Step 4: Use LLaMA to query your custom data</h2><p id="22f6">Open a new Terminal, and navigate to the <em>llama-retrieval-plugin</em> repo.</p><p id="8069"><em>Activate the Conda environment (from Step 1):</em></p><pre><span id="ea99">conda activate llama-retrieval-plugin</span></pre><p id="6f61"><em>Define the environment variables:</em></p><pre><span id="6915"># Make sure the BEARER_TOKEN is set to the same value as in Step 1<br>export BEARER_TOKEN=test1234<br># Set the URL to the query endpoint that you tested in Step 2<br>export DATASTORE_QUERY_URL=http://0.0.0.0:8000/query<br># Set to the directory where you have LLaMA set up -- such as the root of the llama.cpp repo<br>export LLAMA_WORKING_DIRECTORY=./llama.cpp</span></pre><p id="9a73"><em>Run the </em><strong><em>llama_with_retrieval</em></strong><em> script with the desired prompt:</em></p><pre><span id="f22a">python3 llama_with_retrieval.py "What is the title of the LLaMA paper?" </span></pre><p id="c602">This script takes the prompt, calls the <em>query </em>endpoint to extract the most relevant embeddings from the data store, and then constructs a prompt to pass to LLaMA that contains these embeddings.</p><p id="7e58">You can read the code here: <a href="https://github.com/lastmile-ai/llama-retrieval-plugin/blob/main/llama_with_retrieval.py" rel="noopener ugc nofollow" target="_blank">llama-retrieval-plugin/llama_with_retrieval.py</a></p><h2 id="1b4b">Step 5: Tweak and experiment</h2><p id="f371">You can modify the <em>llama_with_retrieval </em>script to experiment with different settings that may yield better performance:</p><ul><li id="870c">Change the token limit (e.g. reduce it to give more room for the model response).</li><li id="a609">Change the prompt template and observe model behavior.</li><li id="2596">Change the LLaMA model parameters by modifying the command line. <strong>Note: </strong>You can also specify a custom LLaMA command line by setting the LLAMA_CMD environment variable.</li></ul><blockquote><p id="a9d2">You can also use <a href="https://lastmileai.dev/" rel="noopener ugc nofollow" target="_blank">lastmileai.dev</a> to track your various experiments as you tweak and tune models. For example, <a href="https://colab.research.google.com/drive/1sFHDD-lR7_7WMEj-GgzmIBEDd81FFI9_?usp=sharing" rel="noopener ugc nofollow" target="_blank">here’s a notebook</a> saving some trials using Stable Diffusion.</p></blockquote><p id="4ea9">We hope this exercise shows the need for standardizing interactions between foundation models and plugins/extensions. We should be able to use a plugin designed for OpenAI models with another large language model, and vice versa. This is only possible with a Foundation Model Plugin Protocol standard.</p><p id="82b8">We are in the early stages of a revolution in computing, powered by the advent of state-of-the-art foundation models. We have an opportunity to define the behaviors that govern our interactions with these models, and return to the rich legacy of open protocols of the early internet instead of closed platforms of the modern era.</p><h2 id="c62f">Foundation Model Plugin Protocol</h2><p id="e825">The <em>lastmile ai</em> team is exploring what it takes to define a plugin protocol, and spur its adoption. We believe the protocol should be:</p><ul><li id="aca5"><strong>model-agnostic</strong> — support GPTx, LLaMA, Bard, and any other foundation model.</li><li id="8ad6"><strong>modal-agnostic </strong>— support different types of inputs and outputs, instead of just text.</li></ul><p id="f43c">Our early thinking on this is inspired by SMTP for email, and <a href="https://microsoft.github.io/language-server-protocol/" rel="noopener ugc nofollow" target="_blank">LSP (Language Server Protocol)</a> for IDEs. We will be sharing what we have in this space in the coming days, and <strong>would love to collaborate with you</strong>.</p><p id="3c47">We are just getting started at <em>lastmile ai, </em>and would love to hear from you, especially if you share our vision for an open and interoperable future. You can reach us here:</p><ul><li id="bc76"><a href="https://twitter.com/lastmileai_dev" rel="noopener ugc nofollow" target="_blank">Twitter</a></li><li id="84e2"><a href="http://discord.gg/xBhNKTetGx" rel="noopener ugc nofollow" target="_blank">Discord</a></li><li id="bdec"><a href="mailto:sarmad@lastmileai.dev?subject=llama-retrieval-plugin%20followup&amp;body=Hello%20folks%20%40%20lastmile%20ai" rel="noopener ugc nofollow" target="_blank">Email</a></li></ul><p id="a8ef">We would also appreciate your feedback on our initial product offering, available at<strong> </strong><a href="https://lastmileai.dev/" rel="noopener ugc nofollow" target="_blank"><strong>lastmileai.dev</strong></a>.</p></div></div></section></div>]]>
@@ -801,7 +1522,7 @@ March 26, 2023 | https://filthydreams.org/2023/03/25/i-started-a-shitstorm-or-co
             </title>
             <description>
 <![CDATA[
-Score 62 | Comments 94 (<a href="https://news.ycombinator.com/item?id=35313943">thread link</a>) | @LinuxBender
+Score 62 | Comments 95 (<a href="https://news.ycombinator.com/item?id=35313943">thread link</a>) | @LinuxBender
 <br/>
 March 26, 2023 | https://blog.mnus.de/2023/03/archlinux-zfs/ | <a href="https://web.archive.org/web/*/https://blog.mnus.de/2023/03/archlinux-zfs/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -921,7 +1642,7 @@ arch-chroot<span> </span>/mnt
             </title>
             <description>
 <![CDATA[
-Score 59 | Comments 71 (<a href="https://news.ycombinator.com/item?id=35313578">thread link</a>) | @forrestbrazeal
+Score 62 | Comments 76 (<a href="https://news.ycombinator.com/item?id=35313578">thread link</a>) | @forrestbrazeal
 <br/>
 March 26, 2023 | https://newsletter.goodtechthings.com/p/when-programming-is-gone-will-we | <a href="https://web.archive.org/web/*/https://newsletter.goodtechthings.com/p/when-programming-is-gone-will-we">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><article><div><div><div dir="auto"><p><em>First DALL-E came for the artists, and we laughed, because artists are worthless.</em></p><p><em>Then chatGPT came for the writers, and we laughed even harder, because those people are not only worthless but actively detrimental to society.</em></p><p><em>Then GitHub Copilot (and a thundercloud of bigger, better AI models on the horizon) came for programmers like us—and we were prepared, because automation doesn’t make US obsolete, oh no. It only makes us FASTER and BETTER and lets us focus on MORE IMPORTANT THINGS.</em></p><p>OK, that isn’t how every software developer thinks about AI. But … it’s a pretty common subtext, right?</p><p><span>As evidence I submit two HackerNews discussions.</span></p><p><span> </span><a href="https://news.ycombinator.com/item?id=33988356" rel="">This one</a><span> (until it was flagged) was about an article that bemoaned AI’s existential threat to human creatives. The top responses to this article were variants on:</span></p><ul><li><p>Art is just personal expression anyway, like a child’s finger painting; humans don’t need or deserve commercial opportunities to create art.</p></li><li><p>Technology marches on, jobs become obsolete. Suck it up and deal, artists.</p></li><li><p><span>Haha, this article sounds like it was written by ChatGPT. (Implied: </span><em><span>you’ve already been replaced, </span><a href="https://www.vice.com/en/article/pkpqzb/ok-wtf-are-wordcels-and-shape-rotators" rel="">wordcel</a></em><span>.)</span></p></li></ul><p>Any mediating voices were heavily downvoted.</p><p><span>The </span><a href="https://news.ycombinator.com/item?id=34087000" rel="">second discussion</a><span> was about an ACM op-ed titled “</span><a href="https://cacm.acm.org/magazines/2023/1/267976-the-end-of-programming/fulltext" rel="">The End of Programming</a><span>”. The article predicts that “classical computer science” (algorithms, programming language design, and so on) will become obsolete</span></p><p><span> because future builders will tease nondeterministic AI models into producing software instead of writing actual code. </span></p><p><span>In this view, Copilot is not automating you out of a job, it’s doing something much more demoralizing: it’s automating you </span><em>into </em><span>a job, a strange and scary new job made up of </span><a href="https://lspace.swyx.io/p/why-prompt-engineering-and-generative" rel="">prompt engineering</a><span> and </span><a href="https://xkcd.com/1838/" rel="">model-stirring</a><span> that doesn’t feel much like slinging code at all</span><em>.</em></p><p>The reactions to this article were… a little different. They were not dismissive; they were ENRAGED. Everybody agreed that “The End of Programming” was ridiculous, but no two programmers could converge on why. Here are some sample complaints:</p><ul><li><p><span>The author of the article, </span><a href="https://en.wikipedia.org/wiki/Matt_Welsh_(computer_scientist)" rel="">Matt Welsh</a><span>, cannot be taken seriously because he currently runs an AI-tooling startup, which gives him a financial motive to push his ideas. (No commenter seemed concerned that as a programmer, they might have an equally strong financial motive to </span><em>suppress</em><span> his ideas.</span><em>)</em></p></li><li><p>Writing code is different and more exacting than other kinds of knowledge work, and AI will never be able to sit between humans and code in a trustworthy fashion. (“Would YOU trust the design of a life-support system to an LLM?”)</p></li><li><p>Actually, programming itself is often trivial; it’s the LEAST interesting and important part of software engineering, and giving that part of the job to an AI doesn’t change much about the need for a professional software engineer’s input.</p></li></ul><p>Those last two complaints, you will note, apparently contradict each other—which, again, nobody seemed to realize.</p><p>So—on the one hand, we have a bunch of shape rotators feeling pretty cavalier about the destruction of human creative opportunities, if not actively welcoming it. On the other hand, they insist that AI won’t upend their own very different and special jobs.</p><p><span>I went to the take store to pick up my own take on this, but they were all out of takes because the </span><a href="https://twitter.com/Jack_Raines/status/1614287514952687617" rel="">threadbois</a><span> had grabbed them up like shoppers buying all the milk and bread before a half-inch snowfall.</span></p><p>But it seems like maybe the two contradictory HN arguments can be resolved like this:</p><ul><li><p><span>SOME software engineering jobs are extra-finicky and likely to involve human developers writing hands-on code for the foreseeable future.</span></p></li><li><p>MANY software engineering jobs can have LOTS and LOTS of the “code” part generated by AIs. It probably won’t be great code at first. It will probably have lots of bugs. But it will be incredibly fast and increasingly cheap, and that’s gonna look appealing to both engineers and their bosses.</p></li></ul><p><span>Hey, that’s automation for you. It Frees Us Up To Focus On More Important Things. We said the same thing about the cloud and about high-level programming languages and probably about abacuses.</span></p><p><span> But not to worry; even the foretold AI developer-bots will need human engineers alongside them. </span></p><p><span>That’s why Matt Welsh’s article isn’t called “The End of Software Engineering.” For all I know, the demand for people called “software engineers” will increase. The question is what those people will </span><em>do. </em><span>Welsh thinks they’ll be like educators, shouting examples at AI models the way substitutes teach unruly children. My friend Ben, in </span><a href="https://ben11kehoe.medium.com/the-end-of-programming-will-look-a-lot-like-programming-8b877c8efef8" rel="">his own takedown</a><span> of the “End of Programming” article, suggests that they might be something like product managers, translating user needs and business requirements for an AI dev team. (You know, wordcel stuff!)</span></p><div><figure><a target="_blank" href="https://www.goodtechthings.com/ai-coding-assistant/" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6ef3959b-c9ae-4497-9a69-a4824331deb5_1372x1104.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6ef3959b-c9ae-4497-9a69-a4824331deb5_1372x1104.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6ef3959b-c9ae-4497-9a69-a4824331deb5_1372x1104.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6ef3959b-c9ae-4497-9a69-a4824331deb5_1372x1104.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6ef3959b-c9ae-4497-9a69-a4824331deb5_1372x1104.png" width="1372" height="1104" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/6ef3959b-c9ae-4497-9a69-a4824331deb5_1372x1104.png&quot;,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:1104,&quot;width&quot;:1372,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:&quot;AI Coding Assistant&quot;,&quot;title&quot;:&quot;AI Coding Assistant&quot;,&quot;type&quot;:null,&quot;href&quot;:&quot;https://www.goodtechthings.com/ai-coding-assistant/&quot;,&quot;belowTheFold&quot;:true,&quot;internalRedirect&quot;:null}" alt="AI Coding Assistant" title="AI Coding Assistant" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6ef3959b-c9ae-4497-9a69-a4824331deb5_1372x1104.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6ef3959b-c9ae-4497-9a69-a4824331deb5_1372x1104.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6ef3959b-c9ae-4497-9a69-a4824331deb5_1372x1104.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6ef3959b-c9ae-4497-9a69-a4824331deb5_1372x1104.png 1456w" sizes="100vw" loading="lazy"></picture></div></a><figcaption>“We can’t write code fast enough” has rarely been the bottleneck in large organizations.</figcaption></figure></div><p><span>But </span><em>programming </em><span>- well, programming is a different story. We still have mechanical engineers, but they don’t employ roomfuls of draftspeople drawing straight lines anymore; they use AutoCAD. Is programming—or, if you like, “hacking” in the </span><a href="http://www.paulgraham.com/hp.html" rel="">hackers and painters</a><span> sense</span></p><p><span>—headed the way of draftsmanship, an outdated craft replaced by AI assistance?</span></p><p><span>And that brings us to the existential question: If AI really lets you work faster and focus on more important things, but those things </span><em>aren’t programming</em><span>, will you be happy?</span></p><p><span>Sure, we spend lots of time complaining about the soul-sucking slog of coding, the StackOverflow tabs and the tooling sprawl and all the rest. But just stop for a minute and think about what you </span><em>love </em><span>about programming. </span></p><p><span>Think about the first language you ever loved—Lisp or ANSI C or Haskell or Python or ASP.NET or TurboPascal—inscrutable to most people, beautiful to you. Imagine digging into an algorithm on a whiteboard or a scrap of copy paper, feeling yourself disappearing deeper and deeper into the abstractions until you too become almost a symbolic construct. Inhabit that feeling of flow after you get the boilerplate code laid out and things begin to </span><em>happen: </em><span>screens are populating and commands are parsing and now you see a better way to modularize everything so you abstract out some components and feel the design click into place like the little tumblers in a safe. All built on the bedrock confidence that beneath the layers of abstraction, when you tell a computer to do something, it will do EXACTLY what you said—and if it doesn’t, then you or somebody in your toolchain has made a mistake and with enough patience you can trace that bug right back to its source and mount its thorax on a little pin. That profound satisfaction when the bug is dead and logic triumphs again. The pride of creation. The joy of self-expression in the medium you love.</span></p><p>Yeah, you were lucky enough to live in that world, and if you were in the right place at the right time you even got paid unimaginable amounts of money to do it. How will you feel when it’s all over?</p><p><span>Because here come the business bois cranking out AI-assisted apps by the thousands. Breaking that fundamental link between input and output: if you don’t like what the five-quintillion parameter model spit out, write another prompt and hope you held your tongue the right way this time. </span><em>Of course </em><span>it’s mediocre and buggy and unreliable, of course it’s worse than your handcrafted code. How could it not be? But it’s cheap. And it’s fast. So it’s winning. </span></p><p><span>You might still program by hand, the old-fashioned way, just for the sake of personal enjoyment. You might even open-source some stuff, like a child sticking its finger paintings on the refrigerator. But is that really enough? Will that really give you the joy and pride you felt when you knew that doing what you loved most really </span><em>mattered </em><span>in the world?</span></p><p>Well, now you know how the artists feel.</p><p>Anyway, the other thing that AI is going to do is turn a lot of people into shape rotators in title, but wordcels in function--and probably in salary too. It might be good to start getting mad at that idea now, so you're accustomed to it when it gets real.</p><p>In the meantime, here’s at least one game AI isn’t likely to beat us at anytime soon:</p><div><figure><a target="_blank" href="https://www.goodtechthings.com/a-strange-game/" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F34baf5f6-34bc-4139-8555-7d324ed716f9_1140x1140.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F34baf5f6-34bc-4139-8555-7d324ed716f9_1140x1140.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F34baf5f6-34bc-4139-8555-7d324ed716f9_1140x1140.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F34baf5f6-34bc-4139-8555-7d324ed716f9_1140x1140.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F34baf5f6-34bc-4139-8555-7d324ed716f9_1140x1140.png" width="1140" height="1140" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/34baf5f6-34bc-4139-8555-7d324ed716f9_1140x1140.png&quot;,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:1140,&quot;width&quot;:1140,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:&quot;A Strange Game&quot;,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:&quot;https://www.goodtechthings.com/a-strange-game/&quot;,&quot;belowTheFold&quot;:true,&quot;internalRedirect&quot;:null}" alt="A Strange Game" title="A Strange Game" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F34baf5f6-34bc-4139-8555-7d324ed716f9_1140x1140.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F34baf5f6-34bc-4139-8555-7d324ed716f9_1140x1140.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F34baf5f6-34bc-4139-8555-7d324ed716f9_1140x1140.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F34baf5f6-34bc-4139-8555-7d324ed716f9_1140x1140.png 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p><span>I got pretty worked up on </span><a href="https://devinterrupted.com/podcast/educating-the-next-generation-of-cloud-engineers/" rel="">this podcast</a><span> about how tech is failing entry-level applicants, particularly those from nontraditional backgrounds. TL;DL: the term "skills gap" is a rhetorical trick that shifts the blame onto newbies. The actual problem is an "experience gap", and that puts the blame right back on the industry for not providing onramps to experience for juniors.</span></p><p><span>On Wednesday I’m joining Lucy Wang for </span><a href="https://www.youtube.com/watch?v=b8imSRcY0eo" rel="">a chat about learning cloud in 2023</a><span>, including a walkthrough of the Cloud Resume Challenge.</span></p><p><span>Also, </span><a href="https://www.youtube.com/watch?v=VVc5QiMedno" rel="">my 30-minute “set” from DevOps Enterprise Summit</a><span> is now online, featuring a grand piano, a one-man rap battle, and some actual serious points, too.</span></p><p>You wouldn’t be worried about AI at all if you were as hardcore as this:</p><div id="youtube2-4HV0BqAjX8s" data-attrs="{&quot;videoId&quot;:&quot;4HV0BqAjX8s&quot;,&quot;startTime&quot;:null,&quot;endTime&quot;:null}"><p><iframe src="https://www.youtube-nocookie.com/embed/4HV0BqAjX8s?rel=0&amp;autoplay=0&amp;showinfo=0&amp;enablejsapi=0" frameborder="0" loading="lazy" gesture="media" allow="autoplay; fullscreen" allowautoplay="true" allowfullscreen="true" width="728" height="409"></iframe></p></div></div></div></div></article></div></div></div>]]>
@@ -932,11 +1653,623 @@ March 26, 2023 | https://newsletter.goodtechthings.com/p/when-programming-is-gon
         </item>
         <item>
             <title>
+<![CDATA[Algebraic Path Finding]]>
+            </title>
+            <description>
+<![CDATA[
+Score 15 | Comments 3 (<a href="https://news.ycombinator.com/item?id=35312716">thread link</a>) | @g0xA52A2A
+<br/>
+March 26, 2023 | https://iagoleal.com/posts/algebraic-path/ | <a href="https://web.archive.org/web/*/https://iagoleal.com/posts/algebraic-path/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+
+<p>Consider a graph with weights on its edges. Like the one in the
+figure, for example. One way to represent this graph is via an adjacency
+matrix <span>A</span> whose component <span>A(s, t)</span> is the weight of the edge between
+nodes <span>s</span> and <span>t</span>. Notice that since there may not be edges
+between all vertices (after all, what’s the fun in a complete graph?),
+<span>A</span> is a partial function. We can solve
+this by adjoining a value <span>\infty</span> to the
+possible weights and assigning it as the weight of the non-existent
+edges. In case this solution seems like a dirty trick to you, a
+possibility is to think of this process as the same as returning a
+<code>Maybe</code> value to make a partial function total, with <span>\infty</span> playing the role of
+<code>Nothing</code>.<a href="#fn1" id="fnref1" role="doc-noteref"><sup>1</sup></a></p>
+<p>Given this graph, a common question to ask is what are best ways to
+travel between its vertices. That is, if you want to go from node <span>s</span> to node <span>t</span>,
+which sequence of edges should you choose? If you’ve read what <a href="https://iagoleal.com/posts/dynamic-programming">I have been writing about dynamic
+programming</a>, you are probably already smelling the sweet scent of
+<em>value functions</em> and Bellman equations in the air.</p>
+<p>Let <span>\mathcal{S}</span> be the (finite) set
+of nodes in the graph, and let’s define <span>V
+\colon \mathcal{S}\times \mathcal{S}\to (-\infty, \infty]</span> as the
+value function which tells us the length of the shortest path between
+two vertices. With a bit of dynamic programming, we can find out that
+<span>V</span> satisfies a Bellman equation:</p>
+<p><span>
+\begin{aligned}
+V(s, s) &amp;= 0 \\
+V(s, t) &amp;= \min_{q \in \mathcal{S}}\, A(s, q) + V(q, t), \; \forall
+s \ne t.
+\end{aligned}
+</span></p>
+<p>The first line is the base case for the recursion and represents the
+0-step paths. It costs nothing to just stay where you are, but it is in
+turn impossible to reach any other vertex in zero steps. This may seem
+really simple, but let’s nevertheless define a matrix <span>I</span> to represent this 0-step reachability
+relation. Why we want to do that will soon be clear.</p>
+<p><span>
+I(s, t) = \begin{cases}
+   0      ,&amp; s = t \\
+   \infty ,&amp; s \ne t.
+\end{cases}
+</span></p>
+<p>We can use <span>I</span> to write the recurrence
+more compactly:</p>
+<p><span>
+  V(s, t) = \min \left\{ I(s, t),\, \min_{q \in \mathcal{S}} A(s, q) +
+V(q, t) \right\}
+</span></p>
+<p>What the above equation means is that the minimal distance between
+two vertices is the shortest among staying in the vertex (an empty path)
+and recursively following the shortest path with at least one edge.</p>
+<h2 id="sec:algebraic-paths">Every problem is linear if you squint hard
+enough</h2>
+<p>The equation above is indeed rather ugly. However, by looking at it
+with care, one can the structure unveiling. First, the term</p>
+<p><span>
+  \min_{q \in \mathcal{S}}\, A(s, q) + V(q, t)
+</span></p>
+<p>looks a lot like some kind of composition where we aggregate over the
+middle index <span>q</span>. Even more: if you
+squint your eyes enough, it looks a lot like the formula for matrix
+multiplication.</p>
+<p>Well, let’s try to discover where this idea takes us. Even if it is
+just for the sake of abstract nonsense, it could be interesting. In
+general, when talking about real numbers, we use the usual arithmetic
+structure with addition and multiplication. Today we’re going to be
+eccentric and define a new kind of addition and multiplication:</p>
+<p><span>
+\begin{aligned}
+  a \oplus b  &amp;= \min\{a,\, b\}, \\
+  a \otimes b &amp;= a + b,          \\
+  \mathbf{0}  &amp;= \infty,         \\
+  \mathbf{1}  &amp;= 0.
+\end{aligned}
+</span></p>
+<p>So, what is happening here? The thing is: the real numbers extended
+with <span>\infty</span> satisfy all the axioms for
+a <a href="https://en.wikipedia.org/wiki/Semiring">Semiring
+structure</a> if we take sum to be <span>\min</span>
+and product to be <span>+</span>. This is called the
+<strong>min-plus</strong> or <a href="https://en.wikipedia.org/wiki/Tropical_semiring"><strong>Tropical</strong>
+semiring</a> and, surprisingly, satisfies a lot of the axioms we expect
+from a sum and product The main difference is that instead of having
+inverses, <span>\oplus</span> is idempotent.</p>
+<p>Before further exploring the properties of the Tropical semiring, or
+of semirings in general, let’s take advantage of our new notation to
+rewrite the ugly equation</p>
+<p><span>
+  V(s, t) = I(s, t) \oplus \bigoplus_{q \in \mathcal{S}} A(s, q) \otimes
+V(q, t)
+</span></p>
+<p>into the much more elegant (and index-free!) matrix format</p>
+<p><span>
+  V = I \oplus (A \otimes V).
+</span></p>
+<p>By now, the choice of the letter <span>I</span>
+for the 0-step becomes clear: it is the identity matrix in the Tropical
+algebra!</p>
+<p>What is cool is that in this form, finding the shortest path becomes
+the same as solving a linear system. Can we transfer the methods from
+classical linear algebra to this semiring setting? Unfortunately the
+answer is in general negative… This is why we will have to require a
+further piece of structure from our semirings: a <strong>closure
+operator</strong> denoted <span>^*</span> which
+returns the fixed point of the mapping <span>x
+\mapsto \mathbf{1} \oplus a \otimes x</span>, that is, we require
+that</p>
+<p><span> x^* = \mathbf{1} \oplus a \otimes x^* =
+\mathbf{1} \oplus x^\star \otimes a. </span></p>
+<p>Now, you may call me a cheater since this is the scalar version of
+the shortest path equation. Nevertheless, we will see that while such an
+operator tends to be pretty simple to define for the scalar field, it is
+also the missing piece for solving the <strong>Algebraic Path
+Problem</strong>. That is, an algorithm capable of solving the Bellman
+equation in a way that is polymorphic on the semiring.</p>
+<p>Alright, that was a pretty mathematical introduction. It’s far from
+time for this post to become more computational. Let’s take the above
+discussion to Haskell land by defining a <code>Semiring</code>
+class.</p>
+<div id="cb2"><pre><code><span id="cb2-1"><span>class</span> <span>Semiring</span> r <span>where</span></span>
+<span id="cb2-2"> zero,<span>  one   ::</span> r</span>
+<span id="cb2-3"> (<span>|+|</span>),<span> (|*|) ::</span> r <span>-&gt;</span> r <span>-&gt;</span> r</span>
+<span id="cb2-4"><span> closure      ::</span> r <span>-&gt;</span> r</span>
+<span id="cb2-5"></span>
+<span id="cb2-6"><span>infixl</span> <span>6</span> <span>|+|</span></span>
+<span id="cb2-7"><span>infixl</span> <span>7</span> <span>|*|</span></span>
+<span id="cb2-8"><span>infixl</span> <span>8</span> <span>|^|</span></span></code></pre></div>
+<p>For later use, let’s also define an exponentiation operator using the
+classic divide-and-conquer formula.</p>
+<div id="cb3"><pre><code><span id="cb3-1"><span>(|^|) ::</span> (<span>Semiring</span> r, <span>Integral</span> n) <span>=&gt;</span> r <span>-&gt;</span> n <span>-&gt;</span> r</span>
+<span id="cb3-2">x <span>|^|</span> <span>0</span> <span>=</span> one</span>
+<span id="cb3-3">x <span>|^|</span> n <span>|</span> <span>even</span> n    <span>=</span> x <span>|^|</span> <span>div</span> n <span>2</span> <span>|*|</span> x <span>|^|</span> <span>div</span> n <span>2</span></span>
+<span id="cb3-4">        <span>|</span> <span>otherwise</span> <span>=</span> x <span>|*|</span> x <span>|^|</span> (n<span>-</span><span>1</span>)</span></code></pre></div>
+<p>As usual, there are also a bunch of laws that an element of this
+class must obey. Since those are all pretty standard, I will just direct
+you to the <a href="https://en.wikipedia.org/wiki/Semiring">Wikipedia
+article on the topic</a>.</p>
+<h2 id="the-tropical-semiring-and-shortest-paths">The Tropical Semiring
+and Shortest Paths</h2>
+<p>One can think of a semiring as a structure with an operation for
+combining two values (<span>\otimes</span>) and
+another for aggregating values (<span>\oplus</span>). Since the min-plus semiring was our
+choice for intuition, let’s start the implementation with it.</p>
+<div id="cb4"><pre><code><span id="cb4-1"><span>data</span> <span>Tropical</span> a <span>=</span> <span>Finite</span> a <span>|</span> <span>Infinity</span></span>
+<span id="cb4-2">  <span>deriving</span> (<span>Eq</span>, <span>Functor</span>)</span></code></pre></div>
+<p>One thing to notice about our motivation is that we only used two
+operations on the real numbers: the capacity of combining weights along
+a path with addition (our product) and the capacity of aggregating
+weights of different paths by choosing the smallest among them (our
+addition). Thus, the Tropical structure works for any monoid endowed
+with a total order. We will define the operations in this more general
+setting<a href="#fn2" id="fnref2" role="doc-noteref"><sup>2</sup></a> however, I advise you to keep the
+Real numbers in mind for the intuition. You will shortly see why this
+generality pays off.</p>
+<div id="cb5"><pre><code><span id="cb5-1"><span>instance</span> (<span>Ord</span> a, <span>Monoid</span> a) <span>=&gt;</span> <span>Semiring</span> (<span>Tropical</span> a) <span>where</span></span>
+<span id="cb5-2"> zero <span>=</span> <span>Infinity</span>       <span>-- Weight of nonexistent path</span></span>
+<span id="cb5-3"> one  <span>=</span> <span>Finite</span> <span>mempty</span>  <span>-- Weight of empty path</span></span></code></pre></div>
+<p>For addition, <code>Infinity</code> works as identity since we are
+minimizing.</p>
+<div id="cb6"><pre><code><span id="cb6-1"> <span>Infinity</span> <span>|+|</span> x        <span>=</span> x</span>
+<span id="cb6-2"> x        <span>|+|</span> <span>Infinity</span> <span>=</span> x</span>
+<span id="cb6-3"> <span>Finite</span> x <span>|+|</span> <span>Finite</span> y <span>=</span> <span>Finite</span> (<span>min</span> x y) <span>-- Choose the smallest among paths</span></span></code></pre></div>
+<p>For the product, we combine two values in the usual way with the
+extension that <code>Infinity</code> is absorbing: adding an infinite
+quantity to any number, no matter how small, always produces an infinite
+result.</p>
+<div id="cb7"><pre><code><span id="cb7-1"> x        <span>|*|</span> <span>Infinity</span> <span>=</span> <span>Infinity</span></span>
+<span id="cb7-2"> <span>Infinity</span> <span>|*|</span> y        <span>=</span> <span>Infinity</span></span>
+<span id="cb7-3"> <span>Finite</span> x <span>|*|</span> <span>Finite</span> y <span>=</span> <span>Finite</span> (x <span>&lt;&gt;</span> y)  <span>-- Combine weights along a path</span></span></code></pre></div>
+<p>Now, this next one is interesting. The closure of <code>x</code> is
+equivalent to the shortest distance in a graph with a single node. If
+there are no negative cycles, this should equal the weight of an empty
+path, which is the identity to the product.</p>
+<div id="cb8"><pre><code><span id="cb8-1"> closure _ <span>=</span> one <span>-- the distance taken by not moving</span></span></code></pre></div>
+<p>Of course, we are not interested only in single node graphs. Let’s
+take a look at weighted adjacency matrices.</p>
+<h3 id="matrices-over-a-semiring-are-a-semiring">Matrices over a
+semiring are a semiring</h3>
+<p>Since working wht Haskell arrays may be described as anything but
+pleasent, let’s define some simple wrappers to ease our life a little
+bit. We will go with some dependentish square matrices, but nothing that
+makes our code too complicated.</p>
+<div id="cb9"><pre><code><span id="cb9-1"><span>type</span> <span>Edge</span> <span>=</span> (<span>Nat</span>, <span>Nat</span>)</span>
+<span id="cb9-2"></span>
+<span id="cb9-3"><span>-- | n x n square matrix with components in r</span></span>
+<span id="cb9-4"><span>newtype</span> <span>Matrix</span> (<span>n ::</span> <span>Nat</span>) a <span>=</span> <span>Matrix</span> (<span>Array</span> <span>Edge</span> a)</span>
+<span id="cb9-5">  <span>deriving</span> (<span>Eq</span>, <span>Functor</span>, <span>Foldable</span>, <span>Traversable</span>)</span></code></pre></div>
+<p>To ease our life, let’s also define some methods to get a cleaner
+interface. First of all, a smart constructor that transforms a function
+on pairs of indices into a <code>Matrix</code>.</p>
+<div id="cb10"><pre><code><span id="cb10-1"><span>-- | Extract a type-level natural to the term level</span></span>
+<span id="cb10-2"><span>nat ::</span> <span>forall</span> n<span>.</span> <span>KnownNat</span> n <span>=&gt;</span> <span>Nat</span></span>
+<span id="cb10-3">nat <span>=</span> natVal (<span>Proxy</span> <span>@</span>n)</span>
+<span id="cb10-4"></span>
+<span id="cb10-5"><span>matrix ::</span> <span>forall</span> n a<span>.</span> <span>KnownNat</span> n <span>=&gt;</span> (<span>Edge</span> <span>-&gt;</span> a) <span>-&gt;</span> <span>Matrix</span> n a</span>
+<span id="cb10-6">matrix f <span>=</span> <span>Matrix</span> <span>$</span> array ends [(x, f x) <span>|</span> x <span>&lt;-</span> <span>range</span> ends]</span>
+<span id="cb10-7">  <span>where</span> ends <span>=</span> ((<span>1</span>, <span>1</span>), (nat <span>@</span>n, nat <span>@</span>n))</span></code></pre></div>
+<p>And another smart constructor that turns a list of edges into the
+respective adjacency matrix.</p>
+<div id="cb11"><pre><code><span id="cb11-1"><span>adjacency ::</span> <span>forall</span> n r<span>.</span> (<span>KnownNat</span> n, <span>Semiring</span> r)</span>
+<span id="cb11-2">          <span>=&gt;</span> [(<span>Edge</span>, r)] <span>-&gt;</span> <span>Matrix</span> n r</span>
+<span id="cb11-3">adjacency es <span>=</span> <span>let</span> <span>Matrix</span> o <span>= one ::</span> <span>Matrix</span> n r</span>
+<span id="cb11-4">               <span>in</span> <span>Matrix</span> (o <span>//</span> es)</span></code></pre></div>
+<p>It is also nice to have an <code>Applicative</code> instance, in
+order to aide us during future lifts. Notice that since our matrices are
+a type with fixed size, we can lift operations by simply matching the
+components.</p>
+<div id="cb12"><pre><code><span id="cb12-1"><span>instance</span> <span>KnownNat</span> n <span>=&gt;</span> <span>Applicative</span> (<span>Matrix</span> n) <span>where</span></span>
+<span id="cb12-2"> <span>pure</span> x <span>=</span> matrix (<span>const</span> x)</span>
+<span id="cb12-3"> (<span>Matrix</span> f) <span>&lt;*&gt;</span> (<span>Matrix</span> y) <span>=</span> matrix <span>$</span> \(s,t) <span>-&gt;</span> (f <span>!</span> (s,t)) (y <span>!</span> (s,t))</span></code></pre></div>
+<p>With these tools, we can keep away from the Array low-level API, with
+the exception of indexing. Now we can properly define the
+<code>Semiring</code> instance for a matrix.</p>
+<p>Addition and zero are simply defined pointwisely.</p>
+<div id="cb13"><pre><code><span id="cb13-1"><span>instance</span> (<span>KnownNat</span> n, <span>Semiring</span> r) <span>=&gt;</span> <span>Semiring</span> (<span>Matrix</span> n r) <span>where</span></span>
+<span id="cb13-2"> <span>-- These are the pointwise lifts of their scalar versions</span></span>
+<span id="cb13-3"> zero  <span>=</span> <span>pure</span> zero</span>
+<span id="cb13-4"> (<span>|+|</span>) <span>=</span> liftA2 (<span>|+|</span>)</span></code></pre></div>
+<p>For multiplication, we define <code>one</code> as the identity matrix
+with <code>one</code>s on the diagonal and zero elsewhere (the same as
+in the introduction), and use the traditional definition to build the
+product.</p>
+<div id="cb14"><pre><code><span id="cb14-1"> <span>-- Identity matrix</span></span>
+<span id="cb14-2"> one  <span>=</span> matrix <span>$</span> \(i, j) <span>-&gt;</span> <span>if</span> i <span>==</span> j <span>then</span> one <span>else</span> zero</span>
+<span id="cb14-3"> <span>-- Matrix multiplication using Semiring operators</span></span>
+<span id="cb14-4"> <span>Matrix</span> x <span>|*|</span> <span>Matrix</span> y <span>=</span> matrix contract</span>
+<span id="cb14-5">  <span>where</span></span>
+<span id="cb14-6">   contract (s, t) <span>=</span> add [x <span>!</span> (s, q) <span>|*|</span> y <span>!</span> (q, t) <span>|</span> q <span>&lt;-</span> [<span>1</span><span>..</span>nat <span>@</span>n]]</span>
+<span id="cb14-7">   add             <span>=</span> foldl' (<span>|+|</span>) zero</span></code></pre></div>
+<p>Finally, it is time for our main algorithm: how to calculate the
+closure of a matrix. Let’s take another look at the equation that <span>A^\star</span> must obey in order to gather some
+intuition.</p>
+<p><span>
+  A^\star = I \oplus (A \otimes A^\star)
+</span></p>
+<p>Let’s try an experiment: what happens if we repeatedly substitute the
+<span>A^\star</span> term on the right-hand side
+with the entire right-hand side? After all, they’re equal… By doing
+that, we get a representation of the closure as a power series.</p>
+<p><span>
+  \begin{aligned}
+  A^\star &amp;= I \oplus A \oplus A^2 \oplus A^3 \oplus A^4 \oplus
+\ldots \\
+          &amp;= \bigoplus_{k = 1}^\infty A^k
+  \end{aligned}
+</span></p>
+<p>What does this view contributes to us? Let’s take a look in the
+Tropical Semiring. Each power <span>A^k</span> of
+the adjacency matrix has at its components <span>A^k(s, t)</span> the distance of the shortest path
+from <span>s</span> to <span>t</span> with exacly <span>k</span> edges. Thus, while the recursive Bellman
+equation decomposes the cost of an edge plus the cost of a smaller path,
+this power series formulation, on the other hand, is saying that the
+optimal cost among all paths may be decomposed by path length. The
+minimum among all path is the minimum among all paths of any fixed
+length.<a href="#fn3" id="fnref3" role="doc-noteref"><sup>3</sup></a></p>
+<p>Since there are just <span>n</span> vertices and
+we are assuming no negative cycles in order for the problem to be
+well-posed, looking at any power <span>A^{n+1}</span> is redundant. Because, without
+negative cycles, it is never worth it to pass through any vertex more
+than once.</p>
+<p>A way to calculate the closure is with a variation the <a href="https://en.wikipedia.org/wiki/Floyd-Warshall_algorithm">Floyd-Warshall</a>
+or the <a href="https://en.wikipedia.org/wiki/Gaussian_elimination">Gauss-Jordan</a>
+algorithm that is adapted to work on any closed semiring.<a href="#fn4" id="fnref4" role="doc-noteref"><sup>4</sup></a></p>
+<div id="cb16"><pre><code><span id="cb16-1"> closure x <span>=</span> one <span>|+|</span> foldl' step x [<span>1</span><span>..</span>nat <span>@</span>n]</span>
+<span id="cb16-2">  <span>where</span> step (<span>Matrix</span> m) k <span>=</span> matrix relax</span>
+<span id="cb16-3">         <span>where</span> relax (i, j) <span>=</span> <span>let</span> c <span>=</span> closure (m <span>!</span> (k, k))</span>
+<span id="cb16-4">                 <span>in</span> m <span>!</span> (i, j) <span>|+|</span> m <span>!</span> (i, k) <span>|*|</span> c <span>|*|</span> m <span>!</span> (k, j)</span></code></pre></div>
+<p>To see that it is in general necessary to cross <span>n</span> vertices, consider a graph consisting of a
+single path passing through all nodes. It takes exactly <span>n</span> iterations to discover that all vertices
+are reacheable from the first.</p>
+<div>
+  <div>
+
+<h3 id="everything-you-ever-wanted-to-know-about-your-graphs">Everything
+you ever wanted to know about your graphs</h3>
+<p>Great, we have all the necessary tools to solve the Bellman Equation
+on the tropical semiring! Let’s write a little wrapper that turns an
+association list of weighted edges into the matrix of shortest distance
+between vertices. It works by converting the weights into a Tropical
+semiring where we use Haskell’s <code>Sum</code> monoid to indicate that
+it should combine values with addition.</p>
+<div id="cb17"><pre><code><span id="cb17-1"><span>shortestDistances ::</span> (<span>KnownNat</span> n, <span>Ord</span> r, <span>Num</span> r)</span>
+<span id="cb17-2">                  <span>=&gt;</span> [(<span>Edge</span>, r)] <span>-&gt;</span> <span>Matrix</span> n (<span>Tropical</span> (<span>Sum</span> r))</span>
+<span id="cb17-3">shortestDistances <span>=</span> closure <span>.</span> adjacency <span>.</span> <span>fmap</span> tropicalize</span>
+<span id="cb17-4"> <span>where</span> tropicalize <span>=</span> <span>fmap</span> (<span>Finite</span> <span>.</span> <span>Sum</span>)</span></code></pre></div>
+<p>This matrix represents the problem’s optimal value function, and,
+from it we can reconstruct the optimal paths. But wouldn’t it be cooler
+if the algorithm could already form the paths for us? It is, in some
+sense, walking over the graph after all… As you may guess, there is a
+semiring capable of just that!</p>
+<p>Thanks to our generic Tropical semiring and Haskell’s default
+instances, this addition is almost an one-liner.</p>
+<div id="cb18"><pre><code><span id="cb18-1"><span>-- | Perform an optimization problem storing the optimal paths</span></span>
+<span id="cb18-2"><span>solveWithPath ::</span> (<span>KnownNat</span> n, <span>Ord</span> (f r), <span>Monoid</span> (f r))</span>
+<span id="cb18-3">              <span>=&gt;</span> (a <span>-&gt;</span> f r) <span>-&gt;</span> [(<span>Edge</span>, a)] <span>-&gt;</span> <span>Matrix</span> n (<span>Tropical</span> (f r, [<span>Edge</span>]))</span>
+<span id="cb18-4">solveWithPath f <span>=</span> closure <span>.</span> adjacency <span>.</span> <span>fmap</span> withEdge</span>
+<span id="cb18-5"> <span>where</span> withEdge (e, w) <span>=</span> (e, <span>Finite</span> (f w, [e]))</span>
+<span id="cb18-6"></span>
+<span id="cb18-7"><span>shortestPath ::</span> (<span>KnownNat</span> n, <span>Ord</span> r, <span>Num</span> r)</span>
+<span id="cb18-8">             <span>=&gt;</span> [(<span>Edge</span>, r)] <span>-&gt;</span> <span>Matrix</span> n (<span>Tropical</span> (<span>Sum</span> r, [<span>Edge</span>]))</span>
+<span id="cb18-9">shortestPath <span>=</span> solveWithPath <span>Sum</span></span></code></pre></div>
+<p>Well, how does the above work? The List type has a default Monoid
+instance given by <code>[]</code> and concatenation, and pairs of
+monoids are also monoids with pointwise operations. Furthermore, Haskell
+provides default <code>Òrd</code> instances for pairs and lists using
+the lexicographic order. Thus, in the type
+<code>Tropical (Sum r, [Edge])</code>, the product is sums sums the
+weights in the first component and concatenate the paths in the second,
+while the addition takes the lexicographic minimum: keep the pair with
+smallest weight or, if they are equal, disambiguate the paths
+lexicographically. Since we only want one shortest path, any
+disambiguation criterion works, and we happily receive our path.</p>
+<p>Of course, this technique works for many more operations. By using
+the <code>Down</code> constructor, which inverts an <code>Ord</code>
+instance, we can also solve maximization problems! For example, by
+changing a single constructor, we can query for the largest path.</p>
+<div id="cb19"><pre><code><span id="cb19-1"><span>largestPath ::</span> (<span>KnownNat</span> n, <span>Ord</span> r, <span>Num</span> r)</span>
+<span id="cb19-2">            <span>=&gt;</span> [(<span>Edge</span>, r)] <span>-&gt;</span> <span>Matrix</span> n (<span>Tropical</span> (<span>Down</span> (<span>Sum</span> r), [<span>Edge</span>]))</span>
+<span id="cb19-3">largestPath <span>=</span> solveWithPath (<span>Down</span> <span>.</span> <span>Sum</span>)</span></code></pre></div>
+<p>Keep in mind that in this case, our previous assumption of no
+negative cycles becomes the dual, but for some reason much less
+agreeable, assumption of of positive cycles.</p>
+<p>Now suppose that you heavy a very important letter to send to
+somebody you know. Unfortunately, the roads (or the network links) are
+each day more dangerous and finding a route that will actually deliver
+your message is no easy task. One can model this situation as a graph
+whose weights this edge’s <strong>reliability</strong>, that is, the
+probability of the message crossing that edge without being compromised.
+Assuming independence, the reliability of a path is the product of its
+edge’s probabilities and we can find the most reliable path by
+maximizing among all of them. At this point, you can already guess:
+there is a semiring for that. Use take <span>\max</span> to be the sum and <span>\times</span> for the product et voilà, were’
+done.</p>
+<div id="cb20"><pre><code><span id="cb20-1"><span>mostReliablePath ::</span> (<span>KnownNat</span> n, <span>Ord</span> r, <span>Num</span> r)</span>
+<span id="cb20-2">                 <span>=&gt;</span> [(<span>Edge</span>, r)] <span>-&gt;</span> <span>Matrix</span> n (<span>Tropical</span> (<span>Down</span> (<span>Product</span> r), [<span>Edge</span>]))</span>
+<span id="cb20-3">mostReliablePath <span>=</span> solveWithPath (<span>Down</span> <span>.</span> <span>Product</span>)</span></code></pre></div>
+<p>Suppose now that you’re not worried about the message failing to be
+delivered, but with its size. You want to send a really big package and
+most know whether it can pass on the road. In order to guarantee the
+delivery, you decide to find the <strong>widest path</strong> on the
+graph. To find it, we define the width of a path as the minimum width
+among its edges (the bottleneck) and then aggregate among all paths by
+choosing the one with the largest bottleneck. That’s a semiring with
+<span>\oplus = \max</span>, and <span>\otimes = \min</span>.</p>
+<div id="cb21"><pre><code><span id="cb21-1"><span>widestPath ::</span> (<span>KnownNat</span> n, <span>Ord</span> r, <span>Bounded</span> r)</span>
+<span id="cb21-2">           <span>=&gt;</span> [(<span>Edge</span>, r)] <span>-&gt;</span> <span>Matrix</span> n (<span>Tropical</span> (<span>Down</span> (<span>Min</span> r), [<span>Edge</span>]))</span>
+<span id="cb21-3">widestPath <span>=</span> solveWithPath (<span>Down</span> <span>.</span> <span>Min</span>)</span></code></pre></div>
+<p>Besides those, a lot of other queries on graphs are realizable in
+terms of semirings, and specially some variation of the tropical
+semiring. A book with a lot of examples in the applied field of networks
+is the one by <span data-cites="path_networks_2010">John S. Baras and George
+Theodorakopoulos<a href="#fn5" id="fnref5" role="doc-noteref"><sup>5</sup></a></span>.</p>
+<h2 id="transitive-closures-of-relations">Transitive Closures of
+Relations</h2>
+<p>Let’s now divert our attention to another topic that is nevertheless
+closely related: finite relations. Think about the common binary
+relations that we work with everyday: equality, order (<span>\le</span>, <span>&lt;</span>,
+<span>\ge</span>, <span>&gt;</span>), equivalence relations… All of them
+share two important properties: <strong>transitivity</strong> and
+<strong>reflexivity</strong>.</p>
+<p>So, if you’re going to work with some relation, a typical process is
+to complete it in order to turn this relation transitive and reflexive.
+Of course, your relation is just for the VIP and you don’t want to add
+every arbitrary pair of elements during this operation. You want to find
+the <em>smallest</em> reflexive-transitive relation containing
+yours.</p>
+<p>This is called the <strong>reflexive-transitive closure</strong> of a
+relation. Now, how do we calculate this thing? As you may imagine, there
+is a semiring made just for that and the algorithm is exactly the same
+as for shortest paths. All we have to do is to use the Boolean
+semiring.</p>
+<div id="cb22"><pre><code><span id="cb22-1"><span>instance</span> <span>Semiring</span> <span>Bool</span> <span>where</span></span>
+<span id="cb22-2"> one  <span>=</span> <span>True</span></span>
+<span id="cb22-3"> zero <span>=</span> <span>False</span></span>
+<span id="cb22-4"> (<span>|+|</span>) <span>=</span> (<span>||</span>)</span>
+<span id="cb22-5"> (<span>|*|</span>) <span>=</span> (<span>&amp;&amp;</span>)</span>
+<span id="cb22-6"> closure _ <span>=</span> one  <span>-- Reflexivity for a single vertex</span></span></code></pre></div>
+<p>Using the old trick of representing a finite relation as a Boolean
+matrix, the operation we need is exaclty the closure for the matrix
+semiring.</p>
+<div id="cb23"><pre><code><span id="cb23-1"><span>reflexiveTransitive ::</span> <span>KnownNat</span> n <span>=&gt;</span> <span>Matrix</span> n <span>Bool</span> <span>-&gt;</span> <span>Matrix</span> n <span>Bool</span></span>
+<span id="cb23-2">reflexiveTransitive <span>=</span> closure</span></code></pre></div>
+<p>Interestingly, the above can also be comprehended as a common
+operation on graphs. By translating the boolean matrix into the
+(unweighted) adjacency matrix of a directed graph, this closure returns
+the graph whose edges are all paths on the original graph. If one can go
+from <span>s</span> to <span>t</span> in <span>G</span>, then
+<span>G^\star(s, t) = \mathtt{true}</span>. In the
+figure below, we illustrate this relationship.</p>
+<h2 id="free-as-in-regular-expressions">Free as in Regular
+Expressions</h2>
+<p>When we study some kind of algebraic structure, we tend to find out
+some kind of datastructure that is intimately related to it. For
+example, monoids have lists, magmas have binary trees, and vector spaces
+have fixed-length boxes of numbers. These datatypes are a way to
+represent the <strong>free</strong> version of the algebraic structure.
+The actual definition of something being free in mathematics is a bit
+too technical for this blog’s tone, but the important to us is that, in
+general, a free structure can act as a skeleton (or syntax tree)
+representing a computation and any other instance of the algebraic
+structure can be recovered with a suitable interpreter.<a href="#fn6" id="fnref6" role="doc-noteref"><sup>6</sup></a></p>
+<p>Well, do you have any guess for what is the free closed semiring?
+Perhaps surprisingly, it consists of <strong>Regular
+Expressions</strong>, at least when we assume the sum to be
+idempotent.<a href="#fn7" id="fnref7" role="doc-noteref"><sup>7</sup></a> Yep, regular expressions, those
+strange grawlixes that perl programmers love so much and that renders
+your queries completely unreadable a couple of weeks after you’ve
+written them. Since I don’t want this page to be worthy of a comic book
+cursing context, we will follow a more disciplined approach and
+represent the regular expressions as its own a <a href="https://en.wikipedia.org/wiki/Regular_expression#Formal_definition">datatype</a>.<a href="#fn8" id="fnref8" role="doc-noteref"><sup>8</sup></a></p>
+<div id="cb24"><pre><code><span id="cb24-1"><span>data</span> <span>Regex</span> a <span>=</span> <span>Nope</span>                      <span>-- Empty Set: matches nothing</span></span>
+<span id="cb24-2">             <span>|</span> <span>Empty</span>                     <span>-- Empty String: matches anything</span></span>
+<span id="cb24-3">             <span>|</span> <span>Literal</span> a                 <span>-- A single character from the alphabet</span></span>
+<span id="cb24-4">             <span>|</span> <span>Union</span> (<span>Regex</span> a) (<span>Regex</span> a) <span>-- matches either an argument or the other</span></span>
+<span id="cb24-5">             <span>|</span> <span>Join</span>  (<span>Regex</span> a) (<span>Regex</span> a) <span>-- Matches one argument followed by the other</span></span>
+<span id="cb24-6">             <span>|</span> <span>Many</span>  (<span>Regex</span> a)           <span>-- Kleene star: Matches zero or more instances of something</span></span></code></pre></div>
+<p>Notice that we’re limiting ourselves to truly regular expressions,
+those that represent some kind of <a href="https://en.wikipedia.org/wiki/Regular_language"><strong>Regular
+Language</strong></a>.</p>
+<p>The semiring instance is straighforward, since the constructors
+closely resemble the class methods. We will only implement a couple
+simplifications in order to not get expressions with redundant
+parts.</p>
+<div id="cb25"><pre><code><span id="cb25-1"><span>instance</span> <span>Eq</span> a <span>=&gt;</span> <span>Semiring</span> (<span>Regex</span> a) <span>where</span></span>
+<span id="cb25-2"> zero    <span>=</span> <span>Nope</span></span>
+<span id="cb25-3"> one     <span>=</span> <span>Empty</span></span>
+<span id="cb25-4"> <span>-- Union with some eliminations for empty elements</span></span>
+<span id="cb25-5"> <span>Nope</span> <span>|+|</span> e    <span>=</span> e</span>
+<span id="cb25-6"> e    <span>|+|</span> <span>Nope</span> <span>=</span> e</span>
+<span id="cb25-7"> <span>-- Remove empties when possible</span></span>
+<span id="cb25-8"> <span>Empty</span>    <span>|+|</span> (<span>Many</span> e) <span>=</span> <span>Many</span> e  <span>-- Star contains the empty string</span></span>
+<span id="cb25-9"> (<span>Many</span> e) <span>|+|</span> <span>Empty</span>    <span>=</span> <span>Many</span> e</span>
+<span id="cb25-10"> <span>Empty</span>    <span>|+|</span> <span>Empty</span>    <span>=</span> <span>Empty</span></span>
+<span id="cb25-11"> x        <span>|+|</span> y        <span>=</span> <span>Union</span> x y</span>
+<span id="cb25-12"><span>-- Concatenation and some simplifications</span></span>
+<span id="cb25-13"> <span>Nope</span>  <span>|*|</span> x     <span>=</span> <span>Nope</span>          <span>-- Annihilation</span></span>
+<span id="cb25-14"> x     <span>|*|</span> <span>Nope</span>  <span>=</span> <span>Nope</span></span>
+<span id="cb25-15"> <span>Empty</span> <span>|*|</span> x     <span>=</span> x             <span>-- Identity</span></span>
+<span id="cb25-16"> x     <span>|*|</span> <span>Empty</span> <span>=</span> x</span>
+<span id="cb25-17"> x     <span>|*|</span> y     <span>=</span> <span>Join</span> x y</span>
+<span id="cb25-18"> <span>-- Kleene star</span></span>
+<span id="cb25-19"> closure <span>Nope</span>     <span>=</span> <span>Empty</span>        <span>-- the closure is at least empty</span></span>
+<span id="cb25-20"> closure <span>Empty</span>    <span>=</span> <span>Empty</span>        <span>-- many instances of something empty</span></span>
+<span id="cb25-21"> closure (<span>Many</span> e) <span>=</span> <span>Many</span> e       <span>-- idempotence of Kleene star</span></span>
+<span id="cb25-22"> closure e        <span>=</span> <span>Many</span> e</span></code></pre></div>
+<p>The previous definition was long but rather mechanical and, most
+important of all, gave us a shining new semiring to play with! Alright,
+what does the closure of a matrix of regular expressions? First, a graph
+labeled with regular expressions is exactly a finite state machine (more
+precisely, a ε-NFA), and since in this case <span>\oplus</span> is union and <span>\otimes</span> is concatenation, we get from the
+power series interpretation that the closure <span>A^*</span> is the component-wise union of all fixed
+length paths one can follow in this automaton. Hence, each component
+<span>A^*(s, t)</span> is a regular expression
+representing the language accepted by this automaton with initial state
+<span>s</span> and accepting state <span>t</span>.</p>
+<p>What is the Floyd-Warshall implementation, when specialized to this
+context? Here it becomes Kleene’s algorithm for converting a finite
+state machine into a regular expression.</p>
+<p>As we discussed earlier, regular expressions are the free closed
+(idempotent) semiring. This means that any operation on semirings, such
+as finding shortest-paths, may be first calculated on regexes and then
+converted to the proper type. We achieve this with an interpreter
+function.</p>
+<div id="cb26"><pre><code><span id="cb26-1"><span>interpret ::</span> <span>Semiring</span> r <span>=&gt;</span> (a <span>-&gt;</span> r) <span>-&gt;</span> (<span>Regex</span> a <span>-&gt;</span> r)</span>
+<span id="cb26-2">interpret f <span>Nope</span>        <span>=</span> zero</span>
+<span id="cb26-3">interpret f <span>Empty</span>       <span>=</span> one</span>
+<span id="cb26-4">interpret f (<span>Literal</span> a) <span>=</span> f a</span>
+<span id="cb26-5">interpret f (<span>Union</span> x y) <span>=</span> interpret f x <span>|+|</span> interpret f y</span>
+<span id="cb26-6">interpret f (<span>Join</span>  x y) <span>=</span> interpret f x <span>|*|</span> interpret f y</span>
+<span id="cb26-7">interpret f (<span>Many</span>  e)   <span>=</span> closure (interpret f e)</span></code></pre></div>
+<p>This is similar to how Haskell’s <a href="https://hackage.haskell.org/package/base-4.18.0.0/docs/Prelude.html#v:foldMap"><code>foldMap</code></a>
+works for monoids or the <code>eval</code> function that we <a href="https://iagoleal.com/posts/calculus-symbolic#sec:floating-calculus">defined for
+calculus expressions on another post</a>. All of them are some kind of
+“realizations of typeclass”.</p>
+<p>The usefulness of this interpreter comes from the fact that it
+commutes with the matrix operations. Thus, whenever we want to perform
+many queries in a same graph with idempotent aggregations (such as
+shortest paths, largest paths, most reliable paths, widest paths etc.),
+we may first calculate the regular expressions representing these paths
+and then collapse them separately for each semiring.</p>
+<h2 id="classical-matrix-inversion">Classical Matrix Inversion</h2>
+<p>To wrap up this post, let’s take a look at a semiring that is not
+idempotent: the classical field structure on the real/complex numbers.
+Or, to be technicality accurate, one of these fields complete with an
+extra point to amount for the non-invertibility of zero.</p>
+<div id="cb27"><pre><code><span id="cb27-1"><span>data</span> <span>Classical</span> a <span>=</span> <span>Field</span> a <span>|</span> <span>Extra</span></span>
+<span id="cb27-2">  <span>deriving</span> <span>Eq</span></span></code></pre></div>
+<div id="cb28"><pre><code><span id="cb28-1"><span>instance</span> (<span>Eq</span> a, <span>Fractional</span> a) <span>=&gt;</span> <span>Semiring</span> (<span>Classical</span> a) <span>where</span></span>
+<span id="cb28-2"> zero <span>=</span> <span>Field</span> <span>0</span></span>
+<span id="cb28-3"> one  <span>=</span> <span>Field</span> <span>1</span></span>
+<span id="cb28-4"> <span>Extra</span>   <span>|+|</span> _       <span>=</span> <span>Extra</span></span>
+<span id="cb28-5"> _       <span>|+|</span> <span>Extra</span>   <span>=</span> <span>Extra</span></span>
+<span id="cb28-6"> <span>Field</span> x <span>|+|</span> <span>Field</span> y <span>=</span> <span>Field</span> (x <span>+</span> y)</span>
+<span id="cb28-7"></span>
+<span id="cb28-8"> <span>Field</span> <span>0</span> <span>|*|</span> _       <span>=</span> <span>Field</span> <span>0</span></span>
+<span id="cb28-9"> _       <span>|*|</span> <span>Field</span> <span>0</span> <span>=</span> <span>Field</span> <span>0</span></span>
+<span id="cb28-10"> <span>Extra</span>   <span>|*|</span> _       <span>=</span> <span>Extra</span></span>
+<span id="cb28-11"> _       <span>|*|</span> <span>Extra</span>   <span>=</span> <span>Extra</span></span>
+<span id="cb28-12"> <span>Field</span> x <span>|*|</span> <span>Field</span> y <span>=</span> <span>Field</span> (x <span>*</span> y)</span></code></pre></div>
+<p>For a field, the closure operation has, in general, a closed form
+solution:</p>
+<p><span>
+  x^\star = 1 + x\cdot x^* \implies x^* = (1 - x)^{-1}.
+</span></p>
+<p>Great, I must admit that I had already started missing being able to
+subtract and divide our numbers… Unfortunately, not everything is
+flowers and the number <span>1</span> is
+non-invertible. That’s why we had to add an extra point to the
+structure.</p>
+<div id="cb29"><pre><code><span id="cb29-1"> closure <span>Extra</span>     <span>=</span> <span>Extra</span></span>
+<span id="cb29-2"> closure (<span>Field</span> <span>1</span>) <span>=</span> <span>Extra</span></span>
+<span id="cb29-3"> closure (<span>Field</span> x) <span>=</span> <span>Field</span> <span>$</span> <span>recip</span> (<span>1</span> <span>-</span> x)</span></code></pre></div>
+<p>Since matrices have themselves a notion of inverse, their closure
+also satisfies the equation <span>B^* = (I -
+B)^{-1}</span> whenever the inverse on the right makes sense. With a
+change of variables <span>I - B \to A</span>, we
+arrive at a formula for matrix inversion:</p>
+<p><span> A^{-1} = (I - A)^*.</span></p>
+<p>Furthermore, this works whenever the right-hand side has no
+<code>Extra</code> terms, meaning that we’ve arrived at a safe inversion
+formula for a matrix.</p>
+<div id="cb30"><pre><code><span id="cb30-1"><span>inv ::</span> (<span>Fractional</span> a, <span>Eq</span> a, <span>KnownNat</span> n) <span>=&gt;</span> <span>Matrix</span> n a <span>-&gt;</span> <span>Maybe</span> (<span>Matrix</span> n a)</span>
+<span id="cb30-2">inv <span>=</span> <span>traverse</span> toMaybe <span>.</span> closure <span>.</span> conj</span>
+<span id="cb30-3"> <span>where</span></span>
+<span id="cb30-4">  conj a <span>=</span> one <span>|+|</span> <span>fmap</span> (<span>Field</span> <span>.</span> <span>negate</span>) a   <span>-- A -&gt; I - A</span></span>
+<span id="cb30-5">  toMaybe <span>Extra</span>     <span>=</span> <span>Nothing</span></span>
+<span id="cb30-6">  toMaybe (<span>Field</span> a) <span>=</span> <span>Just</span> a</span></code></pre></div>
+<p>To which classical algorithm is this equivalent? By looking
+attentively at the definition of closure, you will see that this is
+exactly the Gauss-Jordan elimination, where in our case multiplying by
+the closure takes the same role as dividing by a row in the classical
+presentation.</p>
+<h2 id="farewell">Farewell</h2>
+<p>This was a lot of fun, but every post must come to an end. Most of
+it, I’ve learned from <span data-cites="path_networks_2010">Baras and Theodorakopoulos<a href="#fn9" id="fnref9" role="doc-noteref"><sup>9</sup></a></span>, which also contains <em>a
+lot</em> of examples in the context of networks. If you want to go
+deeper on tropical mathematics and the theory of closed semirings, the
+best book I know is <span data-cites="graphs_dioids_semirings_2008">Michel Gondran and Michel
+Minoux<a href="#fn10" id="fnref10" role="doc-noteref"><sup>10</sup></a></span>. A lot of the
+implementations on this site where inspired by those from <span data-cites="dolan_semiring_pearl_2013">Stephen Dolan<a href="#fn11" id="fnref11" role="doc-noteref"><sup>11</sup></a></span>’s paper and the very
+interesting blog post by <span data-cites="r6_ca_paths">Russel O’Connor<a href="#fn12" id="fnref12" role="doc-noteref"><sup>12</sup></a></span>.</p>
+<p>Farewell, and have fun spotting shortest paths where you would never
+imagine before. Heads up, there’s a lot of semirings lurking around.</p>
+<section id="footnotes" role="doc-endnotes">
+<hr>
+<ol>
+<li id="fn1"><p>Assuming you don’t consider Kleisli categories are as
+dirty as arithmetic with infinities.<a href="#fnref1" role="doc-backlink">↩︎</a></p></li>
+<li id="fn2"><p>As if this posts wasn’t abstract enough.<a href="#fnref2" role="doc-backlink">↩︎</a></p></li>
+<li id="fn3"><p>This is very similar to how a linked list can be viewed
+either as a pair containing a value and a reference to another list or
+as a vector that can have any possible length.<a href="#fnref3" role="doc-backlink">↩︎</a></p></li>
+<li id="fn4"><p>There is also a pretty elegant alternative that,
+unfortunately, only works for idempotent semirings. It is a little
+slower (<span>O(n^3 \log n)</span> versus <span>O(n^3)</span>) but it is worth showing here. If
+<span>R</span> is idempotent, then all cross-terms
+in a binomial cancel out and we get <span> (I
+\oplus A)^n = \bigoplus_{k=0}^n A^k = A^\star. </span> From this
+equation follows a pretty sleek one-liner:</p>
+<pre><code>closure a = (one |+| a) |^| nat @n</code></pre>
+<p>Sadly, it requires idempotence…<a href="#fnref4" role="doc-backlink">↩︎</a></p></li>
+<li id="fn5"><p><em>Path <span>Problems</span> in
+<span>Networks</span></em>, Synthesis <span>Lectures</span> on
+<span>Learning</span>, <span>Networks</span>, and
+<span>Algorithms</span> (Cham: Springer International Publishing, 2010),
+<a href="https://doi.org/10.1007/978-3-031-79983-9" role="doc-biblioref">https://doi.org/10.1007/978-3-031-79983-9</a>.<a href="#fnref5" role="doc-backlink">↩︎</a></p></li>
+<li id="fn6"><p>As always in mathematics there are some technicalities
+about when this holds. That’s a cool topic related to monads and CT, but
+too out of scope for this discussion. I suggest the books: <span data-cites="perrone_notes_2021">Paolo Perrone,
+<span>“Notes on <span>Category</span> <span>Theory</span> with Examples
+from Basic Mathematics,”</span> February 2021, chap. 5, <a href="https://doi.org/10.48550/arXiv.1912.10642" role="doc-biblioref">https://doi.org/10.48550/arXiv.1912.10642</a></span>
+and <span data-cites="riehl_ct_context">Emily Riehl,
+<em>Category Theory in Context</em>, n.d., chap. 5, <a href="https://math.jhu.edu/~eriehl/context/" role="doc-biblioref">https://math.jhu.edu/~eriehl/context/</a></span>.<a href="#fnref6" role="doc-backlink">↩︎</a></p></li>
+<li id="fn7"><p>To be precise, regular expressions are the free <a href="https://en.wikipedia.org/wiki/Kleene_algebra">Kleene
+Algebra</a>.<a href="#fnref7" role="doc-backlink">↩︎</a></p></li>
+<li id="fn8"><p>For a primer on regular expressions in Haskell, see
+Pedro Vasconcelos’ <a href="https://www.schoolofhaskell.com/user/pbv/a-regular-expression-matcher">A
+regular expression matcher</a>.<a href="#fnref8" role="doc-backlink">↩︎</a></p></li>
+<li id="fn9"><p><em>Path <span>Problems</span> in
+<span>Networks</span></em>.<a href="#fnref9" role="doc-backlink">↩︎</a></p></li>
+<li id="fn10"><p><em>Graphs, <span>Dioids</span> and
+<span>Semirings</span></em>, vol. 41, Operations
+<span>Research</span>/<span>Computer</span> <span>Science</span>
+<span>Interfaces</span> (Boston, MA: Springer US, 2008), <a href="https://doi.org/10.1007/978-0-387-75450-5" role="doc-biblioref">https://doi.org/10.1007/978-0-387-75450-5</a>.<a href="#fnref10" role="doc-backlink">↩︎</a></p></li>
+<li id="fn11"><p><span>“Fun with Semirings: A Functional Pearl on the
+Abuse of Linear Algebra,”</span> in <em>Proceedings of the 18th
+<span>ACM</span> <span>SIGPLAN</span> International Conference on
+<span>Functional</span> Programming</em> (Boston Massachusetts USA: ACM,
+2013), 101–10, <a href="https://doi.org/10.1145/2500365.2500613" role="doc-biblioref">https://doi.org/10.1145/2500365.2500613</a>.<a href="#fnref11" role="doc-backlink">↩︎</a></p></li>
+<li id="fn12"><p><span>“A Very General Method of Computing Shortest
+Paths,”</span> n.d., <a href="https://r6.ca/blog/20110808T035622Z.html" role="doc-biblioref">https://r6.ca/blog/20110808T035622Z.html</a>.<a href="#fnref12" role="doc-backlink">↩︎</a></p></li>
+</ol>
+</section>
+
+
+
+</div></div></div></div>]]>
+            </description>
+            <link>https://iagoleal.com/posts/algebraic-path/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-35312716</guid>
+            <pubDate>Sun, 26 Mar 2023 09:44:30 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[The Anti-Productivity Manifesto]]>
             </title>
             <description>
 <![CDATA[
-Score 214 | Comments 137 (<a href="https://news.ycombinator.com/item?id=35312563">thread link</a>) | @imartin2k
+Score 221 | Comments 144 (<a href="https://news.ycombinator.com/item?id=35312563">thread link</a>) | @imartin2k
 <br/>
 March 26, 2023 | https://invertedpassion.com/the-anti-productivity-manifesto/ | <a href="https://web.archive.org/web/*/https://invertedpassion.com/the-anti-productivity-manifesto/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="post-2003">
@@ -1100,7 +2433,7 @@ March 26, 2023 | https://invertedpassion.com/the-anti-productivity-manifesto/ | 
             </title>
             <description>
 <![CDATA[
-Score 124 | Comments 201 (<a href="https://news.ycombinator.com/item?id=35312508">thread link</a>) | @rain1
+Score 128 | Comments 209 (<a href="https://news.ycombinator.com/item?id=35312508">thread link</a>) | @rain1
 <br/>
 March 26, 2023 | https://borretti.me/article/and-yet-it-understands | <a href="https://web.archive.org/web/*/https://borretti.me/article/and-yet-it-understands">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -1521,7 +2854,7 @@ March 26, 2023 | https://kairos.io/blog/2023/03/22/understanding-immutable-linux
             </title>
             <description>
 <![CDATA[
-Score 100 | Comments 32 (<a href="https://news.ycombinator.com/item?id=35308672">thread link</a>) | @MrBruh
+Score 101 | Comments 32 (<a href="https://news.ycombinator.com/item?id=35308672">thread link</a>) | @MrBruh
 <br/>
 March 25, 2023 | https://mrbruh.com/dismantling_malware_operation/ | <a href="https://web.archive.org/web/*/https://mrbruh.com/dismantling_malware_operation/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2061,7 +3394,7 @@ March 25, 2023 | https://alexsaveau.dev/blog/projects/performance/files/fuc/fast
             </title>
             <description>
 <![CDATA[
-Score 151 | Comments 144 (<a href="https://news.ycombinator.com/item?id=35306805">thread link</a>) | @spqr233
+Score 152 | Comments 144 (<a href="https://news.ycombinator.com/item?id=35306805">thread link</a>) | @spqr233
 <br/>
 March 25, 2023 | https://www.careered.ai/tool/cover-letter | <a href="https://web.archive.org/web/*/https://www.careered.ai/tool/cover-letter">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><section id="header"><div><h2>𝖨</h2><p>Paste your resume and the job post you'll be applying to, and get a personalized Cover Letter.</p><div><h3>Takes Just a Few Minutes.</h3><ol><li><b>Paste </b>a copy of the job description</li><li><b>Paste </b>a copy of your resume or linkedin</li><li><b>Get </b>a cover letter you can save and use however you want.</li></ol></div></div><form><div><p><span>0<!-- -->/1000 words</span></p></div></form></section></div></div>]]>
@@ -2222,7 +3555,7 @@ March 25, 2023 | https://haaksezeedijk.com/dhz/dijkenbekkens/ | <a href="https:/
             </title>
             <description>
 <![CDATA[
-Score 25 | Comments 2 (<a href="https://news.ycombinator.com/item?id=35306234">thread link</a>) | @luu
+Score 29 | Comments 3 (<a href="https://news.ycombinator.com/item?id=35306234">thread link</a>) | @luu
 <br/>
 March 25, 2023 | http://msinilo.pl/blog2/post/microcorruption-writeup/ | <a href="https://web.archive.org/web/*/http://msinilo.pl/blog2/post/microcorruption-writeup/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="layout">
@@ -2462,7 +3795,7 @@ March 25, 2023 | https://goomics.net/62/ | <a href="https://web.archive.org/web/
             </title>
             <description>
 <![CDATA[
-Score 54 | Comments 8 (<a href="https://news.ycombinator.com/item?id=35305591">thread link</a>) | @gmays
+Score 54 | Comments 10 (<a href="https://news.ycombinator.com/item?id=35305591">thread link</a>) | @gmays
 <br/>
 March 25, 2023 | https://www.trulyadventure.us/odd-caliber | <a href="https://web.archive.org/web/*/https://www.trulyadventure.us/odd-caliber">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-nc-base="header" data-controller="AncillaryLayout">
@@ -4198,7 +5531,7 @@ March 25, 2023 | https://www.ox.ac.uk/news/2023-03-22-any-type-hormonal-contrace
             </title>
             <description>
 <![CDATA[
-Score 64 | Comments 133 (<a href="https://news.ycombinator.com/item?id=35305193">thread link</a>) | @herodotus
+Score 65 | Comments 134 (<a href="https://news.ycombinator.com/item?id=35305193">thread link</a>) | @herodotus
 <br/>
 March 25, 2023 | https://billwadge.com/2023/03/25/a-bad-trip-to-infinity/ | <a href="https://web.archive.org/web/*/https://billwadge.com/2023/03/25/a-bad-trip-to-infinity/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4420,7 +5753,7 @@ March 25, 2023 | https://billwadge.com/2023/03/25/a-bad-trip-to-infinity/ | <a h
             </title>
             <description>
 <![CDATA[
-Score 212 | Comments 132 (<a href="https://news.ycombinator.com/item?id=35303423">thread link</a>) | @josem
+Score 215 | Comments 132 (<a href="https://news.ycombinator.com/item?id=35303423">thread link</a>) | @josem
 <br/>
 March 25, 2023 | https://josem.co/call-yourself-titles/ | <a href="https://web.archive.org/web/*/https://josem.co/call-yourself-titles/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><article><div><p>We constantly question ourselves when attempting anything new for the first time, which is daunting. And what’s worse, it prevents us from doing anything new, so we can’t change who we are.</p><p>If you’ve always been terrible at sports and want to start working out, the natural reaction after a few attempts is to stop and return to your old habits. At the end of the day, you’re not an athlete.</p><p>If you’ve always drawn poorly and always had low marks in arts, and want to start drawing, after a few attempts, you might wonder, what am I even doing? I’m not an artist. And so on and so forth. But there’s a solution to this challenge: calling ourselves with the new title very early in the process.</p><p>We become a runner when we start running a few days a week. An amateur one, a beginner in the world of runners, but a runner nonetheless. And runners run.</p><p>If you start going to the gym to improve your fitness (and not just record yourself to post it on TikTok), you’re an athlete. Yes, you’re not a CrossFit world champion; you’re a beginner, but an athlete at the end of the day.</p><p>And here’s where the magic happens. If you’re now an athlete, you’ll go to the gym often and pay attention to your nutrition because that’s what athletes do. When presented with a decision around your lifestyle, you’ll choose correctly because of your new identity.</p><p>If we start calling ourselves our new titles, what we think of ourselves changes as well, and it’ll be easier to overcome that impostor syndrome and stick to new habits, feeling that you’re doing what you’re supposed to be doing.</p><p>The earlier you use that new term: “athlete,” “writer,” or “artist,” the easier it will be to accept your new identity and act accordingly.</p><p>If you start playing the piano, you’re a pianist, and pianists play the piano. Some do it better than others, but they practice and keep improving, and now you belong to that group.</p><p>You don’t need to do something for years, or even professionally, to call yourself by your new title. By using that new identity early and accepting it naturally, you’ll have a head start in your new hobby or habit you want to incorporate. Give it a try.</p></div></article></div></div>]]>
@@ -4651,7 +5984,7 @@ March 25, 2023 | https://www.ilograph.com/blog/posts/concrete-diagramming-models
             </title>
             <description>
 <![CDATA[
-Score 23 | Comments 8 (<a href="https://news.ycombinator.com/item?id=35301939">thread link</a>) | @todsacerdoti
+Score 48 | Comments 18 (<a href="https://news.ycombinator.com/item?id=35301939">thread link</a>) | @todsacerdoti
 <br/>
 March 25, 2023 | https://hondu.co/blog/file-expiration-using-bpf | <a href="https://web.archive.org/web/*/https://hondu.co/blog/file-expiration-using-bpf">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article itemscope="" itemtype="http://schema.org/BlogPosting">
@@ -4812,7 +6145,7 @@ March 24, 2023 | https://www.bitesizedengineering.com/p/database-isolation-level
             </title>
             <description>
 <![CDATA[
-Score 455 | Comments 381 (<a href="https://news.ycombinator.com/item?id=35297074">thread link</a>) | @bilsbie
+Score 455 | Comments 385 (<a href="https://news.ycombinator.com/item?id=35297074">thread link</a>) | @bilsbie
 <br/>
 March 24, 2023 | https://blog.getclearspace.com/we-ran-a-phone-check-at-a-ycombinator-event-in-san-francisco-heres-how-it-went-fb920a54c755 | <a href="https://web.archive.org/web/*/https://blog.getclearspace.com/we-ran-a-phone-check-at-a-ycombinator-event-in-san-francisco-heres-how-it-went-fb920a54c755">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section><div><div><figure><div role="button" tabindex="0"></div><figcaption>picture by <a href="https://medium.com/u/36c89cf03831?source=post_page-----fb920a54c755--------------------------------" rel="noopener" target="_blank">Pete Koomen</a></figcaption></figure><p id="ea9f">YCombinator keeps telling us to <em>“do things that don’t scale,”</em> and since we are building <a href="https://www.getclearspace.com/" rel="noopener ugc nofollow" target="_blank">software that helps people spend less time on their phones</a>, we decided to do the least scalable thing possible: <strong>take everyone’s phone from them during happy hour</strong>.</p><p id="9df3">Of the ~150 guests in attendance at the event, 37 of them opted to go “phone free” for the evening, and left their phones with us.</p><p id="ca06">Here’s how it worked:</p><p id="a51f"><strong><em>Your claim check doubles as a raffle ticket to win one of our three analog prizes: typewriter, coloring book, art book.</em></strong></p><figure><div role="button" tabindex="0"></div></figure><p id="1e41"><strong><em>In case you need to write down something that comes up while networking like “reminder to follow up with </em></strong><a href="https://medium.com/u/bb249e5e0d1b?source=post_page-----fb920a54c755--------------------------------" rel="noopener" target="_blank"><strong><em>Brian Chesky</em></strong></a><strong><em> about buying clearspace for all airbnb employees”</em></strong></p><p id="be08">The “no phone” sticker became a badge of honor. We heard reports that throughout the happy hour whenever one “phone free founder” saw another, they would gravitate towards each other. It also served as the perfect natural growth loop to draw more party goers to our phone check.</p><p id="656f">First and foremost, we wanted to give our batch mates an opportunity to experience something that is increasingly rare, especially with 2-weeks to go until demo day: <strong>a night of being unplugged</strong>.</p><p id="bea2">Secondly, we wanted to <strong>hear all the actual reasons someone wouldn’t give up their phone</strong>. As we continue to build software that works to <strong>separate the utility of devices from the distracting components </strong>we are always gathering data around what are the truly mission critical aspects of the device.</p><ul><li id="c3b9">“I’m expecting an investor call”</li><li id="736d">“girlfriend might be breaking up with me”</li><li id="47c7">“I love my phone”</li><li id="7471">“getting a call from my mom”</li><li id="9002">“I don’t trust you guys”</li></ul><ul><li id="ae9b">“I talked to way more people”</li><li id="16f6">“It felt liberating, a little scary, it was fun”</li><li id="015d">“I was anxious to do this, it was a lot easier than I expected”</li><li id="b471">“My cofounder needed me to 2FA our Stripe login, and I couldn’t” ☠️</li><li id="92ff">“I reached for my phone in my pocket several times, I don’t like that I did that”</li></ul><figure></figure><p id="9d1a">clearspace is an <a href="https://apps.apple.com/us/app/clearspace-less-screen-time/id1572515807" rel="noopener ugc nofollow" target="_blank">iPhone app</a> that eliminates compulsive phone use and cuts doom scrolling sessions short. We are a part of the current YCombinator W23 batch and help thousands of people a day cut their screen time in half. Check us out in the App Store and let us know what you think!</p><p id="31c3">And if you want us to run a phone check at your event email <a href="mailto:phonecheck@getclearspace.com" rel="noopener ugc nofollow" target="_blank">phonecheck@getclearspace.com</a> 😆</p></div></div></section></div>]]>
@@ -4936,7 +6269,7 @@ March 24, 2023 | https://mle-online.com/projects/internet_skull/index.html | <a 
             </title>
             <description>
 <![CDATA[
-Score 214 | Comments 49 (<a href="https://news.ycombinator.com/item?id=35294111">thread link</a>) | @pubby
+Score 215 | Comments 49 (<a href="https://news.ycombinator.com/item?id=35294111">thread link</a>) | @pubby
 <br/>
 March 24, 2023 | https://pubby.games/codegen.html | <a href="https://web.archive.org/web/*/https://pubby.games/codegen.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
@@ -5752,7 +7085,7 @@ L1:
             </title>
             <description>
 <![CDATA[
-Score 330 | Comments 166 (<a href="https://news.ycombinator.com/item?id=35292422">thread link</a>) | @ryanlpeterman
+Score 331 | Comments 166 (<a href="https://news.ycombinator.com/item?id=35292422">thread link</a>) | @ryanlpeterman
 <br/>
 March 24, 2023 | https://www.developing.dev/p/why-engineers-need-to-write | <a href="https://web.archive.org/web/*/https://www.developing.dev/p/why-engineers-need-to-write">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><article><div><div><div dir="auto"><p>I hated writing in high school. It wasn’t objective like my favorite subjects, math and science. It also didn’t help that we had to write about old, hard-to-understand literature like Shakespeare. But my perspective on writing changed once I started working full-time as a software engineer.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F563950db-225a-4580-8083-c68bf3de222a_1200x800.jpeg" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F563950db-225a-4580-8083-c68bf3de222a_1200x800.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F563950db-225a-4580-8083-c68bf3de222a_1200x800.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F563950db-225a-4580-8083-c68bf3de222a_1200x800.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F563950db-225a-4580-8083-c68bf3de222a_1200x800.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F563950db-225a-4580-8083-c68bf3de222a_1200x800.jpeg" width="1200" height="800" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/563950db-225a-4580-8083-c68bf3de222a_1200x800.jpeg&quot;,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:800,&quot;width&quot;:1200,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:52927,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/jpeg&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F563950db-225a-4580-8083-c68bf3de222a_1200x800.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F563950db-225a-4580-8083-c68bf3de222a_1200x800.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F563950db-225a-4580-8083-c68bf3de222a_1200x800.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F563950db-225a-4580-8083-c68bf3de222a_1200x800.jpeg 1456w" sizes="100vw"></picture></div></a><figcaption>I use my laptop but you get the point</figcaption></figure></div><p>The way I worked started to change around when I became a mid-level engineer. I led a small workstream of a few engineers and to get my work done, I was writing more and more without realizing it. Soon writing became a significant part of my work outside of coding. This became even more true when COVID hit since most conversations moved to async chats and word docs.</p><p><span>Almost everything software engineers do requires writing. We need to write when we ask technical questions, comment on code reviews, or create design docs. This is because writing software is collaborative. </span><strong>The better you are at writing, the more effective you will be at building software.</strong><span> </span></p><p>Aside from being a necessity, writing is the most efficient way for you to scale yourself. As a concrete example, I have a friend who takes incredible notes at work. His notes become a wiki of common terminal commands, code pointers, and diagrams for the team he works on. The best part is that his writing helps others move faster without any work on his part after sharing it. </p><p><span>At the end of the day, you can only ship so much code by yourself. You can have much more impact by influencing others to ship what matters most. </span><strong>Writing is the most scalable way to influence others.</strong></p><p>Some worry that ChatGPT may make writing obsolete. Even if AI tools write for us, I still think writing is valuable. </p><p>Writing your thoughts down forces them into a coherent, logical narrative. Condensing your writing gives you a deeper understanding. This process improves your thinking.</p><p><strong>Also, writing doesn’t just clarify your existing ideas; it generates more of them</strong><span>. When I write design docs, I often discover optimizations or edge cases I didn’t think of at first. So long as critical thinking is necessary, writing will not be obsolete.</span></p><p><strong>It is no coincidence that the strongest engineers I know are all excellent technical writers</strong><span>. It is one of the key skills engineers need to be effective at work. This is one of the main reasons I’ve committed to writing once a week for this Substack. </span></p><p><strong>Over to you: Do you think writing is important for engineers? If so, what’s helped you improve most?</strong></p><p><span>Thanks for reading,</span><br><em>Ryan Peterman</em></p></div></div></div></article></div></div></div>]]>
@@ -5977,7 +7310,7 @@ March 24, 2023 | https://maciej.codes/2023-03-23-kobold.html | <a href="https://
             </title>
             <description>
 <![CDATA[
-Score 250 | Comments 478 (<a href="https://news.ycombinator.com/item?id=35288190">thread link</a>) | @gradys
+Score 251 | Comments 478 (<a href="https://news.ycombinator.com/item?id=35288190">thread link</a>) | @gradys
 <br/>
 March 24, 2023 | https://grady.io/post-gpt-computing/ | <a href="https://web.archive.org/web/*/https://grady.io/post-gpt-computing/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article itemscope="" itemtype="http://schema.org/Article"><header><p>March 24, 2023</p></header><section itemprop="articleBody"><p>Yesterday, I watched someone upload a video file to a chat app, ask a language

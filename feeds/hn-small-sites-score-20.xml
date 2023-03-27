@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Mon, 27 Mar 2023 08:32:04 GMT</lastBuildDate>
+        <lastBuildDate>Mon, 27 Mar 2023 13:53:21 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-20.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Mon, 27 Mar 2023 08:32:04 GMT</pubDate>
+        <pubDate>Mon, 27 Mar 2023 13:53:21 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,14 +20,608 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Setting up a packaging environment for Alpine Linux (introducing alpkg)]]>
+            </title>
+            <description>
+<![CDATA[
+Score 22 | Comments 1 (<a href="https://news.ycombinator.com/item?id=35324938">thread link</a>) | @todsacerdoti
+<br/>
+March 27, 2023 | https://blog.orhun.dev/alpine-packaging-setup/ | <a href="https://web.archive.org/web/*/https://blog.orhun.dev/alpine-packaging-setup/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div itemprop="articleBody">
+      <p>Recently I have been interested in <a href="https://www.alpinelinux.org/">Alpine Linux</a> and thought it would be nice to maintain some Rust packages in their repositories. In this post, I will share my notes/adventures on setting up a packaging environment and a tool called "<strong>alpkg</strong>" for automating this process.</p>
+<p><img src="https://blog.orhun.dev/mountain-view.jpg" alt="mountain view"></p>
+<p>My first interest in Alpine Linux began when I first started to containerize my open source projects using lightweight Alpine containers. I especially like to follow this approach for Rust applications because the sizes of traditional (<a href="https://en.wikipedia.org/wiki/Glibc"><code>glibc</code></a>) distro containers like Debian/Ubuntu can go up to 200-300MB due to <em>bloat</em> whereas Alpine (<a href="https://www.musl-libc.org/"><code>musl</code></a>) containers can stay so minimal such as only 3 MB!</p>
+<p>Here is an example Dockerfile from <a href="https://github.com/orhun/rustypaste">rustypaste</a> that results in a <a href="https://hub.docker.com/r/orhunp/rustypaste">3MB image</a> when built/compressed:</p>
+<pre data-lang="dockerfile"><code data-lang="dockerfile"><span>FROM</span><span> rust:1.67.0-alpine3.17 </span><span>as </span><span>builder
+</span><span>WORKDIR </span><span>/app
+</span><span>RUN </span><span>apk update
+</span><span>RUN </span><span>apk add --no-cache musl-dev
+</span><span>COPY</span><span> . .
+</span><span>RUN </span><span>cargo build --locked --release
+</span><span>RUN </span><span>mkdir -p build-out/
+</span><span>RUN </span><span>cp target/release/rustypaste build-out/
+</span><span>
+</span><span>FROM</span><span> scratch
+</span><span>WORKDIR </span><span>/app
+</span><span>COPY</span><span> --from=builder /app/build-out/rustypaste .
+</span><span>ENV </span><span>SERVER__ADDRESS=0.0.0.0:8000
+</span><span>EXPOSE </span><span>8000
+</span><span>USER </span><span>1000:1000
+</span><span>CMD </span><span>[</span><span>"./rustypaste"</span><span>]
+</span></code></pre>
+<p>One thing to note here, I especially choose <a href="https://hub.docker.com/_/scratch"><code>scratch</code></a> image as the runner since it is super minimal. You can get similar results with images like <a href="https://github.com/GoogleContainerTools/distroless"><code>distroless</code></a> as well.</p>
+<p>Although you need to deal with compiling with <code>musl</code> sometimes, it is worth the hassle when the result is that satisfying. Other things that are different in Alpine are the following:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>glibc               ➔  musl
+</span><span>systemd             ➔  OpenRC
+</span><span>GNU Core Utilities  ➔  BusyBox
+</span></code></pre>
+<p>For more information about Alpine, check out <a href="https://blog.brixit.nl/alpine-linux-is-pretty-neat/">this post</a> which goes into detail about why it's neat.</p>
+<p>Now, let's talk about how to set up a packaging environment for Alpine Linux.</p>
+<hr>
+<h3 id="overview">Overview</h3>
+<p>In my specific case, I would like to keep using my Arch Linux system and also package for Alpine Linux. There are a couple of options for doing that:</p>
+<ul>
+<li>Run Alpine Linux on a <a href="https://wiki.alpinelinux.org/wiki/Install_Alpine_on_VirtualBox">virtual machine</a></li>
+<li>Run Alpine Linux in a <a href="https://en.wikipedia.org/wiki/Chroot">chroot</a></li>
+<li>Use a Docker/Podman container with persistent storage</li>
+</ul>
+<p>I immediately eliminated the first option since I didn't want to deal with VM software and thought it would add extra complexity to my setup.</p>
+<p>Then I spun up a Docker container that runs Alpine and tried to make the storage persistent. After coming across <a href="https://stackoverflow.com/questions/67546583/creating-persistent-durable-worker-box-docker-container">this StackOverflow post</a>, it turned out to be something harder than I expected and I started to feel like I was re-inventing VMs due to all those mount-binds and permissions. Unsurprisingly enough, I ditched that idea as well.</p>
+<p>Later on, I came across <a href="https://wiki.alpinelinux.org/wiki/Alpine_Linux_in_a_chroot">this great article</a> on Alpine Wiki about creating a chroot:</p>
+<blockquote>
+<p>Inside the chroot environment, you can build, debug, and run Alpine packages or develop things. It's the most known way to do so without replacing your system or using a Virtual Machine.</p>
+</blockquote>
+<p>This is exactly what I needed!</p>
+<p>After settling on what to use, I had a plan in mind and came up with this diagram:</p>
+<center>
+<img src="https://blog.orhun.dev/alpine-packaging-diagram.png" width="80%">
+</center>
+<p>Let's break it down:</p>
+<ul>
+<li>Everything is running inside Arch Linux.</li>
+<li>There is a chroot container that holds the package sources and Alpine SDK tools needed.
+<ul>
+<li>In Alpine, packages are <a href="https://wiki.alpinelinux.org/wiki/APKBUILD_Reference">APKBUILD</a> scripts that contain the build instructions for <a href="https://wiki.alpinelinux.org/wiki/Include:Abuild">abuild</a> tool.</li>
+</ul>
+</li>
+<li>There is a Git repository set up <em>outside</em> the chroot for adding/updating/deleting packages.
+<ul>
+<li>For interacting with the repositories, we can simply send a patch (i.e. merge request) to <code>aports</code> repositories which reside in <a href="https://gitlab.alpinelinux.org/alpine/aports">gitlab.alpinelinux.org/alpine/aports</a>.</li>
+<li>We only need to create a GitLab account and fork the repository, no special role is needed!</li>
+</ul>
+</li>
+</ul>
+<hr>
+<h3 id="setting-up-the-chroot">Setting up the chroot</h3>
+<p><a href="https://github.com/alpinelinux/alpine-chroot-install">alpine-chroot-install</a> is a tool that automates the manual steps of creating a chroot. We can use it as follows:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ alpine-chroot-install \
+</span><span>	-a</span><span> x86_64 \      </span><span># architecture
+</span><span>	-d alpine \      </span><span># directory
+</span><span>	-p build-base \  </span><span># install build-base
+</span><span>	-p alpine-sdk    </span><span># install alpine-sdk
+</span></code></pre>
+<p>In a couple of seconds, it will create a chroot and we can easily switch to it with the following script:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ alpine/enter-chroot</span><span> -u </span><span>"$USER" </span><span>&lt;</span><span>CMD</span><span>&gt;
+</span></code></pre>
+<center>
+<p><img src="https://blog.orhun.dev/alpine-chroot.gif" alt="alpine chroot"></p>
+<p>And here we have Alpine Linux running inside Arch Linux!</p>
+</center>
+<hr>
+<h4 id="story-time">Story Time</h4>
+<p>After I created the Alpine chroot, I played around a bit and tried out different features of <code>apk</code> package manager. I installed some of my favorite Rust tools and everything was working smoothly.</p>
+<p>Then I got an idea: I should try installing those tools during the chroot installation. Luckily, <code>alpine-chroot-install</code> has an option for it and you can simply use <code>-p &lt;pkg&gt;</code> for installing packages.</p>
+<p>Of course, I wanted to remove the chroot directory I just created before creating another chroot. For a second I thought chroot was just a simple directory and tried to delete it with <code>rm -rf</code>.</p>
+<p>Ouch.</p>
+<p>However, chroot was not a regular directory. It has a bunch of things mounted to it:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ alpine-chroot-install
+</span><span>
+</span><span># ...
+</span><span>&gt;</span><span> Binding filesystems into chroot
+</span><span>mount: none mounted on /alpine/proc.
+</span><span>mount: /sys bound on /alpine/sys.
+</span><span>mount: /dev bound on /alpine/dev.
+</span></code></pre>
+<p>So when I deleted chroot, I also deleted <code>/dev</code> x_x</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ rm</span><span> -rf</span><span> /chroot
+</span><span>
+</span><span>rm: WARNING: Circular directory structure.
+</span><span>This almost certainly means that you have a corrupted file system.
+</span><span>NOTIFY YOUR SYSTEM MANAGER.
+</span></code></pre>
+<p>Then everything started to fail:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ ls
+</span><span>
+</span><span>Failed to open file to remap file descriptor (No such file or directory)
+</span></code></pre>
+<p><code>/dev/null</code> was also gone and I got errors like "permission denied: /dev/null" as well. Fun.</p>
+<p>Luckily a simple reboot fixes this issue. The scariest part was when everything started to throw errors left and right, I panicked and realized what I did. I was afraid I <code>rm -rf</code>'d my whole system but luckily it was just the mount points.</p>
+<p>Lesson learned, I used the removal script for deleting the chroot next time: <code>/chroot/destroy --remove</code>.</p>
+<hr>
+<h3 id="setting-up-the-packaging-environment">Setting up the packaging environment</h3>
+<p>Let's install the necessary packages for packaging/development on Alpine:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ apk add alpine-sdk atools
+</span></code></pre>
+<p>After that, we need to configure the build defaults in <code>/etc/abuild.conf</code>, especially the packager information:</p>
+<pre data-lang="sh"><code data-lang="sh"><span># PACKAGER and MAINTAINER are used by newapkbuild when creating new aports for
+</span><span># the APKBUILD's "Contributor:" and "Maintainer:" comments, respectively.
+</span><span>PACKAGER</span><span>=</span><span>"Your Name &lt;your@email.address&gt;"
+</span><span>MAINTAINER</span><span>=</span><span>"$PACKAGER"
+</span></code></pre>
+<p>Next, we can configure the security keys:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ abuild-keygen</span><span> --append --install
+</span></code></pre>
+<p>After this step, we are now ready for preparing <code>APKBUILDs</code> according to <a href="https://wiki.alpinelinux.org/wiki/Creating_an_Alpine_package">this guide</a> and build them via <code>abuild -r</code>.</p>
+<hr>
+<h3 id="setting-up-the-repository">Setting up the repository</h3>
+<p>After forking the <a href="https://gitlab.alpinelinux.org/alpine/aports">aports</a> repository on GitLab, we can clone it somewhere on our main system and configure Git according to the packager information we have provided earlier in <code>/etc/abuild.conf</code>:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ git clone https://gitlab.alpinelinux.org/</span><span>&lt;</span><span>user</span><span>&gt;</span><span>/aports
+</span><span>$ git config</span><span> --global</span><span> user.name </span><span>"Your Name"
+</span><span>$ git config</span><span> --global</span><span> user.email </span><span>"your@email.address"
+</span></code></pre>
+<p>Official documentation <a href="https://wiki.alpinelinux.org/wiki/Creating_an_Alpine_package#Commit_your_work">recommends</a> adding the following Git hook for automatically generating the commit message based on the package that is being committed:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ cat </span><span>&lt;&lt;-</span><span>'</span><span>_EOF_</span><span>' </span><span>&gt;</span><span>".git/hooks/prepare-commit-msg"
+</span><span>  #!/bin/sh
+</span><span>  case "$2,$3" in
+</span><span>    ,|template,)
+</span><span>      if git diff-index --diff-filter=A --name-only --cached HEAD \
+</span><span>          | grep -q '/APKBUILD$'; then
+</span><span>        meta() { git diff --staged | grep "^+$1" | sed 's/.*="\?//;s/"$//';}
+</span><span>        printf 'testing/%s: new aport\n\n%s\n%s\n' "$(meta pkgname)" \
+</span><span>          "$(meta url)" "$(meta pkgdesc)" "$(cat $1)" &gt; "$1"
+</span><span>      else
+</span><span>        printf '%s\n\n%s' `git diff-index --name-only --cached HEAD \
+</span><span>          | sed -n 's/\/APKBUILD$//p;q'` "$(cat $1)" &gt; "$1"
+</span><span>      fi;;
+</span><span>  esac
+</span><span>_EOF_
+</span><span>chmod +x </span><span>".git/hooks/prepare-commit-msg"
+</span></code></pre>
+<p>This hook will result in generating commit messages such as:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>testing/git-cliff: new aport
+</span><span>
+</span><span>https://github.com/orhun/git-cliff
+</span><span>A highly customizable changelog generator
+</span><span>testing/
+</span></code></pre>
+<p>Nice.</p>
+<hr>
+<h3 id="creating-packages">Creating packages</h3>
+<p>Alpine Linux has a convenient tool called <code>newapkbuild</code> for generating <code>APKBUILD</code> prototypes based on the given parameters:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ newapkbuild</span><span> -h
+</span><span>
+</span><span>newapkbuild 3.10.0-r0 - generate a new APKBUILD
+</span><span>Usage: newapkbuild </span><span>[</span><span>-n PKGNAME</span><span>] [</span><span>-d PKGDESC</span><span>] [</span><span>-l LICENSE</span><span>] [</span><span>-u URL</span><span>]
+</span><span>       [-a </span><span>| </span><span>-C </span><span>| </span><span>-m </span><span>| </span><span>-p </span><span>| </span><span>-y </span><span>| </span><span>-r] </span><span>[</span><span>-s</span><span>] [</span><span>-c</span><span>] [</span><span>-f</span><span>] [</span><span>-h</span><span>]
+</span><span>       PKGNAME[-PKGVER] </span><span>| </span><span>SRCURL
+</span><span>Options:
+</span><span>  -n  Set package name to PKGNAME (only use with SRCURL)
+</span><span>  -d  Set package description to PKGDESC
+</span><span>  -l  Set package license to LICENSE, use identifiers from:
+</span><span>      </span><span>&lt;</span><span>https://spdx.org/licenses/</span><span>&gt;
+</span><span>  -u  Set package URL
+</span><span>  -a  Create autotools package (use ./configure ...)
+</span><span>  -C  Create CMake package (Assume cmake/ is there)
+</span><span>  -m  Create meson package (Assume meson.build is there)
+</span><span>  -p  Create perl package (Assume Makefile.PL is there)
+</span><span>  -y  Create python package (Assume setup.py is there)
+</span><span>  -r  Create rust package (Assume Cargo.toml is there)
+</span><span>  -s  Use sourceforge source URL
+</span><span>  -c  Copy a sample init.d, conf.d, and install script
+</span><span>  -f  Force even if directory already exists
+</span><span>  -h  Show this help
+</span></code></pre>
+<p>It is especially useful if you don't want to write the same boilerplate functions over and over again.</p>
+<p>It can be used for Rust packages as follows:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ newapkbuild</span><span> -r </span><span>\
+</span><span>              -u </span><span>"https://github.com/orhun/git-cliff" </span><span>\
+</span><span>              -d </span><span>"A highly customizable changelog generator" </span><span>\
+</span><span>              -l </span><span>"GPL-3.0-only" </span><span>\
+</span><span>              </span><span>"git-cliff"
+</span></code></pre>
+<p>This will generate the following <code>APKBUILD</code> in <code>git-cliff</code> directory:</p>
+<pre data-lang="sh"><code data-lang="sh"><span># Contributor: Your Name &lt;your@email.address&gt;
+</span><span># Maintainer: Your Name &lt;your@email.address&gt;
+</span><span>pkgname</span><span>=</span><span>git-cliff
+</span><span>pkgver</span><span>=
+</span><span>pkgrel</span><span>=</span><span>0
+</span><span>pkgdesc</span><span>=</span><span>"A highly customizable changelog generator"
+</span><span>url</span><span>=</span><span>"https://github.com/orhun/git-cliff"
+</span><span>arch</span><span>=</span><span>"all"
+</span><span>license</span><span>=</span><span>"GPL-3.0-only"
+</span><span>depends</span><span>=</span><span>""
+</span><span>makedepends</span><span>=</span><span>"cargo"
+</span><span>checkdepends</span><span>=</span><span>""
+</span><span>install</span><span>=</span><span>""
+</span><span>subpackages</span><span>=</span><span>"$pkgname-dev $pkgname-doc"
+</span><span>source</span><span>=</span><span>""
+</span><span>builddir</span><span>=</span><span>"$srcdir/"
+</span><span>
+</span><span>prepare</span><span>() {
+</span><span>	default_prepare
+</span><span>
+</span><span>	cargo fetch</span><span> --locked
+</span><span>}
+</span><span>
+</span><span>build</span><span>() {
+</span><span>	cargo build</span><span> --frozen --release
+</span><span>}
+</span><span>
+</span><span>check</span><span>() {
+</span><span>	cargo test</span><span> --frozen
+</span><span>}
+</span><span>
+</span><span>package</span><span>() {
+</span><span>	cargo install</span><span> --frozen --offline --path</span><span> .</span><span> --root</span><span>=</span><span>"$pkgdir/usr"
+</span><span>	rm </span><span>"$pkgdir"</span><span>/usr/.crates</span><span>*
+</span><span>}
+</span></code></pre>
+<p>You can read more about <code>APKBUILD</code> functions/variables in the <a href="https://wiki.alpinelinux.org/wiki/APKBUILD_Reference">official reference</a>. With some edits, we can fit our project into this template easily. Here is the final <code>APKBUILD</code>:</p>
+<pre data-lang="sh"><code data-lang="sh"><span># Contributor: Orhun Parmaksız &lt;orhunparmaksiz@gmail.com&gt;
+</span><span># Maintainer: Orhun Parmaksız &lt;orhunparmaksiz@gmail.com&gt;
+</span><span>pkgname</span><span>=</span><span>git-cliff
+</span><span>pkgver</span><span>=</span><span>1.1.2
+</span><span>pkgrel</span><span>=</span><span>0
+</span><span>pkgdesc</span><span>=</span><span>"A highly customizable changelog generator"
+</span><span>url</span><span>=</span><span>"https://github.com/orhun/git-cliff"
+</span><span># s390x, ppc64le, riscv64: blocked by ring crate
+</span><span>arch</span><span>=</span><span>"all !s390x !ppc64le !riscv64"
+</span><span>license</span><span>=</span><span>"GPL-3.0-or-later"
+</span><span>makedepends</span><span>=</span><span>"
+</span><span>	cargo
+</span><span>	libgit2-dev
+</span><span>	"
+</span><span>subpackages</span><span>=</span><span>"
+</span><span>	$pkgname-doc
+</span><span>	$pkgname-bash-completion
+</span><span>	$pkgname-zsh-completion
+</span><span>	$pkgname-fish-completion
+</span><span>	"
+</span><span>options</span><span>=</span><span>"net"
+</span><span>source</span><span>=</span><span>"$pkgname-$pkgver.tar.gz::https://github.com/orhun/git-cliff/archive/v$pkgver.tar.gz"
+</span><span>
+</span><span>prepare</span><span>() {
+</span><span>	default_prepare
+</span><span>
+</span><span>	cargo fetch</span><span> --target</span><span>=</span><span>"$CTARGET"</span><span> --locked
+</span><span>}
+</span><span>
+</span><span>build</span><span>() {
+</span><span>	cargo build</span><span> --frozen --release
+</span><span>	mkdir</span><span> -p</span><span> man
+</span><span>	OUT_DIR</span><span>=</span><span>man/ "./target/release/$pkgname-mangen"
+</span><span>	mkdir</span><span> -p</span><span> completions
+</span><span>	OUT_DIR</span><span>=</span><span>completions/ "./target/release/$pkgname-completions"
+</span><span>}
+</span><span>
+</span><span>check</span><span>() {
+</span><span>	cargo test</span><span> --frozen</span><span> --</span><span> --skip </span><span>"git_log"
+</span><span>}
+</span><span>
+</span><span>package</span><span>() {
+</span><span>	install</span><span> -Dm</span><span> 755 </span><span>"target/release/$pkgname"</span><span> -t </span><span>"$pkgdir/usr/bin"
+</span><span>	install</span><span> -Dm</span><span> 644 README.md</span><span> -t </span><span>"$pkgdir/usr/share/doc/$pkgname"
+</span><span>	install</span><span> -Dm</span><span> 644 </span><span>"man/$pkgname.1"</span><span> -t </span><span>"$pkgdir/usr/share/man/man1"
+</span><span>	install</span><span> -Dm</span><span> 644 </span><span>"completions/$pkgname.bash" "$pkgdir/usr/share/bash-completion/completions/$pkgname"
+</span><span>	install</span><span> -Dm</span><span> 644 </span><span>"completions/$pkgname.fish"</span><span> -t </span><span>"$pkgdir/usr/share/fish/completions"
+</span><span>	install</span><span> -Dm</span><span> 644 </span><span>"completions/_$pkgname"</span><span> -t </span><span>"$pkgdir/usr/share/zsh/site-functions"
+</span><span>}
+</span><span>
+</span><span>sha512sums</span><span>=</span><span>"
+</span><span>f5564f1d6d492ea6527f2ac10eaa1dc90aa1846fb9b090224ff7a2c1cad78d8850a13364c5e4beae987c4ebf65891e804e0677fd9ab193e56d9565292d6cf2ba  git-cliff-1.1.2.tar.gz
+</span><span>"
+</span></code></pre>
+<p>After we have the <code>APKBUILD</code>, we can use the following commands.</p>
+<p>To generate checksums:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ abuild checksum
+</span></code></pre>
+<p>To build:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ abuild</span><span> -r
+</span></code></pre>
+<p>To lint:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ apkbuild-lint APKBUILD
+</span></code></pre>
+<p>After the package is successfully built, there will be an <code>apk</code> file in the <code>$HOME/packages</code> directory. It is possible to list the <code>apk</code> contents with the following command:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ tar tvvf git-cliff-1.1.2-r0.apk
+</span><span>-rw-r--r-- 0/0             512 2023-03-22 19:08 .SIGN.RSA.orhunparmaksiz@gmail.com-641b3a67.rsa.pub
+</span><span>-rw-r--r-- root/root       754 2023-03-22 19:08 .PKGINFO
+</span><span>drwxr-xr-x root/root         0 2023-03-22 19:08 usr/
+</span><span>drwxr-xr-x root/root         0 2023-03-22 19:08 usr/bin/
+</span><span>-rwxr-xr-x root/root   7064056 2023-03-22 19:08 usr/bin/git-cliff
+</span><span>-rwxr-xr-x root/root    469160 2023-03-22 19:08 usr/bin/git-cliff-completions
+</span><span>-rwxr-xr-x root/root    440488 2023-03-22 19:08 usr/bin/git-cliff-mangen
+</span></code></pre>
+<p>To install the locally built package, we can update the repository index (<code>/etc/apk/repositories</code>) to point to the local directory and install it via <code>apk</code>:</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ cat /etc/apk/repositories
+</span><span>
+</span><span>/home/orhun/packages/orhun/
+</span><span>http://dl-cdn.alpinelinux.org/alpine/latest-stable/main
+</span><span>http://dl-cdn.alpinelinux.org/alpine/latest-stable/community
+</span><span>
+</span><span>$ apk add git-cliff
+</span></code></pre>
+<p>If everything works fine, then congratulations, you just built your first Alpine package!</p>
+<hr>
+<h3 id="submitting-patches">Submitting patches</h3>
+<p>Alpine Linux has 3 repositories:</p>
+<ol>
+<li><code>main</code>: Directly supported official packages which are maintained by the Alpine core team.</li>
+</ol>
+<ul>
+<li>Similar to <code>core</code>/<code>extra</code> repositories in Arch Linux.</li>
+</ul>
+<ol start="2">
+<li><code>community</code>: Packages that are created by the contributors and developers. Not fully supported, maintenance is dependent on the contributor activity.</li>
+</ol>
+<ul>
+<li>Same as <code>community</code> repository on Arch Linux.</li>
+</ul>
+<ol start="3">
+<li><code>testing</code>: New packages that are added by contributors. Packages from this repository are accepted into the <code>community</code> repository. This repository is only available on <a href="https://wiki.alpinelinux.org/wiki/Edge">edge</a> (development) branch of Alpine.</li>
+</ol>
+<ul>
+<li>Similar to the AUR / <code>testing</code> repositories on Arch Linux.</li>
+</ul>
+<p>Since we have just created a <em>new</em> package, it will go to the <code>testing</code> repository. We can simply commit <code>testing/&lt;package&gt;/APKBUILD</code> and then create a merge request on GitLab.</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ cd aports/
+</span><span>$ git pull
+</span><span>$ git checkout</span><span> -b</span><span> aport/git-cliff
+</span><span>$ mkdir</span><span> -p</span><span> testing/git-cliff
+</span><span>$ cp /chroot/home/orhun/git-cliff/APKBUILD testing/git-cliff/
+</span><span>$ git add testing/git-cliff
+</span><span>$ git commit
+</span><span>$ git push
+</span></code></pre>
+<p>And there we go: <a href="https://gitlab.alpinelinux.org/alpine/aports/-/merge_requests/45319"><strong>https://gitlab.alpinelinux.org/alpine/aports/-/merge_requests/45319</strong></a></p>
+<p>After the merge request is approved/merged, our package will show up on <a href="https://pkgs.alpinelinux.org/">https://pkgs.alpinelinux.org</a>:</p>
+<p><img src="https://blog.orhun.dev/alpine-pkg.png" alt="alpine package"></p>
+<center>
+<p>Yay! <a href="https://github.com/orhun/git-cliff"><code>git-cliff</code></a> is now available for Alpine Linux!</p>
+</center>
+<hr>
+<h3 id="automating-mostly-everything-with-alpkg">Automating (mostly) everything with <a href="https://github.com/orhun/alpkg"><strong>alpkg</strong></a> 🏔️</h3>
+<p>⭐ GitHub: <a href="https://github.com/orhun/alpkg"><strong>https://github.com/orhun/alpkg</strong></a></p>
+<blockquote>
+<p><code>alpkg</code> can create a chroot with preinstalled tools in a matter of seconds, set up <a href="https://gitlab.alpinelinux.org/alpine/aports">aports repository</a>, and fetch/update packages. Most importantly, it provides a split layout via <a href="https://github.com/zellij-org/zellij">Zellij</a> for easy editing/building <a href="https://wiki.alpinelinux.org/wiki/APKBUILD_Reference"><code>APKBUILD</code></a> files.</p>
+</blockquote>
+<p><img src="https://raw.githubusercontent.com/orhun/alpkg/main/assets/demo.gif" alt="alpkg demo"></p>
+<p><code>alpkg</code> does everything that is mentioned earlier in this post and more. For example, in the GIF above:</p>
+<ul>
+<li>an Alpine chroot is created. (<code>alpkg init</code>)</li>
+<li>an existing <code>APKBUILD</code> is fetched. (<code>alpkg fetch</code>)</li>
+<li><code>APKBUILD</code> is edited and built. (<code>alpkg edit</code>)</li>
+<li>changes are committed to <code>aports</code>. (<code>alpkg update</code>)</li>
+</ul>
+<p>Let's go over these features.</p>
+<p>Creating a chroot is as easy as running <code>alpkg init</code>. It also installs the SDK tools that we need and sets up the <code>aports</code> repository for us.</p>
+<p><img src="https://raw.githubusercontent.com/orhun/alpkg/main/assets/init.gif" alt="alpkg init"></p>
+<p>We can fetch and edit a <code>APKBUILD</code> via <code>alpkg fetch</code>. It will provide a split layout for both editing and other operations such as running <code>abuild -r</code>.</p>
+<p><img src="https://raw.githubusercontent.com/orhun/alpkg/main/assets/fetch.gif" alt="alpkg fetch"></p>
+<p>To create a new <code>APKBUILD</code>, we can simply use <code>alpkg edit</code>.</p>
+<p><img src="https://raw.githubusercontent.com/orhun/alpkg/main/assets/edit-1.gif" alt="alpkg edit"></p>
+<p>Lastly, if we want to commit the changes to <code>aports</code>, we can run <code>alpkg update</code>.</p>
+<p><img src="https://raw.githubusercontent.com/orhun/alpkg/main/assets/update.gif" alt="alpkg update"></p>
+<p>You can get more information about the tool and see detailed usage examples in the <a href="https://github.com/orhun/alpkg">repository</a>.</p>
+<hr>
+<h3 id="endnote">Endnote</h3>
+<p>Alpine Linux is neat. I'm really looking forward to oxidizing it (add more Rust packages to their repositories) and learning more about their implementation choices to eventually do more development. I'm glad how <code>alpkg</code> turned out and I'm planning to improve it based on my needs and the feedback from the Alpine community. I like automating things.</p>
+<p>Hope you enjoyed reading and see you in the next one!</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$ docker run alpine echo </span><span>"안녕히 가세요"
+</span></code></pre>
+
+    </div></div>]]>
+            </description>
+            <link>https://blog.orhun.dev/alpine-packaging-setup/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-35324938</guid>
+            <pubDate>Mon, 27 Mar 2023 10:31:10 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Thoughts on Svelte]]>
+            </title>
+            <description>
+<![CDATA[
+Score 130 | Comments 54 (<a href="https://news.ycombinator.com/item?id=35324430">thread link</a>) | @naansequitur
+<br/>
+March 27, 2023 | https://tyhopp.com/notes/thoughts-on-svelte | <a href="https://web.archive.org/web/*/https://tyhopp.com/notes/thoughts-on-svelte">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+        
+        <time datetime="2023-03-27">2023-03-27</time>
+        <p>Over the span of a month I built a <a href="https://github.com/tyhopp/t-rss-reader">personal RSS reader</a>.</p>
+<p>For the web client I used <a href="https://svelte.dev/">Svelte</a> and <a href="https://kit.svelte.dev/">SvelteKit</a>, mostly as a way to evaluate whether I'd use the tools in larger projects.</p>
+<p>Here are my thoughts on Svelte.</p>
+<h2 id="tldr">TL;DR</h2>
+<p>I enjoyed the Svelte experience on the whole. Highlights are the component format, built-in stores, and the event dispatcher API. Lowlights are reactive statements (<code>$</code>), <code>await</code> blocks, and built-in transition and animation APIs.</p>
+<h2 id="component-format">Component format</h2>
+<p>Svelte's component format is my favorite thing about it. When you write <code>.svelte</code> files, your default context is the same as the browser's: HTML.</p>
+<p>This snippet from the <a href="https://svelte.dev/docs#component-format">Svelte docs</a> (with some example markup, JS and CSS added) is illustrative:</p>
+<pre><code><span>&lt;<span>script</span>&gt;</span><span>
+  
+  <span>function</span> <span>add</span>(<span>a, b</span>) {
+    <span>return</span> a + b;
+  }
+</span><span>&lt;/<span>script</span>&gt;</span>
+
+
+<span>&lt;<span>p</span>&gt;</span>1 + 2 is: {add(1, 2)}<span>&lt;/<span>p</span>&gt;</span>
+
+<span>&lt;<span>style</span>&gt;</span>
+  /* styles go here */
+  p {
+    color: blue;
+  }
+<span>&lt;/<span>style</span>&gt;</span></code></pre><p>Contrast this with React, where JavaScript is the default context and HTML is interleaved via JSX:</p>
+<pre><code><span>import</span> <span>'../some-styles.css'</span>; 
+
+<span>export</span> <span>function</span> <span>SomeComponent</span>(<span></span>) {
+  
+  <span>function</span> <span>add</span>(<span>a, b</span>) {
+    <span>return</span> a + b;
+  }
+
+  
+  <span>return</span> <span><span>&lt;<span>p</span> <span>className</span>=<span>"some-class"</span>&gt;</span>{`1 + 2 is: ${add(1, 2)}`}<span>&lt;/<span>p</span>&gt;</span></span>;
+}</code></pre><p>It's hard to pin down why this approach is great in real terms. You can't really say "Svelte's component format makes our team X times faster when building components than with Y framework" with any certainty.</p>
+<p>I think that the component format is a big part of why people say they enjoy working with Svelte. There's a temptation to explain it as there's less context switching since the browser thinks about HTML first too, but I'm not sure that holds water. Either way, I like it.</p>
+<h2 id="built-in-stores">Built-in stores</h2>
+<p>Svelte comes with built-in <a href="https://svelte.dev/docs#run-time-svelte-store">stores</a> as an option for state management.</p>
+<p>What should and should not be the concern of a user interface library/framework is a contested topic. I like that Svelte acknowledges that state management is a problem you will probably have and gives you a solution you can use or extend if you want to.</p>
+<p>It's also nice that this solution isn't strongly linked to the component tree like React context is.</p>
+<h2 id="event-dispatcher-api">Event dispatcher API</h2>
+<p>Svelte has <a href="https://svelte.dev/docs#run-time-svelte-createeventdispatcher">a built-in API</a> that lets you create a <a href="https://developer.mozilla.org/en-US/docs/Web/API/CustomEvent/CustomEvent"><code>CustomEvent</code></a>, dispatch it, and listen for it on parent elements.</p>
+<p>It's difficult to have an answer for the web's event model in systems that are built on the concept of a unidirectional data flow. By nature, the web's event model lets data flow upwards.</p>
+<p>Svelte acknowledges that you might need to send data up the tree and gives you an API that uses web platform primitives. Thumbs up from me.</p>
+<h2 id="reactive-statements">Reactive statements</h2>
+<p>I found Svelte's <a href="https://svelte.dev/docs#component-format-script-3-$-marks-a-statement-as-reactive">reactive statements</a> confusing.</p>
+<p>Svelte's basic reactivity is <a href="https://svelte.dev/docs#component-format-script-2-assignments-are-reactive">based on variable assignments</a>. That I understand. The docs give this example:</p>
+<pre><code><span>&lt;<span>script</span>&gt;</span><span>
+  <span>let</span> count = <span>0</span>;
+
+  <span>function</span> <span>handleClick</span>(<span></span>) {
+    
+    
+    count = count + <span>1</span>;
+  }
+</span><span>&lt;/<span>script</span>&gt;</span></code></pre><p>Makes sense to me.</p>
+<p>Now, introducing the reactive <code>$</code> label, the docs give this example:</p>
+<pre><code><span>&lt;<span>script</span>&gt;</span><span>
+  <span>export</span> <span>let</span> title;
+  <span>export</span> <span>let</span> person;
+
+  
+  
+  <span>$</span>: <span>document</span>.<span>title</span> = title;
+
+  <span>$</span>: {
+    <span>console</span>.<span>log</span>(<span>`multiple statements can be combined`</span>);
+    <span>console</span>.<span>log</span>(<span>`the current title is <span>${title}</span>`</span>);
+  }
+
+  
+  <span>$</span>: ({ name } = person);
+
+  
+  <span>let</span> name2 = name;
+</span><span>&lt;/<span>script</span>&gt;</span></code></pre><p>There is a lot going on here, and this is the doc's first example introducing the topic. Still, if you stare at it for a while it makes sense.</p>
+<p>Add to that this gotcha from the <a href="https://svelte.dev/docs#component-format-script-3-$-marks-a-statement-as-reactive">Svelte docs</a>:</p>
+<blockquote>
+<p>It is important to note that the reactive blocks are ordered via simple static analysis at compile time, and all the compiler looks at are the variables that are assigned to and used within the block itself, not in any functions called by them. This means that yDependent will not be updated when x is updated in the following example:</p>
+</blockquote>
+<pre><code><span>&lt;<span>script</span>&gt;</span><span>
+  <span>let</span> x = <span>0</span>;
+  <span>let</span> y = <span>0</span>;
+
+  <span>const</span> <span>setY</span> = (<span>value</span>) =&gt; {
+    y = value;
+  };
+
+  <span>$</span>: yDependent = y;
+  <span>$</span>: <span>setY</span>(x);
+</span><span>&lt;/<span>script</span>&gt;</span></code></pre><p>This subtlety led to more than one case where I didn't understand why a component didn't update.</p>
+<p>In the end I found it was difficult to determine reliably when to reach for the <code>$</code> label. I'd use it in one scenario and it seemed to work like I expect, then throw it at another scenario and it didn't work like I expect.</p>
+<p>So I avoided it altogether. One exception is I did use it to <a href="https://svelte.dev/docs#component-format-script-4-prefix-stores-with-$-to-access-their-values">access store values</a>. Unfortunately, it's also another use case that overloads <code>$</code>.</p>
+<p>The <code>$</code> label is one technical reason why I would be hesitant to adopt Svelte for larger projects. It's a core part of Svelte that you can't always avoid, and I think the potential for introducing bugs through it is high to start and very high at scale.</p>
+<h2 id="await-blocks">Await blocks</h2>
+<p>Svelte gives you <code>{#if ...}</code> and <code>{#each ...}</code> syntax as the primary control flow methods for markup rendering. It also has <code>{#await ...}</code> for <a href="https://svelte.dev/docs#template-syntax-await">deciding what to render based on the state of a Promise</a>.</p>
+<p>I like the idea, but in practice I always ended up refactoring it out. There was always something else I needed to do after the Promise resolved or rejected prior to rendering, and I didn't want to run that logic every time I used the service.</p>
+<p>The logic also didn't belong inline in the rendering code, though. So where does it go?</p>
+<p>Rip out <code>{#await ...}</code> and put it in the <code>&lt;script&gt;</code> logic, then use local variables when rendering.</p>
+<p>I think it's not a bad thing that <code>{#await ...}</code> exists in Svelte core, I was just disappointed to find that the elegant use case in the docs is somewhat of a mirage.</p>
+<h2 id="transition-and-animation-apis">Transition and animation APIs</h2>
+<p>My gripe with Svelte's <a href="https://svelte.dev/docs#run-time-svelte-transition">transition</a> and <a href="https://svelte.dev/docs#template-syntax-element-directives-animate-fn">animation</a> APIs is that I think they should be a concern of CSS and not Svelte.</p>
+<p>Svelte gives you an elegant way to use CSS in your components with <code>&lt;style&gt;</code> tags, why not implement transitions and animations in CSS there?</p>
+<p>I very well could have just not found a use case where I was glad for these APIs to exist, fair enough. Until I do, I will question why these not insignificantly complex APIs exist in Svelte's core.</p>
+<h2 id="wrapping-up">Wrapping up</h2>
+<p>Well, these are my thoughts on my experience using <a href="https://svelte.dev/">Svelte</a>!</p>
+<p>I'd use it again for personal projects, maybe not for large company projects if I was the architect.</p>
+<p>I also have thoughts on <a href="https://kit.svelte.dev/">SvelteKit</a>, but I don't have as much to say since I built an SPA, and so much of SvelteKit seems to be about server-side rendering.</p>
+<p>Until next time!</p>
+
+        <hr>
+        <p>Thanks for reading! Go <a href="https://tyhopp.com/">home</a> for more notes.</p>
+      </div></div>]]>
+            </description>
+            <link>https://tyhopp.com/notes/thoughts-on-svelte</link>
+            <guid isPermaLink="false">hacker-news-small-sites-35324430</guid>
+            <pubDate>Mon, 27 Mar 2023 08:56:56 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Deployments Not Releases – Get Good at Delivering Software]]>
+            </title>
+            <description>
+<![CDATA[
+Score 21 | Comments 12 (<a href="https://news.ycombinator.com/item?id=35323484">thread link</a>) | @kiyanwang
+<br/>
+March 26, 2023 | https://blog.mangoteque.com//blog/2023/03/13/deployments-not-releases/ | <a href="https://web.archive.org/web/*/https://blog.mangoteque.com//blog/2023/03/13/deployments-not-releases/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+      
+
+
+
+<div id="main" role="main">
+  
+  
+
+
+
+  <div>
+    
+      
+    
+    <p><em>“Dave, we can’t release more often, our customers wouldn’t tolerate it.”</em>  Having been an architect in Infrastructure Engineering at Salesforce, I’m very familiar with customers being intolerant of continual changes to UI or features. However, there is simply more to shipping than UI tweaks and features.</p>
+
+<p>In his book, <a href="https://itrevolution.com/project-to-product-by-mik-kersten/">Project to Product</a> , Dr. Mik Kersten describes four different “flow items” that can move through the system and that should be adjusted to different proportions based on the changing needs of the business. They are:</p>
+
+<ul>
+  <li>Features - new functionality, changing that button from orange to purple</li>
+  <li>Defects - bugs.  Broken functionality that gives the user a bad/wrong experience.</li>
+  <li>Risks - security and compliance problems.  Things that will cost your business <em>money</em> if they are not fixed.</li>
+  <li>Debt - Things that are a burden on the business objectives.  Things that slow down the speed or quality of delivery.</li>
+</ul>
+
+<p>A horribly incomplete list of things that can be released that are not Features: Rails upgrades, updated Amazon Machine Images (AMIs)/container images, algorithmic optimization, user behavior collection, blog posts, observability improvements, database upgrades, redeploying infrastructure with IaC, dogfood features, replacing credentials with a proper secrets store…</p>
+
+<p>Of course, we still want to release features, but in order to release often we need to…</p>
+
+<h2 id="make-it-safe">Make it Safe</h2>
+
+<p>Some of these things can be released by developers, some by operations, and some by marketing!  But how can it be safe for marketing to release?</p>
+
+<p>Feature flags.  Feature flags allow those teams to deploy software more safely.   Being able to deploy more safely means we deploy more often, which means we get better at deploying (because: practice, practice, practice).</p>
+
+<p>When deployments go out behind a robust feature flagging mechanism (slice by group, by percentage, by customerid, etc) , companies don’t need to worry about “releases” anymore.  When you do this, releases are no longer an engineering term, but rather a marketing term.  They describe a collection of deployments that are considered a “release” even though each of those deployments was pushed to production at a different time.  They may be activated individually or as a group, but they are no longer collected into a big batch release. We want to do this because the science is clear that small batch deployment is safer and better for rapidly achieving desired business outcomes.</p>
+
+<p>Sometimes portfolio companies do feature flagging in customer database records, sometimes they push all changes to a staging environment and then release them at once.  Make the leap.  Move to robust feature flagging, deploy to production behind a flag that can be instantly turned on or off.</p>
+
+<p>With this in place, Marketing can make noise in the marketplace with features they know have been tested and work well.  The business can retain talent with more modern software, retain customers with infrastructure that is continually kept secure and performant, and win in the marketplace without feature releases.</p>
+
+
+
+
+
+
+
+
+
+  </div>
+</div>
+    </div></div>]]>
+            </description>
+            <link>https://blog.mangoteque.com//blog/2023/03/13/deployments-not-releases/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-35323484</guid>
+            <pubDate>Mon, 27 Mar 2023 06:23:26 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[The Vesuvius Challenge]]>
             </title>
             <description>
 <![CDATA[
-Score 21 | Comments 2 (<a href="https://news.ycombinator.com/item?id=35322809">thread link</a>) | @benbreen
+Score 110 | Comments 11 (<a href="https://news.ycombinator.com/item?id=35322809">thread link</a>) | @benbreen
 <br/>
 March 26, 2023 | https://scrollprize.org/overview | <a href="https://web.archive.org/web/*/https://scrollprize.org/overview">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><main><div><div><div><div><article><div><header></header><p>The objective of the Vesuvius Challenge is to make history by reading an unopened Herculaneum scroll for the very first time. We believe that an open competition will accelerate progress and enable us to achieve this goal in 2023.</p><p>We are providing all contestants with the following resources:</p><ul><li><strong><a href="https://scrollprize.org/overview#grand-prize-150000">Prizes</a></strong>: $1,000,000+ in prizes, including a $700,000 Grand Prize and the rest in <a href="https://scrollprize.org/overview#progress-prizes-100000">Progress Prizes</a>. The first progress prize is a $100,000 ink detection competition on <a href="https://www.kaggle.com/competitions/vesuvius-challenge-ink-detection" target="_blank" rel="noopener noreferrer">Kaggle</a>. We also have some smaller <a href="https://scrollprize.org/overview#open-source-prizes-3x-2000">Open Source Prizes</a>.</li><li><strong><a href="https://scrollprize.org/data">Data</a></strong>: 3D X-ray scans of two unopened scrolls from Herculaneum, and scans and images of three papyrus fragments</li><li><strong><a href="https://scrollprize.org/tutorial1">Tutorials and tools</a></strong>: the current best tools and techniques for virtually unwrapping papyrus scrolls</li><li><strong><a href="https://scrollprize.org/participate">Community</a></strong>: a Discord server where you can connect with other contestants and the Vesuvius Challenge team</li></ul><ul><li>Join our <a href="https://discord.gg/6FgWYNjb4N" target="_blank" rel="noopener noreferrer">Discord server</a> to ask questions, learn about what is going on, hang out with fellow contestants and interested onlookers, and perhaps find teammates.</li><li>Receive updates every 1-2 weeks from our <a href="https://scrollprize.substack.com/" target="_blank" rel="noopener noreferrer">mailing list on Substack</a>.</li><li>Follow <a href="https://twitter.com/scrollprize" target="_blank" rel="noopener noreferrer">@scrollprize</a> on Twitter.</li></ul><p>Our team is available for any questions and feedback on Discord. You can also email us at <a href="https://scrollprize.org/cdn-cgi/l/email-protection#fe8a9b9f93be8d9d8c9192928e8c97849bd0918c99" target="_blank" rel="noopener noreferrer"><span data-cfemail="d1a5b4b0bc91a2b2a3bebdbda1a3b8abb4ffbea3b6">[email&nbsp;protected]</span></a>.</p><h3 id="grand-prize-700000">Grand Prize ($700,000)<a href="#grand-prize-700000" title="Direct link to heading">​</a></h3><p>The Grand Prize will go to the first team to read four passages of text from the inside of the two intact scrolls. More details on the qualifying criteria are available <a href="https://scrollprize.org/participate">here</a>.</p><p>Here are the scrolls in question:</p><div><div><p><img loading="lazy" src="https://scrollprize.org/img/overview/scroll1-small.jpg"></p><figcaption>Scroll 1</figcaption></div><div><p><img loading="lazy" src="https://scrollprize.org/img/overview/scroll2-small.jpg"></p><figcaption>Scroll 2</figcaption></div></div><p>We have provided you with 8µm 3D X-ray scans of each of these scrolls, which you can find <a href="https://scrollprize.org/data">here</a>. Your job is to extract the text from these scans.</p><p>You can approach this challenge through any means necessary: machine learning, computer vision, or machine-assisted tools operated by humans.</p><figure><video autoplay="" playsinline="" loop="" muted="" poster="https://scrollprize.org/img/overview/scroll-inside-animation-4.jpg"><source src="https://scrollprize.org/img/overview/scroll-inside-animation-4.webm" type="video/webm"><source src="https://scrollprize.org/img/overview/scroll-inside-animation-4.mp4" type="video/mp4"></video><figcaption>3D X-ray scan of a scroll <a href="https://www.youtube.com/watch?v=PpNq2cFotyY" target="_blank" rel="noopener noreferrer">(source)</a></figcaption></figure><h4 id="why-is-this-difficult">Why is this difficult?<a href="#why-is-this-difficult" title="Direct link to heading">​</a></h4><p>As you will read in the <a href="https://scrollprize.org/tutorial1">tutorials</a>, advanced tools and techniques exist for virtually unwrapping papyrus scrolls. This was demonstrated in 2015 when Dr. Seales's team <a href="https://www2.cs.uky.edu/dri/the-scroll-from-en-gedi/" target="_blank" rel="noopener noreferrer">unwrapped the En-Gedi scroll</a>, and in their recent result <a href="https://raw.githubusercontent.com/educelab/EduceLab-Scrolls/main/paper/EduceLab-Scrolls.pdf" target="_blank" rel="noopener noreferrer">identifying ink from 3D X-ray scans in the Herculaneum scrolls</a>.</p><p>But the Herculaneum scrolls have proved more challenging. The remaining challenges include:</p><ul><li>Segmenting the scrolls. The Herculaneum scrolls are especially long, tightly wrapped, damaged, and distorted. To date, no one has successfully done a large-scale segmentation of these scrolls to identify the surfaces of all the rolled layers.</li><li>Finding the ink. The ink used in the Herculaneum scrolls is <a href="https://en.wikipedia.org/wiki/Radiodensity" target="_blank" rel="noopener noreferrer">radiolucent</a>, making it difficult to see in the scans. Recently, Dr. Seales's team has trained a machine learning model which can detect the ink from subtle patterns in the 3D X-rays. This works in the fragments, but these models are not yet perfect and will probably need to be improved to work at the scale of an entire scroll.</li><li>Putting it all together. Applying the ink detection models to the segmented scroll has not yet been successfully demonstrated.</li></ul><p>Based on the <a href="https://raw.githubusercontent.com/educelab/EduceLab-Scrolls/main/paper/EduceLab-Scrolls.pdf" target="_blank" rel="noopener noreferrer">landmark results</a> that Dr. Seales and his team have recently produced, we believe that it is possible to read the Herculaneum scrolls using the <a href="https://scrollprize.org/data">scans</a> that we already have and the tools and tecniques that they have developed. And that is the Vesuvius Challenge!</p><p>The Grand Prize deadline is 11:59pm Pacific, December 31st, 2023.</p><h2 id="progress-prizes">Progress prizes<a href="#progress-prizes" title="Direct link to heading">​</a></h2><p>The purpose of progress prizes is to encourage contestants to solve important subproblems and release their work. We also hope that they attract more participants who are interested in starting with a narrower task, and then go on to try to win the Grand Prize.</p><p>Progress prizes are optional! You can choose to skip them and work directly on the Grand Prize.</p><h3 id="ink-detection-on-kaggle-100000-total">Ink Detection on Kaggle ($100,000 total)<a href="#ink-detection-on-kaggle-100000-total" title="Direct link to heading">​</a></h3><p>As you will learn in the <a href="https://scrollprize.org/tutorial1">tutorials</a>, one of the big challenges of reading the Herculaneum Papyri is detecting the ink in the 3D X-ray scans.</p><figure><video autoplay="" playsinline="" loop="" muted="" poster="https://scrollprize.org/img/tutorials/ink-detection-anim2-dark.jpg"><source src="https://scrollprize.org/img/tutorials/ink-detection-anim2-dark.webm" type="video/webm"><source src="https://scrollprize.org/img/tutorials/ink-detection-anim2-dark.mp4" type="video/mp4"></video></figure><p>For this important subproblem, we are offering a $100,000 <a href="https://www.kaggle.com/competitions/vesuvius-challenge-ink-detection/" target="_blank" rel="noopener noreferrer">Ink Detection Progress Prize</a>. This progress prize is hosted on Kaggle, and the final submission deadline is June 14th, 2023.</p><h3 id="open-source-prizes-3x-2000">Open Source Prizes (3x $2,000)<a href="#open-source-prizes-3x-2000" title="Direct link to heading">​</a></h3><p>All of us organizing the Vesuvius Challenge are big believers in open source and  incremental progress. We want to encourage building in the open and benefiting the whole community — something that is typically disincentivized in a competition format.</p><p>That’s why we are introducing “open source prizes”. These are small prizes that may be awarded for any open source or publicly available contributions: software, documentation, research notes, Kaggle notebooks, anything goes.</p><ul><li><strong>Anything that you release in public</strong> can qualify for an open source prize. You need to publicly release your work before you can win an open source prize.</li><li>It has to be accessible and usable by other contestants (e.g. licensed under MIT, Apache, GPL, Creative Commons, etc).</li><li>You may make multiple submissions. Please edit the form when doing so. We may award a single prize to a set of multiple submissions by one person or team.</li><li>Your submission will be judged subjectively: the Technical Team (Dr. Brent Seales, Nat Friedman, Stephen Parsons, Seth Parker, JP Posma, and Daniel Havíř) will decide what they think are the best open source contributions.</li><li>The first batch of prizes will be <strong>3 prizes of $2,000 each</strong> (plus a fun surprise!), which you must submit for by <strong>April 11th 11:59pm PT</strong>.</li><li>If you are submitting as a team, the team leader should make the submission, and is responsible for distributing the prize money (and fun surprise) among the team.</li><li>Make your submissions <a href="https://forms.gle/4qiDBW4uxKET87oh8" target="_blank" rel="noopener noreferrer">here</a>.</li></ul><h3 id="future-progress-prizes">Future Progress Prizes<a href="#future-progress-prizes" title="Direct link to heading">​</a></h3><p>We have some ideas of what future progress prizes might best accelerate overall progress on the Vesuvius Challenge, but we’re also keeping an open mind. If you have suggestions, please let us know!</p></div></article></div></div></div></div></main></div></div>]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><main><div><div><div><div><article><div><header></header><p>The objective of the Vesuvius Challenge is to make history by reading an unopened Herculaneum scroll for the very first time. We believe that an open competition will accelerate progress and enable us to achieve this goal in 2023.</p><p>We are providing all contestants with the following resources:</p><ul><li><strong><a href="https://scrollprize.org/overview#grand-prize-150000">Prizes</a></strong>: $1,000,000+ in prizes, including a $700,000 Grand Prize and the rest in <a href="https://scrollprize.org/overview#progress-prizes-100000">Progress Prizes</a>. The first progress prize is a $100,000 ink detection competition on <a href="https://www.kaggle.com/competitions/vesuvius-challenge-ink-detection" target="_blank" rel="noopener noreferrer">Kaggle</a>. We also have some smaller <a href="https://scrollprize.org/overview#open-source-prizes-3x-2000">Open Source Prizes</a>.</li><li><strong><a href="https://scrollprize.org/data">Data</a></strong>: 3D X-ray scans of two unopened scrolls from Herculaneum, and scans and images of three papyrus fragments</li><li><strong><a href="https://scrollprize.org/tutorial1">Tutorials and tools</a></strong>: the current best tools and techniques for virtually unwrapping papyrus scrolls</li><li><strong><a href="https://scrollprize.org/participate">Community</a></strong>: a Discord server where you can connect with other contestants and the Vesuvius Challenge team</li></ul><ul><li>Join our <a href="https://discord.gg/6FgWYNjb4N" target="_blank" rel="noopener noreferrer">Discord server</a> to ask questions, learn about what is going on, hang out with fellow contestants and interested onlookers, and perhaps find teammates.</li><li>Receive updates every 1-2 weeks from our <a href="https://scrollprize.substack.com/" target="_blank" rel="noopener noreferrer">mailing list on Substack</a>.</li><li>Follow <a href="https://twitter.com/scrollprize" target="_blank" rel="noopener noreferrer">@scrollprize</a> on Twitter.</li></ul><p>Our team is available for any questions and feedback on Discord. You can also email us at <a href="https://scrollprize.org/cdn-cgi/l/email-protection#6c18090d012c1f0f1e0300001c1e05160942031e0b" target="_blank" rel="noopener noreferrer"><span data-cfemail="295d4c4844695a4a5b464545595b40534c07465b4e">[email&nbsp;protected]</span></a>.</p><h3 id="grand-prize-700000">Grand Prize ($700,000)<a href="#grand-prize-700000" title="Direct link to heading">​</a></h3><p>The Grand Prize will go to the first team to read four passages of text from the inside of the two intact scrolls. More details on the qualifying criteria are available <a href="https://scrollprize.org/participate">here</a>.</p><p>Here are the scrolls in question:</p><div><div><p><img loading="lazy" src="https://scrollprize.org/img/overview/scroll1-small.jpg"></p><figcaption>Scroll 1</figcaption></div><div><p><img loading="lazy" src="https://scrollprize.org/img/overview/scroll2-small.jpg"></p><figcaption>Scroll 2</figcaption></div></div><p>We have provided you with 8µm 3D X-ray scans of each of these scrolls, which you can find <a href="https://scrollprize.org/data">here</a>. Your job is to extract the text from these scans.</p><p>You can approach this challenge through any means necessary: machine learning, computer vision, or machine-assisted tools operated by humans.</p><figure><video autoplay="" playsinline="" loop="" muted="" poster="https://scrollprize.org/img/overview/scroll-inside-animation-4.jpg"><source src="https://scrollprize.org/img/overview/scroll-inside-animation-4.webm" type="video/webm"><source src="https://scrollprize.org/img/overview/scroll-inside-animation-4.mp4" type="video/mp4"></video><figcaption>3D X-ray scan of a scroll <a href="https://www.youtube.com/watch?v=PpNq2cFotyY" target="_blank" rel="noopener noreferrer">(source)</a></figcaption></figure><h4 id="why-is-this-difficult">Why is this difficult?<a href="#why-is-this-difficult" title="Direct link to heading">​</a></h4><p>As you will read in the <a href="https://scrollprize.org/tutorial1">tutorials</a>, advanced tools and techniques exist for virtually unwrapping papyrus scrolls. This was demonstrated in 2015 when Dr. Seales's team <a href="https://www2.cs.uky.edu/dri/the-scroll-from-en-gedi/" target="_blank" rel="noopener noreferrer">unwrapped the En-Gedi scroll</a>, and in their recent result <a href="https://raw.githubusercontent.com/educelab/EduceLab-Scrolls/main/paper/EduceLab-Scrolls.pdf" target="_blank" rel="noopener noreferrer">identifying ink from 3D X-ray scans in the Herculaneum scrolls</a>.</p><p>But the Herculaneum scrolls have proved more challenging. The remaining challenges include:</p><ul><li>Segmenting the scrolls. The Herculaneum scrolls are especially long, tightly wrapped, damaged, and distorted. To date, no one has successfully done a large-scale segmentation of these scrolls to identify the surfaces of all the rolled layers.</li><li>Finding the ink. The ink used in the Herculaneum scrolls is <a href="https://en.wikipedia.org/wiki/Radiodensity" target="_blank" rel="noopener noreferrer">radiolucent</a>, making it difficult to see in the scans. Recently, Dr. Seales's team has trained a machine learning model which can detect the ink from subtle patterns in the 3D X-rays. This works in the fragments, but these models are not yet perfect and will probably need to be improved to work at the scale of an entire scroll.</li><li>Putting it all together. Applying the ink detection models to the segmented scroll has not yet been successfully demonstrated.</li></ul><p>Based on the <a href="https://raw.githubusercontent.com/educelab/EduceLab-Scrolls/main/paper/EduceLab-Scrolls.pdf" target="_blank" rel="noopener noreferrer">landmark results</a> that Dr. Seales and his team have recently produced, we believe that it is possible to read the Herculaneum scrolls using the <a href="https://scrollprize.org/data">scans</a> that we already have and the tools and tecniques that they have developed. And that is the Vesuvius Challenge!</p><p>The Grand Prize deadline is 11:59pm Pacific, December 31st, 2023.</p><h2 id="progress-prizes">Progress prizes<a href="#progress-prizes" title="Direct link to heading">​</a></h2><p>The purpose of progress prizes is to encourage contestants to solve important subproblems and release their work. We also hope that they attract more participants who are interested in starting with a narrower task, and then go on to try to win the Grand Prize.</p><p>Progress prizes are optional! You can choose to skip them and work directly on the Grand Prize.</p><h3 id="ink-detection-on-kaggle-100000-total">Ink Detection on Kaggle ($100,000 total)<a href="#ink-detection-on-kaggle-100000-total" title="Direct link to heading">​</a></h3><p>As you will learn in the <a href="https://scrollprize.org/tutorial1">tutorials</a>, one of the big challenges of reading the Herculaneum Papyri is detecting the ink in the 3D X-ray scans.</p><figure><video autoplay="" playsinline="" loop="" muted="" poster="https://scrollprize.org/img/tutorials/ink-detection-anim2-dark.jpg"><source src="https://scrollprize.org/img/tutorials/ink-detection-anim2-dark.webm" type="video/webm"><source src="https://scrollprize.org/img/tutorials/ink-detection-anim2-dark.mp4" type="video/mp4"></video></figure><p>For this important subproblem, we are offering a $100,000 <a href="https://www.kaggle.com/competitions/vesuvius-challenge-ink-detection/" target="_blank" rel="noopener noreferrer">Ink Detection Progress Prize</a>. This progress prize is hosted on Kaggle, and the final submission deadline is June 14th, 2023.</p><h3 id="open-source-prizes-3x-2000">Open Source Prizes (3x $2,000)<a href="#open-source-prizes-3x-2000" title="Direct link to heading">​</a></h3><p>All of us organizing the Vesuvius Challenge are big believers in open source and  incremental progress. We want to encourage building in the open and benefiting the whole community — something that is typically disincentivized in a competition format.</p><p>That’s why we are introducing “open source prizes”. These are small prizes that may be awarded for any open source or publicly available contributions: software, documentation, research notes, Kaggle notebooks, anything goes.</p><ul><li><strong>Anything that you release in public</strong> can qualify for an open source prize. You need to publicly release your work before you can win an open source prize.</li><li>It has to be accessible and usable by other contestants (e.g. licensed under MIT, Apache, GPL, Creative Commons, etc).</li><li>You may make multiple submissions. Please edit the form when doing so. We may award a single prize to a set of multiple submissions by one person or team.</li><li>Your submission will be judged subjectively: the Technical Team (Dr. Brent Seales, Nat Friedman, Stephen Parsons, Seth Parker, JP Posma, and Daniel Havíř) will decide what they think are the best open source contributions.</li><li>The first batch of prizes will be <strong>3 prizes of $2,000 each</strong> (plus a fun surprise!), which you must submit for by <strong>April 11th 11:59pm PT</strong>.</li><li>If you are submitting as a team, the team leader should make the submission, and is responsible for distributing the prize money (and fun surprise) among the team.</li><li>Make your submissions <a href="https://forms.gle/4qiDBW4uxKET87oh8" target="_blank" rel="noopener noreferrer">here</a>.</li></ul><h3 id="future-progress-prizes">Future Progress Prizes<a href="#future-progress-prizes" title="Direct link to heading">​</a></h3><p>We have some ideas of what future progress prizes might best accelerate overall progress on the Vesuvius Challenge, but we’re also keeping an open mind. If you have suggestions, please let us know!</p></div></article></div></div></div></div></main></div></div>]]>
             </description>
             <link>https://scrollprize.org/overview</link>
             <guid isPermaLink="false">hacker-news-small-sites-35322809</guid>
@@ -39,7 +633,7 @@ March 26, 2023 | https://scrollprize.org/overview | <a href="https://web.archive
             </title>
             <description>
 <![CDATA[
-Score 23 | Comments 26 (<a href="https://news.ycombinator.com/item?id=35322214">thread link</a>) | @fahhem
+Score 32 | Comments 47 (<a href="https://news.ycombinator.com/item?id=35322214">thread link</a>) | @fahhem
 <br/>
 March 26, 2023 | https://blog.fahhem.com/2023/03/free-solution-uber-eats-swapped-orders/ | <a href="https://web.archive.org/web/*/https://blog.fahhem.com/2023/03/free-solution-uber-eats-swapped-orders/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div> <p>While at a restaurant recently, I noticed they had multiple shelves of pickup orders. It's a popular local restaurant, so they had orders from all the major food delivery companies, Doordash, Uber Eats, Grubhub, and they all had little receipts on them.</p> <p>Each receipt had one line printed really large, and it was different for each of these companies. Here, we'll focus on Uber Eats because it was the most problematic one. For Uber Eats, it says "UBER_EATS #F35DF NO Utensils Courier-powered Delivery - Samuel M (#1423)".</p> <h2>What's the problem?</h2> <p>Firstly, let's go over the problems. There are two numbers here, both seem to be unique to this order. It also puts the originator, the originator's "ID", whether they want utensils or not, and that it has an originator, as well as the orderer's name all at the same level of importance.</p> <p>Now, one might think these are all very important. But if you actually stand in that restaurant for more than a couple minutes, you'll notice something. All of the delivery drivers follow the same efficient pattern. They come in, read from their app "Uber eats 5DF", then the restaurant worker will go back to the rack, read the receipts in a random order, grab the first one that matches, hand that to the driver, and the driver will run off in a hurry. Notice the driver doesn't double check the receipt. None of them did.</p> <p>And I don't blame them, what are the chances that "5DF" is repeated? 16<sup>3</sup>, which is "only" 4,096. That means the chances are 0.02%. Note: I used 16 as the base, not 36, because they're only used hexadecimal (0-9 and A-F), which will come up later.</p> <p>If we were talking about 1 restaurant, or even 100, that would mean that 1 in 4,096 orders (or 1 every 40 days) are getting swapped due to this efficiency. However, we're talking about Uber Eats, which does at least millions of orders a month, which is over 33 thousand a day (on average), or about 10 swaps a day.</p> <p>This is all assuming drivers pronounce and restaurant workers hear every letter correctly, and no other mistake is made in the selection of an order. If you take that into account, you'll likely see a much higher rate of swaps.</p> <h2>Why does it matter?</h2> <p>I just explained the scope of the problem, but at Uber Eats' scale, 10 swaps a day isn't even an hour of a customer support person's time.</p> <p>However, if you poll everyone you know that uses these delivery services, there's a consistent theme. If this was truly so rare, why does everyone have a story? As someone who's used these services only in rare circumstances (under 10 times, though I never thought to count), I have 2 such cases. I might be a statistical outlier though.</p> <p>Given the theoretical scale is small, the cost is likely small, why bother? Because it affects the perception of your service. Perception of a service costs much more than the immediate customer support bill, it affects the business through the customer-acquisition cost (the famous "free" word of mouth), the customer retention rate, and generally the bottom-line.</p> <h2>Okay, so what's the solution?</h2> <p>You might think I've written this much so far and I'm about to write a complicated solution out. Or that it might cost Uber/Uber Eats days or weeks of engineering to write a new receipt format, or require new printers.</p> <p>No, the reason I believe in this solution is that it's simple. If the drivers are going to read out 3 letters, then give them more options. Make the math use bigger numbers.</p> <p>Instead of hexadecimal, use all the distinctly-named letters and numbers. Throw out C, D, E since they all sound like B, keeping only A, B, F from the first version. Then add in the other visually- and phonetically-distinct letters: H, I, L, M, Q, R, U, W, X, Y. Now we're up to 23 letters, so the probability is now 1 in 23<sup>3</sup>, or 12,167 or 0.008%, a 3x improvement.</p> <p>This solution makes no changes to the format of the receipt whatsoever, so it's just a simple transform. Here's some sample code in Python and then in Go, since I know most of Uber Eats is written in Go.</p> <div><pre><span></span><code><span>def</span> <span>hex_to_baseN</span><span>(</span><span>hex_string</span><span>,</span> <span>baseN_chars</span><span>):</span>
@@ -110,7 +704,7 @@ March 26, 2023 | https://blog.fahhem.com/2023/03/free-solution-uber-eats-swapped
             </title>
             <description>
 <![CDATA[
-Score 32 | Comments 8 (<a href="https://news.ycombinator.com/item?id=35321606">thread link</a>) | @fagnerbrack
+Score 40 | Comments 9 (<a href="https://news.ycombinator.com/item?id=35321606">thread link</a>) | @fagnerbrack
 <br/>
 March 26, 2023 | https://creatomate.com/blog/video-rendering-with-nodejs-and-ffmpeg | <a href="https://web.archive.org/web/*/https://creatomate.com/blog/video-rendering-with-nodejs-and-ffmpeg">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><h2>Introduction</h2>
@@ -721,7 +1315,7 @@ Once again, FFmpeg comes to the rescue. Let's make a utility function at <!-- --
             </title>
             <description>
 <![CDATA[
-Score 81 | Comments 83 (<a href="https://news.ycombinator.com/item?id=35320565">thread link</a>) | @vslira
+Score 86 | Comments 98 (<a href="https://news.ycombinator.com/item?id=35320565">thread link</a>) | @vslira
 <br/>
 March 26, 2023 | https://blog.vslira.net/2023/03/an-interview-with-steve-wozniak-by.html | <a href="https://web.archive.org/web/*/https://blog.vslira.net/2023/03/an-interview-with-steve-wozniak-by.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="post-body-4930482377232917237">
@@ -738,7 +1332,7 @@ March 26, 2023 | https://blog.vslira.net/2023/03/an-interview-with-steve-wozniak
             </title>
             <description>
 <![CDATA[
-Score 290 | Comments 135 (<a href="https://news.ycombinator.com/item?id=35315542">thread link</a>) | @Flux159
+Score 299 | Comments 137 (<a href="https://news.ycombinator.com/item?id=35315542">thread link</a>) | @Flux159
 <br/>
 March 26, 2023 | https://blog.lastmileai.dev/using-openais-retrieval-plugin-with-llama-d2e0b6732f14 | <a href="https://web.archive.org/web/*/https://blog.lastmileai.dev/using-openais-retrieval-plugin-with-llama-d2e0b6732f14">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section><div><div><p id="9371">OpenAI just released initial support for <a href="https://openai.com/blog/chatgpt-plugins" rel="noopener ugc nofollow" target="_blank">plugins to ChatGPT</a>, allowing the language model to act as agents and interact with the outside world using APIs. Here we show a proof of concept using OpenAI’s <a href="https://github.com/openai/chatgpt-retrieval-plugin" rel="noopener ugc nofollow" target="_blank">chatgpt-retrieval-plugin</a> with Meta’s <a href="https://arxiv.org/abs/2302.13971" rel="noopener ugc nofollow" target="_blank">LLaMA</a> language model.</p><p id="42ba">This is more than just a guide. It is a call-to-action to build an open protocol for foundation model plugins allowing us to share plugins across LLMs, and govern their interactions.</p><figure><div role="button" tabindex="0"></div><figcaption>LLaMA answering a question about the LLaMA paper with the chatgpt-retrieval-plugin. So Meta!</figcaption></figure><p id="70b3">OpenAI’s <a href="https://platform.openai.com/docs/plugins/introduction" rel="noopener ugc nofollow" target="_blank">documentation on plugins</a> explains that plugins are able to enhance ChatGPT’s capabilities by specifying a manifest &amp; an openapi specification.</p><p id="cd90">There are few details available about how the plugins are wired to ChatGPT, but OpenAI open-sourced the <a href="https://github.com/openai/chatgpt-retrieval-plugin" rel="noopener ugc nofollow" target="_blank">chatgpt-retrieval-plugin</a> for semantic search and retrieving custom data for additional context.</p><p id="b917">In this guide we will take that retrieval plugin, and add a script that integrates it with LLaMA 7B running on your local machine.</p><blockquote><p id="26ed">The code that glues the plugin to LLaMA is available in this repo (we welcome contributions):</p><p id="204a"><a href="https://github.com/lastmile-ai/llama-retrieval-plugin" rel="noopener ugc nofollow" target="_blank">lastmile-ai/llama-retrieval-plugin</a></p></blockquote><p id="0a6e">This approach successfully adds external context to LLaMA, albeit with gaps compared to OpenAI’s plugin approach:</p><ul><li id="e172"><strong>Limitations in the underlying model. </strong>LLaMA is far from ChatGPT in many ways. It requires significant additional fine-tuning (such as <a href="https://github.com/tatsu-lab/stanford_alpaca" rel="noopener ugc nofollow" target="_blank">Alpaca</a>).</li><li id="2172"><strong>Not generalizable to other plugins. </strong>The <a href="https://platform.openai.com/docs/plugins/introduction/plugin-flow" rel="noopener ugc nofollow" target="_blank">OpenAI documentation</a> suggests ChatGPT can read a plugin’s API schema, and dynamically construct the right API calls that satisfy the user’s request. By contrast, things didn’t go well when we tried to ask LLaMA to construct a cURL request given an OpenAPI schema. One solution to this would be fine-tuning a model specifically for OpenAPI schemas.</li></ul><p id="63b6">We first set up our data store and upload two PDFs to it — the LLaMA<a href="https://arxiv.org/pdf/2302.13971.pdf" rel="noopener ugc nofollow" target="_blank"> paper</a> and the <a href="https://docs.conda.io/projects/conda/en/4.6.0/_downloads/52a95608c49671267e40c689e0bc00ca/conda-cheatsheet.pdf" rel="noopener ugc nofollow" target="_blank">Conda cheatsheet</a>.</p><figure><div></div></figure><p id="8c3e">Then we can query this data, with the relevant embeddings pulled in to the prompt as additional context.</p><figure><div></div></figure><h2 id="c0de">Step 0: Clone the llama-retrieval-plugin repo</h2><h2 id="57aa"><strong>Step 1: </strong>Set up the data store</h2><p id="c7f9">This step is almost identical to setting up the OpenAI retrieval plugin, but simplified through the use of conda and using pinecone as the vector DB. Following the <a href="https://github.com/lastmile-ai/llama-retrieval-plugin/blob/main/README.md#quickstart" rel="noopener ugc nofollow" target="_blank">quickstart in the repo</a>:</p><p id="1fd5"><em>Set up the environment:</em></p><pre><span id="6b12">conda env create -f environment.yml<br>conda activate llama-retrieval-plugin<br>poetry install</span></pre><p id="adde"><em>Define the environment variables:</em></p><pre><span id="e1a2"># In production use-cases, make sure to set up the bearer token properly<br>export BEARER_TOKEN=test1234<br>export OPENAI_API_KEY=my_openai_api_key<p># We used pinecone for our vector database, but you can use a different one<br>export DATASTORE=pinecone<br>export PINECONE_API_KEY=my_pinecone_api_key<br>export PINECONE_ENVIRONMENT=us-east1-gcp<br>export PINECONE_INDEX=my_pinecone_index_name</p></span></pre><p id="5d93"><em>Start the server:</em></p><pre><span id="00eb">poetry run start</span></pre><h2 id="382c">Step 2: Upload files to the data store</h2><p id="ca77">For this step, we used the Swagger UI available locally at <a href="http://localhost:8000/docs" rel="noopener ugc nofollow" target="_blank">http://localhost:8000/docs</a></p><p id="112f"><em>Authorize:</em></p><figure><div role="button" tabindex="0"></div><figcaption>Authorize using the value of the BEARER_TOKEN you specified in Step 1</figcaption></figure><p id="9102"><em>Upsert File:</em></p><figure><div role="button" tabindex="0"></div><figcaption>Specify any PDF file that you would like to get chunked into embeddings</figcaption></figure><p id="b982"><em>Query the data store to test:</em></p><p id="f4f6">Take the id returned by the upsert, and construct a query in the Swagger UI to see what embeddings will be returned given a prompt:</p><pre><span id="18c2">{<br>  "queries": [<br>    {<br>      "query": "What is the title of the LLaMA paper?",<br>      "filter": {<br>        "document_id": "f443884b-d137-421e-aac2-9809113ad53d"<br>      },<br>      "top_k": 3<br>    }<br>  ]<br>}</span></pre><figure><div role="button" tabindex="0"></div><figcaption>The query API lets you test out the vector store, and configure the filters</figcaption></figure><h2 id="7cb0">Step 3: Set up LLaMA</h2><p id="0cd7">Our repo links to llama.cpp as a submodule, which is what we used for getting LLaMA 7B running locally.</p><p id="9853"><em>Follow the llama.cpp readme to get set up</em></p><h2 id="e5cf">Step 4: Use LLaMA to query your custom data</h2><p id="22f6">Open a new Terminal, and navigate to the <em>llama-retrieval-plugin</em> repo.</p><p id="8069"><em>Activate the Conda environment (from Step 1):</em></p><pre><span id="ea99">conda activate llama-retrieval-plugin</span></pre><p id="6f61"><em>Define the environment variables:</em></p><pre><span id="6915"># Make sure the BEARER_TOKEN is set to the same value as in Step 1<br>export BEARER_TOKEN=test1234<br># Set the URL to the query endpoint that you tested in Step 2<br>export DATASTORE_QUERY_URL=http://0.0.0.0:8000/query<br># Set to the directory where you have LLaMA set up -- such as the root of the llama.cpp repo<br>export LLAMA_WORKING_DIRECTORY=./llama.cpp</span></pre><p id="9a73"><em>Run the </em><strong><em>llama_with_retrieval</em></strong><em> script with the desired prompt:</em></p><pre><span id="f22a">python3 llama_with_retrieval.py "What is the title of the LLaMA paper?" </span></pre><p id="c602">This script takes the prompt, calls the <em>query </em>endpoint to extract the most relevant embeddings from the data store, and then constructs a prompt to pass to LLaMA that contains these embeddings.</p><p id="7e58">You can read the code here: <a href="https://github.com/lastmile-ai/llama-retrieval-plugin/blob/main/llama_with_retrieval.py" rel="noopener ugc nofollow" target="_blank">llama-retrieval-plugin/llama_with_retrieval.py</a></p><h2 id="1b4b">Step 5: Tweak and experiment</h2><p id="f371">You can modify the <em>llama_with_retrieval </em>script to experiment with different settings that may yield better performance:</p><ul><li id="870c">Change the token limit (e.g. reduce it to give more room for the model response).</li><li id="a609">Change the prompt template and observe model behavior.</li><li id="2596">Change the LLaMA model parameters by modifying the command line. <strong>Note: </strong>You can also specify a custom LLaMA command line by setting the LLAMA_CMD environment variable.</li></ul><blockquote><p id="a9d2">You can also use <a href="https://lastmileai.dev/" rel="noopener ugc nofollow" target="_blank">lastmileai.dev</a> to track your various experiments as you tweak and tune models. For example, <a href="https://colab.research.google.com/drive/1sFHDD-lR7_7WMEj-GgzmIBEDd81FFI9_?usp=sharing" rel="noopener ugc nofollow" target="_blank">here’s a notebook</a> saving some trials using Stable Diffusion.</p></blockquote><p id="4ea9">We hope this exercise shows the need for standardizing interactions between foundation models and plugins/extensions. We should be able to use a plugin designed for OpenAI models with another large language model, and vice versa. This is only possible with a Foundation Model Plugin Protocol standard.</p><p id="82b8">We are in the early stages of a revolution in computing, powered by the advent of state-of-the-art foundation models. We have an opportunity to define the behaviors that govern our interactions with these models, and return to the rich legacy of open protocols of the early internet instead of closed platforms of the modern era.</p><h2 id="c62f">Foundation Model Plugin Protocol</h2><p id="e825">The <em>lastmile ai</em> team is exploring what it takes to define a plugin protocol, and spur its adoption. We believe the protocol should be:</p><ul><li id="aca5"><strong>model-agnostic</strong> — support GPTx, LLaMA, Bard, and any other foundation model.</li><li id="8ad6"><strong>modal-agnostic </strong>— support different types of inputs and outputs, instead of just text.</li></ul><p id="f43c">Our early thinking on this is inspired by SMTP for email, and <a href="https://microsoft.github.io/language-server-protocol/" rel="noopener ugc nofollow" target="_blank">LSP (Language Server Protocol)</a> for IDEs. We will be sharing what we have in this space in the coming days, and <strong>would love to collaborate with you</strong>.</p><p id="3c47">We are just getting started at <em>lastmile ai, </em>and would love to hear from you, especially if you share our vision for an open and interoperable future. You can reach us here:</p><ul><li id="bc76"><a href="https://twitter.com/lastmileai_dev" rel="noopener ugc nofollow" target="_blank">Twitter</a></li><li id="84e2"><a href="http://discord.gg/xBhNKTetGx" rel="noopener ugc nofollow" target="_blank">Discord</a></li><li id="bdec"><a href="mailto:sarmad@lastmileai.dev?subject=llama-retrieval-plugin%20followup&amp;body=Hello%20folks%20%40%20lastmile%20ai" rel="noopener ugc nofollow" target="_blank">Email</a></li></ul><p id="a8ef">We would also appreciate your feedback on our initial product offering, available at<strong> </strong><a href="https://lastmileai.dev/" rel="noopener ugc nofollow" target="_blank"><strong>lastmileai.dev</strong></a>.</p></div></div></section></div>]]>
@@ -753,7 +1347,7 @@ March 26, 2023 | https://blog.lastmileai.dev/using-openais-retrieval-plugin-with
             </title>
             <description>
 <![CDATA[
-Score 62 | Comments 94 (<a href="https://news.ycombinator.com/item?id=35313943">thread link</a>) | @LinuxBender
+Score 62 | Comments 95 (<a href="https://news.ycombinator.com/item?id=35313943">thread link</a>) | @LinuxBender
 <br/>
 March 26, 2023 | https://blog.mnus.de/2023/03/archlinux-zfs/ | <a href="https://web.archive.org/web/*/https://blog.mnus.de/2023/03/archlinux-zfs/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -873,7 +1467,7 @@ arch-chroot<span> </span>/mnt
             </title>
             <description>
 <![CDATA[
-Score 59 | Comments 71 (<a href="https://news.ycombinator.com/item?id=35313578">thread link</a>) | @forrestbrazeal
+Score 62 | Comments 76 (<a href="https://news.ycombinator.com/item?id=35313578">thread link</a>) | @forrestbrazeal
 <br/>
 March 26, 2023 | https://newsletter.goodtechthings.com/p/when-programming-is-gone-will-we | <a href="https://web.archive.org/web/*/https://newsletter.goodtechthings.com/p/when-programming-is-gone-will-we">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><article><div><div><div dir="auto"><p><em>First DALL-E came for the artists, and we laughed, because artists are worthless.</em></p><p><em>Then chatGPT came for the writers, and we laughed even harder, because those people are not only worthless but actively detrimental to society.</em></p><p><em>Then GitHub Copilot (and a thundercloud of bigger, better AI models on the horizon) came for programmers like us—and we were prepared, because automation doesn’t make US obsolete, oh no. It only makes us FASTER and BETTER and lets us focus on MORE IMPORTANT THINGS.</em></p><p>OK, that isn’t how every software developer thinks about AI. But … it’s a pretty common subtext, right?</p><p><span>As evidence I submit two HackerNews discussions.</span></p><p><span> </span><a href="https://news.ycombinator.com/item?id=33988356" rel="">This one</a><span> (until it was flagged) was about an article that bemoaned AI’s existential threat to human creatives. The top responses to this article were variants on:</span></p><ul><li><p>Art is just personal expression anyway, like a child’s finger painting; humans don’t need or deserve commercial opportunities to create art.</p></li><li><p>Technology marches on, jobs become obsolete. Suck it up and deal, artists.</p></li><li><p><span>Haha, this article sounds like it was written by ChatGPT. (Implied: </span><em><span>you’ve already been replaced, </span><a href="https://www.vice.com/en/article/pkpqzb/ok-wtf-are-wordcels-and-shape-rotators" rel="">wordcel</a></em><span>.)</span></p></li></ul><p>Any mediating voices were heavily downvoted.</p><p><span>The </span><a href="https://news.ycombinator.com/item?id=34087000" rel="">second discussion</a><span> was about an ACM op-ed titled “</span><a href="https://cacm.acm.org/magazines/2023/1/267976-the-end-of-programming/fulltext" rel="">The End of Programming</a><span>”. The article predicts that “classical computer science” (algorithms, programming language design, and so on) will become obsolete</span></p><p><span> because future builders will tease nondeterministic AI models into producing software instead of writing actual code. </span></p><p><span>In this view, Copilot is not automating you out of a job, it’s doing something much more demoralizing: it’s automating you </span><em>into </em><span>a job, a strange and scary new job made up of </span><a href="https://lspace.swyx.io/p/why-prompt-engineering-and-generative" rel="">prompt engineering</a><span> and </span><a href="https://xkcd.com/1838/" rel="">model-stirring</a><span> that doesn’t feel much like slinging code at all</span><em>.</em></p><p>The reactions to this article were… a little different. They were not dismissive; they were ENRAGED. Everybody agreed that “The End of Programming” was ridiculous, but no two programmers could converge on why. Here are some sample complaints:</p><ul><li><p><span>The author of the article, </span><a href="https://en.wikipedia.org/wiki/Matt_Welsh_(computer_scientist)" rel="">Matt Welsh</a><span>, cannot be taken seriously because he currently runs an AI-tooling startup, which gives him a financial motive to push his ideas. (No commenter seemed concerned that as a programmer, they might have an equally strong financial motive to </span><em>suppress</em><span> his ideas.</span><em>)</em></p></li><li><p>Writing code is different and more exacting than other kinds of knowledge work, and AI will never be able to sit between humans and code in a trustworthy fashion. (“Would YOU trust the design of a life-support system to an LLM?”)</p></li><li><p>Actually, programming itself is often trivial; it’s the LEAST interesting and important part of software engineering, and giving that part of the job to an AI doesn’t change much about the need for a professional software engineer’s input.</p></li></ul><p>Those last two complaints, you will note, apparently contradict each other—which, again, nobody seemed to realize.</p><p>So—on the one hand, we have a bunch of shape rotators feeling pretty cavalier about the destruction of human creative opportunities, if not actively welcoming it. On the other hand, they insist that AI won’t upend their own very different and special jobs.</p><p><span>I went to the take store to pick up my own take on this, but they were all out of takes because the </span><a href="https://twitter.com/Jack_Raines/status/1614287514952687617" rel="">threadbois</a><span> had grabbed them up like shoppers buying all the milk and bread before a half-inch snowfall.</span></p><p>But it seems like maybe the two contradictory HN arguments can be resolved like this:</p><ul><li><p><span>SOME software engineering jobs are extra-finicky and likely to involve human developers writing hands-on code for the foreseeable future.</span></p></li><li><p>MANY software engineering jobs can have LOTS and LOTS of the “code” part generated by AIs. It probably won’t be great code at first. It will probably have lots of bugs. But it will be incredibly fast and increasingly cheap, and that’s gonna look appealing to both engineers and their bosses.</p></li></ul><p><span>Hey, that’s automation for you. It Frees Us Up To Focus On More Important Things. We said the same thing about the cloud and about high-level programming languages and probably about abacuses.</span></p><p><span> But not to worry; even the foretold AI developer-bots will need human engineers alongside them. </span></p><p><span>That’s why Matt Welsh’s article isn’t called “The End of Software Engineering.” For all I know, the demand for people called “software engineers” will increase. The question is what those people will </span><em>do. </em><span>Welsh thinks they’ll be like educators, shouting examples at AI models the way substitutes teach unruly children. My friend Ben, in </span><a href="https://ben11kehoe.medium.com/the-end-of-programming-will-look-a-lot-like-programming-8b877c8efef8" rel="">his own takedown</a><span> of the “End of Programming” article, suggests that they might be something like product managers, translating user needs and business requirements for an AI dev team. (You know, wordcel stuff!)</span></p><div><figure><a target="_blank" href="https://www.goodtechthings.com/ai-coding-assistant/" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6ef3959b-c9ae-4497-9a69-a4824331deb5_1372x1104.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6ef3959b-c9ae-4497-9a69-a4824331deb5_1372x1104.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6ef3959b-c9ae-4497-9a69-a4824331deb5_1372x1104.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6ef3959b-c9ae-4497-9a69-a4824331deb5_1372x1104.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6ef3959b-c9ae-4497-9a69-a4824331deb5_1372x1104.png" width="1372" height="1104" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/6ef3959b-c9ae-4497-9a69-a4824331deb5_1372x1104.png&quot;,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:1104,&quot;width&quot;:1372,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:&quot;AI Coding Assistant&quot;,&quot;title&quot;:&quot;AI Coding Assistant&quot;,&quot;type&quot;:null,&quot;href&quot;:&quot;https://www.goodtechthings.com/ai-coding-assistant/&quot;,&quot;belowTheFold&quot;:true,&quot;internalRedirect&quot;:null}" alt="AI Coding Assistant" title="AI Coding Assistant" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6ef3959b-c9ae-4497-9a69-a4824331deb5_1372x1104.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6ef3959b-c9ae-4497-9a69-a4824331deb5_1372x1104.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6ef3959b-c9ae-4497-9a69-a4824331deb5_1372x1104.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6ef3959b-c9ae-4497-9a69-a4824331deb5_1372x1104.png 1456w" sizes="100vw" loading="lazy"></picture></div></a><figcaption>“We can’t write code fast enough” has rarely been the bottleneck in large organizations.</figcaption></figure></div><p><span>But </span><em>programming </em><span>- well, programming is a different story. We still have mechanical engineers, but they don’t employ roomfuls of draftspeople drawing straight lines anymore; they use AutoCAD. Is programming—or, if you like, “hacking” in the </span><a href="http://www.paulgraham.com/hp.html" rel="">hackers and painters</a><span> sense</span></p><p><span>—headed the way of draftsmanship, an outdated craft replaced by AI assistance?</span></p><p><span>And that brings us to the existential question: If AI really lets you work faster and focus on more important things, but those things </span><em>aren’t programming</em><span>, will you be happy?</span></p><p><span>Sure, we spend lots of time complaining about the soul-sucking slog of coding, the StackOverflow tabs and the tooling sprawl and all the rest. But just stop for a minute and think about what you </span><em>love </em><span>about programming. </span></p><p><span>Think about the first language you ever loved—Lisp or ANSI C or Haskell or Python or ASP.NET or TurboPascal—inscrutable to most people, beautiful to you. Imagine digging into an algorithm on a whiteboard or a scrap of copy paper, feeling yourself disappearing deeper and deeper into the abstractions until you too become almost a symbolic construct. Inhabit that feeling of flow after you get the boilerplate code laid out and things begin to </span><em>happen: </em><span>screens are populating and commands are parsing and now you see a better way to modularize everything so you abstract out some components and feel the design click into place like the little tumblers in a safe. All built on the bedrock confidence that beneath the layers of abstraction, when you tell a computer to do something, it will do EXACTLY what you said—and if it doesn’t, then you or somebody in your toolchain has made a mistake and with enough patience you can trace that bug right back to its source and mount its thorax on a little pin. That profound satisfaction when the bug is dead and logic triumphs again. The pride of creation. The joy of self-expression in the medium you love.</span></p><p>Yeah, you were lucky enough to live in that world, and if you were in the right place at the right time you even got paid unimaginable amounts of money to do it. How will you feel when it’s all over?</p><p><span>Because here come the business bois cranking out AI-assisted apps by the thousands. Breaking that fundamental link between input and output: if you don’t like what the five-quintillion parameter model spit out, write another prompt and hope you held your tongue the right way this time. </span><em>Of course </em><span>it’s mediocre and buggy and unreliable, of course it’s worse than your handcrafted code. How could it not be? But it’s cheap. And it’s fast. So it’s winning. </span></p><p><span>You might still program by hand, the old-fashioned way, just for the sake of personal enjoyment. You might even open-source some stuff, like a child sticking its finger paintings on the refrigerator. But is that really enough? Will that really give you the joy and pride you felt when you knew that doing what you loved most really </span><em>mattered </em><span>in the world?</span></p><p>Well, now you know how the artists feel.</p><p>Anyway, the other thing that AI is going to do is turn a lot of people into shape rotators in title, but wordcels in function--and probably in salary too. It might be good to start getting mad at that idea now, so you're accustomed to it when it gets real.</p><p>In the meantime, here’s at least one game AI isn’t likely to beat us at anytime soon:</p><div><figure><a target="_blank" href="https://www.goodtechthings.com/a-strange-game/" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F34baf5f6-34bc-4139-8555-7d324ed716f9_1140x1140.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F34baf5f6-34bc-4139-8555-7d324ed716f9_1140x1140.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F34baf5f6-34bc-4139-8555-7d324ed716f9_1140x1140.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F34baf5f6-34bc-4139-8555-7d324ed716f9_1140x1140.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F34baf5f6-34bc-4139-8555-7d324ed716f9_1140x1140.png" width="1140" height="1140" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/34baf5f6-34bc-4139-8555-7d324ed716f9_1140x1140.png&quot;,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:1140,&quot;width&quot;:1140,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:&quot;A Strange Game&quot;,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:&quot;https://www.goodtechthings.com/a-strange-game/&quot;,&quot;belowTheFold&quot;:true,&quot;internalRedirect&quot;:null}" alt="A Strange Game" title="A Strange Game" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F34baf5f6-34bc-4139-8555-7d324ed716f9_1140x1140.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F34baf5f6-34bc-4139-8555-7d324ed716f9_1140x1140.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F34baf5f6-34bc-4139-8555-7d324ed716f9_1140x1140.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F34baf5f6-34bc-4139-8555-7d324ed716f9_1140x1140.png 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p><span>I got pretty worked up on </span><a href="https://devinterrupted.com/podcast/educating-the-next-generation-of-cloud-engineers/" rel="">this podcast</a><span> about how tech is failing entry-level applicants, particularly those from nontraditional backgrounds. TL;DL: the term "skills gap" is a rhetorical trick that shifts the blame onto newbies. The actual problem is an "experience gap", and that puts the blame right back on the industry for not providing onramps to experience for juniors.</span></p><p><span>On Wednesday I’m joining Lucy Wang for </span><a href="https://www.youtube.com/watch?v=b8imSRcY0eo" rel="">a chat about learning cloud in 2023</a><span>, including a walkthrough of the Cloud Resume Challenge.</span></p><p><span>Also, </span><a href="https://www.youtube.com/watch?v=VVc5QiMedno" rel="">my 30-minute “set” from DevOps Enterprise Summit</a><span> is now online, featuring a grand piano, a one-man rap battle, and some actual serious points, too.</span></p><p>You wouldn’t be worried about AI at all if you were as hardcore as this:</p><div id="youtube2-4HV0BqAjX8s" data-attrs="{&quot;videoId&quot;:&quot;4HV0BqAjX8s&quot;,&quot;startTime&quot;:null,&quot;endTime&quot;:null}"><p><iframe src="https://www.youtube-nocookie.com/embed/4HV0BqAjX8s?rel=0&amp;autoplay=0&amp;showinfo=0&amp;enablejsapi=0" frameborder="0" loading="lazy" gesture="media" allow="autoplay; fullscreen" allowautoplay="true" allowfullscreen="true" width="728" height="409"></iframe></p></div></div></div></div></article></div></div></div>]]>
@@ -888,7 +1482,7 @@ March 26, 2023 | https://newsletter.goodtechthings.com/p/when-programming-is-gon
             </title>
             <description>
 <![CDATA[
-Score 214 | Comments 137 (<a href="https://news.ycombinator.com/item?id=35312563">thread link</a>) | @imartin2k
+Score 221 | Comments 144 (<a href="https://news.ycombinator.com/item?id=35312563">thread link</a>) | @imartin2k
 <br/>
 March 26, 2023 | https://invertedpassion.com/the-anti-productivity-manifesto/ | <a href="https://web.archive.org/web/*/https://invertedpassion.com/the-anti-productivity-manifesto/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="post-2003">
@@ -1052,7 +1646,7 @@ March 26, 2023 | https://invertedpassion.com/the-anti-productivity-manifesto/ | 
             </title>
             <description>
 <![CDATA[
-Score 124 | Comments 201 (<a href="https://news.ycombinator.com/item?id=35312508">thread link</a>) | @rain1
+Score 128 | Comments 209 (<a href="https://news.ycombinator.com/item?id=35312508">thread link</a>) | @rain1
 <br/>
 March 26, 2023 | https://borretti.me/article/and-yet-it-understands | <a href="https://web.archive.org/web/*/https://borretti.me/article/and-yet-it-understands">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -1252,7 +1846,7 @@ text from the concepts.</p>
             </title>
             <description>
 <![CDATA[
-Score 100 | Comments 32 (<a href="https://news.ycombinator.com/item?id=35308672">thread link</a>) | @MrBruh
+Score 101 | Comments 32 (<a href="https://news.ycombinator.com/item?id=35308672">thread link</a>) | @MrBruh
 <br/>
 March 25, 2023 | https://mrbruh.com/dismantling_malware_operation/ | <a href="https://web.archive.org/web/*/https://mrbruh.com/dismantling_malware_operation/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1792,7 +2386,7 @@ March 25, 2023 | https://alexsaveau.dev/blog/projects/performance/files/fuc/fast
             </title>
             <description>
 <![CDATA[
-Score 151 | Comments 144 (<a href="https://news.ycombinator.com/item?id=35306805">thread link</a>) | @spqr233
+Score 152 | Comments 144 (<a href="https://news.ycombinator.com/item?id=35306805">thread link</a>) | @spqr233
 <br/>
 March 25, 2023 | https://www.careered.ai/tool/cover-letter | <a href="https://web.archive.org/web/*/https://www.careered.ai/tool/cover-letter">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><section id="header"><div><h2>𝖨</h2><p>Paste your resume and the job post you'll be applying to, and get a personalized Cover Letter.</p><div><h3>Takes Just a Few Minutes.</h3><ol><li><b>Paste </b>a copy of the job description</li><li><b>Paste </b>a copy of your resume or linkedin</li><li><b>Get </b>a cover letter you can save and use however you want.</li></ol></div></div><form><div><p><span>0<!-- -->/1000 words</span></p></div></form></section></div></div>]]>
@@ -1953,7 +2547,7 @@ March 25, 2023 | https://haaksezeedijk.com/dhz/dijkenbekkens/ | <a href="https:/
             </title>
             <description>
 <![CDATA[
-Score 25 | Comments 2 (<a href="https://news.ycombinator.com/item?id=35306234">thread link</a>) | @luu
+Score 29 | Comments 3 (<a href="https://news.ycombinator.com/item?id=35306234">thread link</a>) | @luu
 <br/>
 March 25, 2023 | http://msinilo.pl/blog2/post/microcorruption-writeup/ | <a href="https://web.archive.org/web/*/http://msinilo.pl/blog2/post/microcorruption-writeup/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="layout">
@@ -2193,7 +2787,7 @@ March 25, 2023 | https://goomics.net/62/ | <a href="https://web.archive.org/web/
             </title>
             <description>
 <![CDATA[
-Score 54 | Comments 8 (<a href="https://news.ycombinator.com/item?id=35305591">thread link</a>) | @gmays
+Score 54 | Comments 10 (<a href="https://news.ycombinator.com/item?id=35305591">thread link</a>) | @gmays
 <br/>
 March 25, 2023 | https://www.trulyadventure.us/odd-caliber | <a href="https://web.archive.org/web/*/https://www.trulyadventure.us/odd-caliber">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-nc-base="header" data-controller="AncillaryLayout">
@@ -3929,7 +4523,7 @@ March 25, 2023 | https://www.ox.ac.uk/news/2023-03-22-any-type-hormonal-contrace
             </title>
             <description>
 <![CDATA[
-Score 64 | Comments 133 (<a href="https://news.ycombinator.com/item?id=35305193">thread link</a>) | @herodotus
+Score 65 | Comments 134 (<a href="https://news.ycombinator.com/item?id=35305193">thread link</a>) | @herodotus
 <br/>
 March 25, 2023 | https://billwadge.com/2023/03/25/a-bad-trip-to-infinity/ | <a href="https://web.archive.org/web/*/https://billwadge.com/2023/03/25/a-bad-trip-to-infinity/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4151,7 +4745,7 @@ March 25, 2023 | https://billwadge.com/2023/03/25/a-bad-trip-to-infinity/ | <a h
             </title>
             <description>
 <![CDATA[
-Score 212 | Comments 132 (<a href="https://news.ycombinator.com/item?id=35303423">thread link</a>) | @josem
+Score 215 | Comments 132 (<a href="https://news.ycombinator.com/item?id=35303423">thread link</a>) | @josem
 <br/>
 March 25, 2023 | https://josem.co/call-yourself-titles/ | <a href="https://web.archive.org/web/*/https://josem.co/call-yourself-titles/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><article><div><p>We constantly question ourselves when attempting anything new for the first time, which is daunting. And what’s worse, it prevents us from doing anything new, so we can’t change who we are.</p><p>If you’ve always been terrible at sports and want to start working out, the natural reaction after a few attempts is to stop and return to your old habits. At the end of the day, you’re not an athlete.</p><p>If you’ve always drawn poorly and always had low marks in arts, and want to start drawing, after a few attempts, you might wonder, what am I even doing? I’m not an artist. And so on and so forth. But there’s a solution to this challenge: calling ourselves with the new title very early in the process.</p><p>We become a runner when we start running a few days a week. An amateur one, a beginner in the world of runners, but a runner nonetheless. And runners run.</p><p>If you start going to the gym to improve your fitness (and not just record yourself to post it on TikTok), you’re an athlete. Yes, you’re not a CrossFit world champion; you’re a beginner, but an athlete at the end of the day.</p><p>And here’s where the magic happens. If you’re now an athlete, you’ll go to the gym often and pay attention to your nutrition because that’s what athletes do. When presented with a decision around your lifestyle, you’ll choose correctly because of your new identity.</p><p>If we start calling ourselves our new titles, what we think of ourselves changes as well, and it’ll be easier to overcome that impostor syndrome and stick to new habits, feeling that you’re doing what you’re supposed to be doing.</p><p>The earlier you use that new term: “athlete,” “writer,” or “artist,” the easier it will be to accept your new identity and act accordingly.</p><p>If you start playing the piano, you’re a pianist, and pianists play the piano. Some do it better than others, but they practice and keep improving, and now you belong to that group.</p><p>You don’t need to do something for years, or even professionally, to call yourself by your new title. By using that new identity early and accepting it naturally, you’ll have a head start in your new hobby or habit you want to incorporate. Give it a try.</p></div></article></div></div>]]>
@@ -4352,7 +4946,7 @@ March 25, 2023 | https://www.ilograph.com/blog/posts/concrete-diagramming-models
             </title>
             <description>
 <![CDATA[
-Score 23 | Comments 8 (<a href="https://news.ycombinator.com/item?id=35301939">thread link</a>) | @todsacerdoti
+Score 48 | Comments 18 (<a href="https://news.ycombinator.com/item?id=35301939">thread link</a>) | @todsacerdoti
 <br/>
 March 25, 2023 | https://hondu.co/blog/file-expiration-using-bpf | <a href="https://web.archive.org/web/*/https://hondu.co/blog/file-expiration-using-bpf">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article itemscope="" itemtype="http://schema.org/BlogPosting">
@@ -4513,7 +5107,7 @@ March 24, 2023 | https://www.bitesizedengineering.com/p/database-isolation-level
             </title>
             <description>
 <![CDATA[
-Score 455 | Comments 381 (<a href="https://news.ycombinator.com/item?id=35297074">thread link</a>) | @bilsbie
+Score 455 | Comments 385 (<a href="https://news.ycombinator.com/item?id=35297074">thread link</a>) | @bilsbie
 <br/>
 March 24, 2023 | https://blog.getclearspace.com/we-ran-a-phone-check-at-a-ycombinator-event-in-san-francisco-heres-how-it-went-fb920a54c755 | <a href="https://web.archive.org/web/*/https://blog.getclearspace.com/we-ran-a-phone-check-at-a-ycombinator-event-in-san-francisco-heres-how-it-went-fb920a54c755">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section><div><div><figure><div role="button" tabindex="0"></div><figcaption>picture by <a href="https://medium.com/u/36c89cf03831?source=post_page-----fb920a54c755--------------------------------" rel="noopener" target="_blank">Pete Koomen</a></figcaption></figure><p id="ea9f">YCombinator keeps telling us to <em>“do things that don’t scale,”</em> and since we are building <a href="https://www.getclearspace.com/" rel="noopener ugc nofollow" target="_blank">software that helps people spend less time on their phones</a>, we decided to do the least scalable thing possible: <strong>take everyone’s phone from them during happy hour</strong>.</p><p id="9df3">Of the ~150 guests in attendance at the event, 37 of them opted to go “phone free” for the evening, and left their phones with us.</p><p id="ca06">Here’s how it worked:</p><p id="a51f"><strong><em>Your claim check doubles as a raffle ticket to win one of our three analog prizes: typewriter, coloring book, art book.</em></strong></p><figure><div role="button" tabindex="0"></div></figure><p id="1e41"><strong><em>In case you need to write down something that comes up while networking like “reminder to follow up with </em></strong><a href="https://medium.com/u/bb249e5e0d1b?source=post_page-----fb920a54c755--------------------------------" rel="noopener" target="_blank"><strong><em>Brian Chesky</em></strong></a><strong><em> about buying clearspace for all airbnb employees”</em></strong></p><p id="be08">The “no phone” sticker became a badge of honor. We heard reports that throughout the happy hour whenever one “phone free founder” saw another, they would gravitate towards each other. It also served as the perfect natural growth loop to draw more party goers to our phone check.</p><p id="656f">First and foremost, we wanted to give our batch mates an opportunity to experience something that is increasingly rare, especially with 2-weeks to go until demo day: <strong>a night of being unplugged</strong>.</p><p id="bea2">Secondly, we wanted to <strong>hear all the actual reasons someone wouldn’t give up their phone</strong>. As we continue to build software that works to <strong>separate the utility of devices from the distracting components </strong>we are always gathering data around what are the truly mission critical aspects of the device.</p><ul><li id="c3b9">“I’m expecting an investor call”</li><li id="736d">“girlfriend might be breaking up with me”</li><li id="47c7">“I love my phone”</li><li id="7471">“getting a call from my mom”</li><li id="9002">“I don’t trust you guys”</li></ul><ul><li id="ae9b">“I talked to way more people”</li><li id="16f6">“It felt liberating, a little scary, it was fun”</li><li id="015d">“I was anxious to do this, it was a lot easier than I expected”</li><li id="b471">“My cofounder needed me to 2FA our Stripe login, and I couldn’t” ☠️</li><li id="92ff">“I reached for my phone in my pocket several times, I don’t like that I did that”</li></ul><figure></figure><p id="9d1a">clearspace is an <a href="https://apps.apple.com/us/app/clearspace-less-screen-time/id1572515807" rel="noopener ugc nofollow" target="_blank">iPhone app</a> that eliminates compulsive phone use and cuts doom scrolling sessions short. We are a part of the current YCombinator W23 batch and help thousands of people a day cut their screen time in half. Check us out in the App Store and let us know what you think!</p><p id="31c3">And if you want us to run a phone check at your event email <a href="mailto:phonecheck@getclearspace.com" rel="noopener ugc nofollow" target="_blank">phonecheck@getclearspace.com</a> 😆</p></div></div></section></div>]]>
@@ -4637,7 +5231,7 @@ March 24, 2023 | https://mle-online.com/projects/internet_skull/index.html | <a 
             </title>
             <description>
 <![CDATA[
-Score 214 | Comments 49 (<a href="https://news.ycombinator.com/item?id=35294111">thread link</a>) | @pubby
+Score 215 | Comments 49 (<a href="https://news.ycombinator.com/item?id=35294111">thread link</a>) | @pubby
 <br/>
 March 24, 2023 | https://pubby.games/codegen.html | <a href="https://web.archive.org/web/*/https://pubby.games/codegen.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
@@ -5453,7 +6047,7 @@ L1:
             </title>
             <description>
 <![CDATA[
-Score 330 | Comments 166 (<a href="https://news.ycombinator.com/item?id=35292422">thread link</a>) | @ryanlpeterman
+Score 331 | Comments 166 (<a href="https://news.ycombinator.com/item?id=35292422">thread link</a>) | @ryanlpeterman
 <br/>
 March 24, 2023 | https://www.developing.dev/p/why-engineers-need-to-write | <a href="https://web.archive.org/web/*/https://www.developing.dev/p/why-engineers-need-to-write">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><article><div><div><div dir="auto"><p>I hated writing in high school. It wasn’t objective like my favorite subjects, math and science. It also didn’t help that we had to write about old, hard-to-understand literature like Shakespeare. But my perspective on writing changed once I started working full-time as a software engineer.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F563950db-225a-4580-8083-c68bf3de222a_1200x800.jpeg" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F563950db-225a-4580-8083-c68bf3de222a_1200x800.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F563950db-225a-4580-8083-c68bf3de222a_1200x800.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F563950db-225a-4580-8083-c68bf3de222a_1200x800.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F563950db-225a-4580-8083-c68bf3de222a_1200x800.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F563950db-225a-4580-8083-c68bf3de222a_1200x800.jpeg" width="1200" height="800" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/563950db-225a-4580-8083-c68bf3de222a_1200x800.jpeg&quot;,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:800,&quot;width&quot;:1200,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:52927,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/jpeg&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F563950db-225a-4580-8083-c68bf3de222a_1200x800.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F563950db-225a-4580-8083-c68bf3de222a_1200x800.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F563950db-225a-4580-8083-c68bf3de222a_1200x800.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F563950db-225a-4580-8083-c68bf3de222a_1200x800.jpeg 1456w" sizes="100vw"></picture></div></a><figcaption>I use my laptop but you get the point</figcaption></figure></div><p>The way I worked started to change around when I became a mid-level engineer. I led a small workstream of a few engineers and to get my work done, I was writing more and more without realizing it. Soon writing became a significant part of my work outside of coding. This became even more true when COVID hit since most conversations moved to async chats and word docs.</p><p><span>Almost everything software engineers do requires writing. We need to write when we ask technical questions, comment on code reviews, or create design docs. This is because writing software is collaborative. </span><strong>The better you are at writing, the more effective you will be at building software.</strong><span> </span></p><p>Aside from being a necessity, writing is the most efficient way for you to scale yourself. As a concrete example, I have a friend who takes incredible notes at work. His notes become a wiki of common terminal commands, code pointers, and diagrams for the team he works on. The best part is that his writing helps others move faster without any work on his part after sharing it. </p><p><span>At the end of the day, you can only ship so much code by yourself. You can have much more impact by influencing others to ship what matters most. </span><strong>Writing is the most scalable way to influence others.</strong></p><p>Some worry that ChatGPT may make writing obsolete. Even if AI tools write for us, I still think writing is valuable. </p><p>Writing your thoughts down forces them into a coherent, logical narrative. Condensing your writing gives you a deeper understanding. This process improves your thinking.</p><p><strong>Also, writing doesn’t just clarify your existing ideas; it generates more of them</strong><span>. When I write design docs, I often discover optimizations or edge cases I didn’t think of at first. So long as critical thinking is necessary, writing will not be obsolete.</span></p><p><strong>It is no coincidence that the strongest engineers I know are all excellent technical writers</strong><span>. It is one of the key skills engineers need to be effective at work. This is one of the main reasons I’ve committed to writing once a week for this Substack. </span></p><p><strong>Over to you: Do you think writing is important for engineers? If so, what’s helped you improve most?</strong></p><p><span>Thanks for reading,</span><br><em>Ryan Peterman</em></p></div></div></div></article></div></div></div>]]>
@@ -5678,7 +6272,7 @@ March 24, 2023 | https://maciej.codes/2023-03-23-kobold.html | <a href="https://
             </title>
             <description>
 <![CDATA[
-Score 250 | Comments 478 (<a href="https://news.ycombinator.com/item?id=35288190">thread link</a>) | @gradys
+Score 251 | Comments 478 (<a href="https://news.ycombinator.com/item?id=35288190">thread link</a>) | @gradys
 <br/>
 March 24, 2023 | https://grady.io/post-gpt-computing/ | <a href="https://web.archive.org/web/*/https://grady.io/post-gpt-computing/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article itemscope="" itemtype="http://schema.org/Article"><header><p>March 24, 2023</p></header><section itemprop="articleBody"><p>Yesterday, I watched someone upload a video file to a chat app, ask a language
