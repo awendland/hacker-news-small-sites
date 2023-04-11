@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Tue, 11 Apr 2023 16:22:27 GMT</lastBuildDate>
+        <lastBuildDate>Tue, 11 Apr 2023 20:20:39 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-50.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Tue, 11 Apr 2023 16:22:27 GMT</pubDate>
+        <pubDate>Tue, 11 Apr 2023 20:20:39 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,26 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[SQL Maxis: Why We Ditched RabbitMQ and Replaced It with a Postgres Queue]]>
+            </title>
+            <description>
+<![CDATA[
+Score 266 | Comments 154 (<a href="https://news.ycombinator.com/item?id=35526846">thread link</a>) | @ctc24
+<br/>
+April 11, 2023 | https://www.prequel.co/blog/sql-maxis-why-we-ditched-rabbitmq-and-replaced-it-with-a-postgres-queue | <a href="https://web.archive.org/web/*/https://www.prequel.co/blog/sql-maxis-why-we-ditched-rabbitmq-and-replaced-it-with-a-postgres-queue">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><p>Embracing our SQL Maxi nature: how we ripped out RabbitMQ from our infrastructure and replaced it with a Postgres queue.</p><div><p>We recently ripped out RabbitMQ from our system and replaced it with a queue built on top of our Postgres db and written in SQL. The change took half a day to implement + test, and had a net delta of -580 LOC. Much more importantly, it drastically improved the reliability and resiliency of our system. This is a writeup of that change, the rationale behind it, and how we did it.</p><p>Note: this is not an indictment against RabbitMQ or other queuing systems. It’s quite possible (likely, really) that we were holding it wrong. If anything, it’s a push to keep things simple. And, of course, a very biased reminder that SQL is unbelievably powerful. In fact, it often really is all you need. Do we dream of a world where everything is SQL? Maybe.</p><h3><strong>Some useful context</strong></h3><p>Let’s talk briefly about why we needed a queue in the first place. Prequel is a large-scale data pipeline: we help B2B SaaS companies sync data to or from their customer’s database. In other words, our business consists of running data transfers between various dbs and warehouses. Each of these transfers can be modeled as a job, which is put into a queue and processed by workers. One idiosyncrasy of these jobs is that they can be fairly long to process: it’s not unheard of for a data backfill to take several hours, and the fastest jobs take at least a few seconds. To make all of this run smoothly, we enqueue and dequeue thousands of jobs every day.</p><p>‍</p><h3><strong>RabbitMQ: good enough to start</strong></h3><p>When we initially designed our system, we settled on RabbitMQ as the right queuing solution for the job. It was widely adopted, based on an even more widely adopted protocol (<a href="https://www.amqp.org/">AMQP</a>), seemed mature and production-grade, and looked easy enough to add to our Helm chart. We wrote our own GoLang wrapper around an <a href="https://pkg.go.dev/github.com/streadway/amqp">existing client</a>, didn’t think about it twice, and shipped it.</p><p>Our setup was fairly straightforward. We configured it such that any message could only be processed by one consumer: this allowed us to avoid having different workers running the same transfer, which would be a waste of everyone’s compute. We also set it up such that consumers would “manually” ACK messages. We tried to keep everything as lightweight as possible, and it worked well for us for a while.</p><p>‍</p><h3><strong>Issues started popping up</strong></h3><p>We started experiencing issues and challenges a few months in. We spent a lot of time tweaking our consumer reconnection behavior, aka what happens if somehow one of the workers loses its connection to the queue. We had a handful of multi-threading bugs where a consumer timing out from the queue would cause it to reconnect twice, effectively growing the number of queue threads exponentially. This led to some fun memory utilization graphs. We dealt with those and moved on.</p><p>Until one fateful evening, when we got paged by a customer. They were seeing some of their transfers arbitrarily delayed by up to a few hours, sometimes so much so that our system would mark them as stale and cancel them. There wasn’t any good explanation for this: our queue wasn’t showing any major backlogs, our workers looked healthy, and the majority of jobs were being processed just fine. Except for those occasional, seemingly non-deterministic stragglers. Of course, that didn’t make for a very satisfying answer for our customers: “sorry, we know a handful of your transfers are delayed by a matter of hours, but our system looks healthy so ¯\_(ツ)_/¯”.</p><p>After _hours_ of investigating and a bunch of banging our heads against our desks, we managed to root-cause the issue. Turns out each RabbitMQ consumer was prefetching the next message (job) when it picked up the current one. This prevented other consumers from acking the message, and thus from picking it up from the queue. See RabbitMQ documentation on this <a href="https://www.rabbitmq.com/confirms.html#channel-qos-prefetch">here</a>.</p><p>Now, this is fine when most jobs take a roughly even and well-bounded amount of time. Where things get dicey is when some jobs can take hours (remember, we’re talking about data transfers here). What was happening in our case was: a worker would pick up a message, and prefetch the next one. It would process the current message, a multi-hour transfer, and hold the next one effectively hostage until it had completed the one it was chewing on.</p><p>Even worse, there was no way (that we could find) to disable the behavior. You could set the prefetch count to 1, which meant every worker will prefetch at most 1 message. Or you could set it to 0, which meant they will each prefetch an infinite number of messages. But there was seemingly no way to _actually_ set the prefetch count to zero (ie disable prefetching).</p><p>‍</p><h3><strong>Earning our stripes as SQL maxis</strong></h3><p>We had a good grasp on what was happening, but we had no immediate way of fixing it. This was causing issues for production customers, so waiting it out wasn’t an option. We couldn’t figure out how to make the queue behave in the way that we wanted it to. We also couldn’t just rip out the queue entirely. Or could we…</p><p>It turns out that we could actually recreate the same queue functionality in our Postgres database, but tweak it to match our exact requirements. Better yet, that implementation would be _way_ simpler and fully modifiable in the future if our requirements changed in any way.</p><p>So that’s what we built: a new queue backed by a single, and surprisingly simple, Postgres table. Our publishers write to it. Our consumers (workers) read from it. We maintain things like queue ordering by adding an ORDER BY clause in the query that consumers use to read from it (groundbreaking, we know). And we guarantee that jobs won’t be picked up by more than one worker through <a href="https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE">simple read/write row-level locks</a>. The new system is actually kind of absurdly simple when you look at it. And that’s a good thing. It’s also behaved flawlessly so far.</p><p>It comes with several, significant upsides for our team. For one, the application state is no longer spread out over two systems (RabbitMQ storage and Postgres). It’s now centralized in our application database. This makes disaster recovery that much easier, and increases the resiliency of the overall system by removing moving pieces.</p><p>Better yet, we all understand this queuing system _really_ well since we wrote it and are all fluent in SQL. This allows us to tweak it if we need to update its behavior, and makes monitoring and debugging easier. We already have plenty of tooling set up to deal with Postgres, and we don’t need to remember how to set up this one different piece of infra like we did with RabbitMQ. That may not sound like much, but the delta in time and complexity makes a world of difference during an outage.</p><p>One of our team members has gotten into the habit of pointing out that “you can do this in Postgres” whenever we do some kind of system design or talk about implementing a new feature. So much so that it’s kind of become a meme at the company. But there’s a good reason for it: he’s right. It turns out that, when your problem involves enforcing constraints on your data, you can do it in Postgres, and it’s probably way simpler than the mountains of code you were going to write for it otherwise. We’re proud SQL maxis.</p><p>‍</p></div></div>]]>
+            </description>
+            <link>https://www.prequel.co/blog/sql-maxis-why-we-ditched-rabbitmq-and-replaced-it-with-a-postgres-queue</link>
+            <guid isPermaLink="false">hacker-news-small-sites-35526846</guid>
+            <pubDate>Tue, 11 Apr 2023 15:48:40 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[The Coming of Local LLMs]]>
             </title>
             <description>
 <![CDATA[
-Score 62 | Comments 34 (<a href="https://news.ycombinator.com/item?id=35526401">thread link</a>) | @yarapavan
+Score 177 | Comments 156 (<a href="https://news.ycombinator.com/item?id=35526401">thread link</a>) | @yarapavan
 <br/>
 April 11, 2023 | https://nickarner.com/notes/the-coming-of-local-llms-march-23-2023/ | <a href="https://web.archive.org/web/*/https://nickarner.com/notes/the-coming-of-local-llms-march-23-2023/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><p>While there’s been a truly remarkable advance in large language models as they continue to scale up, facilitated by being trained and run on larger and larger GPU clusters, there is still a need to be able to run smaller models on devices that have constraints on memory and processing power.</p><p>Being able to run models at the edge enables creating applications that may be more sensitive to user privacy or latency considerations - ensuring that user data does not leave the device.</p><p>This also enables the application to be able to always work without concerns over server outages or degradation, or upstream provider policy or API changes.</p><h2 id="llama-changes-everything">LLaMA Changes Everything</h2><p>Recently, the weights of <a href="https://ai.facebook.com/blog/large-language-model-llama-meta-ai/">Facebook’s LLaMA model</a> <a href="https://www.theverge.com/2023/3/8/23629362/meta-ai-language-model-llama-leak-online-misuse">leaked via a torrent posted to 4Chan</a>. This sparked a flurry of open-source activity, including <a href="https://github.com/ggerganov/llama.cpp">llama.cpp</a>. Authored by the <a href="https://ggerganov.com/">creator</a> of <a href="https://github.com/ggerganov/whisper.cpp">whisper.cpp</a>, it quickly showed that <a href="https://twitter.com/ggerganov/status/1634320862722551809">it’s possible to get an LLM running on an M1 Mac</a>:</p><p><img src="https://nickarner.com/blog_assets/2023/LLaMA_On_M1.png" alt="LLaMa_On_M1"></p><p>Soon, Anih Thite <a href="https://twitter.com/thiteanish/status/1635188333705043969">posted a video</a> of it running on a Google Pixel 6 phone. It was incredibly slow, at 1 token per second, but it was a start.</p><p>The next day, <a href="https://twitter.com/thiteanish/status/1635678053853536256">he posted a new video</a> - showing it running at 5 tokens a second.</p><p><img src="https://nickarner.com/blog_assets/2023/LLaMA_Pixel6.png" alt="LLaMA_Pixel6"></p><p><a href="https://twitter.com/miolini">Artem Andreenko</a> soon was able to get LLaMA running on a Raspberry Pi 4:</p><p><img src="https://nickarner.com/blog_assets/2023/LLaMA_On_Raspberry_Pi.png" alt="LLaMa_On_Raspberry_Pi"></p><p><a href="https://twitter.com/antimatter15">Kevin Kwok</a> created a <a href="https://github.com/antimatter15/alpaca.cpp">fork of llama.cpp</a> that included an add-on for a Chat-GPT style interface:</p><p><img src="https://nickarner.com/blog_assets/2023/AlpacaCPPChat.png" alt="AlpacaCPPChat"></p><p>And finally, yesterday, he <a href="https://twitter.com/antimatter15/status/1638695917514784775?s=20">posted a demonstration of Alpaca running on an iPhone</a>:</p><p><img src="https://nickarner.com/blog_assets/2023/Alpacca_On_iPhone.png" alt="AlpacaCPPChat"></p><h2 id="consumer-electronics-companies-and-llms">Consumer Electronics Companies and LLMs</h2><p>With the rapid advances being made for running local LLMs in the open source community, the question is bound to be asked - what is Apple doing? While Apple does have significant ML capabilities and talent, a look at their <a href="https://www.apple.com/careers/us/machine-learning-and-ai.html">ML Jobs Listings</a> does not indicate they are actively hiring for any LLM projects. The cream of the crop of expertise in LLM’s are at OpenAI, Anthropic, and DeepMind.</p><p>Apple is generally always late to deploying big technological advancements into their products. If and when Apple does develop on-device LLM capabilities, it could either arrive in the form of <a href="https://developer.apple.com/documentation/coreml">CoreML</a> models that are embedded in individual apps and come with different flavors; such as summarization, sentiment analysis, and text generation.</p><p>Or, alternatively, they could deploy a single LLM as part of an OS update. Apps could then interact with the LLM through system frameworks, <a href="https://machinelearning.apple.com/research/face-detection">similar to how the Vision SDK works</a>.</p><p>This, to me, seems the more likely of the two approaches - both to be sure that each app on a user’s phone does not embed their own, large model bundled with them, and - more importantly - that would allow Apple to have a much more capable version of Siri.</p><p>It’s incredibly unlikely that Apple will ever license the use of LLMs from outside parties like OpenAI or Anthropic. Their strategy is much more the style of either building it all in-house, or to acquire small startups that they integrate into their products. This is what happened with the <a href="https://www.forbes.com/sites/parmyolson/2011/10/06/steve-jobs-leaves-a-legacy-in-a-i-with-siri/?sh=4354901d5dd3">Siri acquisition</a>.</p><p>One consumer electronics company that isn’t shy about having a partnership with OpenAI is <a href="http://hu.ma.ne/">Humane</a>. They recently <a href="https://hu.ma.ne/media/humane-raises-100m-in-series-c-round-as-it-builds-device-and-services-platform-for-the-ai-era">announced a $100M Series C round of financing</a>. While still in stealth, they’re widely considered to be a laser-projector based AR wearable. Such a device would surely have major constraints on power, due to the nature of the laser projector. This would probably have a major restriction on running an embedded LLM, at least in their first version.</p><p>As part of their fundraising announcement, they did disclose that they’re partnering with several companies, including OpenAI. <a href="https://twitter.com/nickarner/status/1633519507997335552?s=20">My guess</a> is that they’re going to use a combination of <a href="https://openai.com/research/whisper">Whisper</a> and <a href="https://openai.com/research/gpt-4">GPT4</a> for some kind of personal assistant as part of their hardware product. While Whisper has been shown to be quite capable of running on-device, it will probably be some time until a powerful language model will be able to do so in production.</p><h2 id="closing-thoughts">Closing Thoughts</h2><p>I think we’re going to eventually see a demo showing an open source model running on an iPhone as well. I don’t have intuition as to how long it will take until we start seeing these models being baked into production apps, and eventually, into the OS’s themselves. I do anticipate this to eventually happen, opening the door to extremely personal and personalized ML models that we will carry with us in our pockets - having intelligent assistants with us at all times.</p><p>If you’re doing work in the area of local LLMs, particularly ones that may be able to run on phones or other embedded devices, please reach out.</p><h2 id="further-reading">Further Reading</h2><ul><li><a href="https://simonwillison.net/2023/Mar/11/llama/">Large language models are having their Stable Diffusion moment</a></li><li><a href="https://arstechnica.com/information-technology/2023/03/you-can-now-run-a-gpt-3-level-ai-model-on-your-laptop-phone-and-raspberry-pi/?utm_social-type=owned&amp;utm_medium=social&amp;utm_source=twitter&amp;utm_brand=ars">You can now run a GPT-3-level AI model on your laptop, phone, and Raspberry Pi</a></li><li><a href="https://github.com/ggerganov/llama.cpp/discussions/205">Inference at the edge</a></li></ul></div></div></div>]]>
@@ -39,7 +54,7 @@ April 11, 2023 | https://nickarner.com/notes/the-coming-of-local-llms-march-23-2
             </title>
             <description>
 <![CDATA[
-Score 59 | Comments 3 (<a href="https://news.ycombinator.com/item?id=35525661">thread link</a>) | @josevalim
+Score 161 | Comments 16 (<a href="https://news.ycombinator.com/item?id=35525661">thread link</a>) | @josevalim
 <br/>
 April 11, 2023 | https://news.livebook.dev/distributed2-machine-learning-notebooks-with-elixir-and-livebook---launch-week-1---day-2-1aIlaw | <a href="https://web.archive.org/web/*/https://news.livebook.dev/distributed2-machine-learning-notebooks-with-elixir-and-livebook---launch-week-1---day-2-1aIlaw">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><p><span>Welcome to the second day of Livebook Launch Week! 🎉</span></p><p><span>Today we will discuss all the new Machine Learning capabilities in Elixir and Livebook. First, we will discuss some of the new Neural Network tasks in Livebook v0.9. Then we will show how easy it is to make an existing model run concurrently and then distributed across multiple machines and multiple GPUs.</span></p><p><span>Let’s get started!</span></p><h2><span>Distributed² Machine Learning with Elixir</span></h2><p><span>This new Livebook release has many new Machine Learning models you can use with just a few clicks. But there is more exciting news about the Machine Learning story in the Elixir world.</span></p><p><span>Not only can you do Machine Learning with Elixir, but you can also do Distributed² Machine Learning!</span></p><p><span>But what does that “Distributed²” means?</span></p><p><span>It means that when executing a Machine Learning model with Elixir’s&nbsp;</span><a href="https://hexdocs.pm/nx/Nx.Serving.html#module-stateful-process-workflow" rel="nofollow noopener" target="_blank"><span>Nx</span></a><span>, the distribution can happen on two dimensions:</span></p><ul><li><span>it can be distributed to multiple machines</span></li><li><span>inside each machine, it can be distributed to multiple GPUs</span></li></ul><p><span>This can lead to increased performance and better utilization of your hardware resources. And it only takes very few changes to your code.</span></p><p><span>Do you want to see an example? Watch&nbsp;</span><a href="https://youtu.be/MSMyRBJAoSs?t=232" rel="nofollow noopener" target="_blank"><span>this part of our video</span></a><span>.</span></p><p><span>We are very excited about these features because we are starting to marry the benefits of Nx with the capabilities for building fault-tolerant and distributed software from the Erlang Virtual Machine. Case in point:&nbsp;</span><a href="https://github.com/elixir-nx/nx/pull/1090" rel="nofollow noopener" target="_blank"><span>adding distribution support to Nx took only 400 lines of code</span></a><span>, including docs and tests!</span></p><h2><a href="https://hackmd.io/l6qrM81HQzy0J1f0zydDEg#New-Machine-Learning-models-available" target="_blank" rel="nofollow noopener"></a><span>New Machine Learning models available</span></h2><p><span>Neural network tasks were initially&nbsp;</span><a href="https://news.livebook.dev/announcing-bumblebee-gpt2-stable-diffusion-and-more-in-elixir-3Op73O" rel="nofollow noopener" target="_blank"><span>added to Livebook version 0.8</span></a><span>&nbsp;with the idea of giving you the power to use modern Machine Learning models with just a few clicks.</span></p><p><span>This 0.9 release comes with more models. Here they are.</span></p><h3><a href="https://hackmd.io/l6qrM81HQzy0J1f0zydDEg#Speech-to-text" target="_blank" rel="nofollow noopener"></a><span>Speech-to-text</span></h3><h3><a href="https://hackmd.io/l6qrM81HQzy0J1f0zydDEg#Conversation" target="_blank" rel="nofollow noopener"></a></h3><h3><span>Conversation</span></h3><h3><a href="https://hackmd.io/l6qrM81HQzy0J1f0zydDEg#Question-answering" target="_blank" rel="nofollow noopener"></a></h3><h3><span>Question answering</span></h3><h3><a href="https://hackmd.io/l6qrM81HQzy0J1f0zydDEg#Language-detection" target="_blank" rel="nofollow noopener"></a></h3><h3><span>Language detection</span></h3><h3><a href="https://hackmd.io/l6qrM81HQzy0J1f0zydDEg#Zero-shot-text-classification" target="_blank" rel="nofollow noopener"></a></h3><h3><span>Zero-shot text classification</span></h3><h3><a href="https://hackmd.io/l6qrM81HQzy0J1f0zydDEg#Punctuation" target="_blank" rel="nofollow noopener"></a></h3><h3><span>Punctuation</span></h3><h2><a href="https://hackmd.io/l6qrM81HQzy0J1f0zydDEg#What-now" target="_blank" rel="nofollow noopener"></a></h2><h2><span>What now?</span></h2><p><span>We encourage you to go ahead and&nbsp;</span><a href="https://livebook.dev/#install" rel="nofollow noopener" target="_blank"><span>install Livebook’s latest version</span></a><span>&nbsp;to start playing with all of those Machine Learning models!</span></p><p><span>And if you have any comments or want to share what you’ve built using Livebook, you can&nbsp;</span><a href="https://twitter.com/intent/tweet?text=I%27m%20loving%20the%20new%20Livebook%200.9!%20%23LivebookLaunchWeek" rel="nofollow noopener" target="_blank"><span>tweet using the #LivebookLaunchWeek</span></a><span>&nbsp;hashtag.</span></p><p><span>Stay tuned for the following announcement of the Livebook Launch Week!</span></p><h2>More Launch Week</h2><ul><li><a href="https://news.livebook.dev/deploy-notebooks-as-apps-quality-of-life-upgrades---launch-week-1---day-1-2OTEWI" rel="nofollow noopener" target="_blank">Day 1: Deploy notebooks as apps &amp; quality-of-life upgrades</a></li></ul></div></div></div>]]>
@@ -54,7 +69,7 @@ April 11, 2023 | https://news.livebook.dev/distributed2-machine-learning-noteboo
             </title>
             <description>
 <![CDATA[
-Score 360 | Comments 198 (<a href="https://news.ycombinator.com/item?id=35525294">thread link</a>) | @vanburen
+Score 603 | Comments 378 (<a href="https://news.ycombinator.com/item?id=35525294">thread link</a>) | @vanburen
 <br/>
 April 11, 2023 | https://andgein.ru/blog/all/20-i-worked-at-google-for-10-days/ | <a href="https://web.archive.org/web/*/https://andgein.ru/blog/all/20-i-worked-at-google-for-10-days/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -85,7 +100,7 @@ April 11, 2023 | https://andgein.ru/blog/all/20-i-worked-at-google-for-10-days/ 
             </title>
             <description>
 <![CDATA[
-Score 206 | Comments 140 (<a href="https://news.ycombinator.com/item?id=35522080">thread link</a>) | @ruxudev
+Score 218 | Comments 154 (<a href="https://news.ycombinator.com/item?id=35522080">thread link</a>) | @ruxudev
 <br/>
 April 11, 2023 | https://www.ruxu.dev/articles/ai/maximizing-the-potential-of-llms/ | <a href="https://web.archive.org/web/*/https://www.ruxu.dev/articles/ai/maximizing-the-potential-of-llms/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -228,7 +243,7 @@ April 11, 2023 | https://www.ruxu.dev/articles/ai/maximizing-the-potential-of-ll
             </title>
             <description>
 <![CDATA[
-Score 111 | Comments 40 (<a href="https://news.ycombinator.com/item?id=35522076">thread link</a>) | @abelhn
+Score 125 | Comments 42 (<a href="https://news.ycombinator.com/item?id=35522076">thread link</a>) | @abelhn
 <br/>
 April 11, 2023 | https://www.nativebyx.dev/rust/becoming-rustacean/awesome-free-online-resources-to-earn-rust-programming-language.html | <a href="https://web.archive.org/web/*/https://www.nativebyx.dev/rust/becoming-rustacean/awesome-free-online-resources-to-earn-rust-programming-language.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section> 
@@ -576,7 +591,7 @@ April 10, 2023 | https://www.artisana.ai/articles/generative-agents-stanfords-gr
             </title>
             <description>
 <![CDATA[
-Score 57 | Comments 12 (<a href="https://news.ycombinator.com/item?id=35520059">thread link</a>) | @yeesian
+Score 59 | Comments 13 (<a href="https://news.ycombinator.com/item?id=35520059">thread link</a>) | @yeesian
 <br/>
 April 10, 2023 | https://www.querifylabs.com/blog/relational-operators-in-apache-calcite | <a href="https://web.archive.org/web/*/https://www.querifylabs.com/blog/relational-operators-in-apache-calcite">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><div><p>When a user submits a query to a database, the optimizer translates the query string to an intermediate representation (IR) and applies various transformations to find the optimal execution plan.</p><p>Apache Calcite uses relational operators as the intermediate representation. In this blog post, we discuss the design of common relational operators in Apache Calcite.</p><h2>Syntax Tree</h2><p>Query optimization starts with parsing when a query string is translated into a syntax tree, which defines the syntactic structure of the query.</p><p>Since every database has a parser, the syntax tree might look like a good candidate for the intermediate representation because it is readily available to the database.</p><p>There are two significant problems with syntax tree as query's IR:</p><ol role="list"><li>AST has a highly complicated structure, thanks to the involved ANSI SQL syntax. For example, a `SELECT` node may have dedicated child nodes for `FROM`, `WHERE`, `ORDER BY`, `GROUP BY`, etc.</li><li>AST models the syntactic structure but not relational semantics. It could be problematic to map some valid relational transformations to the syntax tree. For example, a semi-join cannot be expressed easily with ANSI SQL syntax.</li></ol><p>Combined, this makes query optimization over syntax trees challenging and not flexible.</p><h2>Relational Tree</h2><p>An alternative IR is a relational operator tree. We may define common relational operators, such as `Project`, `Filter`, `Join`, `Aggregate`. The query represented in such a way is much simpler to optimize because relational operators have a well-defined scope and usually have only one input (except for joins and set operators). This dramatically simplifies common relational optimizations, such as operator transposition. Also, it gives implementors flexibility to model operators independently of the database syntax rules.</p><figure><p><img src="https://uploads-ssl.webflow.com/5fe5c475cb3c75040200bfe6/60b3612efc0661ba1956b79b_ast-vs-rel.png" loading="lazy" alt=""></p></figure><p>The main disadvantage is the need to translate the syntax tree into a relational tree, which is often non-trivial, especially with complex syntax constructs like subqueries or common table expressions. However, the simplicity and flexibility of relational operators usually outweigh by a high margin the additional efforts on translation.</p><p>Apache Calcite parses the query into a syntax tree. Then it performs the semantic validation of the syntax tree using the <a href="https://github.com/apache/calcite/blob/calcite-1.26.0/core/src/main/java/org/apache/calcite/sql/validate/SqlValidatorImpl.java" target="_blank">SqlValidatorImpl</a> class, resolving involved data types along the way. Finally, the validated syntax tree is converted into a tree or relational operators using the <a href="https://github.com/apache/calcite/blob/calcite-1.26.0/core/src/main/java/org/apache/calcite/sql2rel/SqlToRelConverter.java" target="_blank">SqlToRelConverter</a> class. The subsequent optimizations are performed on the relational tree.</p><p>In this section, we discuss the design of Apache Calcite relational operators.</p><h2>Terminology</h2><p>We start with several simplified definitions, which are not precise but sufficient for this blog post. </p><p>An <strong>attribute</strong> is a pair of a name and a data type. An <strong>attribute value</strong> is defined by an attribute name and value from the attribute type domain. A <strong>tuple</strong> is an unordered set of attribute values. No two attribute values in the tuple may have the same attribute name. A <strong>relation</strong> is a set of tuples. Every tuple within the relation has the same set of attributes. <strong>Relational operators</strong> take zero, one, or more input relations and produce an output relation.</p><figure><p><img src="https://uploads-ssl.webflow.com/5fe5c475cb3c75040200bfe6/60b374a4be8579b98cbce816_blog08-definitions.png" loading="lazy" alt=""></p></figure><h2>Operators</h2><p>To construct a tree of relational operators, we need the ability to define operator inputs. Many operators need access to attributes of the input relations. Therefore we also need the ability to reference input attributes. These are two key requirements for the relational operator interface.</p><p>In Apache Calcite, the relational operator is represented by the <a href="https://github.com/apache/calcite/blob/calcite-1.26.0/core/src/main/java/org/apache/calcite/rel/RelNode.java" target="_blank">RelNode</a> interface. The operator may have zero, one, or more input operators. For example, `TableScan` is an 0-ary operator, `Filter` is a unary operator, and `Union` is an N-ary operator. Every operator exposes the `RelDataType`, which is an ordered list of operator attributes. This is sufficient to construct arbitrarily complex relational trees.</p><figure><p><img src="https://uploads-ssl.webflow.com/5fe5c475cb3c75040200bfe6/60b48ffda5f126e051e3a082_blog08-row-type.png" loading="lazy" alt=""></p></figure><h2>Row Expressions</h2><p>Operators describe various transformations to tuples. A&nbsp;<a href="https://github.com/apache/calcite/blob/calcite-1.26.0/core/src/main/java/org/apache/calcite/rex/RexNode.java" target="_blank">RexNode</a> interface defines an operation that applies to some attribute values of a tuple and produces another value. Common `RexNode` types:</p><ol start="1" role="list"><li>`RexLiteral` - a constant.</li><li>`RexInputRef` - a reference to operator's input attribute.</li><li>`RexCall` - a function call.</li></ol><p>For example, the expression `name = "John"` would be represented as follows.</p><figure><p><img src="https://uploads-ssl.webflow.com/5fe5c475cb3c75040200bfe6/60b7829f70d3200769e64e01_blog08-rex.png" loading="lazy" alt=""></p></figure><p>Notice that `RexInputRef` references the input's attribute by index, which means that attribute order is important in Apache Calcite. On the bright side, it simplifies the design, as you do not need to care about attribute names and potential naming conflicts (think of a join of two tables, which have an attribute with the same name). On the other hand, it has a detrimental effect on join order planning, as we shall see below.</p><p>Now, as we understand the basics, let's discuss the most common Apache Calcite operators: `TableScan`, `Project`, `Filter`, `Calc`, `Aggregate`, and `Join`.</p><p>Other important operators are `Window` and `Union`. We omit them in this blog post because they follow the same design principles as the previously mentioned operators.</p><h2>TableScan</h2><p>`TableScan` is a leaf 0-ary operator that defines a scan of some data source.</p><p>The operator contains the `org.apache.calcite.schema.Table` instance, which describes a data source that produces tuples. It could represent a relational table, an index, a view, a CSV file, a network connection, or anything else. As an implementor, you provide the schema of your database that contains some `Table` instances. Apache Calcite will create a `TableScan` operator with the referenced `Table` inside when you refer to that table in the query. The `Table` must expose the row type so that the parent operators know which attributes are available from the `TableScan`.</p><h2>Project</h2><p>The `Project` operator defines row expressions that should be applied to input tuples to produce new tuples. The operator produces one output tuple for every input tuple. Expressions are organized in a list.</p><p>Because Apache Calcite uses local indexes to reference input attributes, the `Project` operator is also injected whenever we need to change the attribute's order. For example, if there is a table with attributes `[a, b]` in that order and we execute `SELECT&nbsp;b, a FROM&nbsp;t`, the `Project` operator will be added on top of the `TableScan` to reorder attributes as required by the query. This complicates query planning because the optimizer spends time applying transformation rules to otherwise useless operators that do a trivial reorder.</p><p>Physical implementations of the `Project` operator must adjust the input <a href="https://www.querifylabs.com/blog/custom-traits-in-apache-calcite">traits</a>. E.g., if the `TableScan` produces tuples ordered by `[b]` but the `Project` operator doesn't project that column, the order will be lost.</p><p>The relational tree of the query `SELECT a, a+b FROM t` &nbsp;might look like this:</p><figure><p><img src="https://uploads-ssl.webflow.com/5fe5c475cb3c75040200bfe6/60b78e86342fb8c97b6540f5_blog08-project.png" loading="lazy" alt=""></p></figure><h2>Filter</h2><p>The `Filter` operator returns tuples that satisfy a predicate. A predicate is a row expression. The `Filter` output row type is similar to the input's row type. Physical implementations of the `Filter` operator usually don't change input traits. </p><p>The query `SELECT a, a+b FROM t WHERE a+b&gt;5` could be represented as:</p><figure><p><img src="https://uploads-ssl.webflow.com/5fe5c475cb3c75040200bfe6/60b78be9128f38006b87f543_blog08-filter.png" loading="lazy" alt=""></p></figure><h2>Calc</h2><p>The `Calc` is a special operator that combines the functionality of `Project` and `Filter` operators and performs the common sub-expression elimination. Internally, it splits all composite row expressions into primitive expressions. Expressions are organized in a list. The special `RexLocalRef` node is used to link siblings. `Project` becomes a list of expression indexes that should be exposed from the operator. `Filter` becomes an optional expression index that filters input tuples.</p><figure><p><img src="https://uploads-ssl.webflow.com/5fe5c475cb3c75040200bfe6/60b78c01fcaf5405442e5ede_blog08-calc.png" loading="lazy" alt=""></p></figure><p>Apache Calcite provides a lot of optimization rules for `Project` and `Filter` operators. These same optimizations are generally not implemented for the `Calc` operator because it would essentially require duplication of rules logic. Instead, you may do the cost-based optimization with `Project` and `Filter` operations only and then convert `Project` and `Filter` operators into `Calc` in a separate heuristic phase. Apache Calcite provides <a href="https://github.com/apache/calcite/blob/calcite-1.26.0/core/src/main/java/org/apache/calcite/plan/RelOptRules.java#L55-L66" target="_blank">dedicated rules</a> for that. We touched on the multi-phase optimization in our previous <a href="https://www.querifylabs.com/blog/what-is-cost-based-optimization">blog post</a>.</p><h2>Aggregate</h2><p>The `Aggregate` operator models the application of aggregate functions to the input. The operator consists of two parts - the group keys and aggregate functions. </p><p>The group keys define which input attributes to use to construct the groups. The statement `GROUP&nbsp;BY&nbsp;a, b` yields the grouping key `[0, 1]` if `a` and `b` are located on input positions 0 and 1, respectively. If there is no `GROUP&nbsp;BY`&nbsp;clause, the group key would be empty. </p><p>There will be several group keys if there is a `ROLLUP` or `CUBE` clause. For example, `GROUP&nbsp;BY&nbsp;ROLLUP&nbsp;a, b` would yield the grouping keys `[0,1], [0], []`, which means that we would like to output groups for `[a, b]`, groups for `[a]`, and global aggregates without any grouping. </p><p>If there is an expression in the `GROUP&nbsp;BY`&nbsp;statement, it would be moved to a separate `Project` operator below `Aggregate`. This is why it is sufficient to define input attribute indexes for the group keys instead of defining row expressions. Separation of projections and aggregations is essential to keep the complexity of optimization rules under control. Otherwise, we would have to repeat logic from the `Project` optimization rules in the `Aggregate` optimization rules.</p><p>The aggregate functions are the list of aggregates that should be computed for the groups. The aggregate functions do not use the `RexNode` interface because they operate on multiple tuples as opposed to row expressions that are applied to a single tuple. Similar to group keys, aggregate functions refer to input columns by indexes. For example, the function `SUM(a)` is converted to `SUM(0)` if the input attribute `a` is located at position 0. Likewise, complex expressions are moved to a `Project` operator below the `Aggregate`. Aggregate functions may also have advanced properties, such as the `DISTINCT` flag or an optional filter. We will discuss these features in detail in future blog posts.</p><p>The `Aggregate` operator outputs group keys followed by aggregate functions. For the query `SELECT&nbsp;SUM(a), b GROUP&nbsp;BY&nbsp;b`, the relevant `Aggregate` operator would output `[0:b, 1:SUM(a)]`.</p><p>Consider the plan for the query `SELECT&nbsp;SUM(a+b), c FROM&nbsp;t GROUP&nbsp;BY&nbsp;c` below. Notice two `Project` operators:&nbsp;one to calculate `a+b` and another to output `SUM` before the attribute `c`.</p><figure><p><img src="https://uploads-ssl.webflow.com/5fe5c475cb3c75040200bfe6/60b78c1759f1405dda985451_blog08-agg.png" loading="lazy" alt=""></p></figure><h2>Join</h2><p>The `Join` operator joins two inputs. The operator defines the join type (inner, left/right/full outer, semi, etc.) and the optional predicate. </p><p>The `Join` operator outputs all columns from the left input followed by all columns from the right input. There is the convention: given the left input with `L` attributes and the right input with `R`&nbsp;attributes: </p><ul role="list"><li>If the referenced column index `I` is between zero and `L` exclusive, we should use the left input's attribute at position `I`.</li><li>Otherwise, we should use the right input's attribute at position `I - L`. </li></ul><p>In our previous <a href="https://www.querifylabs.com/blog/memoization-in-cost-based-optimizers">blog post</a>, we discussed that cost-based optimizers rely on the equivalence property of operators to encode alternative plans efficiently in the MEMO&nbsp;data structure. In Apache Calcite, `Join(AxB)` and `Join(BxA)` are not semantically equivalent because Apache Calcite relies on attribute indexes in the `RexInputRef` class. Parent operators of `Join(AxB)` and `Join(BxA)` will have to use different indexes when referring to the same join attribute. Internal join predicates will also reference attributes at different indexes.</p><p>Consider the `JoinCommute` rule that changes the order of inputs. To apply this rule, we need to (a)&nbsp;rewrite the internal predicate and (b) add the `Project` on top of the new `Join` to restore the original order of attributes.</p><figure><p><img src="https://uploads-ssl.webflow.com/5fe5c475cb3c75040200bfe6/60b78c222b319033945b0cf1_blog08-join-1.png" loading="lazy" alt=""></p></figure><p>This additional `Project` prevents the execution of other rules. For example, the `JoinAssociate` rule tries to reorder `(A join B) join C` to `A join (B join C)`. The rule looks for a pattern "Join on top of the Join". But with the additional `Project`, we have only "Join on top of the Project". To mitigate this, we may use the `JoinProjectTransposeRule` that transposes `Join` and `Project`, but this dramatically decreases planner's performance to the extent that Apache Calcite cannot do the exhaustive cost-based join planning on more than 5-6 tables in a reasonable time. </p><figure><p><img src="https://uploads-ssl.webflow.com/5fe5c475cb3c75040200bfe6/60b4cbfba395d8e030cc1dbb_blog08-join-2.png" loading="lazy" alt=""></p></figure><p>The alternative solution would be to operate on unique column names rather than indexes. Spark Catalyst and CockroachDB follow this approach. But this would require introducing some unique identifier to every equivalence group, which is also a challenge on its own.</p><p>Apache Calcite parses the query string into a syntax tree. The syntax tree is then translated into a tree of relational operators, which have a simpler internal structure and are more suitable for the subsequent optimizations.</p><p>We discussed several common relational operators in Apache Calcite. `Project` transforms every tuple from the input into another tuple. `Filter` operator returns input tuples that pass the predicate. `Calc` combines `Project` and `Filter` functionality and eliminates the common sub-expressions. `Aggregate` operator performs the grouping and applies aggregate functions. `Join` operator combines tuples two inputs and applies the predicate. </p><p>Designing relational operators is challenging. Every decision may open opportunities for new optimizations but block others. The index-based input attribute references in Apache Calcite are a good example of such a trade-off when a simplification useful for many optimization rules leads to severe problems with one of the most critical optimizer tasks - join order planning.</p><p>In future blog posts, we will dive into concrete optimizations that Apache Calcite applies to individual operators. Stay tuned!</p><p>We are always ready to help you with your query optimizer design. Just <a href="https://www.querifylabs.com/contact" target="_blank">let us know</a>.</p></div></div></div></div>]]>
@@ -591,7 +606,7 @@ April 10, 2023 | https://www.querifylabs.com/blog/relational-operators-in-apache
             </title>
             <description>
 <![CDATA[
-Score 311 | Comments 191 (<a href="https://news.ycombinator.com/item?id=35519706">thread link</a>) | @LorenDB
+Score 326 | Comments 193 (<a href="https://news.ycombinator.com/item?id=35519706">thread link</a>) | @LorenDB
 <br/>
 April 10, 2023 | https://thanks.dev/home | <a href="https://web.archive.org/web/*/https://thanks.dev/home">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
@@ -606,7 +621,7 @@ April 10, 2023 | https://thanks.dev/home | <a href="https://web.archive.org/web/
             </title>
             <description>
 <![CDATA[
-Score 151 | Comments 72 (<a href="https://news.ycombinator.com/item?id=35515873">thread link</a>) | @brakmic
+Score 153 | Comments 73 (<a href="https://news.ycombinator.com/item?id=35515873">thread link</a>) | @brakmic
 <br/>
 April 10, 2023 | https://blog.brakmic.com/keycloak-with-postgresql-on-kubernetes/ | <a href="https://web.archive.org/web/*/https://blog.brakmic.com/keycloak-with-postgresql-on-kubernetes/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="post-2202">
@@ -833,7 +848,7 @@ April 10, 2023 | https://blog.brakmic.com/keycloak-with-postgresql-on-kubernetes
             </title>
             <description>
 <![CDATA[
-Score 184 | Comments 46 (<a href="https://news.ycombinator.com/item?id=35514799">thread link</a>) | @mooreds
+Score 186 | Comments 47 (<a href="https://news.ycombinator.com/item?id=35514799">thread link</a>) | @mooreds
 <br/>
 April 10, 2023 | https://www.bengreenberg.dev/posts/2023-04-09-github-profile-dynamic-content/ | <a href="https://web.archive.org/web/*/https://www.bengreenberg.dev/posts/2023-04-09-github-profile-dynamic-content/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content" tabindex="-1"><div><h2>Use GitHub Actions to Make Your GitHub Profile Dynamic</h2><p><img src="https://dev-to-uploads.s3.amazonaws.com/uploads/articles/t3ggg3o8so8btyijcxg3.png" alt="" loading="lazy"></p><h3>Ben Greenberg</h3><h4>April 9, 2023</h4><p>Where do people first discover you online? Perhaps your social media presence is the first thing people find when they search for you, or perhaps it’s the portfolio site you created for yourself. However, if you use GitHub to share your code and participate in open source projects, then your GitHub profile may be the first place people go to in order to learn more about you.</p><p>What do you want your GitHub profile to say about you? How do you want to express what is important to you and who you are in a concise and easy to read manner for visitors? Whether they are a prospective employer or a prospective partner in an open source project, it’s imperative you have a profile that stands out.</p><p>Using GitHub Actions, you can turn a static markdown document into a dynamic experience that stays up to date on the latest information about you. How do you do that?</p><p>I’ll show you an example of how you can do this quickly and without too much effort. In this example, you’ll learn how to scrape a website and use that data to dynamically update your GitHub profile. We’ll show this example in Ruby, but you can do this with JavaScript, TypeScript, Python, or other languages.</p><h2>How Your GitHub Profile Works</h2><p>Your GitHub profile is found by going to <code>github.com/[your-username]</code> in a web browser, <a href="https://github.com/bencgreenberg">here’s mine</a> for example. Where does the content for that view come from?</p><p>It lives in a special repository in your account with the name of your account username. If you do not have this repository yet, you will not see any special content when you visit <code>github.com/[your-username]</code>, so the first step is to ensure you have that repository created, and if you do not, go ahead and create it.</p><h3>Exploring the files in the profile repository</h3><p>The only required file in the repository is a <code>README.md</code> file that is the source of your profile page.</p><pre><code>./
@@ -913,7 +928,7 @@ jobs:
             </title>
             <description>
 <![CDATA[
-Score 140 | Comments 81 (<a href="https://news.ycombinator.com/item?id=35514002">thread link</a>) | @kevinslin
+Score 141 | Comments 83 (<a href="https://news.ycombinator.com/item?id=35514002">thread link</a>) | @kevinslin
 <br/>
 April 10, 2023 | https://samthor.au/2023/aws-amplify-is-a-grift/ | <a href="https://web.archive.org/web/*/https://samthor.au/2023/aws-amplify-is-a-grift/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1098,7 +1113,7 @@ I'm also available <a href="https://samthor.au/about/consulting/">for consulting
             </title>
             <description>
 <![CDATA[
-Score 77 | Comments 38 (<a href="https://news.ycombinator.com/item?id=35513595">thread link</a>) | @tim_sw
+Score 77 | Comments 39 (<a href="https://news.ycombinator.com/item?id=35513595">thread link</a>) | @tim_sw
 <br/>
 April 10, 2023 | https://blog.sbensu.com/posts/everybody-is-the-main-character/ | <a href="https://web.archive.org/web/*/https://blog.sbensu.com/posts/everybody-is-the-main-character/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1108,6 +1123,1052 @@ April 10, 2023 | https://blog.sbensu.com/posts/everybody-is-the-main-character/ 
             <link>https://blog.sbensu.com/posts/everybody-is-the-main-character/</link>
             <guid isPermaLink="false">hacker-news-small-sites-35513595</guid>
             <pubDate>Mon, 10 Apr 2023 15:36:52 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Two algorithms for randomly generating aperiodic tilings]]>
+            </title>
+            <description>
+<![CDATA[
+Score 109 | Comments 23 (<a href="https://news.ycombinator.com/item?id=35513475">thread link</a>) | @fanf2
+<br/>
+April 10, 2023 | https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/ | <a href="https://web.archive.org/web/*/https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
+    
+    <p>[Simon Tatham, 2023-04-10]</p>
+    <ul>
+      <li>
+        <a href="#intro">Introduction</a>
+      </li>
+      <li>
+        <a href="#subst">Substitution systems</a>
+        <ul>
+          <li>
+            <a href="#subst-penrose">Penrose tilings: half-tile triangles</a>
+          </li>
+          <li>
+            <a href="#subst-hats">Hat tiling: a system of four metatiles</a>
+          </li>
+        </ul>
+      </li>
+      <li>
+        <a href="#random-patch">Choosing a random patch from a fixed expansion</a>
+      </li>
+      <li>
+        <a href="#ccoords">Combinatorial coordinates</a>
+        <ul>
+          <li>
+            <a href="#ccoords-penrose">Penrose tilings: indexing triangle edges</a>
+          </li>
+          <li>
+            <a href="#ccoords-hats">Hats: indexing kite edges, and dealing with non-uniqueness</a>
+          </li>
+          <li>
+            <a href="#making-it-up">Making it up as you go along</a>
+          </li>
+          <li>
+            <a href="#ccoords-output">Generating the output tiling</a>
+          </li>
+          <li>
+            <a href="#ccoords-advantages">Advantages</a>
+          </li>
+        </ul>
+      </li>
+      <li>
+        <a href="#conclusion">Conclusion</a>
+      </li>
+      <li>
+        <a href="#exact-coords">Appendix: exact coordinate systems</a>
+        <ul>
+          <li>
+            <a href="#roots-of-unity">Complex roots of unity</a>
+          </li>
+          <li>
+            <a href="#sqrt5">Separate <i>x</i> and <i>y</i> coordinates using √5</a>
+          </li>
+        </ul>
+      </li>
+      <li>
+        <a href="#penrose-interleaving">Appendix: interleaving the Penrose tiling types</a>
+      </li>
+      <li>
+        <a href="#references">References</a>
+      </li>
+    </ul>
+    <h2 id="intro">Introduction</h2>
+    <p>In the 1970s, Roger Penrose discovered several sets of polygons
+      which will tile the plane, but only <em>aperiodically</em>,
+      without the tiling repeating in a fixed pattern.</p>
+    <p>Samples of his two best-known tiling types, called P2 and P3,
+      are shown below. P2 is composed of quadrilaterals usually
+      referred to as ‘kite’ and ‘dart’; P3 is composed of two sizes of
+      rhombus, known as ‘rhombs’ in this context for some reason:</p>
+    
+    <p>(Strictly speaking, any one of these polygons <em>can</em> tile
+      the plane periodically, because so can any quadrilateral at all.
+      The tiling is only forced to be aperiodic if you restrict the
+      ways the tiles can connect. You could do this by putting
+      jigsaw-piece protrusions and holes on the edges, but that’s
+      ugly, so people normally prefer to show the plain quadrilaterals
+      and let the matching rules be implicit. In this article I’ll
+      ignore this detail just like everyone else.)</p>
+    <p>In 2023, a long-open question was answered: can you force
+      aperiodicity in the same way using only <em>one</em> type of
+      tile, instead of Penrose’s two? You can! The shape in question
+      is described as a ‘hat’ by its discoverers Smith, Myers, Kaplan
+      and Goodman-Strauss, and a sample of its tiling is shown
+      below:</p>
+    <div>
+      <div>
+        <figure>
+          <img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-sample.svg" alt="[hat-sample.svg]">
+          <figcaption>Hat monotiling</figcaption>
+        </figure>
+      </div>
+    </div>
+    <p>(There’s a quibble with this one too: the hat shape is
+      asymmetric, and in order to tile the whole plane, you need to
+      use it in both handednesses. For some purposes this still means
+      you need two types of tile! But from a mathematical perspective
+      it’s more natural to regard reflections as not a fundamentally
+      different shape.)</p>
+    <p>One of the games in my
+      <a href="https://www.chiark.greenend.org.uk/~sgtatham/puzzles/">puzzle
+      collection</a>, namely “Loopy” (also known as Slitherlink), can
+      be played on a lot of different tilings of the plane. Most of
+      them are periodic, but all three of these aperiodic tilings are
+      also perfectly feasible to play Loopy on. So the question
+      arises: how do you best get a computer to generate pieces of
+      these tilings?</p>
+    <p>One really obvious option would be to pre-generate a fixed
+      patch of each tiling, and set Loopy puzzles on that by just
+      varying the puzzle solution (the closed loop you’re trying to
+      reconstruct from clues). But that’s boring – surely the whole
+      point of a tiling that <em>does not repeat</em> is that it
+      shouldn’t be the same every time! So when you request a new
+      game, you should get a different patch of the <em>tiling
+      itself</em>, as well as a different loop to find in it.</p>
+    <p>So our mission goal is: <em>given an output region and a source
+        of random numbers, generate a randomly selected patch of each
+        of these three aperiodic tilings.</em></p>
+    <p>In this article I’ll discuss two very different algorithms for
+      doing this, and say which one I prefer. (Spoiler: there will be
+      a very definite one that I prefer.)</p>
+    <h2 id="subst">Substitution systems</h2>
+    <p>All three of the tilings we’ll discuss here can be generated
+      recursively by the same basic method.</p>
+    <p>For each of these tilings, there’s a system for starting with
+      an existing tiling, and then substituting each tile for smaller
+      tiles according to a fixed rule. This generates a new tiling,
+      using the same set of tiles, but more of them at a smaller
+      scale.</p>
+    <p>Because the output tiling is of the same type, it follows that
+      you can substitute that in the same way, and so on. So if you
+      repeat this many times, you can start from a single initial tile,
+      and expand it into as large a region of the plane as you like.</p>
+    <p>One slight complication, in every case, is that the most
+      convenient substitution system is not based on the actual tiles
+      you want to end up with. In each case, you have to substitute
+      a <em>different</em> system of tiles, and after you’ve done that
+      enough, convert the result into the final tiles you want as
+      output.</p>
+    <h3 id="subst-penrose">Penrose tilings: half-tile triangles</h3>
+    <p>The substitution systems for the Penrose P2 and P3 tilings work
+      in very similar ways, so I’ll describe both of them
+      together.</p>
+    <p>In both cases, the most convenient way to think of the
+      substitution system is to imagine each of the starting tiles
+      being divided in half, to make two isosceles triangles. That
+      way, the substitution can replace each of those triangles with
+      either two or three smaller triangles, exactly filling the same
+      area as the original triangle. (If you didn’t do this, then most
+      smaller tiles would half-overlap two larger tiles, and it would
+      be more awkward to keep track of which tiles you’d expanded from
+      where.)</p>
+    <p>The divisions for each tile type look like this. For the P2
+      tiling, the kite and dart are each divided down their line of
+      symmetry. For the P3 tiling, the thin rhomb is cut along its
+      short diagonal, and the thick one along its long diagonal:</p>
+    
+    <p>(Therefore, in the P2 tiling, the acute isosceles triangles are
+      larger than the obtuse ones, whereas in the P3 tiling, <i>vice
+        versa</i>.)</p>
+    <p>The two halves of each original tile are shown in different
+      colours, because they will be treated differently by the
+      substitution rules. Specifically, they will be mirror images of
+      each other.</p>
+    <p>Here are the substitution rules for each of those types of
+      triangle:</p>
+    
+    <p>To see the complete system in action, select the radio buttons
+      below to see the effect of running a different number of
+      iterations, starting from a single obtuse triangle of each
+      tiling. In each step, you can see that every large triangle
+      transforms into smaller ones in accordance with the rules
+      above.</p>
+    <figure>
+      <div>
+        <div>
+          <div>
+            <p>
+              P2:
+              <span><label for="p2-r0">0</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p2-r0.svg" alt="[p2-r0.svg]"></span>
+              <span><label for="p2-r1">1</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p2-r1.svg" alt="[p2-r1.svg]"></span>
+              <span><label for="p2-r2">2</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p2-r2.svg" alt="[p2-r2.svg]"></span>
+              <span><label for="p2-r3">3</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p2-r3.svg" alt="[p2-r3.svg]"></span>
+              <span><label for="p2-r4">4</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p2-r4.svg" alt="[p2-r4.svg]"></span>
+              <span><label for="p2-r5">5</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p2-r5.svg" alt="[p2-r5.svg]"></span>
+              <span><label for="p2-r6">6</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p2-r6.svg" alt="[p2-r6.svg]"></span>
+              <span><label for="p2-r7">7</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p2-r7.svg" alt="[p2-r7.svg]"></span>
+              <span><label for="p2-r8">8</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p2-r8.svg" alt="[p2-r8.svg]"></span>
+            </p>
+            <p>
+              P3:
+              <span><label for="p3-r0">0</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p3-r0.svg" alt="[p3-r0.svg]"></span>
+              <span><label for="p3-r1">1</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p3-r1.svg" alt="[p3-r1.svg]"></span>
+              <span><label for="p3-r2">2</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p3-r2.svg" alt="[p3-r2.svg]"></span>
+              <span><label for="p3-r3">3</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p3-r3.svg" alt="[p3-r3.svg]"></span>
+              <span><label for="p3-r4">4</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p3-r4.svg" alt="[p3-r4.svg]"></span>
+              <span><label for="p3-r5">5</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p3-r5.svg" alt="[p3-r5.svg]"></span>
+              <span><label for="p3-r6">6</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p3-r6.svg" alt="[p3-r6.svg]"></span>
+              <span><label for="p3-r7">7</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p3-r7.svg" alt="[p3-r7.svg]"></span>
+              <span><label for="p3-r8">8</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p3-r8.svg" alt="[p3-r8.svg]"></span>
+            </p>
+          </div>
+          <p><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/penrose-spacer.svg" alt="">
+        </p></div>
+      </div>
+      <figcaption>Interactive demo of iterated P2 and P3 substitution</figcaption>
+    </figure>
+    <p>So one way to generate Penrose tilings is to expand a starting
+      triangle like this, and when you’ve expanded it enough times,
+      glue each pair of adjacent half-tiles back together into a
+      single kite, dart or rhomb.</p>
+    <h3 id="subst-hats">Hat tiling: a system of four metatiles</h3>
+    <p>The hat tiling can also be generated by a substitution system.
+      In this case, however, the system is based on a set of four
+      tiles that have no obvious relation to the actual hat shape!</p>
+    <p>The paper refers to these as “metatiles”, to avoid confusion
+      with the hat itself (the single <em>tile</em>). The four
+      metatiles are shown below, with their substitution rules:</p>
+    <figure>
+      <div>
+        <p><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-exp-H-before.svg" alt="[hat-exp-H-before.svg]">
+          <img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/arrow.svg" alt="[arrow.svg]">
+          <img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-exp-H-after.svg" alt="[hat-exp-H-after.svg]">
+        </p>
+        <p><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-exp-T-before.svg" alt="[hat-exp-T-before.svg]">
+          <img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/arrow.svg" alt="[arrow.svg]">
+          <img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-exp-T-after.svg" alt="[hat-exp-T-after.svg]">
+        </p>
+        <p><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-exp-P-before.svg" alt="[hat-exp-P-before.svg]">
+          <img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/arrow.svg" alt="[arrow.svg]">
+          <img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-exp-P-after.svg" alt="[hat-exp-P-after.svg]">
+        </p>
+        <p><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-exp-F-before.svg" alt="[hat-exp-F-before.svg]">
+          <img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/arrow.svg" alt="[arrow.svg]">
+          <img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-exp-F-after.svg" alt="[hat-exp-F-after.svg]">
+        </p>
+      </div>
+      <figcaption>Hat metatile substitution rules</figcaption>
+    </figure>
+    <p>The arrows on three of the metatile types indicate orientation:
+      those three metatiles are symmetric, but in the final conversion
+      to hats, each one will generate an entirely asymmetric pattern
+      of hats. So the substitution process has to remember what every
+      metatile’s orientation should be, in order not to get the last
+      step wrong.</p>
+    <p>(The remaining metatile is already asymmetric, so it doesn’t
+      need an arrow.)</p>
+    <p>In these substitution diagrams, the area of the original large
+      metatile is completely covered by the smaller ones, and the
+      smaller ones also overlap the edges. This means that when two
+      metatiles are placed next to each other, their expansions will
+      overlap too. In fact, they will always overlap in a way that
+      causes some of the resulting metatiles to coincide.</p>
+    <p>Here’s an illustration of the expansion in action, expanding a
+      single starting metatile for a few levels of recursion:</p>
+    <figure>
+      <div>
+        <div>
+          <div>
+            <p><span><label for="hat-r0">0</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-r0.svg" alt="[hat-r0.svg]"></span>
+              <span><label for="hat-r1">1</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-r1.svg" alt="[hat-r1.svg]"></span>
+              <span><label for="hat-r2">2</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-r2.svg" alt="[hat-r2.svg]"></span>
+              <span><label for="hat-r3">3</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-r3.svg" alt="[hat-r3.svg]"></span>
+            </p>
+          </div>
+          <p><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-spacer.svg" alt="">
+        </p></div>
+      </div>
+      <figcaption>Interactive demo of iterated hat metatile substitution</figcaption>
+    </figure>
+    <p>So, similarly to the previous section, if you want to generate
+      a large patch of hat tiling, you can start with a single
+      metatile and expand it repeatedly until you think it’s big
+      enough. Finally, each metatile is converted into either 1, 2 or
+      4 hats according to the following rules:</p>
+    <figure>
+      <div>
+        <p><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-exp-H-before.svg" alt="[hat-exp-H-before.svg]">
+          <img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/arrow.svg" alt="[arrow.svg]">
+          <img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-final-H.svg" alt="[hat-final-H.svg]">
+        </p>
+        <p><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-exp-T-before.svg" alt="[hat-exp-T-before.svg]">
+          <img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/arrow.svg" alt="[arrow.svg]">
+          <img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-final-T.svg" alt="[hat-final-T.svg]">
+        </p>
+        <p><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-exp-P-before.svg" alt="[hat-exp-P-before.svg]">
+          <img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/arrow.svg" alt="[arrow.svg]">
+          <img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-final-P.svg" alt="[hat-final-P.svg]">
+        </p>
+        <p><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-exp-F-before.svg" alt="[hat-exp-F-before.svg]">
+          <img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/arrow.svg" alt="[arrow.svg]">
+          <img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-final-F.svg" alt="[hat-final-F.svg]">
+        </p>
+      </div>
+      <figcaption>Rules for converting hat metatiles to hats</figcaption>
+    </figure>
+    <p>(Incidentally, the hat in the centre of the cluster of four
+      expanded from the hexagonal metatile, shown here in the darkest
+      red colour, is the only one of these hats that is reflected
+      compared to the rest. So you can readily identify the rare
+      reflected hats in this tiling, if you’re generating it using
+      this metatile system.)</p>
+    <p>However, beware! The final expansion step isn’t quite as easy
+      as it looks, because the expansion into hats
+      is <em>distorting</em>.</p>
+    <p>As I’ve drawn the metatiles here, the substitution of one set
+      of metatiles for a smaller set is geometrically precise: each
+      large metatile from one iteration of the algorithm can be
+      overlaid on the next iteration and the vertices will align
+      exactly as shown in the diagrams above. But when each metatile
+      expands into a cluster of hats, the clusters aren’t quite
+      exactly the same sizes as the metatiles they replace. So the
+      precise positions in the plane will vary in a nonlinear way, and
+      there’s no simple formula that matches a metatile’s
+      coordinates to the coordinates of its hats.</p>
+    <p>The paper offers an alternative version of this scheme in which
+      the smallest level of metatiles <em>do</em> match up
+      geometrically to the hats they turn into – but in that version,
+      the downside is that each size of metatiles is not precisely the
+      same shape as the next size. Instead, the metatiles themselves
+      gradually distort as they expand.</p>
+    <p>Either way, this makes it more difficult to perform the overall
+      procedure. With the fixed-shape metatiles as shown here, in the
+      final conversion to hats, you can’t just iterate over each
+      metatile and independently write out the coordinates of its
+      hats; with the alternative version, you have the same problem
+      during the expansion of metatiles into smaller ones. In each
+      case, you have to do some kind of a graph search (breadth-first
+      or depth-first, whichever you find easiest), choosing one
+      metatile to start with and processing the rest in an order that
+      guarantees that each metatile you process is adjacent to one
+      you’ve already placed. That way you can figure out the location
+      of each output hat or metatile, by knowing of an existing
+      adjacent thing it has to fit together with.</p>
+    <p>Here’s an example, which also illustrates the distortion. This
+      shows the same set of metatiles as in step 2 of the iteration
+      above, and its expansion into hats. The top left corners of the
+      two images are aligned – but you can see that at the other end,
+      the corresponding pieces of tiling are quite offset from each
+      other.</p>
+    <figure>
+      <div>
+        <div>
+          <div>
+            <p><span><label for="hat-final-m">Metatiles</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-r2.svg" alt="[hat-r2.svg]"></span>
+              <span><label for="hat-final-h">Hats</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-f2.svg" alt="[hat-f2.svg]"></span>
+            </p>
+          </div>
+          <p><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-f2-spacer.svg" alt="">
+        </p></div>
+      </div>
+      <figcaption>Interactive demo of converting hat metatiles to hats</figcaption>
+    </figure>
+    <h2 id="random-patch">Choosing a random patch from a fixed expansion</h2>
+    <p>In the previous section, I’ve shown how all three of our
+      aperiodic tiling types (P2, P3, hats) can be generated by
+      repeated subdivision of a starting tile, followed by a final
+      postprocessing step. (In the two Penrose cases, gluing
+      half-tiles back together into whole ones; in the hat case,
+      substituting the four metatiles for their hat clusters.)</p>
+    <p>This is all very well if you want to generate a <em>fixed</em>
+      piece of tiling. But what if you want a different piece every
+      time?</p>
+    <p>One obvious answer is: <em>make a fixed patch of tiles much
+        larger than you need, and select a small region from it at
+        random.</em></p>
+    <p>This works basically OK in principle. But if you implement it
+      naïvely, it’s very slow, because you spend a lot of effort on
+      generating all the fine detail in huge regions of the tiling
+      that you’re just going to throw away. And the more uniform a
+      probability distribution you want for your output region, the
+      larger the fixed region you have to generate, and the more
+      pointless effort you waste.</p>
+    <p>We can save a lot of that effort by not being quite so naïve
+      about the procedure. Suppose that, instead of generating a patch
+      of tiling and <em>then</em> deciding which part of it to return,
+      we instead decide <em>in advance</em> where our output region is
+      going to be within the starting tile. Then, in <em>each
+      iteration</em>, we can identify a tile that’s completely outside
+      the output region and won’t contribute any tiles to it, and
+      discard it early, before we waste any more time expanding it
+      into lots of subtiles that will all be thrown away.</p>
+    <p>For example, here’s an illustration of how much work this might
+      save when selecting a small rectangle from the same P3 example
+      pictured above:</p>
+    <figure>
+      <div>
+        <div>
+          <div>
+            <p><span><label for="p3-sub-r0">0</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p3-subrect-r0.svg" alt="[p3-subrect-r0.svg]"></span>
+              <span><label for="p3-sub-r1">1</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p3-subrect-r1.svg" alt="[p3-subrect-r1.svg]"></span>
+              <span><label for="p3-sub-r2">2</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p3-subrect-r2.svg" alt="[p3-subrect-r2.svg]"></span>
+              <span><label for="p3-sub-r3">3</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p3-subrect-r3.svg" alt="[p3-subrect-r3.svg]"></span>
+              <span><label for="p3-sub-r4">4</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p3-subrect-r4.svg" alt="[p3-subrect-r4.svg]"></span>
+              <span><label for="p3-sub-r5">5</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p3-subrect-r5.svg" alt="[p3-subrect-r5.svg]"></span>
+              <span><label for="p3-sub-r6">6</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p3-subrect-r6.svg" alt="[p3-subrect-r6.svg]"></span>
+              <span><label for="p3-sub-r7">7</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p3-subrect-r7.svg" alt="[p3-subrect-r7.svg]"></span>
+              <span><label for="p3-sub-r8">8</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p3-subrect-r8.svg" alt="[p3-subrect-r8.svg]"></span>
+            </p>
+            <p><span><label for="p3-sub-zz">Without pruning</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p3-r8.svg" alt="[p3-r8.svg]"></span>
+            </p>
+          </div>
+            <p><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/penrose-spacer.svg" alt="">
+        </p></div>
+      </div>
+      <figcaption>Interactive demo of P3 substitution pruned for the target area</figcaption>
+    </figure>
+    <p>At every stage, we identify triangles – large or small – that
+      are out of our region, and stop bothering to expand them any
+      further. This bounds the wasted effort at a much more acceptable
+      level. Compare the number of triangles in the final pruned
+      output with the number in the unpruned version!</p>
+    <p>This technique is easy to apply for Penrose tilings, because
+      the expansion process is geometrically exact. At every stage of
+      the process, the outline of each triangle is exactly the
+      boundary of the region that will contain all its eventual output
+      tiles. So it’s easy to identify <em>whether</em> a triangle
+      intersects the target region.</p>
+    <p>But in the hats tiling, where the expansion process is
+      geometrically distorting, it’s not so easy. In order to work out
+      whether a given metatile is going to contribute to your target
+      region, first you have to work out what coordinates in the
+      current layer of metatile expansion <em>correspond</em> to the
+      target region in the final hat tiling. This is computationally
+      tricky: even if you could find an exact formula that translates
+      each <em>corner</em> of your target region into its coordinates
+      at the current iteration, then you’re not done, because it’s
+      also not guaranteed that the image of a straight line between
+      two of those corners will still be straight after the distortion
+      is applied. In other words, if you’re trying to construct a
+      patch of hats to fill a specific rectangle, you might find the
+      region of metatiling you need to keep isn’t even
+      rectangular!</p>
+    <p>It might be possible to get this technique to work regardless,
+      by computing a conservative approximation to the target region.
+      That way maybe you do a <em>little</em> more work than you need,
+      computing a few metatiles that never contribute hats to the
+      output but your approximation couldn’t quite prove it; but the
+      effort saving would still be large compared to the naïve
+      approach. But this is likely to be tricky, and has plenty of
+      room for subtle bugs. Err in one direction, and you do more work
+      than you need; err in the other direction and you generate wrong
+      output.</p>
+    <p>This entire approach has another downside. As I mentioned
+      above, if you want your random patch of tiling to be
+      selected <em>uniformly</em> from the limiting probability
+      distribution of finite pieces of tiling over the whole plane,
+      then you can’t achieve it this way, in an exact manner. You can
+      only approximate, by running a large enough number of iterations
+      that the huge patch you’re selecting a rectangle from is
+      close <em>enough</em> to that limiting distribution. And the
+      closer you want the distribution, the more you have to expand,
+      and the more work you have to do.</p>
+    <p>More subtly, this means you have to figure out <em>in
+        advance</em> how many iterations you want to run, based on the
+      size of your target region and the error threshold you’re
+      prepared to tolerate in probability distribution. That
+      involves a fiddly formula which is easy to get wrong,
+      introducing subtle bugs you’ll probably never spot.</p>
+    <p>In the next section, I’ll describe a completely different
+      approach that avoids <em>all</em> these problems, and works for
+      hats as easily as it does for Penrose tiles.</p>
+    <h2 id="ccoords">Combinatorial coordinates</h2>
+    <p>The alternative approach begins with the following observation.</p>
+    <p>Suppose that, in any of these recursive substitution systems,
+      whenever we substitute one larger tile for a number of smaller
+      ones, we assign a different label to each smaller tile.</p>
+    <p>For example, in the P2 tiling, an acute triangle expands into
+      three smaller triangles; so we could number them 0, 1, 2 in some
+      arbitrary but consistent way. And an obtuse triangle expands
+      into just two, which we could call 0 and 1. Or, perhaps more
+      elegantly, we can observe that no two triangles expanded from
+      the same larger triangle are the same type (counting reflections
+      as different), so we could simply label each triangle by one of
+      the four types (two types of acute, two types of obtuse).</p>
+    <p>For the metatiles in the hat system, each metatile has between
+      7 and 13 children, and some of them are the same type as each
+      other. So the problem is larger – but not more difficult. We can
+      still just assign each child a numeric label in an arbitrary
+      way, so that the hexagonal metatile has children labelled from 0
+      to 12 inclusive, the triangle from 0 to 6, etc.</p>
+    <p>Then, after you’ve run the expansion process some particular
+      number of times, each tile of the output can be uniquely
+      identified by the sequence of labels it generated as it was
+      expanded. You could identify some particular tile by saying
+      something like: “From the starting tile, take the child
+      with <em>this</em> label; from there, take the child
+      with <em>that</em> label, then the child with <em>the other</em>
+      label, …” and after you’ve listed the label at every step of
+      the expansion, your listener knows exactly how to find the same
+      tile you were thinking of.</p>
+    <p>Now, supposing I tell you the coordinates of one particular
+      output tile, specified in this way. Can you figure out the
+      coordinates of one of its <em>neighbours</em>, sharing an edge
+      with it?</p>
+    <p>Assuming the tile you want is not on the very edge of the giant
+      starting tile, yes, you can. And you can do it entirely by
+      manipulating the string of labels, without ever having to think
+      about geometry.</p>
+    <h3 id="ccoords-penrose">Penrose tilings: indexing triangle edges</h3>
+    <p>We’ll tackle the Penrose tilings first. In this system, the
+      smallest unit we ever deal with is a single half-tile triangle,
+      so we’ll assign coordinates to each of those.</p>
+    <p>I’ll label the tile types with letters. For the P2 tiling, the
+      two handednesses of acute triangle are called A and B; for the P3
+      they’re C and D. The obtuse triangles in P2 will be U and V; the
+      ones for P3 will be X and Y.</p>
+    <p>Here’s an illustration that shows the coordinates of each
+      output triangle for the first few layers of expansion, in both
+      tiling types. The coordinates are written with the label of the
+      smallest triangle first, followed by its parents in increasing
+      order of size. (This matches the natural way to store them in an
+      array, because that way, the fixed array index 0 corresponds to
+      the real output triangles.) So whenever a triangle is divided
+      into two or three smaller triangles, the coordinates for each
+      smaller triangle are derived from the original triangle by
+      appending a new type label to the <em>front</em>.</p>
+    <figure>
+      <div>
+        <div>
+          <div>
+            <p>
+              P2:
+              <span><label for="p2-labelled-r0">0</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p2-labelled-r0.svg" alt="[p2-labelled-r0.svg]"></span>
+              <span><label for="p2-labelled-r1">1</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p2-labelled-r1.svg" alt="[p2-labelled-r1.svg]"></span>
+              <span><label for="p2-labelled-r2">2</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p2-labelled-r2.svg" alt="[p2-labelled-r2.svg]"></span>
+              <span><label for="p2-labelled-r3">3</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p2-labelled-r3.svg" alt="[p2-labelled-r3.svg]"></span>
+            </p>
+            <p>
+              P3:
+              <span><label for="p3-labelled-r0">0</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p3-labelled-r0.svg" alt="[p3-labelled-r0.svg]"></span>
+              <span><label for="p3-labelled-r1">1</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p3-labelled-r1.svg" alt="[p3-labelled-r1.svg]"></span>
+              <span><label for="p3-labelled-r2">2</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p3-labelled-r2.svg" alt="[p3-labelled-r2.svg]"></span>
+              <span><label for="p3-labelled-r3">3</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/p3-labelled-r3.svg" alt="[p3-labelled-r3.svg]"></span>
+            </p>
+          </div>
+          <p><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/penrose-spacer.svg" alt="">
+        </p></div>
+      </div>
+      <figcaption>Interactive demo of iterated P2 and P3 substitution with combinatorial coordinates</figcaption>
+    </figure>
+    <p>We’ll also need to index the <em>edges</em> of each triangle in
+      a unique way, so as to describe unambiguously which neighbour of
+      a triangle we’re going to ask for. For example, we could say
+      that we always assign index 0 to the base of the isosceles
+      triangle, and the two equal sides are assigned indexes 1 and 2,
+      in anticlockwise order from the base. So when you want to know
+      about a particular neighbour of your starting tile, you’ll
+      identify which neighbour by giving the index of an edge: “What
+      triangle is on the other side of edge {0/1/2} of my current
+      one?”</p>
+    <p>Then, for each substitution rule, we can make a map of which
+      smaller triangles border on which others, and which of their
+      edges correspond:</p>
+    
+    <p>From these maps, with a little recursion, you can work out
+      everything you need.</p>
+    <p>For example, suppose you’re in a type B triangle, and you want
+      to see what’s on the other side of its edge #0. Look at the type
+      of its parent triangle. If the parent is type A or type U, then
+      the maps above for those triangle types show that edge #0 of the
+      type-B sub-triangle is also edge #1 of a type-U triangle. So you
+      can adjust the lowest-order label in your coordinate list to
+      specify a different sub-triangle, and return success.</p>
+    <p>More symbolically: <em>to move across edge #0 of any triangle
+        whose coordinate string begins with BA or BU, just replace the
+        initial B with a U.</em></p>
+    <p>On the other hand, suppose your type-B triangle is expanded
+      from <em>another</em> type-B triangle. In that case, the map for
+      the parent triangle says it doesn’t know what’s on the far side
+      of your edge #0 – that’s off the edge of the map.</p>
+    <p>But that’s all right: recurse further up to find a map on a
+      larger scale! We know that going out of edge #0 of the smaller
+      type-B triangle means going out of edge #1 of the larger type-B
+      triangle. So ask the same type of question one layer further up
+      (perhaps recursing again, if necessary).</p>
+    <p>When the recursive call returns, it will give you an entire
+      updated set of coordinates identifying the <em>second</em>
+      smallest triangle you’re going to end up in, and which edge of
+      it is on the other side of this one’s edge #1. So, finally, you
+      can append the lowest-order coordinate to that, by figuring out
+      which of the <em>smaller</em> triangles of the new large
+      triangle is the one you need to end up at.</p>
+    <p>In our example case, there’s one final step. Going out of edge
+      #0 of our original B meant going out of edge #1 of the larger B.
+      But that edge is divided into two segments, each belonging to a
+      different sub-triangle. So we need to remember <em>which</em>
+      segment of the larger edge we were crossing: were we to the left
+      or the right of the division?</p>
+    <p>We’ll always expect to find that the incoming edge of the new
+      large triangle is subdivided into segments in the same way, and
+      the map for that triangle will let us find which sub-triangle
+      corresponds to each segment of the outer edge. So you can still
+      figure out which sub-triangle you end up in.</p>
+    <p>For example, suppose we had coordinates ending BB, and our
+      recursive call (“we’re going out of edge #1 of a B, what happens
+      next?”) rewrote the second B to an A (perhaps modifying further
+      labels above that) and told us we were coming in along edge #2
+      of the A. Then we consult the A map, and we see that its edge #2
+      is indeed divided in two, and coming in via the right-hand one
+      of those segments leads us in the A child. So we end up with AA
+      as our new lowest-order coordinates (plus whatever rewrites
+      were made at higher orders by the recursion).</p>
+    <p>(You can check these examples in the expansion shown above. In
+      the 3-iteration P2 diagram, there are triangles labelled BABU
+      and BUUU, and as described above, the edge #0 of each one – that
+      is, its short base edge – connects to UABU or UUUU respectively,
+      with only the lowest-order label differing. But the triangle
+      labelled BBBU is a more difficult case, requiring a rewrite at
+      the second layer: its edge #0 connects to a triangle labelled
+      AABU.)</p>
+    <h3 id="ccoords-hats">Hats: indexing kite edges, and dealing with non-uniqueness</h3>
+    <p>For the hats tiling, indexing the edges of the tiles isn’t
+      quite so convenient. The hat polygon itself has 13 edges, and
+      the maps for which ones border on each neighbouring hat are
+      pretty complicated. Not only that, but because the metatile
+      expansions overlap each other, every tile potentially has
+      multiple different, equally legal, lists of coordinates. And the
+      metatiles don’t necessarily meet edge-to-edge, in the sense that
+      one edge of <em>this</em> metatile might join up with the edges
+      of two other metatiles.</p>
+    <p>To solve the first of those problems, I found the easiest thing
+      is to stop considering a whole hat at a time, and use a smaller
+      and more regular unit. The hat tiling can be made to align
+      neatly with a periodic tiling of the plane with kites, shaped so
+      that six of them joined at the pointy ends make a regular
+      hexagon and three joined at the blunt ends make an equilateral
+      triangle:</p>
+    <div>
+      <div>
+        <figure>
+          <img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/kites-hat.svg" alt="[kites-hat.svg]">
+          <figcaption>A hat aligned to its underlying grid</figcaption>
+        </figure>
+      </div>
+    </div>
+    <p>If you align the hats to this tiling, then every hat occupies
+      exactly eight whole kites, as shown above. And the kites are
+      simply shaped, with just four edges. So I found it’s easier to
+      consider each <em>individual kite</em> to have a set of
+      combinatorial coordinates, and to devise an algorithm that will
+      tell you the coordinates of a neighbouring kite, given the
+      coordinates of the starting kite and which of the four edges you
+      want to head out of.</p>
+    <p>The coordinates of an individual kite look something like this:</p>
+    <ul>
+      <li>“I am the <i>k</i>th kite in a hat …</li>
+      <li>which is the <i>h</i>th hat expanded from a first-order
+      metatile of type <i>m</i> …</li>
+      <li>which is the <i>c</i>th child of a second-order
+      metatile of type <i>m</i><sub>2</sub> …</li>
+      <li>which is the <i>c</i><sub>2</sub>th child of a third-order
+      metatile of type <i>m</i><sub>3</sub> …”</li>
+    </ul>
+    <p>and so on. At the highest-order end, this terminates with you
+      knowing the outermost metatile <em>type</em>, but not anything
+      about its parent, or which child of that parent it might be.</p>
+    <p>To navigate this coordinate system, we’ll make a set of giant
+      lookup tables. But first, we’ll have to assign numeric indexes
+      to all three of the expansion processes involved: metatiles to
+      smaller metatiles, then to hats, then to kites. It doesn’t
+      matter how we do this, as long as we do it consistently.</p>
+    
+    <p>The first type of lookup table we’ll need, I call
+      a <i>kitemap</i>. For each type of second-order metatile (i.e.
+      each possible value of <i>m</i><sub>2</sub>), you expand it into
+      its set of first-order metatiles, and then into hats, and then
+      into kites, and you keep the coordinate labels you generated at
+      each stage. To illustrate this, here’s the kitemap for the
+      triangular metatile. (It make a manageable example, because it’s
+      the smallest. The others are similar but larger.)</p>
+    <figure>
+      <div>
+        <div>
+          <div>
+            <p><span><label for="hat-kitemap0">Starting metatile</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-metamap0.svg" alt="[hat-metamap0.svg]"></span>
+              <span><label for="hat-kitemap1">Expand metatiles</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-metamap1.svg" alt="[hat-metamap1.svg]"></span>
+              <span><label for="hat-kitemap2">Expand to hats</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-kitemap-hats.svg" alt="[hat-kitemap-hats.svg]"></span>
+              <span><label for="hat-kitemap3">Expand to kites</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-kitemap.svg" alt="[hat-kitemap.svg]"></span>
+            </p>
+          </div>
+          <p><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-metamap-spacer.svg" alt="">
+        </p></div>
+      </div>
+      <figcaption>Interactive demo of building one of the four kitemaps</figcaption>
+    </figure>
+    <p>From this visual map, you can read off the coordinates of each
+      kite adjacent to a starting kite. For example, consider the kite
+      labelled 7.3.0, at the top right of the central hat in this
+      diagram: you can see that the four kites bordering it are 0.0.0,
+      6,3,0, 3.1.1 and 4.1.1, and you can identify which edge of the
+      kite takes you to each of those neighbours. So if the
+      coordinates of your current kite started with
+      (<i>k</i>,&nbsp;<i>h</i>,&nbsp;<i>c</i>)&nbsp;=&nbsp;(7,&nbsp;3,&nbsp;0), then you would know
+      how to generate the coordinates of each neighbouring kite,
+      simply by rewriting those three low-order labels.</p>
+    <p>The version of the kitemap used by the algorithm is not a
+      visual map like this: it’s a lookup table, or rather one for
+      each of the four metatile types. Each table is indexed by the
+      triple (<i>k</i>,&nbsp;<i>h</i>,&nbsp;<i>c</i>) and a particular kite
+      edge, and it tells you the new values of
+      (<i>k</i>,&nbsp;<i>h</i>,&nbsp;<i>c</i>) corresponding to the kite on the
+      far side of that edge.</p>
+    <p>So, to compute the coordinates of a neighbouring kite, you
+      start by choosing the kitemap lookup table corresponding to the
+      metatile type <i>m</i><sub>2</sub>, and look up
+      (<i>k</i>,&nbsp;<i>h</i>,&nbsp;<i>c</i>,&nbsp;kite edge) in it. If it has an
+      answer, you’re done – just replace the three low-order indices
+      in your input coordinates with the ones you got out of the
+      kitemap lookup table, and you’ve got a set of coordinates for
+      the new kite.</p>
+    <p>(Of course, when you rewrite <i>c</i> in the coordinates, you
+      must also rewrite <i>m</i> to match the type of the new
+      first-order metatile. To do this, you just need a much simpler
+      lookup table of which type of metatile each child is.)</p>
+    <p>But sometimes this doesn’t work. For example, suppose you’re in
+      the kite labelled 0.0.4 in the above map, right at the bottom.
+      Then traversing one of the four kite edges will take you inwards
+      to 1.0.4, but for the other three, this map has no answer. In
+      cases like this, the entry in the kitemap lookup table for “what
+      happens if I head in <em>this</em> direction
+      from <em>here?</em>” will be a special value meaning “don’t
+      know, that’s off the edge of the map.”</p>
+    <p>By analogy with the Penrose case, an obvious thing to try here
+      might be to specify (in some way) <em>which edge</em> of the
+      kitemap you’re stepping off, and then recurse to a higher layer
+      to find out where you’ve come back in to some other kitemap. If
+      we had made smaller kitemaps based only on a
+      single <em>first</em>-order metatile (i.e. just containing 1, 2
+      or 4 hats), then we would have no choice but to do exactly this,
+      because all first-order metatiles’ hat expansions are disjoint.
+      But hat expansions of metatiles have extremely twiddly and
+      complicated edges, and that sounded like a very tricky thing to
+      get right.</p>
+    <p>And we don’t have to! There’s a nicer way, based on the fact
+      that the metatile expansions overlap each other. If we’re about
+      to head off the outermost border of the kitemap, that must mean
+      that we’re near the edge of the expansion of our second-order
+      metatile <i>m</i><sub>2</sub>. So the <em>first</em>-order
+      metatile we’re in must be one of the outermost metatiles in that
+      expansion – which means it overlaps with the expansion of
+      another second-order metatile, or maybe even two of them. And
+      among the second-order metatiles whose expansions contain this
+      particular first-order one, there must be at least one in which
+      we’re about to step <em>inwards</em> towards the centre, not
+      outwards towards the edge.</p>
+    <p>In other words, the fact that there are multiple valid
+      coordinates for the same kite is not a problem after all. It’s
+      an opportunity! If we can rewrite two layers
+      of <em>metatile</em> child index in our coordinate system, then
+      we can find an <em>equivalent</em> representation of our current
+      kite, which places it in a kitemap that we’re not about to step
+      off the edge of. And now we’ve completely avoided having to deal
+      with those long crinkly complicated edges of all the maps.</p>
+    <p>To implement this step, we make a second type of map, which I
+      call a <em>metamap</em>. This time, take
+      each <em>third</em>-order metatile type <i>m</i><sub>3</sub>,
+      and expand it twice, into second- and then into first-order
+      metatiles. As you do that, keep track of all the different ways
+      that each first-order metatile is generated (there will be more
+      than one if it’s in the overlap between the expansions of two or
+      three second-order metatiles). So we end up with a map in which
+      some metatiles have multiple coordinates:</p>
+    <figure>
+      <div>
+        <div>
+          <div>
+            <p><span><label for="hat-metamap0">Starting metatile</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-metamap0.svg" alt="[hat-metamap0.svg]"></span>
+              <span><label for="hat-metamap1">Expand once</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-metamap1.svg" alt="[hat-metamap1.svg]"></span>
+              <span><label for="hat-metamap2">Expand twice</label><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-metamap2.svg" alt="[hat-metamap2.svg]"></span>
+            </p>
+          </div>
+          <p><img src="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/hat-metamap-spacer.svg" alt="">
+        </p></div>
+      </div>
+      <figcaption>Interactive demo of building one of the four metamaps</figcaption>
+    </figure>
+    <p>Finally, we translate that map into a lookup table indexed by
+      any of the coordinate pairs in this diagram, giving all the
+      other coordinate pairs equivalent to it. This lookup table
+      allows you to rewrite the part of the coordinate system that
+      says</p>
+    <p>“… metatile type <i>m</i>, which is
+      child <i>c</i> of type <i>m</i><sub>2</sub>, which is
+      child <i>c</i><sub>2</sub> of <i>m</i><sub>3</sub> …”</p>
+    <p>by selecting the metamap for tile type <i>m</i><sub>3</sub>,
+      and looking up the pair (<i>c</i>,&nbsp;<i>c</i><sub>2</sub>) in it.
+      The metamap might return you one or two alternative
+      (<i>c</i>,&nbsp;<i>c</i><sub>2</sub>) pairs, and for each one, you
+      can substitute those in your coordinates (which doesn’t change
+      which kite you’re referring to). This will also give you a new
+      value of <i>m</i><sub>2</sub>, so you’re representing your
+      existing location relative to a different kitemap which overlaps
+      the previous one. Now you can try looking up your new
+      (<i>k</i>,&nbsp;<i>h</i>,&nbsp;<i>c</i>) triple in it (using the rewritten
+      value of <i>c</i>), and this time, perhaps you’re not on the
+      edge of the map any more, and can find the coordinates of the
+      neighbouring kite successfully.</p>
+    <p>If even <em>that</em> doesn’t work, it’s because you’re on the
+      outer edge of the metamap, meaning you’re near the edge of the
+      expansion of the third-order metatile <i>m</i><sub>3</sub>.
+      And <em>now</em> every layer above this looks the same – so you
+      can try applying the same kind of metamap rewrite one layer up,
+      by looking up (<i>c</i><sub>2</sub>,&nbsp;<i>c</i><sub>3</sub>) in
+      the metamap for <i>m</i><sub>4</sub> and seeing if that permits
+      a more useful rewrite one layer down. If even that doesn’t help,
+      try further up still, and so on.</p>
+    <h3 id="making-it-up">Making it up as you go along</h3>
+    <p>In both of the previous sections, I’ve described a technique
+      for computing the coordinates of each smallest-size element of
+      the tiling (a Penrose half-tile, or a single kite), using a
+      recursive algorithm which looks at higher- and higher-order
+      labels in the coordinate system as necessary.</p>
+    <p>Of course, there’s one obvious way this can fail. You can only
+      store a finite number of coordinates. What if the recursion tries
+      to go all the way off the top, and look at a higher-order
+      coordinate than you have <em>at all?</em></p>
+    <p>One obvious option is: <em>report failure</em>. If for some
+      reason you had decided in advance that you were <em>only</em>
+      interested in some specific fixed patch of tiling, and that
+      nobody should ever go beyond the edges of that at all, then a
+      failure of this type should be interpreted as “Clonk! You have
+      run into the wall, and can’t go that way.”</p>
+    <p>(Perhaps if you had decided to set a text adventure game in the
+      7-level expansion of a type-A Penrose half-tile, or something
+      along those lines, then this might be what you’d actually want!
+      Each individual triangle would correspond to a room, and not all
+      rooms would have exits in all three directions.)</p>
+    <p>But in the main situation I’m discussing here, we don’t ever
+      want to report failure. Our aim is to generate a randomly
+      selected patch of tiling to cover a particular target rectangle.
+      Just because that rectangle turns out to protrude over the edge
+      of the highest-order tile we currently know about doesn’t mean
+      there’s <em>no possible way</em> to extend the tiling in that
+      direction; it just means we haven’t yet made a decision
+      about <em>which</em> way to extend it.</p>
+    <p>If you imagine an infinite tiling of the <em>entire plane</em>
+      in any of our tiling systems, then in principle, any given
+      element has a set of coordinates that go on <em>forever</em> to
+      higher- and higher-order, larger and larger, supertiles. If we
+      had started by inventing an <em>infinite sequence</em> of
+      coordinates for our starting element, then there would be no
+      problem with running out of coordinates during the recursion –
+      we could recurse as high as necessary.</p>
+    <p>Of course, you can’t invent infinitely many things up front in
+      a computer. But what you <em>can</em> do is to invent them
+      <em>lazily</em>, by inventing the first few, and being prepared
+      to generate a new one as and when it’s requested.</p>
+    <p>So this is what we do. In our algorithm, we invent some random
+      coordinates of our original starting element, up to a certain
+      point. And then, if the recursion ever tries to go beyond the
+      level we know about, we simply invent another layer, on demand,
+      append it to the coordinates of the starting element,
+      and <em>pretend it was there all along</em>, and that our
+      starting element has <em>always</em> had that extra coordinate.
+      So if any other coordinate list lying around elsewhere in the
+      software is shorter than the current coordinates of the starting
+      position, then we can extend it by appending the extra elements
+      that have been appended to the starting position since it was
+      generated. (Because it has the semantics “When we last got here,
+      we didn’t know what the next few levels looked like, but now we
+      do know”.)</p>
+    <p>Of course, when you make up a parent coordinate at random, you
+      have to make it consistent with the rules about which tiles can
+      be parents of which other tiles. In the Penrose system, for
+      example, you can see from the maps in a previous section that
+      the type-B triangle can be a child of A or U or another B, but
+      it can’t be a child of a V. So if your current topmost tile type
+      is B, then you must select the next one up by randomly choosing
+      from the set {A,&nbsp;U,&nbsp;B}, and not from all four tile types.
+      Similarly in the hats system, not all metatiles can appear as
+      children of other metatiles: the triangular
+      metatile <em>only</em> appears in the expansion of the hexagonal
+      one, so if your current topmost metatile is a triangle, then you
+      only have one choice for what the next larger one will be. And
+      even if your current metatile occurs as a child of <em>all</em>
+      the metatile types, you also have to decide what its child index
+      will be relative to its parent, and that index must be chosen in
+      a way that matches the tile types.</p>
+    <p>Better still, once you’ve finished generating your output patch
+      of tiling, you can retrieve the full set of coordinates you
+      ended up having to invent for the starting position – and those
+      can act as a short and convenient identifier that allows another
+      person running the same algorithm to generate the identical
+      piece of tiling, because <em>they</em> should never find
+      themselves needing a coordinate you hadn’t already generated.
+      That would only happen if they tried to extend your tiling into
+      a larger region than you had tried yourself.</p>
+    <p>Another thing you can do here is to choose the next parent
+      using a deliberately biased probability distribution, to match
+      the limiting distribution over the whole plane.</p>
+    <p>In each of these tiling systems, there’s a system of linear
+      equations that tells you how many tiles of each type you have
+      after an expansion, if you know how many tiles of each type you
+      started with. By eigenvalue/eigenvector analysis, you can
+      process these equations to determine the proportions of the
+      various tile types occurring overall – or, more precisely, the
+      limit of the proportions in a very large finite patch, as the
+      patch size tends to ∞.</p>
+    <p>This overall distribution of tile types, in turn, can be
+      processed into a set of <em>conditional</em> probabilities, each
+      answering a question of the form “Of all the tiles of
+      type <i>t</i> in the plane, what proportion are child #<i>n</i>
+      of tile type <i>u</i>?” So if you work out all those
+      probabilities, then you can select the next coordinate pair
+      (<i>n</i>,&nbsp;<i>u</i>) in a way that matches that limiting
+      distribution.</p>
+    <p>(Also, when you randomly select your <em>initial</em> tile, you
+      should do it according to the original, unconditional, version
+      of the limiting distribution.)</p>
+    <p>The effect of this refinement is that our piece of tiling will
+      be generated as if the coordinates of the starting element had
+      been chosen <em>uniformly at random from the whole plane!</em>
+      That’s normally a meaningless concept, but in this case it (just
+      about) makes sense, because the number of output patches of
+      tiling you could possibly return is finite, and the distribution
+      of <em>those</em> converges to a limit if you choose uniformly
+      from larger and larger regions of the plane.</p>
+    <p>Compare this to the recursive-expansion technique for
+      generating tilings. In that technique, your output distribution
+      is – by construction – the one you’d get by choosing from
+      an <em>actual</em> fixed patch of tiling of a finite (if large)
+      size, because that’s exactly what you <em>are</em> doing. If you
+      start from a larger and larger patch, your output
+      distribution <em>approaches</em> the idealised limit, but in
+      order to get it closer and closer, you have to do more and more
+      work. Here, we can directly generate a tiling
+      from <em>precisely</em> the limiting distribution, and we didn’t
+      have to do any extra work at all to get there!</p>
+    <h3 id="ccoords-output">Generating the output tiling</h3>
+    <p>So, now we have a method for moving around a tiling and
+      determining a string of coordinates describing each
+      smallest-sized element we come to. What do we <em>do</em> with
+      that?</p>
+    <p>Our ultimate aim is to actually generate a set of tiles that
+      cover the specified target area. For this, we don’t really need
+      the full set of higher- and higher-order coordinates at all. We
+      only need to know the lowest-order tile type labels: enough to
+      know <em>which kind of thing appears next in the tiling.</em>
+      Those low-order labels are the <em>output</em> of the algorithm.
+      The higher-order parts of the coordinate system are just an
+      internal detail of how the algorithm keeps track of where it had
+      got to. (Also, as I mention in the previous section, they can
+      also act as an identifier to make a particular run
+      repeatable.)</p>
+    <p>So, to use this technique to actually generate a Penrose
+      tiling, a simple approach is to use a graph search (say,
+      breadth-first). Pick an initial starting triangle, and place it
+      somewhere in your target area (the centre is an obvious choice,
+      but anywhere will do). Then, repeatedly, find some triangle edge
+      that you don’t know what’s on the other side of yet, and compute
+      the combinatorial coordinates of the triangle on the other side,
+      by starting from the coordinates of the triangle you already
+      have. The lowest-order label in the new triangle’s coordinates
+      will tell you which shape of triangle it is (acute or obtuse),
+      and which of its edges corresponds to the edge you just
+      traversed. That’s enough information to calculate the
+      coordinates of the new triangle’s third vertex, starting from
+      the two endpoints of that edge. Now add the two new edges of
+      that triangle to your queue of edges to try later. Then go back
+      and pick another edge to explore, and so on.</p>
+    <p>At every stage, if you generate a triangle that’s completely
+      outside the target area, there’s no need to store it or to queue
+      up its other edges. If you discard out-of-bounds triangles as
+      you get to them, then this search process will eventually
+      terminate, because the queue of edges that still need exploring
+      has run out, and you’ve covered the whole target region in
+      half-tile triangles.</p>
+    <p>Every time you generate the coordinates of a triangle, you find
+      out which of the <em>four</em> triangle types it is: not just
+      whether it’s acute or obtuse, but also which <em>handedness</em>
+      it is. So you know which half of an output tile each triangle
+      is. Therefore, as you go along, you can also generate the full
+      output Penrose tile corresponding to every triangle. This will
+      generate most of them twice (any tile with both halves inside
+      the target area), but as long as you notice that and
+      de-duplicate them, that’s fine.</p>
+    <p>For generating the hat tiling, you <em>could</em> do the same
+      kind of thing – but there’s an even easier approach that doesn’t
+      need a graph search at all, using the fact that the whole tiling
+      lives on a fixed grid of kites.</p>
+    <p>For the hat tiling, the easiest approach is to specify your
+      target region as a connected set of kites, and simply iterate
+      over that set in some fixed way. For example, to fill a
+      rectangular region, you might process the kites in the region in
+      raster order, iterating along each row from left to right and
+      then going on to the next row. Or you might find it easier to
+      process alternate rows in opposite orders. As long as you
+      process the kites in an order that means every kite (after the
+      first one) is adjacent to a kite you’ve already found the
+      coordinates of, anything will work. At the end of the iteration,
+      you know the combinatorial coordinates of every kite in your
+      region.</p>
+    <p>Once you’ve done that, you can generate the output in whichever
+      way is easiest. For every kite in the region, you know which
+      kite it is out of the 8 making up its containing hat, and that
+      (together with knowing whether the hat is a reflected one) is
+      enough to generate its complete outline. So you could do that
+      for every kite in the region, and discard duplicates.</p>
+    <p>But an even easier way than that is to only generate an output
+      hat when the iteration finds a kite which was #0 in its hat, and
+      even then, discard it if that whole hat doesn’t fit in the
+      output area. This guarantees to generate every valid output
+      hat <em>exactly once</em>, so no de-duplication is even
+      needed.</p>
+    <p>(If you need to generate hats that <em>cover</em> your output
+      area, instead of the subset of hats that fit entirely inside it,
+      then that algorithm can still be used – just expand the output
+      region by the maximum width of a hat on each side, so that any
+      hat that intersects the true region must fall entirely within
+      the expanded one.)</p>
+    <p>As long as you’re only looking at the three coordinates
+      (<i>k</i>,&nbsp;<i>h</i>,&nbsp;<i>m</i>) of each kite (which kite it is,
+      in which hat, of which <em>type</em> of first-order metatile),
+      it doesn’t matter that multiple different coordinates can refer
+      to the same location, because they’ll all agree on those three
+      points. The lowest-order coordinate index that can differ
+      is <i>c</i>, the question of which child of which second-order
+      metatile the first one is. So the information you really need
+      (kite index, and whether the hat is reflected) is easy to read
+      off reliably.</p>
+    <h3 id="ccoords-advantages">Advantages</h3>
+    <p>I’ve mentioned in passing a few ways that this combinatorial
+      coordinate technique is superior to recursive expansion. But
+      let’s bring them all together:</p>
+    <p><strong>Uniform distribution</strong>. By generating each
+      coordinate with the correct probability distribution, you can
+      arrange that your output patch of tiling is chosen
+      from <em>precisely</em> the overall limiting distribution, and
+      not just some approximation to it based on a large finite
+   …</p></div>
+<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/">https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/</a></em></p>]]>
+            </description>
+            <link>https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/aperiodic-tilings/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-35513475</guid>
+            <pubDate>Mon, 10 Apr 2023 15:26:43 GMT</pubDate>
         </item>
         <item>
             <title>
@@ -1143,7 +2204,7 @@ April 10, 2023 | https://www.beautifulpublicdata.com/1000-photos-of-dolphin-fins
             </title>
             <description>
 <![CDATA[
-Score 69 | Comments 13 (<a href="https://news.ycombinator.com/item?id=35511964">thread link</a>) | @ghuntley
+Score 70 | Comments 14 (<a href="https://news.ycombinator.com/item?id=35511964">thread link</a>) | @ghuntley
 <br/>
 April 10, 2023 | https://www.typetheoryforall.com//2023/04/09/29-Jimmy-Koppel.html | <a href="https://web.archive.org/web/*/https://www.typetheoryforall.com//2023/04/09/29-Jimmy-Koppel.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1619,7 +2680,7 @@ April 10, 2023 | https://bytes.zone/posts/modeling-git-internals-in-alloy-part-2
             </title>
             <description>
 <![CDATA[
-Score 158 | Comments 64 (<a href="https://news.ycombinator.com/item?id=35511152">thread link</a>) | @todsacerdoti
+Score 159 | Comments 65 (<a href="https://news.ycombinator.com/item?id=35511152">thread link</a>) | @todsacerdoti
 <br/>
 April 10, 2023 | https://jakob.space/blog/what-ive-learned-about-formal-methods.html | <a href="https://web.archive.org/web/*/https://jakob.space/blog/what-ive-learned-about-formal-methods.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="text-orgdfc40be">
@@ -2916,7 +3977,7 @@ I'm not sure how enlightening any of this is, but I think it does highlight how 
             </title>
             <description>
 <![CDATA[
-Score 72 | Comments 40 (<a href="https://news.ycombinator.com/item?id=35510349">thread link</a>) | @kiyanwang
+Score 74 | Comments 41 (<a href="https://news.ycombinator.com/item?id=35510349">thread link</a>) | @kiyanwang
 <br/>
 April 10, 2023 | https://newsletter.abinoda.com/p/changing-requirements | <a href="https://web.archive.org/web/*/https://newsletter.abinoda.com/p/changing-requirements">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><article><div><div><div dir="auto"><p><em>This is the latest issue of my newsletter. Each week I cover research, opinion, or practice in the field of developer productivity and experience.</em></p><p><span>This week I read </span><a href="https://ieeexplore.ieee.org/document/9769966" rel="">The Emotional Roller Coaster of Responding to Requirements Changes in Software Engineering</a><span>, a recent paper by researchers from the University of Auckland. The study aimed to understand how developers react emotionally to changing requirements at different stages of development.</span></p><p>The researchers hypothesized that unexpected or late Requirements Changes (RCs) impact more than just the cost, quality, or scheduled delivery of projects — they also affect developers' emotional states. Emotions are important because they act as behavioral motivators, and have “direct linkages to cognition, productivity, and decision-making.” By studying the emotional experience of requirements changes, the researchers sought to help engineering teams make more informed decisions about whether to introduce or accept changes.&nbsp;</p><p><em>Requirements changes (RCs) are defined in this study as “additions, modifications, and deletions of functional or non-functional requirements.”</em></p><p>This study was conducted through a world-wide survey of software practitioners. The survey included two core components: it used the Job-related Affective Well-being Scale (JAWS) to assess people’s emotional reactions to their job during the past 30 days. It also included a set of open-ended questions to capture participants’ emotions when handling RCs in their work and query about the different circumstances when they feel these emotions. To analyze survey data, the researchers used a combined approach of statistical analysis, JAWS, and Socio-Technical Grounded Theory (STGT).&nbsp;</p><p>Here’s what the study found:&nbsp;</p><p><span>The researchers explored what events trigger emotional responses with regards to requirements changes. </span><strong>The leading trigger was the </strong><em><strong>point of introduction</strong><span>, </span></em><span>or when the change was introduced in the development process</span><strong>.</strong><span> Other triggers identified included the frequency of introduction, impact, definition, status, severity, and how challenging the change is. These events cause developers to feel fatigued, frustrated, and angry.</span></p><p>The researchers also found that developers are anxious or frustrated when:</p><ul><li><p>the project has begun and requirements seem are not yet fully settled in,&nbsp;</p></li><li><p>RCs are introduced when developers are already in the midst of the implementation or testing phases,&nbsp;</p></li><li><p>a significant amount of interdependencies exist with the RC, or</p></li><li><p>the deadline is approaching.&nbsp;</p></li></ul><p>Time is a lever that teams can use to regulate the emotional responses caused by changes in requirements. Developers care about having a project remain on schedule; when a change must be introduced, consider whether the changes will still allow developers enough time to complete the work on schedule and if not whether the schedule can be changed.&nbsp;</p><p>Last minute RCs were found to be a common occurrence that disrupts flow and triggers emotions such as anger, anxiety, frustration, and fatigue. Conversely, when the RC fits the timeline (i.e., when we extend the timeline), this triggers “high” emotions such as feeling satisfied and energized.&nbsp;</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2e6e48f0-f354-46c4-9eb7-c5eb6262e818_2504x964.png" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2e6e48f0-f354-46c4-9eb7-c5eb6262e818_2504x964.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2e6e48f0-f354-46c4-9eb7-c5eb6262e818_2504x964.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2e6e48f0-f354-46c4-9eb7-c5eb6262e818_2504x964.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2e6e48f0-f354-46c4-9eb7-c5eb6262e818_2504x964.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2e6e48f0-f354-46c4-9eb7-c5eb6262e818_2504x964.png" width="1456" height="561" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/2e6e48f0-f354-46c4-9eb7-c5eb6262e818_2504x964.png&quot;,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:561,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2e6e48f0-f354-46c4-9eb7-c5eb6262e818_2504x964.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2e6e48f0-f354-46c4-9eb7-c5eb6262e818_2504x964.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2e6e48f0-f354-46c4-9eb7-c5eb6262e818_2504x964.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2e6e48f0-f354-46c4-9eb7-c5eb6262e818_2504x964.png 1456w" sizes="100vw" loading="lazy"></picture></div></a><figcaption></figcaption></figure></div><p>Apart from extending timelines when possible, the researchers also recommend that managers prioritize developers’ emotional well-being by being more empathetic in situations surrounding changing requirements.&nbsp;</p><p>Additionally, a decision guide is presented that may help decide when to introduce or accept a requirements change:&nbsp;</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7ad623ce-1ec5-444b-a749-0f36a4f96c7f_2484x1486.png" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7ad623ce-1ec5-444b-a749-0f36a4f96c7f_2484x1486.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7ad623ce-1ec5-444b-a749-0f36a4f96c7f_2484x1486.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7ad623ce-1ec5-444b-a749-0f36a4f96c7f_2484x1486.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7ad623ce-1ec5-444b-a749-0f36a4f96c7f_2484x1486.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7ad623ce-1ec5-444b-a749-0f36a4f96c7f_2484x1486.png" width="1456" height="871" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/7ad623ce-1ec5-444b-a749-0f36a4f96c7f_2484x1486.png&quot;,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:871,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7ad623ce-1ec5-444b-a749-0f36a4f96c7f_2484x1486.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7ad623ce-1ec5-444b-a749-0f36a4f96c7f_2484x1486.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7ad623ce-1ec5-444b-a749-0f36a4f96c7f_2484x1486.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7ad623ce-1ec5-444b-a749-0f36a4f96c7f_2484x1486.png 1456w" sizes="100vw" loading="lazy"></picture></div></a><figcaption></figcaption></figure></div><p>There is a growing body of research on developer emotions and their impact on outcomes such as productivity, creativity, and work quality. This trend is beneficial because it shows the importance of problems that developers know exist but that are harder to quantify, like changing requirements.&nbsp;</p><p><span>This paper may also be a useful conversation starter for teams experiencing friction </span><a href="https://martinfowler.com/articles/bottlenecks-of-scaleups/03-product-v-engineering.html" rel="">between product and engineering</a><span> that are specifically seeing frustration and rework due to product requirements lacking context.&nbsp;</span></p><p>That’s it for this week! Share your thoughts and feedback anytime by replying to this email. &nbsp;</p><p>If this email was forwarded to you, subscribe here so you don’t miss any future posts:&nbsp;</p><p>-Abi&nbsp;</p></div></div></div></article></div></div></div>]]>
@@ -2931,7 +3992,7 @@ April 10, 2023 | https://newsletter.abinoda.com/p/changing-requirements | <a hre
             </title>
             <description>
 <![CDATA[
-Score 269 | Comments 147 (<a href="https://news.ycombinator.com/item?id=35507814">thread link</a>) | @llambda
+Score 270 | Comments 147 (<a href="https://news.ycombinator.com/item?id=35507814">thread link</a>) | @llambda
 <br/>
 April 9, 2023 | https://www.maxcountryman.com/articles/we-need-to-talk-about-vercel | <a href="https://web.archive.org/web/*/https://www.maxcountryman.com/articles/we-need-to-talk-about-vercel">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>Recently there's been some discussion around Vercel and its hefty markup over AWS Lambda or its <a target="_blank" rel="noopener" href="https://twitter.com/shoeboxdnb/status/1643639119824801793">surprise runaway costs</a>.<sup><a id="user-content-fnref-billing-limits" href="https://www.maxcountryman.com/articles/we-need-to-talk-about-vercel#user-content-fn-billing-limits">1</a></sup> That said, there's an argument to be made that the development experience value add is worth the pretty penny. And indeed for some, that may be the case.</p>
@@ -3139,7 +4200,7 @@ April 9, 2023 | https://www.kix.in/2023/04/07/sd-lora-finetuning/ | <a href="htt
 <p>We’ll use <code>pyenv</code> again to manage our Python environment. Let’s make a new one for the <code>kohya_ss</code> GUI, as the requirements here differ slightly from the ones needed for the Automatic1111 UI.</p>
 
 <div><div><pre><code><span>$ </span>pyenv <span>install </span>3.10.10
-<span>$ </span>git clone <a href="https://www.kix.in/cdn-cgi/l/email-protection" data-cfemail="5e39372a1e39372a362b3c703d3133">[email&nbsp;protected]</a>:bmaltais/kohya_ss.git
+<span>$ </span>git clone <a href="https://www.kix.in/cdn-cgi/l/email-protection" data-cfemail="1a7d736e5a7d736e726f7834797577">[email&nbsp;protected]</a>:bmaltais/kohya_ss.git
 <span>$ </span><span>cd </span>kohya_ss
 <span>$ </span>pyenv <span>local </span>3.10.10
 </code></pre></div></div>
@@ -3582,7 +4643,7 @@ Steps: 35, Sampler: Euler a, CFG scale: 7, Seed: 363423421, Size: 512x512
             </title>
             <description>
 <![CDATA[
-Score 123 | Comments 37 (<a href="https://news.ycombinator.com/item?id=35506236">thread link</a>) | @rntz
+Score 124 | Comments 37 (<a href="https://news.ycombinator.com/item?id=35506236">thread link</a>) | @rntz
 <br/>
 April 9, 2023 | https://decomposition.al/blog/2023/04/08/who-invented-vector-clocks/ | <a href="https://web.archive.org/web/*/https://decomposition.al/blog/2023/04/08/who-invented-vector-clocks/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -3690,7 +4751,7 @@ April 9, 2023 | https://decomposition.al/blog/2023/04/08/who-invented-vector-clo
             </title>
             <description>
 <![CDATA[
-Score 186 | Comments 84 (<a href="https://news.ycombinator.com/item?id=35504402">thread link</a>) | @granddave
+Score 187 | Comments 84 (<a href="https://news.ycombinator.com/item?id=35504402">thread link</a>) | @granddave
 <br/>
 April 9, 2023 | https://davidisaksson.dev/posts/closing-stale-ssh-connections/ | <a href="https://web.archive.org/web/*/https://davidisaksson.dev/posts/closing-stale-ssh-connections/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><article><div><p>Suppose you’re connected to a remote host with SSH and after a while the SSH
@@ -5785,7 +6846,7 @@ other languages, but <code>goto</code> is far more flexible. <a href="#user-cont
             </title>
             <description>
 <![CDATA[
-Score 130 | Comments 26 (<a href="https://news.ycombinator.com/item?id=35502874">thread link</a>) | @mplanchard
+Score 131 | Comments 26 (<a href="https://news.ycombinator.com/item?id=35502874">thread link</a>) | @mplanchard
 <br/>
 April 9, 2023 | https://sabrinajewson.org/blog/errors | <a href="https://web.archive.org/web/*/https://sabrinajewson.org/blog/errors">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p id="published"><time datetime="2023-04-08">2023-04-08</time></p><nav><ul><li><a href="#blocks-txt">Case Study: A Blocks.txt Parser</a><ul><li><a href="#problem-1-backtraces">Problem 1: Backtraces</a></li><li><a href="#problem-2-inextensibility">Problem 2: Inextensibility</a></li><li><a href="#problem-3-error-matching">Problem 3: Error Matching</a></li><li><a href="#problem-4-privacy-and-stability">Problem 4: Privacy and Stability</a></li><li><a href="#problem-5-non-modularity">Problem 5: Non-Modularity</a></li></ul></li><li><a href="#guidelines-for-good-errors">Guidelines for Good Errors</a><ul><li><a href="#leveraging-source">Leveraging the <code>.source()</code> method</a></li><li><a href="#constructing-the-error-types">Constructing the error types</a></li><li><a href="#on-from">On <code>From</code></a></li><li><a href="#on-nearness">On “nearness”</a></li><li><a href="#verbosity">Verbosity</a></li></ul></li><li><a href="#conclusion">Conclusion</a></li></ul></nav><p>It is thankfully common wisdom nowadays that documentation must be placed as near as possible to the code it documents, and should be fine-grained to a minimal unit of describability (the thing being documented). The practice provides numerous benefits to the codebase and project as a whole:</p><ol><li>When editing the source code, contributors are less likely to forget to update the documentation as well, ensuring it is kept up-to-date and accurate.</li><li>When reading the source code, reviewers can easily jump back and forth between the docs and the code it documents, helping them understand it and allowing them to contrast the expected with actual behaviour.</li><li>The codebase becomes more modular. Individual parts can be extracted into different crates or projects if necessary, and strong abstraction boundaries make the code easier to understand in small pieces.</li></ol><p>But you probably already knew this; after all, Rust made the excellent design choice of making it the by far easiest method of writing documentation at all. And you probably also know that these same principles apply to tests: when unit tests are kept next to their minimum unit of checkability, you get the same benefits of convenient updating, assisted understanding and modularity. And most Rust projects do use unit tests in this way (when they can, for often there are limitations that prevent it from working), which again we can thank the tooling for.</p><p>But that’s all old news. What I’m here to convince you of today is that this principle applies additionally to <em>error types</em>: that is, error types should be located near to their unit of fallibility. To illustrate this point, I will follow the initial development and later API improvement of a hypothetical Rust library.</p><h2 id="blocks-txt"><a href="#blocks-txt"></a>Case Study: A Blocks.txt Parser</h2><p>Suppose you’re a library author, and you’re working on a crate to implement the parsing of <a href="https://www.unicode.org/Public/UCD/latest/ucd/Blocks.txt">Blocks.txt</a> in the <a href="https://unicode.org/ucd/">Unicode Character Database</a>. If you’re not familiar with this file, it defines the list of so-called <a href="https://en.wikipedia.org/wiki/Unicode_block">Unicode blocks</a>, which are non-overlapping contiguous categories that Unicode characters can be sorted into. It looks a bit like this:</p><pre><code>0000..007F; Basic Latin
@@ -6820,7 +7881,7 @@ April 9, 2023 | https://brr.fyi/posts/sunset | <a href="https://web.archive.org/
             </title>
             <description>
 <![CDATA[
-Score 195 | Comments 166 (<a href="https://news.ycombinator.com/item?id=35500528">thread link</a>) | @erlend_sh
+Score 197 | Comments 166 (<a href="https://news.ycombinator.com/item?id=35500528">thread link</a>) | @erlend_sh
 <br/>
 April 8, 2023 | https://framesurge.sh/perseus/en-US/ | <a href="https://web.archive.org/web/*/https://framesurge.sh/perseus/en-US/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="root"><header data-hk="11.0"></header><main data-hk="1.2" id="scroll-container"><div data-hk="2.12"><div data-hk="2.13" id="intro-tile"><div data-hk="2.14"><div data-hk="2.15"><p data-hk="2.0">The Rust framework for the modern web</p></div></div></div></div><div data-hk="3.9"><div data-hk="3.10" id="state_gen-tile"><div data-hk="3.11"><div data-hk="3.12"><p data-hk="3.0">Generate state, on your terms</p><p data-hk="3.1"><span data-hk="3.2">Perseus apps can generate state whenever they like and pass it to <a href="https://github.com/sycamore-rs/sycamore">Sycamore</a>, one of the fastest web frameworks in the world.</span></p></div></div></div></div><div data-hk="4.13"><div data-hk="4.14" id="i18n-tile"><div data-hk="4.15"><div data-hk="4.16"><div data-hk="4.0"><p><span data-hk="4.2" id="i18n-dotted-border">I18n</span><span data-hk="4.3">Internationalization</span></p><p><span data-hk="4.4"> that just works</span></p></div><p data-hk="4.5"><span data-hk="4.6">Just add translations using <a href="https://projectfluent.org/">Fluent</a>, and your app can be set up in seconds in multiple languages, with automatic user locale detection.</span></p></div></div></div></div><div data-hk="5.4"><div data-hk="5.5" id="opts-tile"><div data-hk="5.6"><div data-hk="5.7"><p data-hk="5.0">You want options? We got options.</p><p data-hk="5.1">Perseus comes with a built-in plugins system and full customizability of almost every part of the system. Static exporting? Serverful deployment? Fetch data by carrier pigeon? Easy.</p></div><div data-hk="5.8"><pre data-hk="5.2"><code data-hk="5.3"># 🚩 Get ready!
@@ -7319,10 +8380,109 @@ April 8, 2023 | https://fullystacked.net/posts/modern-html-email/ | <a href="htt
             </title>
             <description>
 <![CDATA[
-Score 303 | Comments 134 (<a href="https://news.ycombinator.com/item?id=35496712">thread link</a>) | @Backslasher
+Score 304 | Comments 134 (<a href="https://news.ycombinator.com/item?id=35496712">thread link</a>) | @Backslasher
 <br/>
 April 8, 2023 | https://blog.backslasher.net/1.5GB-string.html | <a href="https://web.archive.org/web/*/https://blog.backslasher.net/1.5GB-string.html">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section itemprop="text">
+        
+        <p>In my previous role, I supported a Java service that operated similarly to RDP or Citrix by enabling remote UI functionality. This service relied on sessions, which consisted of interconnected Java objects that were supposed to be cleaned up either when a user logged out or after a predetermined timeout period.</p>
+
+<p>During the course of our capacity planning, we discovered a significant memory waste that I wanted to share with you.</p>
+
+<h2 id="capacity-planning">Capacity Planning</h2>
+<p>Part of my routine work with the team included capacity planning for the next year.
+By analyzing our usage metrics, growth patterns, and population research, our data scientists were able to predict <em>how many users we could expect to have in the coming year</em>.</p>
+
+<p>To determine the necessary infrastructure required to support this anticipated user base, we employed a sophisticated formula:</p>
+
+\[\text{Number of Servers} = { \text{Number of Users} \over \text{Users per Server} } * \text{Safety Buffer}\]
+
+<p>To know how many <em>servers</em> we need to have for next year.</p>
+
+<p>One of our capacity planning sessions revealed that, due to the immense popularity of our service, we were anticipating a significant growth in the number of users in the coming year. Our calculations indicated that we would require more servers than we had available to accommodate this increased demand. Consequently, we were faced with the challenge of figuring out how to fit more users onto each individual server in order to support the projected user base.</p>
+
+<h2 id="what-are-we-bound-on">What are we bound on?</h2>
+<p>With capacity measurement, we can pinpoint the bottleneck in our system, and in this case, it is the memory. As more users are added to the server, the system begins to falter under the increased load, ultimately running out of memory. Understanding we are <em>memory-bound</em> is crucial, as it directs our efforts towards reducing memory consumption in order to accommodate more users on the server.</p>
+
+<h2 id="investigating-memory-usage">Investigating memory usage</h2>
+<p>We had a crude estimation of our per-user memory consumption using this:</p>
+
+\[\text{Per User Memory} = { \text{Server Memory} \over \text{User Capacity} }\]
+
+<p>Using imaginary numbers, we can say something like:</p>
+
+\[\text{Per User Memory} = \text{300MB} = { \text{90 GB} \over \text{300} }\]
+
+<p>So we can approxiamte per-user memory requirement as 300MB.
+In order to understand how to reduce this number, we went into more serious memory measurement.</p>
+
+<p>We began analyzing the Java memory dump of our servers to identify potential areas for improvement. Initially, we reviewed the dumps manually, but due to the sheer number of servers, we developed a custom script to automate the process. Using this script, we were able to identify memory-wasting objects that were attributed to specific sessions. By pinpointing these issues, we can effectively eliminate the waste and optimize our system’s memory usage.</p>
+
+<p>I might cover the script and analysis in another post, but for now I want to focus on a specific quick win the memory analysis gave us.</p>
+
+<h2 id="a-very-big-string">A very big string</h2>
+<p>We started with going over our thousands of memdumps and looking for very big objects. Our biggest whale was a 1.5GB string. It looked something like this:</p>
+
+<p><img src="https://blog.backslasher.net/assets/1.5GB-string/quote.png" alt="\\\\\\\\\\\\\\\\\\\&quot;"></p>
+
+<p>In case the picture didn’t convey the message, the string contained many many backslashes. We found similar smaller ones, but this one was the biggest.</p>
+
+<p>Investigating what the purpose of the string was, I saw that we had classes that looked like this:</p>
+
+<div><div><pre><code>
+<span>class</span> <span>Screen</span> <span>{</span>
+  <span>//...</span>
+  <span>private</span> <span>Screen</span> <span>previous</span><span>;</span>
+
+  <span>public</span> <span>String</span> <span>toJson</span><span>()</span> <span>{</span>
+    <span>JSONObject</span> <span>jo</span> <span>=</span> <span>new</span> <span>JSONObject</span><span>();</span>
+    <span>//...</span>
+    <span>if</span> <span>(</span><span>previous</span> <span>!=</span> <span>null</span><span>)</span> <span>{</span>
+      <span>jo</span><span>.</span><span>put</span><span>(</span><span>"previous"</span><span>,</span> <span>previous</span><span>.</span><span>toJson</span><span>());</span>
+    <span>}</span>
+    <span>//...</span>
+    <span>return</span> <span>jo</span><span>.</span><span>toString</span><span>();</span>
+  <span>}</span>
+<span>}</span>
+
+<span>class</span> <span>Session</span> <span>{</span>
+  <span>//...</span>
+  <span>String</span> <span>currentScreen</span><span>;</span>
+
+  <span>public</span> <span>void</span> <span>setUrl</span><span>(</span><span>Screen</span> <span>s</span><span>)</span> <span>{</span>
+    <span>currentScreen</span> <span>=</span> <span>s</span><span>.</span><span>toJson</span><span>();</span>
+  <span>}</span>
+<span>}</span>
+
+</code></pre></div></div>
+
+<p>So each screen has the previous screen the user visited, to allow the user to go “back” and get the exact screen they were in before (state, scrolling position, validation notices etc). The user session also has the current screen the user is in, so if the user reconnects to an existing session, we can return to where they were.</p>
+
+<p>There are two design problems here:</p>
+<ol>
+  <li>The “back” stack is unlimited, meaning we’re saving more and more state until we explode</li>
+  <li>by running <code>jo.put("previous", previous.toJson());</code>, we’re converting the JSON dictionary to a string. Since JSON fields have quotes, and those quotes need to be escaped when stored in a string, they are stored as <code>\"</code>.
+That backslash needs to be escaped when this string is stored inside another string, compouding into <code>\\\"</code>. A couple more rounds of this, and we get <code>\\\\\\\\\\\\\\\\"</code></li>
+</ol>
+
+<p>It turns out that a user with a session with lots of screens produced a <code>currentScreen</code> String of gigantic proportions.</p>
+
+<h2 id="handling-and-followup">Handling and followup</h2>
+<p>We divided the problem into a quick fix and a long-term one:</p>
+
+<p>The quick fix was truncating the “previous” string if it goes over a specific char amount (e.g. not letting it go over 100MB).
+While this is not a complete solution and might impact the user experience, it was very quick to implement and easy to test, boosting our reliability (preventing a specific session from inflating and bringing the server down).</p>
+
+<p>The long-term fix was rewriting the “previous” stack solution completely, creating a dedicated real stack with self-imposed size limits and reporting.
+It took a long time to write, and longer to test and slowly release, but it really prevented memory waste, rather than only hide away whale-strings as another form of memory (e.g. very deep JSON objects).</p>
+
+<h2 id="epilogue">Epilogue</h2>
+<p>We continued to use the memory-dump analysis tool and found more nonsense we killed, but nothing as easy as this.</p>
+
+<p>My main takeway from this story is that sometimes, checking the details of how your program uses resources (e.g. examining a memdump rather than just measuring overall memory utilization) is crucial for success and produces quick wins from the start.</p>
+
+        
+      </section></div>]]>
             </description>
             <link>https://blog.backslasher.net/1.5GB-string.html</link>
             <guid isPermaLink="false">hacker-news-small-sites-35496712</guid>
