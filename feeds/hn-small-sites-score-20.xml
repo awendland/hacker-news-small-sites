@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Tue, 25 Apr 2023 20:20:55 GMT</lastBuildDate>
+        <lastBuildDate>Wed, 26 Apr 2023 04:22:36 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-20.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Tue, 25 Apr 2023 20:20:55 GMT</pubDate>
+        <pubDate>Wed, 26 Apr 2023 04:22:36 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,499 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[You could have invented futexes]]>
+            </title>
+            <description>
+<![CDATA[
+Score 45 | Comments 19 (<a href="https://news.ycombinator.com/item?id=35708331">thread link</a>) | @dmarto
+<br/>
+April 25, 2023 | https://tavianator.com/2023/futex.html | <a href="https://web.archive.org/web/*/https://tavianator.com/2023/futex.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
+    <div id="body-container">
+        <!-- Provide site root to javascript -->
+        
+
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        
+
+        <nav id="sidebar" aria-label="Table of contents">
+            
+            
+        </nav>
+
+        <div id="page-wrapper">
+
+            <div class="page">
+                                
+                
+
+                
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                
+
+                <div id="content">
+                    <main>
+                        
+<div>
+<p><i></i> <time datetime="2023-04-21">2023-04-21</time>
+<i></i> Tavian Barnes
+<a href="https://github.com/tavianator/futex"><i></i> GitHub</a></p>
+</div>
+<p>The <em>futex</em> (<strong>f</strong>ast <strong>u</strong>serspace mu<strong>tex</strong>) is a Linux kernel feature designed for synchronization primitives (mutexes, condition variables, semaphores, etc.).
+Like many topics in concurrency, they have a reputation for being tricky (for example, see the paper <a href="https://akkadia.org/drepper/futex.pdf"><em>Futexes Are Tricky</em></a>).
+Despite that, they really are a well-motivated and simple but powerful API.
+This post tries to explain that motivation, and even shows how to implement something similar yourself.</p>
+<h2 id="spinlocks"><a href="#spinlocks">Spinlocks</a></h2>
+<p>Let's say you've found yourself implementing the C standard library (my condolences; hopefully this doesn't happen to you too often).
+If your libc has threads, it's also going to need locks.
+The easiest one to implement is probably a <a href="https://en.wikipedia.org/wiki/Spinlock">spinlock</a>, so you start there:</p>
+<pre><code>#include &lt;stdatomic.h&gt;
+
+typedef atomic_flag spinlock_t;
+
+#define SPINLOCK_INITIALIZER ATOMIC_FLAG_INIT
+
+void spin_lock(spinlock_t *lock) {
+    while (atomic_flag_test_and_set_explicit(lock, memoy_order_acquire)) {
+        // spin...
+    }
+}
+
+void spin_unlock(spinlock_t *lock) {
+    atomic_flag_clear(lock, memory_order_release);
+}
+</code></pre>
+<p>This is not the best spinlock implementation (it could be more efficient with <a href="https://rigtorp.se/spinlock/">TTAS</a>, or more fair as a <a href="https://en.wikipedia.org/wiki/Ticket_lock">ticket lock</a>), but it works.
+Maybe you're not a memory ordering expert, but <code>acquire</code> sounds right for <em>acquiring</em> a lock, and <code>release</code> sounds right for <em>releasing</em> it, so that's probably correct (it is).</p>
+<h2 id="mutexes"><a href="#mutexes">Mutexes</a></h2>
+<p>Spinlocks are great when they don't actually have to spin.
+But as soon as two threads are contending for the same lock, the one that loses the race starts spinning, at 100% CPU utilization, running up your power bill/killing your battery and contributing to global warming.
+It would be better for the spinning thread to go to sleep, using 0% CPU, until the lock gets unlocked.</p>
+<p>Okay, but how do you make a thread "go to sleep"?
+You could literally <code>sleep(1)</code>, but that's way too much latency.
+You could try <code>usleep(1)</code>, but then you're waking up a million times a second.
+Ideally, we would go to sleep <em>indefinitely</em>, and get whoever unlocks the lock to wake us up.</p>
+<p>There's a few ways to implement the "<em>go to sleep</em>" and "<em>wake another thread up</em>" operations, but they all involve system calls.
+You might have heard that syscalls are slow, particularly since <a href="https://www.brendangregg.com/blog/2018-02-09/kpti-kaiser-meltdown-performance.html">Meltdown</a>/<wbr><a href="https://www.phoronix.com/review/3-years-specmelt">Spectre</a>, so you want to avoid them when you can.
+That means</p>
+<ul>
+<li><code>mutex_lock()</code> should avoid sleeping if possible, and</li>
+<li><code>mutex_unlock()</code> should avoid waking anyone up if no one's asleep</li>
+</ul>
+<p>Whether any threads are asleep is a third state (in addition to <em>locked</em> and <em>unlocked</em>), so we can't use an <code>atomic_flag</code> any more.</p>
+<pre><code>typedef atomic_int mutex_t;
+
+enum {
+    UNLOCKED,
+    LOCKED,
+    SLEEPING,
+};
+
+#define MUTEX_INITIALIZER UNLOCKED
+</code></pre>
+<p>Moving from the <code>UNLOCKED</code> to the <code>LOCKED</code> state is cheap, so that's the first thing we try.
+Otherwise, we move to the <code>SLEEPING</code> state, and wait to be woken up.</p>
+<pre><code>void mutex_lock(mutex_t *mutex) {
+    int old = UNLOCKED;
+    if (atomic_compare_exchange_weak_explicit(
+        mutex, &amp;old, LOCKED,
+        memory_order_acquire,  // Memory order if it succeeds
+        memory_order_relaxed)) // Memory order if it fails
+    {
+        return;
+    }
+
+    while (true) {
+        old = atomic_exchange_explicit(mutex, SLEEPING, memory_order_acquire);
+        if (old == UNLOCKED) {
+            return;
+        }
+        // 🐛
+        go_to_sleep();
+    }
+}
+
+void mutex_unlock(mutex_t *mutex) {
+    int old = atomic_exchange_explicit(mutex, UNLOCKED, memory_order_release);
+    if (old == SLEEPING) {
+        wake_someone_up();
+    }
+}
+</code></pre>
+<p>You might have spotted a bug in this code: if one thread runs <code>wake_someone_up()</code> while another is at the line marked 🐛, before <code>go_to_sleep()</code> gets called, then no one will wake up (because no one is asleep yet).
+Then when <code>go_to_sleep()</code> does get called, it might sleep forever, as no one else will wake it up.
+This condition is known as a <em>lost wakeup</em>, and left untreated, would cause a deadlock.</p>
+
+<div id="race-1">
+<pre><code><span>// mutex_lock()
+</span><span>old = exchange(mutex, SLEEPING, acquire);
+</span><span>if (old == UNLOCKED) {
+</span><span>    return;
+</span><span>}
+</span><span>// 🐛
+</span><span>go_to_sleep();
+</span><span></span></code></pre>
+<pre><code><span>// mutex_unlock()
+</span><span>old = exchange(mutex, UNLOCKED, release);
+</span><span>if (old == SLEEPING) {
+</span><span>    wake_someone_up();
+</span><span>}
+</span><span></span></code></pre>
+</div>
+
+
+<p>It's not obvious how to fix this.
+We could try to detect the race and avoid sleeping, but that just moves the race window, rather than closing it completely.</p>
+<div id="race-2">
+<pre><code><span>// mutex_lock()
+</span><span>old = exchange(mutex, SLEEPING, acquire);
+</span><span>if (old == UNLOCKED) {
+</span><span>    return;
+</span><span>}
+</span><span>if (load(mutex, relaxed) == SLEEPING) {
+</span><span>    // 🐛
+</span><span>    go_to_sleep();
+</span><span>}
+</span><span></span></code></pre>
+<pre><code><span>// mutex_unlock()
+</span><span>old = exchange(mutex, UNLOCKED, release);
+</span><span>if (old == SLEEPING) {
+</span><span>    wake_someone_up();
+</span><span>}
+</span><span></span></code></pre>
+</div>
+
+<p>If you had an <em>atomic</em> version of</p>
+<pre><code>if (atomic_load_explicit(mutex, memory_order_relaxed) == SLEEPING) {
+    go_to_sleep();
+}
+</code></pre>
+<p>so that the wakeup could not possibly happen between the <code>if</code> and the <code>go_to_sleep()</code>, that would fix the bug.
+That's what a futex is!</p>
+<h2 id="futexes"><a href="#futexes">Futexes</a></h2>
+<p>A minimal futex API looks something like this:</p>
+<pre><code>// Atomically check if `*futex == value`, and if so, go to sleep
+void futex_wait(atomic_int *futex, int value);
+
+// Wake up a thread currently waiting on `futex`
+void futex_wake(atomic_int *futex);
+</code></pre>
+<p>Your mutex implementation could use them like this:</p>
+<pre><code>void mutex_lock(mutex_t *mutex) {
+    ...
+
+    while (true) {
+        old = atomic_exchange_explicit(mutex, SLEEPING, memory_order_acquire);
+        if (old == UNLOCKED) {
+            return;
+        }
+        futex_wait(mutex, SLEEPING);
+    }
+}
+
+void mutex_unlock(mutex_t *mutex) {
+    int old = atomic_exchange_explicit(mutex, UNLOCKED, memory_order_release);
+    if (old == SLEEPING) {
+        futex_wake(mutex, 1);
+    }
+}
+</code></pre>
+<p>This implementation is finally bug-free (I hope, anyway; after all, <em>futexes are tricky</em>).
+You could implement <code>futex_wait()</code> and <code>futex_wake()</code> using the <code>futex()</code> system call, but it's instructive to implement them a different way: with <a href="https://en.wikipedia.org/wiki/Signal_(IPC)">signals</a>.
+<code>futex_wait()</code> will go to sleep until a signal arrives, and <code>futex_wake()</code> will send a signal to the waiting thread(s).
+To do this, we'll keep track of the waiting threads on a <em>wait queue</em>:</p>
+<pre><code>// A single waiting thread
+struct waiter {
+    // The waiting thread
+    pthread_t thread;
+    // The futex it's waiting on
+    atomic_int *futex;
+    // A linked list of waiters.
+    struct waiter *prev, *next;
+};
+
+// A wait queue
+struct waitq {
+    // Lock that protects the wait queue (can't be a mutex,
+    // since we're implementing mutexes)
+    spinlock_t lock;
+    // A circular linked list of waiters
+    struct waiter list;
+};
+
+// The global wait queue
+struct waitq waitq = {
+    .lock = SPINLOCK_INITIALIZER,
+    .list = {
+        .prev = &amp;waitq.list,
+        .next = &amp;waitq.list,
+    },
+};
+</code></pre>
+<p><code>futex_wait()</code> adds the calling thread to the wait queue and sleeps until a signal arrives with <a href="https://pubs.opengroup.org/onlinepubs/9699919799/functions/sigwait.html"><code>sigwait()</code></a>.</p>
+<pre><code>void futex_wait(atomic_int *futex, int value) {
+    spin_lock(&amp;waitq.lock);
+
+    struct waiter *head = &amp;waitq.list;
+    struct waiter waiter = {
+        .thread = pthread_self(),
+        .futex = futex,
+        .prev = head,
+        .next = head-&gt;next,
+    };
+
+    // Insert the waiter into the list
+    waiter.prev-&gt;next = &amp;waiter;
+    waiter.next-&gt;prev = &amp;waiter;
+
+    // Block the signal in the current thread so we can wait for it
+    sigset_t old_mask, mask;
+    sigemptyset(&amp;mask);
+    sigaddset(&amp;mask, SIGCONT);
+    pthread_sigmask(SIG_BLOCK, &amp;mask, &amp;old_mask);
+
+    while (atomic_load_explicit(futex, memory_order_relaxed) == value) {
+        // Unlock the wait queue before we sleep
+        spin_unlock(&amp;waitq.lock);
+        // Sleep until we receive SIGCONT
+        int sig;
+        sigwait(&amp;mask, &amp;sig);
+        // Re-lock the wait queue
+        spin_lock(&amp;waitq.lock);
+    }
+
+    // Remove ourselves from the wait queue
+    waiter.prev-&gt;next = waiter.next;
+    waiter.next-&gt;prev = waiter.prev;
+
+    // Restore the old signal mask
+    pthread_sigmask(SIG_SETMASK, &amp;old_mask, NULL);
+
+    spin_unlock(&amp;waitq.lock);
+}
+</code></pre>
+<p><code>futex_wake()</code> walks the wait queue, signalling any threads waiting on the same futex:</p>
+<pre><code>void futex_wake(atomic_int *futex) {
+    spin_lock(&amp;waitq.lock);
+
+    struct waiter *head = &amp;waitq.list;
+    for (struct waiter *waiter = head-&gt;next; waiter != head; waiter = waiter-&gt;next) {
+        if (waiter-&gt;futex == futex) {
+            pthread_kill(waiter-&gt;thread, SIGCONT);
+            break;
+        }
+    }
+
+    spin_unlock(&amp;waitq.lock);
+}
+</code></pre>
+<p>You might think this has the same race condition as before, that if <code>pthread_kill()</code> happens right before <code>sigwait()</code>, the wakeup will be lost.
+But in fact, because we blocked <code>SIGCONT</code> first, it will remain pending, and <code>sigwait()</code> will return immediately.</p>
+<div id="race-3">
+<pre><code><span>// futex_wait()
+</span><span>while (load(futex, relaxed) == value) {
+</span><span>    spin_unlock(&amp;waitq.lock);
+</span><span>    int sig;
+</span><span>    sigwait(&amp;mask, &amp;sig);
+</span><span>    spin_lock(&amp;waitq.lock);
+</span><span>}
+</span><span></span></code></pre>
+<pre><code><span>// futex_wake()
+</span><span>spin_lock(&amp;waitq.lock);
+</span><span>...
+</span><span>pthread_kill(waiter-&gt;thread, SIGCONT);
+</span><span>...
+</span><span>spin_unlock(&amp;waitq.lock);
+</span><span></span></code></pre>
+</div>
+
+<h2 id="scaling"><a href="#scaling">Scaling</a></h2>
+<p>The above implementation works, but the single wait could cause a lot of unnecessary contention if many threads are waiting on different futexes.
+We could reduce that contention by having multiple wait queues, and using a hash function to assign each futex to a (hopefully) different wait queue.</p>
+<pre><code>struct waitq table[TABLE_SIZE];
+
+// Use the address of the futex to pick a wait queue
+struct waitq *get_waitq(atomic_int *futex) {
+    size_t i = hash((uintptr_t)futex);
+    return &amp;table[i % TABLE_SIZE];
+}
+</code></pre>
+<p>That's basically what the <a href="https://github.com/torvalds/linux/blob/master/kernel/futex/core.c">actual futex implementation</a> does.
+It's also what WebKit's <a href="https://webkit.org/blog/6161/locking-in-webkit/">ParkingLot</a> does, and in general it's a very useful trick for reducing contention.</p>
+
+                    </main>
+
+                    
+                </div>
+            </div>
+
+            
+
+        </div>
+
+
+
+
+
+
+        
+        
+        
+
+        
+        
+        
+
+        <!-- Custom JS scripts -->
+
+
+    </div>
+    
+
+</div>]]>
+            </description>
+            <link>https://tavianator.com/2023/futex.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-35708331</guid>
+            <pubDate>Wed, 26 Apr 2023 00:10:56 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[LTESniffer: An open-source LTE downlink/uplink eavesdropper [pdf]]]>
+            </title>
+            <description>
+<![CDATA[
+Score 188 | Comments 28 (<a href="https://news.ycombinator.com/item?id=35705683">thread link</a>) | @stacktrust
+<br/>
+April 25, 2023 | https://syssec.kaist.ac.kr/pub/2023/wisec2023_tuan.pdf | <a href="https://web.archive.org/web/*/https://syssec.kaist.ac.kr/pub/2023/wisec2023_tuan.pdf">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
+            </description>
+            <link>https://syssec.kaist.ac.kr/pub/2023/wisec2023_tuan.pdf</link>
+            <guid isPermaLink="false">hacker-news-small-sites-35705683</guid>
+            <pubDate>Tue, 25 Apr 2023 19:47:37 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Show HN: I built a multiplayer voxel browser game engine]]>
+            </title>
+            <description>
+<![CDATA[
+Score 117 | Comments 40 (<a href="https://news.ycombinator.com/item?id=35705063">thread link</a>) | @Vekz
+<br/>
+April 25, 2023 | https://kevzettler.com/2023/04/25/multiplayer-voxel-game-engine/ | <a href="https://web.archive.org/web/*/https://kevzettler.com/2023/04/25/multiplayer-voxel-game-engine/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><h2>TLDR;</h2>
+<p>This post is a retrospective on a <a href="https://github.com/kevzettler/multiplayer-voxel-browser-game-engine" target="_blank" rel="noopener noreferrer">multiplayer voxel browser game engine</a> I built. This post will cover the squishy storytelling side of the project, and the <a href="https://github.com/kevzettler/multiplayer-voxel-browser-game-engine" target="_blank" rel="noopener noreferrer">accompanying code repository</a> has all of the intricate technical details. This post is essentially a 2 part post. Read this and read the <a href="https://github.com/kevzettler/multilpayer-voxel-browser-game-engine" target="_blank" rel="noopener noreferrer">repo README</a>.</p>
+<p><a href="https://kevzettler.com/img/multiplayer-engine-post/play.gif">
+  <img src="https://kevzettler.com/img/multiplayer-engine-post/play.gif" alt="Animated give of a 3d multiplayer browser engine" title="Demonstration of multiplayer game engine multiple players">
+</a></p><h3>Context</h3>
+<p>This project is a bit old and stale at the time of this post. Some of the tech decisions made sense during development but are questionable today. I will try to address that in this post. I started this project with very minimal game development experience. I had no idea how many things worked, shaders, 3d asset files, raw binary buffer manipulation, scene graphs, and physics engines. I learned all these skills and more during this project. This experience also helped me later land some major corporate projects. This project was primarily active from 2017-2019; however, exploration for the project goes back to late 2016.</p>
+<p><a href="https://kevzettler.com/img/multiplayer-engine-post/disclaimer.png">
+  <img src="https://kevzettler.com/img/multiplayer-engine-post/disclaimer.png" alt="Should you build a custom engine? Yes." title="Should you build a custom engine? Yes" width="400">
+</a></p><h2>Inspiration &amp; motivation</h2>
+<p>I wanted to build a multiplayer browser game. I was very inspired by <code>.io</code> games and sites like <a href="https://iogames.space/" target="_blank" rel="noopener noreferrer">iogames.space</a>. I love the <code>.io</code> gaming experience of copy-pasting a URL around and getting in a game with your friends. I wanted to recreate a canceled MMO called <a href="https://en.wikipedia.org/wiki/Exteel" target="_blank" rel="noopener noreferrer">Exteel</a> in an <code>.io</code> style. My background was in web development and design. I stuck with the tools and environment I was most familiar with.</p>
+<h3>Target Features</h3>
+<ul><li>network multiplayer</li>
+<li>playable cross-platform in the browser</li>
+<li>Player avatar customization</li>
+<li>lazy loading assets</li>
+<li>shared client &amp; server game code</li>
+<li>third person camera</li>
+<li>platforming physics</li>
+<li>destructible environments</li>
+</ul>
+<p>I completed most of these features except for destructible environments. Destructible environments were a big driver for the voxel asset pipeline, assuming voxels would enable the destructibility. Another browser game <a href="https://github.com/Lallassu/VoxLords" target="_blank" rel="noopener noreferrer">VoxLords</a> inspired the goal of destructible environments. VoxLords had good environmental destruction and captured my imagination. I started this out by forking and modifying VoxLords to be multiplayer.</p>
+<p><a href="https://twitter.com/lallassu/status/725401257377169409?s=20">https://twitter.com/lallassu/status/725401257377169409?s=20</a></p>
+<p>After hacking on VoxLords, it was clear that making a captivating 3D multiplayer browser experience was possible. Unfortunately, Lallassu was correct, and there were some major performance issues in the VoxLords engine that would require extensive refactoring. I decided to start a new project.</p>
+<h4>Why I didn't use one of the megacorp engines</h4>
+<p>I was not happy with Unity and Unreal's HTML5 browser experience. Unity's HTML5 export creates a giant asset bundle where users must sit and watch a loading bar before playing. This loading bar experience was against my goals of lazy loading assets on demand. Additionally, Unity's multiplayer server-side support was sketchy and <a href="https://radcade.com/unity-multiplayer-netcode-for-gameobjects/" target="_blank" rel="noopener noreferrer">still is</a>. Unreal had much stronger multiplayer support but similar issues with browser builds, and in addition, Unreal itself was too large to install on my laptop.</p>
+<h2>The work</h2>
+<p>After hacking the VoxLords multiplayer fork, I started by exploring multiple tech stacks concurrently and building a prototype in each. The stacks I looked at were <a href="https://www.babylonjs.com/" target="_blank" rel="noopener noreferrer">Babylon.js</a>, <a href="https://threejs.org/" target="_blank" rel="noopener noreferrer">Three.js</a>, &amp; <a href="http://stack.gl/" target="_blank" rel="noopener noreferrer">Stackgl</a>.</p>
+<h3>Tech Stack Requirements</h3>
+<p>The first requirement was support for the 3d asset pipeline. I had been working with voxel models in <a href="https://ephtracy.github.io/" target="_blank" rel="noopener noreferrer">MagicaVoxel .vox</a> format. The .vox format was great for static entities. There are primarily two ways to animate a voxel model. You can create frame-based animation, in which each frame is a separate voxel animation, and then you morph or swap them out at runtime. Or you can apply skeletal transformation data to voxel meshes. If you decide on the skeletal route, you must break the voxel mesh into smaller meshes corresponding to the skeleton bones.</p>
+<p>I had a character mesh that I wanted to use in .vox format, but at the time MagicaVoxel did not support multiple meshes. I converted the .vox file to <a href="https://www.getqubicle.com/" target="_blank" rel="noopener noreferrer">quiblce .qb</a> file and broke the character up into separate meshes.</p>
+<p><a href="https://kevzettler.com/img/multiplayer-engine-post/qubicle.png">
+  <img src="https://kevzettler.com/img/multiplayer-engine-post/qubicle.png" alt="Qubicle UI breaking a mesh up." title="Using Qubicle to break up a mesh for skeletal animation">
+</a></p><p>I then imported the segmented Qubicle mesh into Blender and built the skeletal animations in Blender.</p>
+<p><a href="https://kevzettler.com/img/multiplayer-engine-post/blender.gif">
+  <img src="https://kevzettler.com/img/multiplayer-engine-post/blender.gif" alt="Blender skeletal walking animation." title="Voxel model animated in Blender with skeletal animation">
+</a></p><p>The engine then combines the animation data and voxel mesh data at runtime.</p>
+<h3>Tech Stack Evaluation</h3>
+<ul><li><a href="https://threejs.org/" target="_blank" rel="noopener noreferrer">three.js</a><p>I looked at Three.js first because VoxLords was built with it. The Three.js - Blender pipeline had issues, and we could not utilize skeletal animation imports. A colleague of mine who was working on a Three.js project captured some of the <a href="https://gist.github.com/AndrewRayCode/746be166c3008a03167206aec4a46531" target="_blank" rel="noopener noreferrer"> three.js blender exporter issues</a> at the time. The Three.js - Blender compatibility issues were a deal breaker for me.</p>
+<p>Furthermore, Three.js did not have a viable headless server-side offering. Three.js uses custom math libraries that were not easily extractable from the rendering code. This tight coupling of math primitives and client render code meant multiplayer support would take a lot of extra duplicate work, re-implementing the game logic on the server. Three.js has advanced significantly since then, and I don't think these are issues anymore.</p>
+</li>
+<li><a href="https://www.babylonjs.com/" target="_blank" rel="noopener noreferrer">babylon.js</a><p>I made some immediate promising progress in Babylon.js. The asset pipeline was robust and supported skeletal animation data. Babylon has a camera and physics out of the box. The Babylon team and community were super responsive and supportive. I hit a wall with Babylon.js when building the multiplayer server. Like Three.js, Babylon.js had no headless mode. Again, building multiplayer would require duplicate work reproducing all the simulation logic and physics in the server-side codebase. Recent versions of Babylon have a robust headless mode and have decoupled the framework into smaller libraries. These days Three.js is the king of the normie mindshare lexicon, but I still find Babylon.js a much better offering.</p>
+</li>
+<li><a href="http://stack.gl/" target="_blank" rel="noopener noreferrer">stackgl</a><p>Stackgl is the dark horse of this list. Stackgl is not trying to be a complete 3D engine like Three.js and Babylon.js. Stackgl is an ecosystem of small functional tools that can be composed to create 3d browser experiences. Stackgl follows the Unix philosophy of "small sharp tools." Stackgl has some main pillars: Rendering, Math, and Data. Stackgl handles rendering by focusing on direct shader code. Babylon.js and Three.js try to abstract shaders heavily away. Stackgl's primary rendering module is <a href="http://regl.party/" target="_blank" rel="noopener noreferrer">Regl</a>, which provides an entirely novel stateless rendering pattern. Stackgl then provides many small functional math modules for vertex and geometry data. I was quickly more productive in Stackgl than in the previous two stacks.</p>
+<p>The modular nature made it very easy to share code between the client and server, easy to optimize performance and rendering, and easy to add custom functionality. For example, Babylon.js and Three.js have their own vector math implementation libraries. Then if you use a physics engine, the physics engines have their internal vector math libraries. Furthermore, if you use a multiplayer server, you will also need a vector math library there.</p>
+</li>
+</ul><p>
+In Babylon and Three, it becomes a lot of fake work converting and serializing between different vector implementations. In Stackgl, you can easily use the same <a href="https://glmatrix.net/" target="_blank" rel="noopener noreferrer">gl-matrix vector math library</a> across a project which is a huge productivity gain.<a href="https://kevzettler.com/img/multiplayer-engine-post/engines.png">
+  <img src="https://kevzettler.com/img/multiplayer-engine-post/engines.png" alt="Screenshot of GitHub showing multiple game engines." title="Which 3d browser engine is best?">
+</a></p><p><b>When I started progressing with Stackgl, I took a year off and worked on it full-time throughout 2017.</b></p>
+<h2>What went wrong</h2>
+<p>Unfortunately, I consider this project unfinished. I did not ship a complete game experience, and there are some issues with the engine that would be risky for production deployment. I'm writing this post to put closure on the project before moving on to new work and in the hopes that this experience may be helpful to any others interested in this space.</p>
+<h4>React vs. Vanilla Js</h4>
+<p>Most of my web development experience has been with the React framework, and I thought it would complement Regl and the Stackgl ecosystem's functional paradigm. I created a <a href="https://github.com/kevzettler/react-regl" target="_blank" rel="noopener noreferrer">react reconciler to bridge React and Regl</a>. I started using a React stack with Redux to manage all the game state and state transitions. This React+Redux combo turned out to be a huge boon when writing UI. Game developers in traditional engines constantly complain about UI being their least favorite task. The game dev UI complaint is because game engines use geriatric 2-way mutable state management UI code that is error-prone and brittle. Web developers have solved these UI complaints and built tools like React that make creating UIs easy.</p>
+<p><a href="https://kevzettler.com/img/multiplayer-engine-post/react.gif">
+  <img src="https://kevzettler.com/img/multiplayer-engine-post/react.gif" alt="animated gif of a React 3d browser UI." title="React 3d player avatar creation system" width="400">
+</a></p><p>React+Redux setup was too much performance overhead for the real-time gameplay section. The state updates through the Redux action reducer pipeline, and the minimal React render updates were enough to cause noticeable hiccups in the gameplay frame rate. Performance in the browser environment is susceptible to garbage collector management. To minimize garbage collector hits, you need to use object pooling. Object pooling is a mutable state management pattern in which you pre-allocate a pool of objects. The collection of allocated objects gets mutated and reused during the program's life to minimize runtime memory allocations. This object pooling pattern conflicts with the immutable update patterns of React and Redux. Hitting these performance issues was a significant roadblock and essentially became a 'rewrite' in which I had to rewrite the game state management to be performance optimized. This rewrite was costly and took a lot of time.</p>
+<h4>Hobby time</h4>
+<p>When I started progressing with Stackgl, I took a year off and worked on it full-time throughout 2017. I lived off some savings and unemployment checks until late 2018. I got back into corporate roles from 2018-2020. I was invited to Animecon 2019 indie developer section to shill my game in the Indie game section.</p>
+<p><a href="https://kevzettler.com/img/multiplayer-engine-post/animecon.png">
+  <img src="https://kevzettler.com/img/multiplayer-engine-post/animecon.png" alt="A photo of me at Animecon 2019." title="Playing a game with a 2B cosplayer at Animecon 2019">
+</a></p><p>During this time, I switched to hobby mode and started putting less and less time into development. I was maybe averaging 4 hours a week. I was distracted by day job work. This time shortage slowed development progress. Development picked up during the 2020 Covid lockdowns. Unfortunately, returning to development after a hiatus presented some new challenges.</p>
+<h5>Software entropy</h5><p>
+The JavaScript ecosystem is known for moving incredibly fast. I spent much time-fighting severe software entropy when I returned to development. Getting the project to build with the latest dependency chains of Node+NPM+webpack etc., took a lot of work. The animation pipeline using Landon had severe entropy. Landon is a mix of Rust, JavaScript, and Blender versions that are not strictly pinned. The Landon developer was changing the data output format and abandoned the skeletal animation system I used. I had to do work to upgrade to the latest Blender export versions but then write backward compatibility translation layers for the animation data. I upgraded my laptop to an M1 Mac. The M1 transition triggered a roadblock on the project because the WebRTC module I used would not compile on the new M1 Apple silicon chip. The WebRTC module now supports M1 architectures but was pretty much the show-stopper.</p><h2>Byproducts</h2>
+<p>The work put into this project spun off some valuable libraries I have open-sourced and put on GitHub.</p>
+<ul><li><a href="https://github.com/kevzettler/react-regl" target="_blank" rel="noopener noreferrer">react-regl</a><p>A react reconciler to bridge React and Regl</p>
+</li>
+<li><a href="https://github.com/kevzettler/parse-magica-voxel" target="_blank" rel="noopener noreferrer">parse-magica-voxel</a><p>A JavaScript parser for the Magicavoxel .vox binary file format</p>
+</li>
+<li><a href="https://github.com/kevzettler/parse-qubicle" target="_blank" rel="noopener noreferrer">parse-quibicle</a><p>A JavaScript parser for the .qb binary file format.</p>
+</li>
+<li><a href="https://github.com/kevzettler/gl-swept-sphere-triangle" target="_blank" rel="noopener noreferrer">gl-swept-sphere-triangle</a><p>A swept sphere to polygon collision detection algorithm</p>
+</li>
+</ul>
+<h2>Shout outs</h2>
+<p>I built this project with the help and research of other highly skilled software engineers. Their contributions were critical to the development of this project.</p>
+<ul><li><a href="https://twitter.com/MikolaLysenko" target="_blank" rel="noopener noreferrer">Mikola lysenko</a><p>Mikola is a primary driver of the Stackgl ecosystem and a certified 10x genius developer. His blog <a href="https://0fps.net/" target="_blank" rel="noopener noreferrer">0fps.net</a> has some mind-melting content on high-performance computer science and geometry. Mikola assembled a team and built a Roblox clone for China in the browser. The team got together for a podcast to discuss their <a href="https://www.youtube.com/watch?v=Z_--8z549D4" target="_blank" rel="noopener noreferrer">Reflections on building web-based voxel MMO in China (Mikola Lysenko, et al) - YouTube</a>  It is a highly insightful talk, highly recommend if you found this post interesting.</p>
+</li>
+<li><a href="https://chinedufn.com/" target="_blank" rel="noopener noreferrer">Chinedu Francis Nwafili</a><p>Chinedu did terrific work by building the <a href="https://github.com/chinedufn/skeletal-animation-system" target="_blank" rel="noopener noreferrer">stackgl skeletal animation system</a>, which is a vital piece of the Stackgl ecosystem, and this project was highly dependent on and probably couldn't have come together without. While I was building this project, Chinedu also created his own game and engine. We kept in correspondence while making and sharing ideas. Chinedu also built out a very cool suite of tools for Blender called <a href="https://github.com/chinedufn/landon" target="_blank" rel="noopener noreferrer">landon</a>. Landon makes Blender a source of truth for game engine data. Chinedu's blog at <a href="https://chinedufn.com/" target="_blank" rel="noopener noreferrer">https://chinedufn.com/</a> has in-depth development journal posts on his game engine development.</p>
+</li>
+<li><a href="http://www.jameswarlloyd.com/" target="_blank" rel="noopener noreferrer">James Warlloyd</a><p>James created the <a href="https://opengameart.org/content/voxel-mech-sniper" target="_blank" rel="noopener noreferrer">original mech model</a> that I used as the bases for the character art in this engine.</p>
+</li>
+</ul>
+<h2>The state of the art</h2>
+<p>Overall this project was a significant educational return on investment for me. I learned about hardcore browser optimization and many other data-processing techniques. I have continued to do game ( and engine ) development as a hobby and have already looked into some other emerging technologies. My focus is still on browser multiplayer experiences.</p>
+<p>Despite their popularity, I am dissatisfied with the multiplayer offerings provided by the major engines, Unreal, Unity, and Godot, as they fail to deliver user-friendly solutions catered to the needs of indie developers. I have previously written about <a href="https://radcade.com/how-to-add-network-multiplayer-to-your-indie-game/" target="_blank" rel="noopener noreferrer">multiplayer game engine design for indies</a>. The big engines use coding patterns that couple game simulation code to rendering code. This coupling makes it challenging to build a server as you have to decouple the simulation and run it headless.</p>
+<ul><li><a href="https://dotbigbang.com/" target="_blank" rel="noopener noreferrer">DotBigBang</a><p>DotBigBang is everything this project attempted to be and more. It is a multiplayer voxel 3d engine, all fully in the browser. DotBigBang is focused on user-generated content and is essentially a multiplayer game engine. You can get a group of people together, bring your avatars into a 3D scene, and then collaboratively edit and program that scene like a multiplayer Unity editor experience. I had the fortune to hang with the founder of DotBigBang at GDC 2023 and hear about some impressive browser performance optimization they were doing. He told me about forking Chromium to have better performance debugging visibility into how the JIT compilation and memory usage of the browser was working.</p>
+</li>
+<li><a href="https://github.com/matrix-org/thirdroom#manifold-engine" target="_blank" rel="noopener noreferrer">Manifold engine</a><p>The Manifold engine is a stealthy engine currently in development by the <a href="https://matrix.org/" target="_blank" rel="noopener noreferrer">matrix.org</a> team. Manifold is embedded in a repository for another project with a disclaimer they might release in the future. The host project is 'Thirdroom,' a multiplayer VR metaverse platform.</p>
+<p>When I learned about Manifold I was very excited because it has the same design philosophy and high-performance computation architecture that I had been building towards. It uses Web Workers to create multiple threads to process rendering, physics, and networking separately. All the threads share memory over a <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/SharedArrayBuffer" target="_blank" rel="noopener noreferrer">SharedArrayBuffer</a>, and they use object pooling to reduce garbage collection. Manifold also has WebRTC Data channels for networking. I built a promising prototype in Manifold; unfortunately, Manifold is tightly coupled to a matrix.org backend. The matrix backend has a clunky API to use, which would make custom server-side optimization challenging. If the matrix.org team ever decouples and delivers Manifold, it would be a very compelling option.</p>
+</li>
+<li><a href="https://github.com/AmbientRun/Ambient" target="_blank" rel="noopener noreferrer">Ambient engine</a><p>Ambient is a promising new Rust lang engine. It is a default multiplayer engine. It shares code between the client and server. It compiles game code to WASM and then acts as a cross-platform binary runtime to execute that WASM. I have built a promising prototype in Ambient but unfortunately Ambient does not currently have a browser build. The Ambient team is actively working to target browsers and is aiming for an upcoming release.</p>
+</li>
+</ul>
+<p><b>Thanks for reading. checkout the</b> <a href="https://github.com/kevzettler/multiplayer-voxel-browser-game-engine" target="_blank" rel="noopener noreferrer">multiplayer voxel browser game engine repository</a> <b>for more details.</b></p>
+</div></div>]]>
+            </description>
+            <link>https://kevzettler.com/2023/04/25/multiplayer-voxel-game-engine/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-35705063</guid>
+            <pubDate>Tue, 25 Apr 2023 19:00:40 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Explaining tech's notion of talent scarcity]]>
             </title>
             <description>
 <![CDATA[
-Score 49 | Comments 23 (<a href="https://news.ycombinator.com/item?id=35704516">thread link</a>) | @dcreager
+Score 68 | Comments 36 (<a href="https://news.ycombinator.com/item?id=35704516">thread link</a>) | @dcreager
 <br/>
 April 25, 2023 | https://nadia.xyz/top-talent | <a href="https://web.archive.org/web/*/https://nadia.xyz/top-talent">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div ?="">
@@ -180,11 +668,85 @@ April 25, 2023 | https://nadia.xyz/top-talent | <a href="https://web.archive.org
         </item>
         <item>
             <title>
+<![CDATA[Introduction to HTTP Multipart]]>
+            </title>
+            <description>
+<![CDATA[
+Score 55 | Comments 10 (<a href="https://news.ycombinator.com/item?id=35704101">thread link</a>) | @adamch
+<br/>
+April 25, 2023 | https://blog.adamchalmers.com/multipart/ | <a href="https://web.archive.org/web/*/https://blog.adamchalmers.com/multipart/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+<p>Multipart, or "form-encoded data", is something I see everywhere but never had to actually understand or use myself, because HTTP libraries handled it for me. Recently, though, I had to dive deeper into how multipart works, because it's pretty important at both Cloudflare and my new job at KittyCAD. Used correctly, multipart makes your file uploads faster and use less memory. I'm going to explain how it works, at a high level, so you'll recognize when you could use it to save time and memory in your HTTP servers/clients.</p>
+<p>By the way, this doc assumes you know what a MIME type is. If you don't know what a MIME type is, read this <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/MIME_types">MDN article</a> for a great explanation.</p>
+<h2 id="why-use-multipart">Why use multipart?</h2>
+<p>Multipart solves the problem of efficient file upload. Before Multipart, the standard for uploading files was "application/x-www-form-urlencoded", which required clients to URL-encode the file before uploading it. URL-encoding is efficient if the file is mostly ASCII text, but if it's mostly binary data, then you have to URL-escape almost every byte, which is very inefficient. If you wanted to upload multiple files <em>without</em> encoding them, you could send multiple HTTP requests. But that has more latency than sending them all in one request.</p>
+<p>So in 1998, <a href="https://www.rfc-editor.org/rfc/rfc2388">RFC 2388</a> proposed a new standard, "multipart/form-data", which lets you send many files in one HTTP body without encoding them. No encoding means you save a lot of CPU cycles and keeps the total body size small.</p>
+<p>This protocol was designed for uploading files from an HTML form, hence the name. But you can actually use it to upload files from whatever you want -- no part of the spec requires <code>&lt;form&gt;</code> or any HTML at all. You can use it to upload files from any HTTP client to any HTTP server.</p>
+<p>Another advantage of multipart is that the server can stream each part separately. For example, say you're uploading 5 files by encoding them into a JSON object. Your server will have to buffer the entire JSON object into memory, decode it, and examine each file. But with multipart, the server can stream each part (i.e. file), one at a time, reducing memory usage and improving latency (because it can handle file number 1 without waiting for the other 4 to come in).</p>
+<p>(oh, and JSON also can't handle binary files, so you'd need to convert each file into base64 strings. But as discussed above, multipart can handle raw binary, so that's another win)</p>
+<h2 id="in-rust">In Rust</h2>
+<p>Your Rust HTTP server or client framework probably already supports multipart. I wrote about <a href="https://blog.adamchalmers.com/streaming-proxy/">streaming multipart in axum previously</a>. <a href="https://lib.rs/reqwest">reqwest</a> has <a href="https://docs.rs/reqwest/latest/reqwest/struct.RequestBuilder.html#method.multipart">built-in support</a> too.</p>
+<p>If you're building your own HTTP server, I suggest using the <a href="https://lib.rs/multer">multer crate</a> for async multipart support. This is the crate that axum uses, so it should be very fast and reliable. Reusing crates from the ecosystem means you don't even need to know how multipart is implemented. But if you're curious, keep reading.</p>
+<h2 id="what-is-multipart">What <em>is</em> multipart?</h2>
+<p>MIME types fall into two classes, discrete and multipart. </p>
+<ul>
+<li>Discrete hold one document. Examples include <code>application/</code> (binary), <code>image/</code>, <code>text/</code> etc. </li>
+<li>Multipart types are documents with many pieces, and those pieces can have their own MIME types. </li>
+</ul>
+<p>There are two multipart types: message/ and multipart/ -- yes it's confusing that multipart can be a type and also a class. The <code>message/</code> type is basically never used for anything anymore, but <code>multipart/</code> is still very important. You often see <code>multipart/form-data</code> for sending files from web browser to server via HTML forms. The <em>part</em> in <em>multipart</em> refers to a document. The type could have been called multidocument instead! Note it does not <em>have</em> to contain multiple files. It could contain just one file, using multipart for the efficient binary encoding.</p>
+<h2 id="how-is-multipart-implemented">How is multipart implemented?</h2>
+<p>If the content-type is <code>multipart/form-data</code> then the HTTP body contains multiple parts (i.e. documents). Each part is separated by a "boundary delimiter". The root HTTP message has a header which <a href="https://stackoverflow.com/questions/3508338/what-is-the-boundary-in-multipart-form-data">defines the boundary</a> delimiter so the server knows where the boundary between each part is. Each part has some headers too:</p>
+<ul>
+<li>The <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Disposition#as_a_header_for_a_multipart_body">Content-Disposition header</a> defines each part's filename or the name of the form field that contained it (only relevant if you're using an actual HTML form element). </li>
+<li>The <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Type">Content-Type header</a> defines each part's filetype (OK technically their MIME type but that's roughly equivalent). It defaults to text/plain. Unstructured binary data should use application/octet-stream, but if you know the type you should use it, e.g. application/zip, application/pdf, etc.</li>
+<li>No other headers can be used! Quoting <a href="https://www.rfc-editor.org/rfc/rfc7578#section-4.8">RFC 7578</a>: "The multipart/form-data media type does not support any MIME header fields in parts other than Content-Type, Content-Disposition, and (in limited circumstances) Content-Transfer-Encoding. <strong>Other header fields MUST NOT be included and MUST be ignored.</strong>".</li>
+</ul>
+<p>Here's a practical example from of <a href="https://stackoverflow.com/questions/913626/what-should-a-multipart-http-request-with-multiple-files-look-like">how the HTTP body looks</a>, from Stack Overflow. This body is a multipart which contains 3 GIFs.</p>
+<pre><code><span>POST /cgi-bin/qtest HTTP/1.1
+Content-Type: multipart/form-data; boundary=2a8ae6ad-f4ad-4d9a-a92c-6d217011fe0f
+Content-Length: 514
+
+--2a8ae6ad-f4ad-4d9a-a92c-6d217011fe0f
+Content-Disposition: form-data; name="datafile1"; filename="r.gif"
+Content-Type: image/gif
+
+GIF87a.............,...........D..;
+--2a8ae6ad-f4ad-4d9a-a92c-6d217011fe0f
+Content-Disposition: form-data; name="datafile2"; filename="g.gif"
+Content-Type: image/gif
+
+GIF87a.............,...........D..;
+--2a8ae6ad-f4ad-4d9a-a92c-6d217011fe0f
+Content-Disposition: form-data; name="datafile3"; filename="b.gif"
+Content-Type: image/gif
+
+GIF87a.............,...........D..;
+--2a8ae6ad-f4ad-4d9a-a92c-6d217011fe0f--
+</span></code></pre><h2 id="compression">Compression</h2>
+<p>You can gzip the entire Multipart response, but you cannot pick and choose compression for particular parts. This is because the root HTTP body defines compression headers for the entire message, including all the parts within a multipart body. So a client has no way to tell the server "this particular part is compressed, but that one is not." And, as discussed above, only 3 specific HTTP headers are allowed inside the multipart's documents -- and compression headers aren't one of them. Thanks to <a href="https://stackoverflow.com/a/66118265/531650">this great Stack Overflow answer</a> for explaining all this to me.</p>
+<h2 id="why-is-this-interesting">Why is this interesting?</h2>
+<p>So, "multipart" or "form-encoded data" is a MIME type which contains multiple files. Each file has its own MIME type and name. Historically, this was a big improvement over other ways to upload multiple files, because it can send each file as raw binary without extra encoding or escapes.</p>
+<p>Before I wrote this blog post, I found multipart kinda boring. It somehow seems archaic and backwards -- I mean, it was written at a time where HTML forms were the cutting edge of web technology. It's been 25 years since its RFC was first published. Surely we have better ways to upload files now!</p>
+<p>But it's actually pretty interesting, in an abstract way. It's trying to efficiently compose multiple file uploads together, and the question of "how do we compose many of this together" is always an interesting question in computer science. </p>
+<p>Part of why I love JSON is that it's easy to compose JSON. If each file upload was a JSON body, it's trivial to compose them: just compose all <em>n</em> separate JSON bodies into 1 big body with <em>n</em> fields. But this has bad performance:</p>
+<ul>
+<li>You have to base64 the file contents, because JSON can only handle text, not binary</li>
+<li>The server has to buffer the entire JSON body into RAM before decoding it</li>
+</ul>
+<p>I guess multipart/form-data is an attempt to compose multiple file uploads together <em>efficiently</em>. And that tradeoff brings some complexity, like boundaries and content-disposition. I wonder what a modern solution to this problem would look like. Clearly multipart/form-data is good enough, because it's being used everywhere. But if you know of any alternative solutions to this problem, please let me know in the comments!</p>
+</div></div>]]>
+            </description>
+            <link>https://blog.adamchalmers.com/multipart/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-35704101</guid>
+            <pubDate>Tue, 25 Apr 2023 17:49:29 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Use Gröbner bases to solve polynomial equations]]>
             </title>
             <description>
 <![CDATA[
-Score 45 | Comments 8 (<a href="https://news.ycombinator.com/item?id=35703741">thread link</a>) | @ransac9000
+Score 108 | Comments 40 (<a href="https://news.ycombinator.com/item?id=35703741">thread link</a>) | @ransac9000
 <br/>
 April 25, 2023 | https://jingnanshi.com/blog/groebner_basis.html | <a href="https://web.archive.org/web/*/https://jingnanshi.com/blog/groebner_basis.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content">
@@ -314,10 +876,10 @@ x + y + z^{2} = 1.
 We first define the <b><b>ideal</b></b>
 </p><p>
 \begin{align}
-I = &lt; x^{2} + y + z - 1, x + y^{2} + z - 1, x + y + z^{2} - 1&gt;.
+I = \langle x^{2} + y + z - 1, x + y^{2} + z - 1, x + y + z^{2} - 1 \rangle.
 \end{align}
 </p><p>
-where the square brackets represent a set of polynomials following
+where the angle brackets represent a set of polynomials following
 </p><p>
 \begin{align}
 \left\langle f_1, \ldots, f_s\right\rangle=\left\{\sum_{i=1}^s h_i f_i \mid h_1, \ldots, h_s \in k\left[x_1, \ldots, x_n\right]\right\}.
@@ -339,8 +901,8 @@ Note that \(g(4)\) contains only \(z\), and
 g(4) = z^{6} - 4z^{4} + 4z^{3} - z^{2} = z^{2} (z - 1)^{2} (z^{2} + 2z - 1),
 \end{align}
 </p><p>
-which becomes zero when \(z = 0, 1, -1 + \sqrt{2}, -1 - \sqrt(2)\).
-Substituting them back to \(g_{2} = 0\) and \(g_{3} = 0\), we can determine \(y = 1, 0, -1 + \sqrt{2}, -1 - \sqrt(2)\).
+which becomes zero when \(z = 0, 1, -1 + \sqrt{2}, -1 - \sqrt{2}\).
+Substituting them back to \(g_{2} = 0\) and \(g_{3} = 0\), we can determine \(y = 1, 0, -1 + \sqrt{2}, -1 - \sqrt{2}\).
 Then using \(g_{1}\), we can get the corresponding values for \(x\), which leads to the following five possible solutions to the original system:
 </p><p>
 \begin{align}
@@ -1248,7 +1810,7 @@ Here are some additional resources if you want to dive deeper:
             </title>
             <description>
 <![CDATA[
-Score 60 | Comments 14 (<a href="https://news.ycombinator.com/item?id=35702407">thread link</a>) | @wyem
+Score 79 | Comments 22 (<a href="https://news.ycombinator.com/item?id=35702407">thread link</a>) | @wyem
 <br/>
 April 25, 2023 | https://phasellm.com/researchgpt | <a href="https://web.archive.org/web/*/https://phasellm.com/researchgpt">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1288,7 +1850,7 @@ April 25, 2023 | https://phasellm.com/researchgpt | <a href="https://web.archive
             </title>
             <description>
 <![CDATA[
-Score 39 | Comments 8 (<a href="https://news.ycombinator.com/item?id=35701790">thread link</a>) | @asicsp
+Score 46 | Comments 8 (<a href="https://news.ycombinator.com/item?id=35701790">thread link</a>) | @asicsp
 <br/>
 April 25, 2023 | https://avi.im/blag/2023/internet-mvcc/ | <a href="https://web.archive.org/web/*/https://avi.im/blag/2023/internet-mvcc/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article><p>This is a short story about how I hit a wall while implementing a database research paper, found a publication error and how people on the internet helped me.</p><p>The paper is Hekaton MVCC - <a href="https://vldb.org/pvldb/vol5/p298_per-akelarson_vldb2012.pdf">High-Performance Concurrency Control Mechanisms for Main-Memory Databases</a>. Scroll down to the bottom if you are interested in knowing the errata.</p><h2 id="timeline">Timeline</h2><ul><li><code>$whoami</code> I am a backend developer, and databases excite me! I dream of being a database developer one day. I have an educational side project called <a href="https://github.com/avinassh/py-caskdb">CaskDB</a> which aims to teach how to build a key-value store. I always look forward to adding new database features, as it allows me to learn new things.</li><li>[Apr 7] Pekka Enberg <a href="https://twitter.com/penberg/status/1644221651293204480">tweeted</a> about the Hekaton MVCC paper. This research paper was new to me, and I found it approachable. CaskDB does not have transactions yet, so this gave me a great learning opportunity to implement it.</li><li>[Apr 8] Pekka started implementing the paper in Rust and <a href="https://twitter.com/penberg/status/1644676555942109185">tweeted</a> about it. It became easy for me to follow the paper with the code. I also started working on my <a href="https://github.com/avinassh/mvcc-go">Go implementation</a>.</li><li>I am a massive fan of Andy and have watched the videos from his course <a href="https://15721.courses.cs.cmu.edu/spring2023/">CMU Advanced Database Systems</a>. I started rewatching the <a href="https://www.youtube.com/watch?v=9EY0vYFNWxY">Hekaton lectures</a>. The lecture series is excellent; go check it out!</li><li>Reading the paper was straightforward, but when I began thinking about code, I noticed gaps in my understanding. Code is fun; that’s when you see the unexpected challenges and nuances.</li><li>[Apr 9] I started working through the paper’s <code>Version Visibility</code> section. This part explains an ongoing transaction’s effect on a row’s visibility. It addresses the questions like transaction <code>tx1</code> updated a row; can <code>tx2</code> see it? Some of the ideas around row visibility didn’t make sense.</li><li>I went back to the paper and reread it several times now. I thought maybe I had missed something from the earlier sections. I took a pencil and paper and started drawing all possible flows. I did it multiple times, but in vain.</li><li>For a moment, I started wondering if the paper could have errors. But this is a famous paper, and I couldn’t find any errata online. I was uncertain whether I had misunderstood the paper or if it was flawed.</li><li>I started asking in Slack / Discord / Zulip groups. People were helpful, but the answers were related to general MVCC, not particular to the Hekaton MVCC. I explained the paper to one of my friends and asked if he saw any issues. Nothing helped!
@@ -1304,7 +1866,7 @@ April 25, 2023 | https://avi.im/blag/2023/internet-mvcc/ | <a href="https://web.
             </title>
             <description>
 <![CDATA[
-Score 137 | Comments 47 (<a href="https://news.ycombinator.com/item?id=35701572">thread link</a>) | @tworats
+Score 251 | Comments 103 (<a href="https://news.ycombinator.com/item?id=35701572">thread link</a>) | @tworats
 <br/>
 April 25, 2023 | https://www.parand.com/a-completely-non-technical-explanation-of-ai.html | <a href="https://web.archive.org/web/*/https://www.parand.com/a-completely-non-technical-explanation-of-ai.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section>
@@ -1500,7 +2062,7 @@ neural networks.</p>
             </title>
             <description>
 <![CDATA[
-Score 72 | Comments 13 (<a href="https://news.ycombinator.com/item?id=35700301">thread link</a>) | @synergy20
+Score 82 | Comments 15 (<a href="https://news.ycombinator.com/item?id=35700301">thread link</a>) | @synergy20
 <br/>
 April 25, 2023 | https://mlc.ai/web-llm/ | <a href="https://web.archive.org/web/*/https://mlc.ai/web-llm/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1589,7 +2151,7 @@ We have tested it on windows and mac, you will need a gpu with about 6.4G memory
             </title>
             <description>
 <![CDATA[
-Score 130 | Comments 143 (<a href="https://news.ycombinator.com/item?id=35699697">thread link</a>) | @ghuntley
+Score 168 | Comments 193 (<a href="https://news.ycombinator.com/item?id=35699697">thread link</a>) | @ghuntley
 <br/>
 April 25, 2023 | https://osa1.net/posts/2023-04-24-ocaml-thoughts.html | <a href="https://web.archive.org/web/*/https://osa1.net/posts/2023-04-24-ocaml-thoughts.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="column">
@@ -1728,7 +2290,7 @@ print_string "bye"</code></pre>
             </title>
             <description>
 <![CDATA[
-Score 218 | Comments 29 (<a href="https://news.ycombinator.com/item?id=35696776">thread link</a>) | @nyberg
+Score 225 | Comments 31 (<a href="https://news.ycombinator.com/item?id=35696776">thread link</a>) | @nyberg
 <br/>
 April 24, 2023 | https://monadmonkey.com/dnns-from-scratch-in-zig | <a href="https://web.archive.org/web/*/https://monadmonkey.com/dnns-from-scratch-in-zig">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="post-body">
@@ -2170,7 +2732,7 @@ Average Validation Accuracy: 9.586e-01
             </title>
             <description>
 <![CDATA[
-Score 67 | Comments 29 (<a href="https://news.ycombinator.com/item?id=35696111">thread link</a>) | @greenSunglass
+Score 72 | Comments 35 (<a href="https://news.ycombinator.com/item?id=35696111">thread link</a>) | @greenSunglass
 <br/>
 April 24, 2023 | https://ntietz.com/blog/distractions-cause-bad-code/ | <a href="https://web.archive.org/web/*/https://ntietz.com/blog/distractions-cause-bad-code/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2209,7 +2771,7 @@ April 24, 2023 | https://ntietz.com/blog/distractions-cause-bad-code/ | <a href=
             </title>
             <description>
 <![CDATA[
-Score 40 | Comments 18 (<a href="https://news.ycombinator.com/item?id=35692697">thread link</a>) | @computerbuster
+Score 43 | Comments 18 (<a href="https://news.ycombinator.com/item?id=35692697">thread link</a>) | @computerbuster
 <br/>
 April 24, 2023 | https://www.nateranda.com/blog/post/a-defense-of-text-speak/ | <a href="https://web.archive.org/web/*/https://www.nateranda.com/blog/post/a-defense-of-text-speak/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2272,7 +2834,7 @@ April 24, 2023 | https://www.nateranda.com/blog/post/a-defense-of-text-speak/ | 
             </title>
             <description>
 <![CDATA[
-Score 81 | Comments 52 (<a href="https://news.ycombinator.com/item?id=35691459">thread link</a>) | @mradomski
+Score 83 | Comments 54 (<a href="https://news.ycombinator.com/item?id=35691459">thread link</a>) | @mradomski
 <br/>
 April 24, 2023 | https://matradomski.com/posts/local_license_key_verification_theory/ | <a href="https://web.archive.org/web/*/https://matradomski.com/posts/local_license_key_verification_theory/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -2401,7 +2963,7 @@ Using for singing the license key size would be 32 bytes or encoded in base64 ~4
             </title>
             <description>
 <![CDATA[
-Score 179 | Comments 129 (<a href="https://news.ycombinator.com/item?id=35690659">thread link</a>) | @Logans_Run
+Score 182 | Comments 132 (<a href="https://news.ycombinator.com/item?id=35690659">thread link</a>) | @Logans_Run
 <br/>
 April 24, 2023 | https://wiki.wellorder.net/post/nostr-intro/ | <a href="https://web.archive.org/web/*/https://wiki.wellorder.net/post/nostr-intro/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section>
@@ -2469,7 +3031,7 @@ April 24, 2023 | https://wiki.wellorder.net/post/nostr-intro/ | <a href="https:/
             </title>
             <description>
 <![CDATA[
-Score 276 | Comments 37 (<a href="https://news.ycombinator.com/item?id=35690576">thread link</a>) | @how-about-this
+Score 287 | Comments 38 (<a href="https://news.ycombinator.com/item?id=35690576">thread link</a>) | @how-about-this
 <br/>
 April 24, 2023 | https://sesquiotic.com/2023/04/20/ox/ | <a href="https://web.archive.org/web/*/https://sesquiotic.com/2023/04/20/ox/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2515,11 +3077,26 @@ April 24, 2023 | https://sesquiotic.com/2023/04/20/ox/ | <a href="https://web.ar
         </item>
         <item>
             <title>
+<![CDATA[Sovereign Military Order of Malta is the rarest passport in the world]]>
+            </title>
+            <description>
+<![CDATA[
+Score 21 | Comments 1 (<a href="https://news.ycombinator.com/item?id=35690472">thread link</a>) | @thunderbong
+<br/>
+April 24, 2023 | https://www.news.com.au/travel/travel-updates/sovereign-military-order-of-malta-is-the-rarest-passport-in-the-world/news-story/c998e5643ba85db445eb8525e42f0b9e | <a href="https://web.archive.org/web/*/https://www.news.com.au/travel/travel-updates/sovereign-military-order-of-malta-is-the-rarest-passport-in-the-world/news-story/c998e5643ba85db445eb8525e42f0b9e">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="story-primary"><p>Our passports aren’t seeing much action at the moment, but we still know the pain of applying for one. </p><p>But our efforts are nothing compared to what it takes to secure a copy of the world’s rarest passport.</p><p>The Sovereign Military Order of Malta is a Catholic order so exclusive that its passports are granted to only a few hundred people in the world. </p><p>At the last count, in February 2018, there were only about 500 of the diplomatic passports in circulation. </p><p> <b>RELATED: <a href="https://www.news.com.au/travel/travel-ideas/best-of-travel/there-are-four-passport-colours-heres-what-they-mean/news-story/1e2cd87964221517803c04807eeaa1b3" data-tgev="event119" data-tgev-container="bodylink" data-tgev-order="1e2cd87964221517803c04807eeaa1b3" data-tgev-label="travel" data-tgev-metric="ev">What do colours on passports mean?</a></b></p><p> <b>RELATED: <a href="https://www.news.com.au/travel/travel-updates/health-safety/taiwans-confusing-passport-to-be-changed-after-china-mixup/news-story/f28a9131fb44dc038453006cfcf80b0d" data-tgev="event119" data-tgev-container="bodylink" data-tgev-order="f28a9131fb44dc038453006cfcf80b0d" data-tgev-label="travel" data-tgev-metric="ev">Government changes ‘confusing’ passport </a></b></p><p>Even without COVID-19 travelling restrictions, those who do have this passport can’t go too far with it. </p><p>The United Kingdom, United States and New Zealand, for example, don’t accept the passport for travel, along with many other countries and territories who have similar rules.</p><p>Only 23 of the 26 member countries of the Schengen Area recognise the passport.</p><p>The Sovereign Military Order of Malta was officially recognised by Pope Paschal in 1113 and is one of the oldest institutions in the Christian world.</p><p>There are more than 13,500 knights, dames and chaplains in the Order, along with 80,000 volunteers and 25,000 medical employees.</p><p>It operates as a charitable organisation offering medical aid around the globe, and doesn’t control any territory of its own, despite having diplomatic relations with more than 100 states.</p><p>Passports are granted for four year terms so passport-holders can carry out diplomatic assignments. As well as passports, the order also issues its own postage stamps and currency. </p><p>The Sovereign Military Order of Malta passport isn’t close to being one of the most powerful passports in the world. </p><p>Border shutdowns and travel restrictions due to the COVID-19 pandemic have shaken up the global passport power list, but the top honour has <a href="https://www.news.com.au/travel/travel-updates/health-safety/new-zealand-passport-now-most-powerful-in-the-world/news-story/105c30ed145f997e8e7b94d63ea8a746" title="www.news.com.au" data-tgev="event119" data-tgev-container="bodylink" data-tgev-order="105c30ed145f997e8e7b94d63ea8a746" data-tgev-label="travel" data-tgev-metric="ev">most recently been bestowed on New Zealand</a>, which knocked Japan out of the top spot in October.</p><p> <i>With The Sun.</i></p></div></div>]]>
+            </description>
+            <link>https://www.news.com.au/travel/travel-updates/sovereign-military-order-of-malta-is-the-rarest-passport-in-the-world/news-story/c998e5643ba85db445eb8525e42f0b9e</link>
+            <guid isPermaLink="false">hacker-news-small-sites-35690472</guid>
+            <pubDate>Mon, 24 Apr 2023 17:16:42 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Why I'm not worried about AI causing mass unemployment]]>
             </title>
             <description>
 <![CDATA[
-Score 41 | Comments 98 (<a href="https://news.ycombinator.com/item?id=35689989">thread link</a>) | @jger15
+Score 42 | Comments 99 (<a href="https://news.ycombinator.com/item?id=35689989">thread link</a>) | @jger15
 <br/>
 April 24, 2023 | https://www.understandingai.org/p/software-didnt-eat-the-world | <a href="https://web.archive.org/web/*/https://www.understandingai.org/p/software-didnt-eat-the-world">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><article><div><div><div dir="auto"><p><span>In 2011, the venture capitalist Marc Andreessen </span><a href="https://a16z.com/2011/08/20/why-software-is-eating-the-world/" rel="">published an essay</a><span> that became a kind of manifesto for Silicon Valley during the 2010s.</span></p><p>“Software is eating the world,” Andreessen declared.</p><p>Computers and the Internet had already revolutionized a bunch of information-oriented businesses: books, movies, music, photography, telecommunications, and so forth. Software also played a major supporting role in more tangible industries. New cars had dozens of computer chips in them, for example, and the oil and gas industry made heavy use of software to discover new drilling sites.</p><p>But Andreessen, co-founder of the venture capital firm Andreessen Horowitz, argued that the software revolution was only getting started. “In many industries, new software ideas will result in the rise of new Silicon Valley-style start-ups that invade existing industries with impunity,” Andreessen wrote. “Companies in every industry need to assume that a software revolution is coming.”</p><p><span>At the time, Silicon Valley was abuzz with talk of the </span><a href="https://www.fastcompany.com/1747551/sharing-economy" rel="">sharing economy</a><span>. In 2011, Andreessen Horowitz </span><a href="https://www.wsj.com/articles/BL-VCDB-11285" rel="">invested in Airbnb</a><span>, which was working to disrupt hotels by having people rent out their spare rooms. In 2013, the firm </span><a href="https://a16z.com/2013/05/23/its-time-for-lyft-off-2/" rel="">invested in Lyft</a><span>, which was trying to revolutionize the taxi industry by letting people give rides in their personal vehicles.</span></p><p><span>When Bitcoin started to gain mainstream attention in 2013, Andreessen Horowitz </span><a href="https://techcrunch.com/2013/12/12/coinbase-raises-25m-from-andreessen-horowitz-to-build-its-bitcoin-wallet-and-merchant-services/?guccounter=1&amp;guce_referrer=aHR0cHM6Ly93d3cuZ29vZ2xlLmNvbS8&amp;guce_referrer_sig=AQAAAHqR0-ILmTavo8r0PAXkSLy4qIfzvp4ydK0nhUC57A4HDuPrIBpzVoVV5nkMpF3KMlls32lzEjai0apl5DdD4bvgkURjLiZTfPwtR2u8YswPQBhOW8H7LRFeXoXl_9OdBDfGq6WdquCNraF6r0bnVSbk6vCSnEFQBJQs1W_vQs9a" rel="">jumped on that bandwagon</a><span> too. Cryptocurrency was supposed to “eat” the financial world, rendering banks and other financial institutions irrelevant in much the same way Netflix made Blockbuster irrelevant and digital cameras bankrupted Kodak.</span></p><p>The venture capitalists who poured billions of dollars into startups like this during the 2010s expected some of them to eventually be as big as Google or Facebook. After all, they thought, industries like hospitality, transportation, and finance are huge. The rewards for disrupting them should be correspondingly large.</p><p>But it hasn’t worked out that way. Computers and smartphones have become ubiquitous across the economy. But this has led to only modest changes for established industries like health care, education, housing, and transportation.</p><p>Andreessen’s essay reflected a persistent blind spot in Silicon Valley thinking: a tendency to overestimate the power of information technology and underestimate the complexity of the physical world. In 2011, this led to excessive optimism about the economic impact of software startups. Today I suspect this same bias is distorting many people’s thinking about the likely impact of artificial intelligence.</p><p>Many technologists worry that AI will get so powerful that it will be capable of performing most of the jobs currently performed by humans, leading to mass unemployment. I don’t buy it. Certainly AI will have a significant impact on the economy—perhaps even bigger than the Internet. But there will also be significant sectors of the economy that see only modest changes as a result of AI. And there will continue to be plenty of work for human beings to do.</p><p><span>One way to evaluate Andreessen’s 2011 prediction is to look at the most successful software startups of the 2010s. With help from Connor Leech, the CEO of job search website </span><a href="https://www.employbl.com/" rel="">Employbl</a><span>, I made a list of successful Internet startups founded since 2009. They can be broken down into a few major groups:</span></p><p><span>There are social networks and messaging apps like </span><strong>Discord, Instagram, Slack, Snap, TikTok, Whatsapp, </strong><span>and</span><strong> Zoom.</strong><span> The success of these companies doesn’t really bolster the “software eating the world” thesis because they were entering fields already dominated by other tech companies.</span></p><p><span>Companies like </span><strong>Square, Stripe, Robinhood, </strong><span>and</span><strong> Venmo</strong><span> have thrived by offering modern interfaces for traditional financial services. They represent incremental progress in the finance sector, not a revolution.</span></p><p><span>In contrast, cryptocurrency companies like </span><strong>Coinbase </strong><span>and</span><strong> Circle</strong><span> </span><em>are</em><span> trying to build new payment rails that will eventually make conventional financial institutions irrelevant. But these firms have struggled, especially in the last year, and crypto-based financial products remain far from mainstream adoption.</span></p><p><span>The startups that best fit the “software eating the world” thesis are probably “sharing economy” companies like </span><strong>Bird, DoorDash, Instacart, Lime, Lyft, Uber, </strong><span>and</span><strong> WeWork</strong><span>. Each of these companies use software to offer services in the “real world”—taxi rides, scooter rentals, food delivery, lodging, office space, and so forth. They enjoyed a lot of hype in the mid-2010s, and most of them have struggled in the last few years.</span></p><p><span>Some of them have been total fiascos. WeWork failed to disrupt commercial real estate. Shares in the scooter startup Bird have lost 97 percent of their value since the company went public less than two years ago. Last year I </span><a href="https://www.fullstackeconomics.com/p/i-drove-for-lyft-for-a-week-and-learned" rel="">drove for Lyft</a><span> for a week and wrote about its difficulty in turning a profit.&nbsp;</span></p><p>The two most successful “sharing economy” startups are probably Airbnb (founded in 2008) and Uber (founded in 2009). These companies are each worth tens of billions of dollars, and they seem likely to be enduring, profitable businesses.</p><p>Still, Airbnb has only a modest share of the overall lodging industry. And in recent years, the quality of Uber’s service has deteriorated, with higher fees and longer wait times. Smartphone-based ride hailing is a marginal improvement over conventional taxis, but hasn’t been a revolution.</p><p>In his 2011 essay, Andreessen specifically mentions health care and education as industries ripe for disruption by software. But as far as I can see that hasn’t happened. Hospitals increasingly use computers for record-keeping and billing and software has been used to make new drugs and medical devices. Many people learn foreign languages using Duolingo or watch educational videos on YouTube. But people largely go to the same schools and hospitals they did 10 or 20 years ago.</p><p>The reason I’m relitigating this 12-year-old argument is that I hear echoes of it in contemporary discussions of AI. In the early 2010s, Silicon Valley thought leaders looked at the early success of companies like Airbnb and Uber, extrapolated wildly, and concluded that software was going to transform the entire economy. Today, AI thought leaders are looking at the early success of ChatGPT and Stable Diffusion, extrapolating wildly, and concluding that AI software is going to transform the economy and put tons of people out of work.</p><p><span>To be clear, I do think AI is going to be a big deal. I wouldn’t have started an </span><a href="https://www.understandingai.org/" rel="">AI newsletter</a><span> otherwise. But as with the Internet, I expect the impact to be concentrated in information-focused industries and occupations. And most of the American economy is not information-focused: It’s focused on delivering physical goods and services like homes, cars, restaurant meals, and haircuts. It will be hard for AI to have a big impact on these industries for the same reasons that it’s been hard for Internet startups to do so.</span></p><p><span>A common line of thinking about AI and the labor market goes something like this: During the 20th century, we automated a lot of physical tasks. As a result, a worker’s value has increasingly been based on brain power rather than muscle power. But now it looks like AI will enable computers to surpass humans at many cognitive tasks as well. That could lead to a future where the average human worker isn’t better than machines at </span><em>anything</em><span>, and as a result they can’t find a job.</span></p><p>One thing this argument misses is that there are still lots and lots of tasks that human beings can perform better than any machine.</p><p>Take plumbers, for example. They need to get in and out of their cars, climb stairs and ladders, and carry heavy objects. The job also requires fine motor skills.</p><p>Today’s robots can’t perform these tasks at anywhere close to a human level. So even if you had human-level AI that perfectly understood how to be a plumber, it’s not obvious we could build a robot body versatile enough to do the job.</p><p><span>Back in 2015, the Defense Advanced Research Projects Agency </span><a href="https://www.youtube.com/watch?v=8P9geWwi9e0" rel="">held a contest</a><span> where teams competed to build humanoid robots that could perform simple tasks like driving a vehicle, opening a door, turning a valve, and cutting a hole in a wall using a drill. A lot of the robots </span><a href="https://www.youtube.com/watch?v=g0TaYhjpOfo" rel="">fell over</a><span> during the competition. The successful ones performed the tasks far slower than a human being.</span></p><p>And these were research prototypes, not commercial products. Each robot in the DARPA competition was supported by a team of researchers that performed extensive maintenance between trials. So it would take far more human labor to prepare one of these robots to do a plumbing job than to just have a human plumber do the job.</p><p><span>Of course, that was eight years ago. Have robots improved since then? Earlier this year, Boston Dynamics, a leading robotics company, </span><a href="https://arstechnica.com/gadgets/2023/01/boston-dynamics-atlas-robot-grows-a-set-of-hands-attempts-construction-work/" rel="">released a video</a><span> showing that its humanoid Atlas robot (also still a research prototype) now has claw-like hands and can pick up heavy objects. While this represents impressive progress (previous versions had no hands at all), the company still has a long way to go.</span></p><p><span>“The simple claw grippers mean Atlas crushes everything it picks up,” Ars Technica’s Ron Amadeo </span><a href="https://arstechnica.com/gadgets/2023/01/boston-dynamics-atlas-robot-grows-a-set-of-hands-attempts-construction-work/" rel="">wrote</a><span> in his writeup of the video. You wouldn’t want this robot to fixing your leaky faucet no matter how intelligent its software was.</span></p><p><span>Some companies, including </span><a href="https://arstechnica.com/gadgets/2021/08/tesla-bot-is-the-companys-troubled-autopilot-system-in-humanoid-form/" rel="">Tesla</a><span> and </span><a href="https://www.axios.com/2023/03/17/robots-humanoid-figure-tesla-robotics-ai" rel="">Figure</a><span>, claim they’re developing humanoid robots that will be capable of safely performing a range of domestic tasks. As far as I know, none of these companies have shipped these products yet, and I’m skeptical they’ll be able to live up to their own hype. Even if they do, it’ll take many years to manufacture enough humanoid robots to have a major impact on the labor market. And in the short-to-medium term, we’d get a lot of new jobs in the robotics sector.</span></p><p>But let’s suppose robotics technology progresses rapidly and in a couple of decades there are millions of humanoid robots with the physical capacity to perform most jobs people can do. Human workers will still retain another big advantage in the marketplace: the fact that other people like to interact with them.</p><p>This is most obvious in the caring professions. Even if someone invented a robot that was proven to be as safe as a human babysitter, I wouldn’t want it taking care of my 2-year-old. I bet you wouldn’t either. By the same token, elder care workers, physical therapists, psychologists, nurses, and workers in similar jobs should be insulated from AI-related disruption because most people are going to prefer human caregivers over robots.</p><p><span>But this point applies far beyond the caring professions. Think about coffee shops, for example. Many Starbucks locations already have </span><a href="https://starbmag.com/how-much-is-a-mastrena-2-espresso-machine/" rel="">high-end coffee machines</a><span> that grind the beans and produce coffee that’s indistinguishable from what a human barista would make. It wouldn’t be hard to fully automate Starbucks locations so that a robot arm hands you your coffee when it’s ready.</span></p><p>But Starbucks isn’t going to deploy a robot like that because Starbucks customers aren’t just buying cups of coffee—they’re buying the relative luxury experience of having another human being prepare coffee for them.</p><p><span>In 2012, the </span><a href="https://www.wsj.com/articles/SB10001424052748704164004575548403514060736" rel="">Wall Street Journal reported</a><span> that Starbucks had ordered its baristas to “stop making multiple drinks at a time” because customers were complaining that harried baristas had “reduced the fine art of coffee making to a mechanized process with all the romance of an assembly line.” You know what’s even less romantic than your barista making multiple cups of coffee at the same time? Having a robot make your coffee.</span></p><p>Lots of other industries work this way:</p><ul><li><p>Despite the low cost of workout apps (and before that workout videos) lots of people pay a premium to attend fitness classes with human instructors.</p></li><li><p>Recorded music is cheap and ubiquitous, but fans pay a premium to see their favorite artists perform live.</p></li><li><p>Downscale restaurants take orders at the counter (or on a touchscreen) and make customers bus their own trays, while fancier restaurants have a small army of waiters ready to refill your water glass and sweep up crumbs.</p></li></ul><p>This dynamic will become even more important in the AI era. For example, in the future there will probably be low-cost virtual schools where students interact with chatbot tutors rather than human teachers. Undoubtedly some students will find them useful.</p><p>But many others will hate it for the same reasons they hated Zoom school during the pandemic. Lots of people like listening to in-person lectures. It’s easier to stay on track with your studies if you know a human professor (or teaching assistant) will be disappointed in you for turning in an assignment late or getting a bad score on a test. And going to a brick-and-mortar school lets you make friends with your classmates and participate in extracurricular activities. That’s going to continue drawing students to conventional schools no matter how good AI-powered virtual schools get.</p><p>Similarly, you might be able to get a medical diagnosis from a chatbot, but many people will be willing to pay extra for advice from a human doctor or nurse—especially if they need a physical exam. People may feel more comfortable sharing intimate details with a human doctor, not only because they feel an emotional connection but also because they may have more confidence that the information they share won’t be misused.</p><p>There’s a risk we could wind up with a two-tier health care system where affluent patients can talk to human doctors on demand while lower-income patients are required to interact with a chatbot first. But it’s hard to imagine AI eliminating demand for doctors altogether.</p><p>AI very likely will lead to lower employment in some occupations. A few categories of workers may be completely replaced by AI software. But there will be many more occupations where AI automates some parts of the job, allowing human workers to focus on other tasks and become more productive overall.</p><p>Even when machines automate a substantial portion of an occupation, that won’t necessarily lead to big job losses. Take automatic teller machines. Banks installed hundreds of thousands of ATMs in the 1980s and 1990s. This made it cheaper to operate a bank branch, so banks opened more branches. And each branch still had some tellers to handle tasks too complex for the ATM. As a result, the total number of bank tellers in the U.S. changed little between 1980 and 2010.</p><p>I expect AI to have a similar impact on many occupations. For example, Github Co-pilot is AI software that is already helping programmers increase their productivity by 20 to 50 percent. So will companies take this as an opportunity to cut their engineering workforces? Some might, but I bet most will instead take the opportunity to produce more software.</p><p>And in cases where AI does reduce employment in an occupation, workers will move to other occupations where demand is strong. And as we’ve seen, there are plenty of jobs, from plumbers to baristas to doctors, that aren’t going to be replaced by AI any time soon.</p><p><span>A </span><a href="https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4375268" rel="">recent paper</a><span> by computer scientist Ed Felten, business professor Manav Raj, and economist Robert Seamans looked at a database of occupations and tried to define how “exposed” each job was to large language models like ChatGPT. They did this by breaking each job down into 52 human abilities (things like “oral comprehension, oral expression, inductive reasoning, arm-hand steadiness”) and then estimating how well AI software could perform each of these tasks.</span></p><p>Telemarketers topped the list of most exposed occupations, followed by several categories of college professors. Judges, arbitrators, and clinical psychologists also made the list. This seems like a reasonable first step for estimating the impact of AI on the labor market, but I also think the list illustrates the limitations of the methodology.</p><p>For example, it’s very hard to imagine we are ever going to replace human judges with AI. No matter how technically competent AI might get at interpreting and applying the law, people are going to want to keep that function in human hands. People will be more likely to trust rulings made by a human being whose reasoning they can understand and who seems to share their values.</p><p>I’m also skeptical that we’ll see falling demand for clinical psychologists. While some people will undoubtedly enjoy talking to chatbots about their mental health problems, many others will prefer to talk face-to-face with a human being. And as I explained above, it’s not obvious that AI will put many college professors out of work.</p><p>Interestingly, the researchers found a strong positive correlation between language model exposure and income: higher-wage occupations are more likely to be impacted by the latest AI technology. So it’s very possible that AI technology will narrow the large wage premium that opened up between college graduates and less educated workers in the late 20th century.</p><p><span>Finally, it’s important to remember that the level of employment across the economy is </span><a href="https://www.fullstackeconomics.com/p/why-amazons-no-checkout-tech-might-create-jobs-not-destroy-them" rel="">ultimately driven by macroeconomic factors</a><span>: If consumers spend more money, then businesses will respond by hiring more workers. The last three years have illustrated how powerful this can be: In the wake of the pandemic, Congress and the Fed worked a little </span><em>too</em><span> hard to boost the economy, producing a super-tight labor market and rising inflation.</span></p><p>If AI starts replacing workers in the coming years, that will put downward pressure on wages and prices while growing the economic pie. That will give the Fed more leeway to cut interest rates and give Congress more room to raise spending or cut taxes. As long as Congress and the Fed are doing their jobs, there’s no reason for the total number of jobs, economy-wide, to decrease.</p><p>The Internet’s biggest impact on the world may turn out to be cultural rather than economic. Music, television, and journalism have been transformed by platforms like Spotify, YouTube, Netflix, and Twitter. Social media has transformed politics, increasing polarization and powering the rise of populist movements around the world. And many white-collar workers have had to master new tools to remain at the forefront of their careers.</p><p>But in material terms, our lives aren’t much different than they were 30 years ago; our homes, grocery stores, neighborhoods, schools, and hospitals haven’t changed very much. Economic growth in the United States actually slowed down during the Internet era: inflation-adjusted GDP per capita rose more between 1962 and 1992 than it did between 1992 and 2022.</p><p><span>I expect a similar story with AI. Stable Diffusion has already revolutionized how we make digital images, and audio and video content won’t be far behind. The ability to generate customized (and </span><a href="https://www.understandingai.org/p/i-cloned-my-voice-with-ai-and-my" rel="">possibly fake</a><span>) text, images, and video on a large scale could have dramatic and unpredictable effects on our politics. Many white-collar workers will need to master new AI tools to remain at the forefront of their careers. Some might be forced to change careers altogether.</span></p><p>And if (like me) you’re a white-collar worker who sits in front of a computer all day, that will probably feel like a revolution, just as the Internet felt like a revolution to us 20 years ago. But most of life—and most jobs—are not online. The impact of AI on most people’s day-to-day lives is likely to be correspondingly modest.</p><p>I’ve got a favor to ask. To help me keep up with the rapid pace of change in AI, I’m looking to talk to readers who work with AI—whether that’s building it, using it, or studying it.</p><p><span>I’ve opened up a number of 30-minute slots on my calendar tomorrow and Wednesday. If you’d be willing to talk to me, please </span><a href="https://calendly.com/tim-full-stack-economics/30min?month=2023-04&amp;date=2023-04-26" rel="">click here</a><span>. All conversations will be strictly off the record. Thank you!</span></p></div></div></div></article></div></div></div>]]>
@@ -2537,321 +3114,7 @@ April 24, 2023 | https://www.understandingai.org/p/software-didnt-eat-the-world 
 Score 83 | Comments 75 (<a href="https://news.ycombinator.com/item?id=35688878">thread link</a>) | @todsacerdoti
 <br/>
 April 24, 2023 | https://glorifiedgluer.com/blog/2023/developing-with-nix-and-make/ | <a href="https://web.archive.org/web/*/https://glorifiedgluer.com/blog/2023/developing-with-nix-and-make/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
-  <h2>Why I use Nix and make(1) to develop
-    <small>
-      <time>April 19, 2023</time>
-    by ~glorifiedgluer
-
-
-    </small>
-  </h2><p>🗒️ Initially, this blog post was called “<em>Developing with Nix and
-make(1)</em>”, however, I thought to rename it after a brief discussion
-with <a href="https://github.com/soywod">soywod</a> on using Nix as the solo build system.</p>
-
-<p>Today, <a href="https://kmaasrud.com/">Magnus</a>, a friend of mine, posted <em><a href="https://kmaasrud.com/blog/make">a love letter to make</a></em>. In
-his post he talks about how powerful and reliable <code>make(1)</code><sup id="fnref:1"><a href="#fn:1" role="doc-noteref">1</a></sup> is,
-I really recommend you go there and read it too!</p>
-<p>In the meantime, he also posted his blog post to <a href="https://lobste.rs/s/mavub8/love_letter_make">lobste.rs</a>. It was a
-really interesting thread as people discussed from alternatives (such
-as <a href="https://github.com/casey/just">just</a> for a command runner) to lesser known features as <a href="https://lobste.rs/s/mavub8/love_letter_make#c_jjibsy">running
-python as the default shell</a>. I went ahead and made <a href="https://lobste.rs/s/mavub8/love_letter_make#c_xnqvxt">a comment</a> about
-using <a href="https://nixos.org/">Nix</a> and Makefiles as development tools and <a href="https://lobste.rs/u/dkl">u/dkl</a> made a question
-that really made me think:</p>
-<blockquote>
-<p>I don’t understand why Nix alone isn’t sufficient. Can you elaborate
-on your setup a little?</p>
-<p>—u/dkl</p>
-</blockquote>
-<p>I admit that my message was not clear: “<em>using make(1) with Nix to
-make dependencies easier to deal with</em>”. When I wrote this, I was
-thinking about the concept of <code>prerequisites</code> make has on its <a href="https://www.gnu.org/software/make/manual/make.html#Rule-Introduction">rules</a>.
-Which is nothing more than “in order to generate this file, this other
-thing has to be built successfully”.</p>
-<p>Meanwhile, this made me wonder where I found Nix to not be sufficient
-on my setup, more specifically, on my blog setup. As mentioned down
-the same thread, this blog has a relatively simple build process:</p>
-<ol>
-<li>Content is written on a <a href="https://orgmode.org/">Org</a> file</li>
-<li>GNU Emacs transforms this file into multiple <em>hugo-compliant</em>
-Markdown files</li>
-<li>Hugo generates a website from the Markdown files</li>
-<li>A <em>gzipped</em> archive is generated</li>
-<li>The archive is sent to sourcehut pages</li>
-</ol>
-<p>If each step was represented in a shell line, it would look like this:</p>
-<div><pre tabindex="0"><code data-lang="shell"><span><span><span># edit the Org file</span>
-</span></span><span><span>emacs
-</span></span><span><span><span># generate Markdown files</span>
-</span></span><span><span>emacs <span>$(</span><span>pwd</span><span>)</span> --batch -load export.el
-</span></span><span><span><span># generate website</span>
-</span></span><span><span>hugo
-</span></span><span><span><span># create gzipped archive</span>
-</span></span><span><span>tar -cvzf site.tar.gz -C public .
-</span></span><span><span><span># publish website to sourcehut pages</span>
-</span></span><span><span>hut pages publish site.tar.gz --domain glorifiedgluer.com --not-found 404.html
-</span></span></code></pre></div><h2 id="building-and-publishing-with-nix">Building and publishing with Nix</h2>
-<p>This is the <strong>perfect</strong> scenario for Nix as I don’t have <em>any</em> external
-dependencies to be fetched during the build steps. OK, how would one
-build the website with Nix? It would probably look like this:</p>
-<div><pre tabindex="0"><code data-lang="nix"><span><span><span>packages</span><span>.</span><span>website</span> <span>=</span> <span>stdenv</span><span>.</span><span>mkDerivation</span> <span>{</span>
-</span></span><span><span>  <span>name</span> <span>=</span> <span>"glorifiedgluercom"</span><span>;</span>
-</span></span><span><span>  <span>src</span> <span>=</span> <span>lib</span><span>.</span><span>cleanSource</span> <span>./.</span><span>;</span>
-</span></span><span><span>
-</span></span><span><span>  <span>buildInputs</span> <span>=</span> <span>[</span>
-</span></span><span><span>    <span>emacs-nox</span>
-</span></span><span><span>    <span>hugo</span>
-</span></span><span><span>  <span>];</span>
-</span></span><span><span>
-</span></span><span><span>  <span>configurePhase</span> <span>=</span> <span>''
-</span></span></span><span><span><span>    emacs $(pwd) --batch -load export.el
-</span></span></span><span><span><span>  ''</span><span>;</span>
-</span></span><span><span>
-</span></span><span><span>  <span>buildPhase</span> <span>=</span> <span>''
-</span></span></span><span><span><span>    hugo
-</span></span></span><span><span><span>    tar -cvzf site.tar.gz -C public .
-</span></span></span><span><span><span>  ''</span><span>;</span>
-</span></span><span><span>
-</span></span><span><span>  <span>installPhase</span> <span>=</span> <span>''
-</span></span></span><span><span><span>    mkdir -p $out
-</span></span></span><span><span><span>    cp -r site.tar.gz $out
-</span></span></span><span><span><span>  ''</span><span>;</span>
-</span></span><span><span><span>};</span>
-</span></span></code></pre></div><p>Running <code>nix build .#website</code> on this derivation would get you a
-<code>site.tar.gz</code> file in a <code>result</code> directory. More than just declaring
-the build steps, this will also ensure that all the dependencies
-needed to build the website would be the same byte-by-byte.</p>
-<p>What about the <em>developing experience</em>?<sup id="fnref:2"><a href="#fn:2" role="doc-noteref">2</a></sup> How would I run <code>hugo serve</code> to get a feedback loop while I write and how would I publish
-it? You can tell that my feedback loop is not going to happen inside
-that derivation above as I have to keep running <code>nix build</code> in order
-to see how things look like. Fortunately, this is easy to fix with <a href="https://nixos.org/manual/nix/stable/command-ref/new-cli/nix3-run.html">nix
-run</a>.</p>
-<div><pre tabindex="0"><code data-lang="nix"><span><span><span># this is using the helper function from github:numtide/flake-utils</span>
-</span></span><span><span><span>apps</span><span>.</span><span>run</span> <span>=</span> <span>utils</span><span>.</span><span>lib</span><span>.</span><span>mkApp</span> <span>{</span>
-</span></span><span><span>  <span>drv</span> <span>=</span> <span>pkgs</span><span>.</span><span>writeShellScriptBin</span> <span>"run"</span> <span>''
-</span></span></span><span><span><span>    </span><span>${</span><span>emacs</span><span>}</span><span>/bin/emacs $(pwd) --batch -load export.el
-</span></span></span><span><span><span>    </span><span>${</span><span>hugo</span><span>}</span><span>/bin/hugo serve
-</span></span></span><span><span><span>  ''</span><span>;</span>
-</span></span><span><span><span>};</span>
-</span></span></code></pre></div><p>Now I can just run the command <code>nix run .#run</code> and I’ll have hugo
-serving my website locally. The only missing step now is publishing it
-with <code>hut</code>, the sourcehut CLI.</p>
-<div><pre tabindex="0"><code data-lang="nix"><span><span><span>apps</span><span>.</span><span>publish</span> <span>=</span> <span>utils</span><span>.</span><span>lib</span><span>.</span><span>mkApp</span> <span>{</span>
-</span></span><span><span>  <span>drv</span> <span>=</span> <span>pkgs</span><span>.</span><span>writeShellScriptBin</span> <span>"publish"</span> <span>''
-</span></span></span><span><span><span>    </span><span>${</span><span>hut</span><span>}</span><span>/bin/hut pages </span><span>${</span><span>website</span><span>}</span><span> site.tar.gz \
-</span></span></span><span><span><span>        --domain glorifiedgluer.com \
-</span></span></span><span><span><span>        --not-found 404.html
-</span></span></span><span><span><span>  ''</span><span>;</span>
-</span></span><span><span><span>};</span>
-</span></span></code></pre></div><p>Running <code>nix run .#publish</code> will now publish the website to <a href="https://srht.site/">sourcehut
-pages</a>. Note that I’m using the derivation we created above, this
-will ensure that Nix actually built the package before publishing. How
-cool is that? It’s really cool, but we are missing something here:
-<strong>dependencies</strong>!</p>
-<h2 id="makefile-to-the-rescue">Makefile to the rescue</h2>
-<p>As previously mentioned, <code>make</code> has a concept of <em>prerequisites</em>. This
-is exactly what we need to ensure all <em>dependencies</em> are met before
-publishing the website.</p>
-<p>Makefiles have something called <code>target</code>, it is supposed to be mapped
-to a file. If not, it is called a <code>PHONY</code> target. You can understand
-PHONY targets as command runners. Let’s write our Makefile to take
-care of our website build steps:</p>
-<div><pre tabindex="0"><code data-lang="makefile"><span><span><span>all</span><span>:</span> <span>publish</span>
-</span></span><span><span>
-</span></span><span><span>	content:
-</span></span><span><span>	emacs <span>$(</span><span>pwd</span><span>)</span> --batch -load export.el
-</span></span><span><span>
-</span></span><span><span><span>public</span><span>:</span> <span>content</span>
-</span></span><span><span>	hugo
-</span></span><span><span>
-</span></span><span><span><span>site.tar.gz</span><span>:</span> <span>public</span>
-</span></span><span><span>	tar -cvzf site.tar.gz -C public .
-</span></span><span><span>
-</span></span><span><span><span>.PHONY</span><span>:</span> <span>publish</span>
-</span></span><span><span><span>publish</span><span>:</span> <span>site</span>.<span>tar</span>.<span>gz</span>
-</span></span><span><span>	hut pages publish site.tar.gz <span>\
-</span></span></span><span><span><span></span>		--domain glorifiedgluer.com <span>\
-</span></span></span><span><span><span></span>		--not-found 404.html
-</span></span><span><span>
-</span></span><span><span><span>.PHONY</span><span>:</span> <span>run</span>
-</span></span><span><span><span>run</span><span>:</span> <span>content</span>
-</span></span><span><span>	hugo serve
-</span></span></code></pre></div><p>As you can see, we have targets such as <code>public</code> and <code>content</code> defined
-in our Makefile, this means that <code>make</code> will generate the <code>public</code>
-directory if it notices that something changed. Our <code>publish</code> target
-is also interesting, it takes <code>site.tar.gz</code> as a prerequisite, and
-<code>site.tar.gz</code> takes <code>public</code> as one too. This will ensure that every
-<em>dependency</em> on our build is met before actually publishing.</p>
-<h2 id="leveraging-nix-for-package-dependencies">Leveraging Nix for <em>package</em> dependencies</h2>
-<p>One of the nicest things Nix provides, if not the nicest one, is the
-<a href="https://nixos.org/manual/nix/stable/command-ref/new-cli/nix3-develop.html">nix develop</a> command. This can be used to give us a shell environment
-with all the packages needed to build our project.</p>
-<div><pre tabindex="0"><code data-lang="nix"><span><span><span>devShells</span><span>.</span><span>default</span> <span>=</span> <span>mkShell</span> <span>{</span>
-</span></span><span><span>  <span>buildInputs</span> <span>=</span> <span>[</span>
-</span></span><span><span>    <span>emacs</span>
-</span></span><span><span>    <span>gnumake</span>
-</span></span><span><span>    <span>hut</span>
-</span></span><span><span>    <span>hugo</span>
-</span></span><span><span>  <span>];</span>
-</span></span><span><span><span>};</span>
-</span></span></code></pre></div><p>If you run <code>nix develop</code>, you’ll be thrown at a shell session with
-these packages on <code>$PATH</code>. However, you can also run <code>nix develop -c &lt;cmd&gt;</code> to run commands without entering the shell. Do you see where we
-are heading? We can run <code>nix develop -c make</code> and have all the needed
-packages available for <code>make</code> to use.</p>
-<div><pre tabindex="0"><code data-lang="shell"><span><span>user@host:~/glorifiedgluercom$ nix develop -c make
-</span></span><span><span>rm -rf content
-</span></span><span><span>rm -rf public
-</span></span><span><span>rm -rf site.tar.gz
-</span></span><span><span>emacs  --batch -load export.el
-</span></span><span><span>...
-</span></span><span><span>hugo
-</span></span><span><span>...
-</span></span><span><span>tar -cvzf site.tar.gz -C public .
-</span></span><span><span>...
-</span></span><span><span>hut pages publish site.tar.gz <span>\
-</span></span></span><span><span><span></span>	--domain glorifiedgluer.com <span>\
-</span></span></span><span><span><span></span>	--not-found 404.html
-</span></span><span><span>
-</span></span><span><span>Published site at glorifiedgluer.com
-</span></span></code></pre></div><h2 id="wrapping-up">Wrapping up</h2>
-<p>After some more thinking about this subject, it was clear to me that
-using <code>make</code> the way it is presented here might give you the following
-advantages:</p>
-<ol>
-<li>You have a <em>standard</em> way to build your system that Non-Nix users
-can leverage</li>
-<li>It’s relatively easier to reason about the build steps</li>
-</ol>
-<p><strong>ON THE OTHER HAND</strong>, this also gave me a really interesting idea that
-got me excited to try. What are the advantages of using Nix as a
-<code>make</code> <em>replacement</em>?</p>
-<ol>
-<li>You have a single tool to manage dependencies and <em>build steps</em></li>
-</ol>
-<p>In this case, <em>build steps</em> is such a broad thing on Nix that it would
-add a lot more points here and I don’t think it’s fair. You get a
-discoverable CLI with auto-completion (this is also true for <code>make</code>),
-caching dependencies/build steps is rather straightforward and you can
-share everything between your projects with Nix Flakes.</p>
-<p>What about the interesting idea? Some time ago I had another idea and
-wrote about my <a href="https://glorifiedgluer.com/blog/2022/starting-a-personal-monorepo/">personal monorepo</a>, this didn’t get too far<sup id="fnref:3"><a href="#fn:3" role="doc-noteref">3</a></sup>.
-Anyway, most of the problems I faced resolved around tooling and how
-weird it was to switch between multiple languages and tools. I think,
-however, that it might be able possible to overcome this with the
-ideas presented here. Let’s see how it goes! 😊</p>
-
-
-
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-   
-
-
-
-
-
-
-
-      </div></div>]]>
+<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
             </description>
             <link>https://glorifiedgluer.com/blog/2023/developing-with-nix-and-make/</link>
             <guid isPermaLink="false">hacker-news-small-sites-35688878</guid>
@@ -2863,7 +3126,7 @@ ideas presented here. Let’s see how it goes! 😊</p>
             </title>
             <description>
 <![CDATA[
-Score 83 | Comments 123 (<a href="https://news.ycombinator.com/item?id=35687292">thread link</a>) | @mlajtos
+Score 83 | Comments 127 (<a href="https://news.ycombinator.com/item?id=35687292">thread link</a>) | @mlajtos
 <br/>
 April 24, 2023 | https://mlajtos.mu/posts/improbably-right | <a href="https://web.archive.org/web/*/https://mlajtos.mu/posts/improbably-right">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>April 24, 2023<!-- --> · Milan Lajtoš</p><hr><h2>Improbable hens</h2><p>When I was 10 years old, math teacher was giving our class a flash test — word problems from exercise book that were pretty trivial – everybody solved them without too much thinking and we didn't even had to do any calculations on the side. Just write down the answer and then raise a hand to signal that we were done. When every hand was up, we moved onto another question. My hand was constantly up with the fastest ones. We moved from question to question, the pace was pretty rapid – we didn't really waited too much for anybody. And then this question came up:</p><blockquote><p>3 hens lay 3 eggs in 3 days. How many eggs do 12 hens give in 12 days?</p></blockquote><p>My initial reaction was that this is kinda hard to solve just in my head. So I started to scribble some numbers on the side. By this time, every hand was up but mine. I was shocked and ashamed. I asked for some more time. Everybody including the teacher laughed. My face must have been as the ripest tomato under the sun. After few more seconds I raised my hand. I was in disbelief that I was the slowest to solve it. We continued with more rounds of questions. I could not shake off the bad feeling.</p><p>After all rounds were finished, we were going one by one and checked our answers by shouting what we got. I was waiting for that one question in particular. When we got to it, everybody shouted <em>"Twelve!"</em>. I didn't shout. Just said <em>"48"</em> with the most embarrassed voice in my life. I was the slowest to come up with the answer and at the end, I was the only one who got it wrong. The teacher was perplexed of why I said such wrong answer to such simple question. I never felt more ashamed of myself before. We moved on to check the rest of the answers.</p><p>After we went through all the questions, the teacher checked the exercise book for the correct answers. And to everybody's surprise there it was – 48. I was asked to explain why it was the correct answer and I did. With the biggest grin on my tomato face.</p><figure><table><tbody><tr><td></td><td>🌞🌞🌞</td><td>🌞🌞🌞</td><td>🌞🌞🌞</td><td>🌞🌞🌞</td></tr><tr><td>🐓🐓🐓</td><td>🥚🥚🥚</td><td>🥚🥚🥚</td><td>🥚🥚🥚</td><td>🥚🥚🥚</td></tr><tr><td>🐓🐓🐓</td><td>🥚🥚🥚</td><td>🥚🥚🥚</td><td>🥚🥚🥚</td><td>🥚🥚🥚</td></tr><tr><td>🐓🐓🐓</td><td>🥚🥚🥚</td><td>🥚🥚🥚</td><td>🥚🥚🥚</td><td>🥚🥚🥚</td></tr><tr><td>🐓🐓🐓</td><td>🥚🥚🥚</td><td>🥚🥚🥚</td><td>🥚🥚🥚</td><td>🥚🥚🥚</td></tr></tbody></table><figcaption>Super-sophisticated visual illustration of multiplicative relation between hens, days and number of produced eggs.</figcaption></figure><h2>Improbable speed</h2><p>When I was around 15 years old, I happend to be in front of a blackboard, answering a physics question asked by our teacher. The question was without any prior context:</p><blockquote><p>How would you get an average speed of a moving car?</p></blockquote><p>Without hesitation, I answered that I would measure car's speed at every instant and produce an average of those measurements. Teacher laughed and asked me how to make an infinite number of measurements. When she expressed I should use something practical, I produced the usual answer – <code>average-speed := (distance / time)</code>.</p><p>Few years later in math class, I remembered that moment from physics class. We were just presented with integral calculus and there it was – you can get an average of some function with definitive integral. That is literaly measuring car's speed at every instant! Not very practical, but ultimately true.</p><h2>Improbable logic</h2><p>When I was grad student, we had intro to cognitive psychology. Every week we studied some aspect of human cognition and then we presented our findings. One week's topic was logical reasoning. I had to do some test and send my results to the person that was presenting the topic. The task was to check whether specified rule holds or is broken with presented cards. An example of what the task looked like is here. If you want to think first, don't read the text below the box.</p><figure><p>If a card shows an even number on one side,<br>then its opposite side is blue.</p><div><div><div></div></div><div><div></div></div><div><div></div></div><div><div></div></div></div><p>Which cards you need to turn to check if the rule holds?</p><p>(Every card has number on one side, and blue/orange color on the other.)</p><figcaption></figcaption></figure><p>Let's think through which cards we need to check.</p><ol><li><p>The first card has a "3" on its face. Does the rule say something about odd numbers? No, so we don't have to touch this card.</p></li><li><p>If there is "8" on the second card, as the rule suggests, we need to check if the opposite side is blue, right? That's first card that needs to be checked.</p></li><li><p>Next, do we need to check the third card? One would think that we would need to turn the third card which is blue, to check whether there is an even number on the other side, right? Not really. The rule doesn't say there can't be a card with an odd number and blue color. So if the card is blue, it doesn't matter wheter it has even or odd number. We don't have to check this card.</p></li><li><p>Do we need to check the fourth card, which is orange? Rule doesn't say anything about orange color, right? But what if there is an even number there – that would mean, the rule is broken. So we need to turn this card as well.</p></li></ol><p>Some people might recognize this task as test for <a href="https://en.wikipedia.org/wiki/Material_conditional">material implication</a>. At first, the test might seem counter-intuitive and not really straightforward, but it is perfectly logical.</p><p>Back to the story.</p><p>When one of my peers presented the results on the <a href="https://en.wikipedia.org/wiki/Wason_selection_task">Wason selection task</a>, only one participant scored  100%. It was me. Again, the blood rushed to my face as I thought everybody was thinking that I was a cheater. And in fact, I kinda was cheating. I know that humans are biased for intuitive understanding rather than logical one. Intuitions are shortcuts that are very valuable, but sometimes they are just plainly wrong. This was one of those shortcuts and everybody but me took it.</p><p>But wait, there is more – this task has a hidden twist. When Wason selection task is presented in context of social relations (or more broadly "evolutionarily familiar problems"), people tend to get it immediatelly, or rather intuitivelly. Bonkers, right? Here is an example of this social grounding:</p><figure><p>If a person drinks an alcoholic drink,<br>then they must be over the age of 18 years old.</p><div><div><div></div></div><div><div></div></div><div><div></div></div><div><div></div></div></div><p>Which cards you need to turn to check if the rule holds?</p><p>(Every card has age as number on one side, and milk/beer icon on the other.)</p><figcaption></figcaption></figure><p>Easy, right?</p></div></div>]]>
@@ -2878,7 +3141,7 @@ April 24, 2023 | https://mlajtos.mu/posts/improbably-right | <a href="https://we
             </title>
             <description>
 <![CDATA[
-Score 42 | Comments 26 (<a href="https://news.ycombinator.com/item?id=35686310">thread link</a>) | @NiekvdMaas
+Score 44 | Comments 26 (<a href="https://news.ycombinator.com/item?id=35686310">thread link</a>) | @NiekvdMaas
 <br/>
 April 24, 2023 | https://boerman.dev/posts/market20230419/ | <a href="https://web.archive.org/web/*/https://boerman.dev/posts/market20230419/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div>
@@ -3149,10 +3412,10 @@ A fallback situation is not unique to the local validation step, there are fallb
             </title>
             <description>
 <![CDATA[
-Score 333 | Comments 301 (<a href="https://news.ycombinator.com/item?id=35684807">thread link</a>) | @luu
+Score 334 | Comments 301 (<a href="https://news.ycombinator.com/item?id=35684807">thread link</a>) | @luu
 <br/>
 April 24, 2023 | https://www.katsnyderux.com/post/no-i-don-t-want-to-sign-up-for-your-newsletter-horrible-uses-of-exit-overlays | <a href="https://web.archive.org/web/*/https://www.katsnyderux.com/post/no-i-don-t-want-to-sign-up-for-your-newsletter-horrible-uses-of-exit-overlays">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-hook="post-description"><article><div><div><div><div data-rce-version="9.6.3"><div dir="ltr" data-id="rich-content-viewer"><div><div id="viewer-73tge"><div><div data-hook="imageViewer" role="button" tabindex="0"><div id="new-image17965088" aria-label="collage of interstitials blocking user's view of a website's content"><wow-image id="70fc59_178c9c5e4cde4943bd1e3a61ad16675f~mv2.jpg" data-image-info="{&quot;containerId&quot;:&quot;new-image17965088&quot;,&quot;displayMode&quot;:&quot;fill&quot;,&quot;isLQIP&quot;:true,&quot;isSEOBot&quot;:false,&quot;lqipTransition&quot;:&quot;blur&quot;,&quot;imageData&quot;:{&quot;width&quot;:1024,&quot;height&quot;:768,&quot;uri&quot;:&quot;70fc59_178c9c5e4cde4943bd1e3a61ad16675f~mv2.jpg&quot;,&quot;name&quot;:&quot;&quot;,&quot;displayMode&quot;:&quot;fill&quot;}}" data-bg-effect-name="" data-has-ssr-src="true" data-animate-blur=""><img src="https://static.wixstatic.com/media/70fc59_178c9c5e4cde4943bd1e3a61ad16675f~mv2.jpg/v1/fill/w_147,h_110,al_c,q_80,usm_0.66_1.00_0.01,blur_2,enc_auto/70fc59_178c9c5e4cde4943bd1e3a61ad16675f~mv2.jpg" alt="collage of interstitials blocking user's view of a website's content" data-pin-url="https://www.katsnyderux.com/post/no-i-don-t-want-to-sign-up-for-your-newsletter-horrible-uses-of-exit-overlays" data-pin-media="https://static.wixstatic.com/media/70fc59_178c9c5e4cde4943bd1e3a61ad16675f~mv2.jpg/v1/fill/w_1024,h_768,al_c,q_85/70fc59_178c9c5e4cde4943bd1e3a61ad16675f~mv2.jpg"></wow-image></div></div></div></div><p id="viewer-9ptf9"><span><span>When a user moves their  mouse from the middle of the page toward the navigation  bar — presumably to abandon the page — there are technologies which can  track this behavior and trigger a “mouse-out” alert. While this UX  element (from companies such as Crazy Egg and Rooster) has great  potential, I’ve found it far too common that websites use this to  overlay huge pop-ups across the entire screen as a last-ditch effort to  convert users.</span></span></p><p id="viewer-4cdob"><span><span>The exit-intent overlay has to have been popularized by people siloed off from user experience design, because it becomes clear quite quickly  that these exit-intent overlays (1) arguably do a poor job of serving  the initial intent of increasing conversions, and (2) work against the  user’s goals, which exist [gasp!] <em>outside</em> that website.</span></span></p><p id="viewer-1vk3l"><span><span>Let me explain:</span></span></p><ol><li id="viewer-8qjn6"><p><strong>Does a poor job of increasing conversions.</strong> A  person opens a blog post about the psychology of color in marketing. The  first paragraph looks promising and she moves her cursor to the top  right to access the scrollbar. This then triggers the exit-intent  overlay, obscuring her view of the rest of the article. “Sign up for our  newsletter!” the overlay implores. If time on page and the amount a  person scrolls down a page are positive engagement metrics, why has the  site just stopped her from engaging with the rest of the article? If “<a data-hook="linkViewer" href="http://www.tutorialspoint.com/management_concepts/the_rule_of_seven.htm" target="_blank" rel="noopener noreferrer nofollow noopener"><u>the rule of seven</u></a>” — that  a customer needs to interact seven times before buying — is marketing  101, why does the site demand a newsletter conversion before a new user  has even finished reading one article?</p></li><li id="viewer-762lp"><p><strong>Works against user goals.</strong> At the end of my workday, I usually open a row of new tabs of  that day’s UX-related tweets that pique my interest — many people engage  in this kind of parallel browsing and page parking (keeping many tabs  open to multi-task, and opening multiple tabs at once to research a  particular topic). Sites that trigger exit overlays when I switch tabs,  or after a specified amount of time, guarantee that I must close the  overlay <em>before I interact with their content for the first time.</em>  Some overlays even insult my intelligence by making me click a button  that says “No, I don’t want free things” or “I hate good advice” <em>before I interact with their content for the first time</em>.</p></li></ol><p id="viewer-64t8v"><span><span>A variety of companies will try to convince you that <a data-hook="linkViewer" href="http://blog.getrooster.com/what-are-exit-overlays/" target="_blank" rel="noopener noreferrer nofollow noopener"><u>exit overlays</u></a> <a data-hook="linkViewer" href="https://blog.crazyegg.com/2015/07/27/6-exit-overlays/" target="_blank" rel="noopener noreferrer nofollow noopener"><u>are</u></a> <a data-hook="linkViewer" href="http://unbounce.com/landing-pages/exit-overlays-make-your-landing-page-offer-more-persuasive/" target="_blank" rel="noopener noreferrer nofollow noopener"><u>great</u></a>, or at least that you can use them <a data-hook="linkViewer" href="https://www.usertesting.com/blog/2015/09/14/popups-and-user-experience/" target="_blank" rel="noopener noreferrer nofollow noopener"><u>responsibly</u></a>.  I’ll grant that some websites may see increased newsletter conversions,  but at what long-term cost to their brand? While some users may sign up  for the newsletter willingly, many others may feel bullied into signing  up or even leave in disgust. As a research psychologist recently  transitioned to UX, I recognize this aggressive persuasion technique as  an example of <a data-hook="linkViewer" href="https://www.usertesting.com/blog/2015/10/01/dark-patterns-the-sinister-side-of-ux/" target="_blank" rel="noopener noreferrer nofollow noopener"><u>dark design patterns</u></a> and <a data-hook="linkViewer" href="https://www.nngroup.com/articles/needy-design-patterns/" target="_blank" rel="noopener noreferrer nofollow noopener"><u>needy design patterns</u></a>.  With some reworking, perhaps mouse-out trackers can help users and  companies achieve aligned goals — like how Google Calendar sends  notifications to my phone when it knows I do not have Calendar opened in  my browser. When it comes to conversions, however, there are no magic  bullets and there are no short-cuts. Companies that want to up  conversions must allow potential clients time to research on their own  terms.</span></span></p></div></div></div></div></div></div></article></div></div>]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-hook="post-description"><article><div><div><div><div data-rce-version="9.6.3"><div dir="ltr" data-id="rich-content-viewer"><div><div id="viewer-73tge"><div><div data-hook="imageViewer" role="button" tabindex="0"><div id="new-image8034656" aria-label="collage of interstitials blocking user's view of a website's content"><wow-image id="70fc59_178c9c5e4cde4943bd1e3a61ad16675f~mv2.jpg" data-image-info="{&quot;containerId&quot;:&quot;new-image8034656&quot;,&quot;displayMode&quot;:&quot;fill&quot;,&quot;isLQIP&quot;:true,&quot;isSEOBot&quot;:false,&quot;lqipTransition&quot;:&quot;blur&quot;,&quot;imageData&quot;:{&quot;width&quot;:1024,&quot;height&quot;:768,&quot;uri&quot;:&quot;70fc59_178c9c5e4cde4943bd1e3a61ad16675f~mv2.jpg&quot;,&quot;name&quot;:&quot;&quot;,&quot;displayMode&quot;:&quot;fill&quot;}}" data-bg-effect-name="" data-has-ssr-src="true" data-animate-blur=""><img src="https://static.wixstatic.com/media/70fc59_178c9c5e4cde4943bd1e3a61ad16675f~mv2.jpg/v1/fill/w_147,h_110,al_c,q_80,usm_0.66_1.00_0.01,blur_2,enc_auto/70fc59_178c9c5e4cde4943bd1e3a61ad16675f~mv2.jpg" alt="collage of interstitials blocking user's view of a website's content" data-pin-url="https://www.katsnyderux.com/post/no-i-don-t-want-to-sign-up-for-your-newsletter-horrible-uses-of-exit-overlays" data-pin-media="https://static.wixstatic.com/media/70fc59_178c9c5e4cde4943bd1e3a61ad16675f~mv2.jpg/v1/fill/w_1024,h_768,al_c,q_85/70fc59_178c9c5e4cde4943bd1e3a61ad16675f~mv2.jpg"></wow-image></div></div></div></div><p id="viewer-9ptf9"><span><span>When a user moves their  mouse from the middle of the page toward the navigation  bar — presumably to abandon the page — there are technologies which can  track this behavior and trigger a “mouse-out” alert. While this UX  element (from companies such as Crazy Egg and Rooster) has great  potential, I’ve found it far too common that websites use this to  overlay huge pop-ups across the entire screen as a last-ditch effort to  convert users.</span></span></p><p id="viewer-4cdob"><span><span>The exit-intent overlay has to have been popularized by people siloed off from user experience design, because it becomes clear quite quickly  that these exit-intent overlays (1) arguably do a poor job of serving  the initial intent of increasing conversions, and (2) work against the  user’s goals, which exist [gasp!] <em>outside</em> that website.</span></span></p><p id="viewer-1vk3l"><span><span>Let me explain:</span></span></p><ol><li id="viewer-8qjn6"><p><strong>Does a poor job of increasing conversions.</strong> A  person opens a blog post about the psychology of color in marketing. The  first paragraph looks promising and she moves her cursor to the top  right to access the scrollbar. This then triggers the exit-intent  overlay, obscuring her view of the rest of the article. “Sign up for our  newsletter!” the overlay implores. If time on page and the amount a  person scrolls down a page are positive engagement metrics, why has the  site just stopped her from engaging with the rest of the article? If “<a data-hook="linkViewer" href="http://www.tutorialspoint.com/management_concepts/the_rule_of_seven.htm" target="_blank" rel="noopener noreferrer nofollow noopener"><u>the rule of seven</u></a>” — that  a customer needs to interact seven times before buying — is marketing  101, why does the site demand a newsletter conversion before a new user  has even finished reading one article?</p></li><li id="viewer-762lp"><p><strong>Works against user goals.</strong> At the end of my workday, I usually open a row of new tabs of  that day’s UX-related tweets that pique my interest — many people engage  in this kind of parallel browsing and page parking (keeping many tabs  open to multi-task, and opening multiple tabs at once to research a  particular topic). Sites that trigger exit overlays when I switch tabs,  or after a specified amount of time, guarantee that I must close the  overlay <em>before I interact with their content for the first time.</em>  Some overlays even insult my intelligence by making me click a button  that says “No, I don’t want free things” or “I hate good advice” <em>before I interact with their content for the first time</em>.</p></li></ol><p id="viewer-64t8v"><span><span>A variety of companies will try to convince you that <a data-hook="linkViewer" href="http://blog.getrooster.com/what-are-exit-overlays/" target="_blank" rel="noopener noreferrer nofollow noopener"><u>exit overlays</u></a> <a data-hook="linkViewer" href="https://blog.crazyegg.com/2015/07/27/6-exit-overlays/" target="_blank" rel="noopener noreferrer nofollow noopener"><u>are</u></a> <a data-hook="linkViewer" href="http://unbounce.com/landing-pages/exit-overlays-make-your-landing-page-offer-more-persuasive/" target="_blank" rel="noopener noreferrer nofollow noopener"><u>great</u></a>, or at least that you can use them <a data-hook="linkViewer" href="https://www.usertesting.com/blog/2015/09/14/popups-and-user-experience/" target="_blank" rel="noopener noreferrer nofollow noopener"><u>responsibly</u></a>.  I’ll grant that some websites may see increased newsletter conversions,  but at what long-term cost to their brand? While some users may sign up  for the newsletter willingly, many others may feel bullied into signing  up or even leave in disgust. As a research psychologist recently  transitioned to UX, I recognize this aggressive persuasion technique as  an example of <a data-hook="linkViewer" href="https://www.usertesting.com/blog/2015/10/01/dark-patterns-the-sinister-side-of-ux/" target="_blank" rel="noopener noreferrer nofollow noopener"><u>dark design patterns</u></a> and <a data-hook="linkViewer" href="https://www.nngroup.com/articles/needy-design-patterns/" target="_blank" rel="noopener noreferrer nofollow noopener"><u>needy design patterns</u></a>.  With some reworking, perhaps mouse-out trackers can help users and  companies achieve aligned goals — like how Google Calendar sends  notifications to my phone when it knows I do not have Calendar opened in  my browser. When it comes to conversions, however, there are no magic  bullets and there are no short-cuts. Companies that want to up  conversions must allow potential clients time to research on their own  terms.</span></span></p></div></div></div></div></div></div></article></div></div>]]>
             </description>
             <link>https://www.katsnyderux.com/post/no-i-don-t-want-to-sign-up-for-your-newsletter-horrible-uses-of-exit-overlays</link>
             <guid isPermaLink="false">hacker-news-small-sites-35684807</guid>
@@ -3164,7 +3427,7 @@ April 24, 2023 | https://www.katsnyderux.com/post/no-i-don-t-want-to-sign-up-for
             </title>
             <description>
 <![CDATA[
-Score 657 | Comments 236 (<a href="https://news.ycombinator.com/item?id=35684220">thread link</a>) | @philbo
+Score 691 | Comments 245 (<a href="https://news.ycombinator.com/item?id=35684220">thread link</a>) | @philbo
 <br/>
 April 23, 2023 | https://philbooth.me/blog/nine-ways-to-shoot-yourself-in-the-foot-with-postgresql | <a href="https://web.archive.org/web/*/https://philbooth.me/blog/nine-ways-to-shoot-yourself-in-the-foot-with-postgresql">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -3358,17 +3621,27 @@ WHERE id IN (
   FROM event_queue
   WHERE acquired_at IS NULL
   ORDER BY occurred_at
+  FOR UPDATE SKIP LOCKED
   LIMIT 1000 -- Set this limit according to your usage
 )
 RETURNING *;
 </code></pre>
-<p>Setting <code>acquired_at</code> on read guarantees
-that each event is handled only once.
+<p>Setting <code>acquired_at</code> on read
+and using <code>FOR UPDATE SKIP LOCKED</code>
+guarantees each event is handled only once.
 After they've been handled,
 you can then delete the acquired events in batches too
 (there are better options than Postgres
 for permanently storing historical event data
 of unbounded size).</p>
+<p><em><strong>EDIT:</strong></em>
+<em>Thanks to
+<a href="https://www.reddit.com/r/PostgreSQL/comments/12w574s/comment/jhfc455/">labatteg</a>,
+<a href="https://www.reddit.com/r/programming/comments/12ye352/comment/jhn31v2/">notfancy</a>,
+<a href="https://news.ycombinator.com/item?id=35699614">reese_john</a>,
+<a href="https://news.ycombinator.com/item?id=35700422">xnickb</a>
+and <a href="https://news.ycombinator.com/item?id=35701210">Mavvie</a>
+for pointing out the missing <code>FOR UPDATE SKIP LOCKED</code> in this section.</em></p>
 <h3>5. Don't use <code>EXPLAIN ANALYZE</code> on real data</h3>
 <p><a href="https://www.postgresql.org/docs/current/using-explain.html"><code>EXPLAIN</code></a>
 is a core tool in every backend engineer's kit.
@@ -3408,9 +3681,9 @@ there should be no surprises waiting for you
 when they reach production.</p>
 <h3>6. Prefer CTEs over subqueries</h3>
 <p><em><strong>EDIT:</strong></em>
-<em>Thanks to <a href="https://www.reddit.com/user/Randommaggy/">Randommaggy</a> and <a href="https://www.reddit.com/user/Ecksters/">Ecksters</a> on Reddit
+<em>Thanks to <a href="https://www.reddit.com/user/Randommaggy/">Randommaggy</a> and <a href="https://www.reddit.com/user/Ecksters/">Ecksters</a>
 for <a href="https://www.reddit.com/r/PostgreSQL/comments/12w574s/comment/jhdrd2n/">pointing out</a>
-the subquery suggestion in this section is outdated.
+the subquery suggestion in the following section is outdated.
 Since version 12,
 Postgres has been much better at optimising CTEs
 and will often just replace the CTE with a subquery anyway.
@@ -3469,8 +3742,7 @@ The cost of that is write performance of course,
 but it's often worth it for the payoff.</p>
 <h3>8. Don't add indexes to your foreign keys</h3>
 <p>Postgres doesn't automatically create indexes for foreign keys.
-This may come as a surprise
-if you're more familiar with other databases,
+This may come as a surprise if you're more familiar with MySQL,
 so pay attention to the implications
 as it can hurt you in a few ways.</p>
 <p>The most obvious fallout from it
@@ -3502,7 +3774,7 @@ This can be confusing
 the first time you notice it
 in the output from <code>EXPLAIN</code>.</p>
 <p>If that happens
-and you want to force a query use the index instead,
+and you want to force a query to use the index instead,
 you can make the null check explicit
 and then use <code>=</code> for the not-null case.</p>
 <p>In other words,
@@ -3527,7 +3799,7 @@ OR bar = baz;
             </title>
             <description>
 <![CDATA[
-Score 209 | Comments 78 (<a href="https://news.ycombinator.com/item?id=35681810">thread link</a>) | @palidanx
+Score 210 | Comments 78 (<a href="https://news.ycombinator.com/item?id=35681810">thread link</a>) | @palidanx
 <br/>
 April 23, 2023 | https://www.dquach.com/2021/08/01/west-coast-trail-the-75km-48-mile-death-hike/ | <a href="https://web.archive.org/web/*/https://www.dquach.com/2021/08/01/west-coast-trail-the-75km-48-mile-death-hike/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div itemprop="mainContentOfPage">
@@ -4113,7 +4385,7 @@ April 23, 2023 | https://www.dquach.com/2021/08/01/west-coast-trail-the-75km-48-
             </title>
             <description>
 <![CDATA[
-Score 323 | Comments 324 (<a href="https://news.ycombinator.com/item?id=35679911">thread link</a>) | @qword
+Score 329 | Comments 326 (<a href="https://news.ycombinator.com/item?id=35679911">thread link</a>) | @qword
 <br/>
 April 23, 2023 | https://www.qword.net/2023/04/23/lsd-not-even-once-really | <a href="https://web.archive.org/web/*/https://www.qword.net/2023/04/23/lsd-not-even-once-really">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div aria-label="Content">
@@ -4209,7 +4481,7 @@ April 23, 2023 | https://www.qword.net/2023/04/23/lsd-not-even-once-really | <a 
             </title>
             <description>
 <![CDATA[
-Score 208 | Comments 131 (<a href="https://news.ycombinator.com/item?id=35678269">thread link</a>) | @imaq
+Score 208 | Comments 136 (<a href="https://news.ycombinator.com/item?id=35678269">thread link</a>) | @imaq
 <br/>
 April 23, 2023 | https://notes.alinpanaitiu.com/Keyboard%20tricks%20from%20a%20macOS%20app%20dev | <a href="https://web.archive.org/web/*/https://notes.alinpanaitiu.com/Keyboard%20tricks%20from%20a%20macOS%20app%20dev">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -4428,7 +4700,7 @@ April 23, 2023 | https://notes.alinpanaitiu.com/Keyboard%20tricks%20from%20a%20m
             </title>
             <description>
 <![CDATA[
-Score 185 | Comments 55 (<a href="https://news.ycombinator.com/item?id=35677086">thread link</a>) | @idarek
+Score 186 | Comments 55 (<a href="https://news.ycombinator.com/item?id=35677086">thread link</a>) | @idarek
 <br/>
 April 23, 2023 | https://dariusz.wieckiewicz.org/en/bing-jail/ | <a href="https://web.archive.org/web/*/https://dariusz.wieckiewicz.org/en/bing-jail/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><p>A short story on how my website lost all indexed pages in Bing, affecting my presence in DuckDuckGo, secret blacklisting and classification as a splog by Bing AI</p><div id="Read_More"><p>My personal site has been recently penalized by Bing, or if you prefer different naming for it - <strong>secretly blacklisted</strong> or <strong>shadowbanned</strong>. Don’t know exactly why but by the end of January 2023 I lost every indexed page that had been in Bing.</p><p><picture><source media="(max-width: 480px)" srcset="https://dariusz.wieckiewicz.org/images/2023/04/Bing_Search_Performance_DW_6m_hueb62fb2ccc9003d205d86686cab1a78b_30285_960x0_resize_q75_h2_lanczos_3.webp 2x,
@@ -4461,7 +4733,7 @@ https://dariusz.wieckiewicz.org/images/2023/04/Bing_Site_Scan_PL_Issue_details_h
             </title>
             <description>
 <![CDATA[
-Score 68 | Comments 28 (<a href="https://news.ycombinator.com/item?id=35676825">thread link</a>) | @mattsan
+Score 69 | Comments 28 (<a href="https://news.ycombinator.com/item?id=35676825">thread link</a>) | @mattsan
 <br/>
 April 23, 2023 | https://mattsanetra.uk/blog/graph-build-proposal/ | <a href="https://web.archive.org/web/*/https://mattsanetra.uk/blog/graph-build-proposal/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="_main-content"><article><span><time datetime="2023-04-23T15:00:00.000Z">April 23, 2023</time></span><div><p>Yet <em><strong>another</strong></em> build system?</p><p><img alt="Alpaca" src="https://mattsanetra.uk/_astro/alpaca-intrigued.ab5b631e.svg"></p></div><p>Hear me out! This one is simple!! No need to add separate support for different languages, we just write what commands we want to execute.</p><div><p>Isn’t that just Make?</p><p><img alt="Frog" src="https://mattsanetra.uk/_astro/frog-confused.5bf1b652.svg"></p></div><p>Yep! But what if we add <strong>mappings</strong> and <strong>collections</strong>?</p><p>This post is just a proposal and some ideas that I brainstormed to make a build system that is easy to use for any language, without having to learn anything complicated.</p><p>The name I have in mind for this is <strong>Piper</strong>.</p><h2 id="motivation">Motivation</h2><p>I was recently experimenting with a tool that converted one file into another, and then that <em>new</em> file had to be aggregated with files of the same type in the arguments of yet another command.</p><p>It seems complicated, but it’s solved easily with a bash script:</p><pre><code><span><span>#!/bin/bash</span></span>
@@ -4903,7 +5175,7 @@ Number of operations getting executed inside database is still the same.</p>
             </title>
             <description>
 <![CDATA[
-Score 36 | Comments 4 (<a href="https://news.ycombinator.com/item?id=35676444">thread link</a>) | @mixeden
+Score 37 | Comments 4 (<a href="https://news.ycombinator.com/item?id=35676444">thread link</a>) | @mixeden
 <br/>
 April 23, 2023 | https://wearefastflash.com/blog/hackernews | <a href="https://web.archive.org/web/*/https://wearefastflash.com/blog/hackernews">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -5042,7 +5314,7 @@ https://sahbichaieb.com/static/edcceece15a77eb24af740a1a03beb4a/6c99d/profileGPT
             </title>
             <description>
 <![CDATA[
-Score 148 | Comments 100 (<a href="https://news.ycombinator.com/item?id=35675159">thread link</a>) | @gopiandcode
+Score 151 | Comments 102 (<a href="https://news.ycombinator.com/item?id=35675159">thread link</a>) | @gopiandcode
 <br/>
 April 23, 2023 | https://gopiandcode.uk/logs/log-writing-activitypub.html | <a href="https://web.archive.org/web/*/https://gopiandcode.uk/logs/log-writing-activitypub.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -6330,7 +6602,7 @@ end</code></pre><p>If you followed the guide properly (and if I haven’t missed
             </title>
             <description>
 <![CDATA[
-Score 72 | Comments 10 (<a href="https://news.ycombinator.com/item?id=35671367">thread link</a>) | @jsnell
+Score 72 | Comments 11 (<a href="https://news.ycombinator.com/item?id=35671367">thread link</a>) | @jsnell
 <br/>
 April 22, 2023 | https://www.corsix.org/content/converting-fp32-to-fp16 | <a href="https://web.archive.org/web/*/https://www.corsix.org/content/converting-fp32-to-fp16">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -6823,7 +7095,7 @@ April 22, 2023 | https://epochai.org/blog/will-we-run-out-of-ml-data-evidence-fr
             </title>
             <description>
 <![CDATA[
-Score 650 | Comments 98 (<a href="https://news.ycombinator.com/item?id=35666598">thread link</a>) | @tim_sw
+Score 651 | Comments 98 (<a href="https://news.ycombinator.com/item?id=35666598">thread link</a>) | @tim_sw
 <br/>
 April 22, 2023 | https://build-your-own.org/blog/20230420_byodb_done/ | <a href="https://web.archive.org/web/*/https://build-your-own.org/blog/20230420_byodb_done/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -7611,7 +7883,7 @@ if ((bVar1) &amp;&amp; (ctx-&gt;version &lt; VERSION_2.3.0)) {
             </title>
             <description>
 <![CDATA[
-Score 24 | Comments 3 (<a href="https://news.ycombinator.com/item?id=35664505">thread link</a>) | @g0xA52A2A
+Score 25 | Comments 3 (<a href="https://news.ycombinator.com/item?id=35664505">thread link</a>) | @g0xA52A2A
 <br/>
 April 22, 2023 | https://two-wrongs.com/purely-functional-avl-trees-in-common-lisp.html | <a href="https://web.archive.org/web/*/https://two-wrongs.com/purely-functional-avl-trees-in-common-lisp.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
