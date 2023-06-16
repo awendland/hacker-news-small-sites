@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Fri, 16 Jun 2023 16:23:09 GMT</lastBuildDate>
+        <lastBuildDate>Fri, 16 Jun 2023 20:21:07 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-50.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Fri, 16 Jun 2023 16:23:09 GMT</pubDate>
+        <pubDate>Fri, 16 Jun 2023 20:21:07 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,451 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Writing a chat application in Django 4.2 using async StreamingHttpResponse]]>
+            </title>
+            <description>
+<![CDATA[
+Score 56 | Comments 14 (<a href="https://news.ycombinator.com/item?id=36359376">thread link</a>) | @ipmb
+<br/>
+June 16, 2023 | https://valberg.dk/django-sse-postgresql-listen-notify.html | <a href="https://web.archive.org/web/*/https://valberg.dk/django-sse-postgresql-listen-notify.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+    <hr>
+<p>With the release of Django 4.2 we got the following <sup id="fnref:0"><a href="#fn:0">1</a></sup>:</p>
+<blockquote>
+<p><a href="https://docs.djangoproject.com/en/4.2/ref/request-response/#django.http.StreamingHttpResponse" title="django.http.StreamingHttpResponse"><code>StreamingHttpResponse</code></a> now supports async iterators when Django is served via ASGI.</p>
+</blockquote>
+<p>And the documentation has been expanded with the following <sup id="fnref:1"><a href="#fn:1">2</a></sup>:</p>
+<blockquote>
+<p>When serving under ASGI, however, a <a href="https://docs.djangoproject.com/en/4.2/ref/request-response/#django.http.StreamingHttpResponse" title="django.http.StreamingHttpResponse"><code>StreamingHttpResponse</code></a> need not stop other requests from being served whilst waiting for I/O. This opens up the possibility of long-lived requests for streaming content and implementing patterns such as long-polling, and server-sent events.</p>
+</blockquote>
+<p>Being a sucker for simplicity I got quite intrigued by the possibility to serve
+server-sent events (also known as SSE) from Django in an asynchronous manner.</p>
+<p>So I set out to write a small, drumroll please, chat application!</p>
+<p>This blog post documents my process of writing this application and how the bits
+and pieces fit together.</p>
+<p>The code for the chat application can be found at
+<a href="https://github.com/valberg/django-sse">github.com/valberg/django-sse</a>.</p>
+<p><strong>Table of contents</strong></p>
+
+<h3 id="what-are-server-sent-events-and-why-do-we-want-to-use-them">What are server-sent events and why do we want to use them?</h3>
+<p>Server-sent events is "old tech", as in that is has been supported in major
+browser since around 2010-2011 <sup id="fnref:2"><a href="#fn:2">3</a></sup>. The idea is that the client "subscribes" to
+an HTTP endpoint, and the server can then issue data to the client as long as
+the connection is open. This is a great performance boost compared to other
+techniques as for instance polling the server.</p>
+<p><em>But wait, isn't websockets "shinier"?</em></p>
+<p>It depends. In many situations when it comes to developing web applications, we
+just want a way to push data to the client, and here a bidirectional
+connection like websockets feel like an overkill. Also, I would argue that using
+POST/PUT requests from the client and SSE to the client might be "just enough"
+compared to websockets.</p>
+<p>SSE also has the added benefit of having a built-in reconnection mechanism, 
+which is something we would have to implement ourselves with websockets.</p>
+<p>All in all SSE is a much simpler solution than websockets, and in many (most?) 
+cases that is all we need.</p>
+<h3 id="a-simple-implementation-of-an-sse-endpoint">A simple implementation of an SSE endpoint</h3>
+<p>So lets get to some code! </p>
+<p>First we need our model for storing the chat messages:</p>
+<div><pre><span></span><code><span>class</span> <span>ChatMessage</span><span>(</span><span>models</span><span>.</span><span>Model</span><span>):</span>
+    <span>user</span> <span>=</span> <span>models</span><span>.</span><span>CharField</span><span>(</span><span>max_length</span><span>=</span><span>255</span><span>)</span>
+    <span>text</span> <span>=</span> <span>models</span><span>.</span><span>CharField</span><span>(</span><span>max_length</span><span>=</span><span>255</span><span>)</span>
+</code></pre></div>
+
+<p>With the model defined we can write our view to stream the messages.</p>
+<p>The following is something along the lines of my initial attempt. First we have
+to define the view, which in fact will not change for the remainder of this
+blog post. The juicy bits are in the  <code>stream_messages()</code> function. Note that
+the view is an async view, denoted by the <code>async</code> keyword.</p>
+<div><pre><span></span><code><span>async</span> <span>def</span> <span>stream_messages_view</span><span>(</span><span>request</span><span>:</span> <span>HttpRequest</span><span>)</span> <span>-&gt;</span> <span>StreamingHttpResponse</span><span>:</span>
+    <span>return</span> <span>StreamingHttpResponse</span><span>(</span>
+        <span>streaming_content</span><span>=</span><span>stream_messages</span><span>(),</span>
+        <span>content_type</span><span>=</span><span>"text/event-stream"</span><span>,</span>
+    <span>)</span>
+</code></pre></div>
+
+<p>We tell the <code>StreamingHttpResponse</code> class to get its streaming content from the
+<code>stream_messages</code> function. The following is my first initial implementation of 
+<code>stream_messages</code>:</p>
+<div><pre><span></span><code><span>async</span> <span>def</span> <span>stream_messages</span><span>()</span> <span>-&gt;</span> <span>AsyncGenerator</span><span>[</span><span>str</span><span>,</span> <span>None</span><span>]:</span>
+    <span>latest_message</span> <span>=</span> <span>None</span>
+
+    <span>while</span> <span>True</span><span>:</span>
+        <span>current_message</span> <span>=</span> <span>await</span> <span>ChatMessage</span><span>.</span><span>objects</span><span>.</span><span>order_by</span><span>(</span><span>"-id"</span><span>)</span><span>.</span><span>afirst</span><span>()</span>
+
+        <span># If we have a new message yield that</span>
+        <span>if</span> <span>latest_message</span> <span>!=</span> <span>current_message</span><span>:</span>
+            <span>yield</span> <span>"data: </span><span>{current_message.text}</span><span>\n\n</span><span>"</span>
+            <span>latest_message</span> <span>=</span> <span>current_message</span>
+
+        <span>await</span> <span>asyncio</span><span>.</span><span>sleep</span><span>(</span><span>5</span><span>)</span>
+</code></pre></div>
+
+<p>So we've gotten rid of the HTTP overhead of polling by not having to do a
+request from the client every 5 seconds. But we are still doing a query to the
+database every 5 seconds, and that for each client. This is not ideal and is 
+probably something we could have done with a synchronous view.</p>
+<p>Let's see if we can do better.</p>
+<h3 id="more-old-tech-to-the-rescue-postgresql-listennotify">More old tech to the rescue: PostgreSQL LISTEN/NOTIFY</h3>
+<p>This is where we could reach for more infrastructure which could help us giving
+the database a break. This could be listening for data in Redis (this is what
+django-channels does), or even having a queue in RabbitMQ. No matter what, it
+is means more infrastructure.</p>
+<p>But I use PostgreSQL - and PostgreSQL is, like Django, "batteries included".</p>
+<p>PostgreSQL has a mechanism called "LISTEN/NOTIFY" where a client can <code>LISTEN</code> 
+to a "channel" and then other clients can <code>NOTIFY</code> on that same channel which
+will be broadcasted to all listeners .</p>
+<p>This seems like something we can use, but the good ol' psycopg2 doesn't have async support, and I'm not
+even sure if <code>asgiref</code>'s <code>sync_to_async</code><sup id="fnref:3"><a href="#fn:3">4</a></sup> would help us here.</p>
+<h4 id="enter-psycopg-3">Enter psycopg 3</h4>
+<p>I had put the whole thing on ice until I realized that another big thing (maybe
+a bit bigger than StreamingHttpResponse) in Django 4.2 is the support for
+psycopg 3 - and psycopg 3 is very much async!</p>
+<p>So I went for a stroll in the psycopg 3 documentation and struck gold<sup id="fnref:4"><a href="#fn:4">5</a></sup>:</p>
+<div><pre><span></span><code><span>import</span> <span>psycopg</span>
+<span>conn</span> <span>=</span> <span>psycopg</span><span>.</span><span>connect</span><span>(</span><span>""</span><span>,</span> <span>autocommit</span><span>=</span><span>True</span><span>)</span>
+<span>conn</span><span>.</span><span>execute</span><span>(</span><span>"LISTEN mychan"</span><span>)</span>
+<span>gen</span> <span>=</span> <span>conn</span><span>.</span><span>notifies</span><span>()</span>
+<span>for</span> <span>notify</span> <span>in</span> <span>gen</span><span>:</span>
+    <span>print</span><span>(</span><span>notify</span><span>)</span>
+    <span>if</span> <span>notify</span><span>.</span><span>payload</span> <span>==</span> <span>"stop"</span><span>:</span>
+        <span>gen</span><span>.</span><span>close</span><span>()</span>
+<span>print</span><span>(</span><span>"there, I stopped"</span><span>)</span>
+</code></pre></div>
+
+<p>This does almost what we want! It just isn't async and isn't getting connection
+info from Django.</p>
+<p>So by combining the snippet from the psycopg 3 documentation and my previous
+<code>stream_messages</code> I came up with this:</p>
+<div><pre><span></span><code><span>from</span> <span>collections.abc</span> <span>import</span> <span>AsyncGenerator</span>
+<span>import</span> <span>psycopg</span>
+<span>from</span> <span>django.db</span> <span>import</span> <span>connection</span>
+
+<span>async</span> <span>def</span> <span>stream_messages</span><span>()</span> <span>-&gt;</span> <span>AsyncGenerator</span><span>[</span><span>str</span><span>,</span> <span>None</span><span>]:</span>
+
+    <span># Get the connection params from Django</span>
+    <span>connection_params</span> <span>=</span> <span>connection</span><span>.</span><span>get_connection_params</span><span>()</span>
+
+    <span># Somehow Django 4.2.1 sets the cursor_factory to </span>
+    <span># django.db.backends.postgresql.base.Cursor</span>
+    <span># which causes problems. Read more about it in the </span>
+    <span># "Differences between 4.2 and 4.2.1" section in the Appendix.</span>
+    <span># Removing it from the connection parameters works around this.</span>
+    <span>connection_params</span><span>.</span><span>pop</span><span>(</span><span>'cursor_factory'</span><span>)</span>
+
+    <span>aconnection</span> <span>=</span> <span>await</span> <span>psycopg</span><span>.</span><span>AsyncConnection</span><span>.</span><span>connect</span><span>(</span>
+        <span>**</span><span>connection_params</span><span>,</span>
+        <span>autocommit</span><span>=</span><span>True</span><span>,</span>
+    <span>)</span>
+
+    <span>channel_name</span> <span>=</span> <span>"lobby"</span>
+
+    <span>async</span> <span>with</span> <span>aconnection</span><span>.</span><span>cursor</span><span>()</span> <span>as</span> <span>acursor</span><span>:</span>
+        <span>await</span> <span>acursor</span><span>.</span><span>execute</span><span>(</span><span>f</span><span>"LISTEN </span><span>{</span><span>channel_name</span><span>}</span><span>"</span><span>)</span>
+        <span>gen</span> <span>=</span> <span>aconnection</span><span>.</span><span>notifies</span><span>()</span>
+        <span>async</span> <span>for</span> <span>notify</span> <span>in</span> <span>gen</span><span>:</span>
+            <span>yield</span> <span>f</span><span>"data: </span><span>{</span><span>notify</span><span>.</span><span>payload</span><span>}</span><span>\n\n</span><span>"</span>
+</code></pre></div>
+
+<p>Appart from problems with the <code>cursor_factory</code> (which I'll get back to in the 
+<a href="#difference-between-42-and-421">appendix</a>), this code is pretty straight forward and, most importantly, works!</p>
+<p>Whenever a <code>NOTIFY lobby, '&lt;message&gt;'</code> is issued, the <code>stream_messages</code> function
+will yield the message to the listener.</p>
+<h3 id="test-the-endpoint-with-curl">Test the endpoint with curl</h3>
+<p>So now we've got the <code>LISTEN</code> part in place.</p>
+<p>If we connect to the endpoint using curl (<code>-N</code> disables buffering and is a way to consume streming content with curl):</p>
+<div><pre><span></span><code><span>$ </span>curl<span> </span>-N<span> </span>http://localhost:8000/messages/
+</code></pre></div>
+
+<p>And connect to our database and run:</p>
+<div><pre><span></span><code><span>NOTIFY</span><span> </span><span>lobby</span><span>,</span><span> </span><span>'Hello, world!'</span><span>;</span>
+</code></pre></div>
+
+<p>We, excitingly, get the following result :</p>
+
+
+<p>Amazing!</p>
+<h3 id="issuing-the-notify-command-from-django">Issuing the NOTIFY command from Django</h3>
+<p>But we want the <code>NOTIFY</code> command to be issued when a new chat message is submitted.</p>
+<p>For this we'll have a small utility function which does the heavy lifting. Note
+that this is just a very simple synchronous function since everything is just
+happening within a single request-response cycle.</p>
+<div><pre><span></span><code><span>from</span> <span>django.db</span> <span>import</span> <span>connection</span>
+
+
+<span>def</span> <span>notify</span><span>(</span><span>*</span><span>,</span> <span>channel</span><span>:</span> <span>str</span><span>,</span> <span>event</span><span>:</span> <span>str</span><span>,</span> <span>payload</span><span>:</span> <span>str</span><span>)</span> <span>-&gt;</span> <span>None</span><span>:</span>
+    <span>payload</span> <span>=</span> <span>json</span><span>.</span><span>dumps</span><span>({</span>
+        <span>"event"</span><span>:</span> <span>event</span><span>,</span>
+        <span>"content"</span><span>:</span> <span>payload</span><span>,</span>
+    <span>})</span>
+    <span>with</span> <span>connection</span><span>.</span><span>cursor</span><span>()</span> <span>as</span> <span>cursor</span><span>:</span>
+        <span>cursor</span><span>.</span><span>execute</span><span>(</span>
+            <span>f</span><span>"NOTIFY </span><span>{</span><span>channel</span><span>}</span><span>, '</span><span>{</span><span>payload</span><span>}</span><span>'"</span><span>,</span>
+        <span>)</span>
+</code></pre></div>
+
+<p>And then we can use this in our view (I'm using <code>@csrf_exempt</code> here since this is just a quick proof of concept):</p>
+<div><pre><span></span><code><span>@csrf_exempt</span>
+<span>@require_POST</span>
+<span>def</span> <span>post_message_view</span><span>(</span><span>request</span><span>:</span> <span>HttpRequest</span><span>)</span> <span>-&gt;</span> <span>HttpResponse</span><span>:</span>
+    <span>message</span> <span>=</span> <span>request</span><span>.</span><span>POST</span><span>.</span><span>get</span><span>(</span><span>"message"</span><span>)</span>
+    <span>user</span> <span>=</span> <span>request</span><span>.</span><span>POST</span><span>.</span><span>get</span><span>(</span><span>"user"</span><span>)</span>
+    <span>message</span> <span>=</span> <span>ChatMessage</span><span>.</span><span>objects</span><span>.</span><span>create</span><span>(</span><span>user</span><span>=</span><span>user</span><span>,</span> <span>text</span><span>=</span><span>message</span><span>)</span>
+    <span>notify</span><span>(</span>
+        <span>channel</span><span>=</span><span>"lobby"</span><span>,</span>
+        <span>event</span><span>=</span><span>"message_created"</span><span>,</span>
+        <span>content</span><span>=</span><span>json</span><span>.</span><span>dumps</span><span>({</span>
+            <span>"text"</span><span>:</span> <span>message</span><span>.</span><span>text</span><span>,</span>
+            <span>"user"</span><span>:</span> <span>message</span><span>.</span><span>user</span><span>,</span>
+        <span>})</span>
+    <span>)</span>
+    <span>return</span> <span>HttpResponse</span><span>(</span><span>"OK"</span><span>)</span>
+</code></pre></div>
+
+<p>The keen observer will notice that we are storing the payload content as a JSON string within a JSON string.</p>
+<p>This is because we have two recipients of the payload. The first is the <code>stream_messages</code> function which is going to
+send the payload to the client with a <code>event</code>, and the second is the browser which is going to parse the payload and use
+the <code>event</code> to determine what to do with the payload.</p>
+<p>For this we'll have to update our <code>stream_messages</code> function as follows:</p>
+<div><pre><span></span><code><span>async</span> <span>def</span> <span>stream_messages</span><span>()</span> <span>-&gt;</span> <span>AsyncGenerator</span><span>[</span><span>str</span><span>,</span> <span>None</span><span>]:</span>
+    <span>connection_params</span> <span>=</span> <span>connection</span><span>.</span><span>get_connection_params</span><span>()</span>
+
+    <span># Remove the cursor_factory parameter since I can't get</span>
+    <span># the default from Django 4.2.1 to work.</span>
+    <span># Django 4.2 didn't have the parameter and that worked.</span>
+    <span>connection_params</span><span>.</span><span>pop</span><span>(</span><span>'cursor_factory'</span><span>)</span>
+
+    <span>aconnection</span> <span>=</span> <span>await</span> <span>psycopg</span><span>.</span><span>AsyncConnection</span><span>.</span><span>connect</span><span>(</span>
+        <span>**</span><span>connection_params</span><span>,</span>
+        <span>autocommit</span><span>=</span><span>True</span><span>,</span>
+    <span>)</span>
+    <span>channel_name</span> <span>=</span> <span>"lobby"</span>
+    <span>async</span> <span>with</span> <span>aconnection</span><span>.</span><span>cursor</span><span>()</span> <span>as</span> <span>acursor</span><span>:</span>
+        <span>await</span> <span>acursor</span><span>.</span><span>execute</span><span>(</span><span>f</span><span>"LISTEN </span><span>{</span><span>channel_name</span><span>}</span><span>"</span><span>)</span>
+        <span>gen</span> <span>=</span> <span>aconnection</span><span>.</span><span>notifies</span><span>()</span>
+        <span>async</span> <span>for</span> <span>notify</span> <span>in</span> <span>gen</span><span>:</span>
+            <span>payload</span> <span>=</span> <span>json</span><span>.</span><span>loads</span><span>(</span><span>notify</span><span>.</span><span>payload</span><span>)</span>
+            <span>event</span> <span>=</span> <span>payload</span><span>.</span><span>pop</span><span>(</span><span>"event"</span><span>)</span>
+            <span>data</span> <span>=</span> <span>payload</span><span>.</span><span>pop</span><span>(</span><span>"data"</span><span>)</span>
+            <span>yield</span> <span>f</span><span>"event: </span><span>{</span><span>event</span><span>}</span><span>\n</span><span>data: </span><span>{</span><span>data</span><span>}</span><span>\n\n</span><span>"</span>
+</code></pre></div>
+
+<p>Everything is the same except that we now parse the payload from the <code>NOTIFY</code> command and construct the SSE payload with
+an <code>event</code> and a <code>data</code> field. This will come in handy when dealing with the frontend.</p>
+<p>Another way to do this would be to use Django's
+<a href="https://docs.djangoproject.com/en/4.2/topics/signals/">signals</a> or event
+writing a PostgreSQL
+<a href="https://www.postgresql.org/docs/15/plpgsql-trigger.html">trigger</a> which issues
+the <code>NOTIFY</code> command.</p>
+<h3 id="hooking-up-the-frontend">Hooking up the frontend</h3>
+<p>Now that we've got the backend in place, we can get something up and running on
+the frontend.</p>
+<p>We could use HTMX's <a href="https://htmx.org/extensions/server-sent-events/">SSE
+extension</a> but for this
+example we'll just use the
+<a href="https://developer.mozilla.org/en-US/docs/Web/API/EventSource">EventSource</a> API
+directly.</p>
+<div><pre><span></span><code><span>&lt;</span><span>template</span> <span>id</span><span>=</span><span>"message"</span><span>&gt;</span>
+    <span>&lt;</span><span>div</span> <span>style</span><span>=</span><span>"border: 1px solid black; margin: 5px; padding: 5px;"</span><span>&gt;</span>
+        <span>&lt;</span><span>strong</span> <span>class</span><span>=</span><span>"user"</span><span>&gt;&lt;/</span><span>strong</span><span>&gt;</span>: <span>&lt;</span><span>span</span> <span>class</span><span>=</span><span>"message"</span><span>&gt;&lt;/</span><span>span</span><span>&gt;</span>
+    <span>&lt;/</span><span>div</span><span>&gt;</span>
+<span>&lt;/</span><span>template</span><span>&gt;</span>
+
+<span>&lt;</span><span>div</span> <span>id</span><span>=</span><span>"messages"</span><span>&gt;&lt;/</span><span>div</span><span>&gt;</span>
+
+<span>&lt;</span><span>script</span><span>&gt;</span>
+<span>    </span><span>const</span><span> </span><span>source</span><span> </span><span>=</span><span> </span><span>new</span><span> </span><span>EventSource</span><span>(</span><span>"/messages/"</span><span>);</span>
+
+<span>    </span><span>// Note that the event we gave our notify utility function is called "message_created"</span>
+<span>    </span><span>// so that's what we listen for here.</span>
+<span>    </span><span>source</span><span>.</span><span>addEventListener</span><span>(</span><span>"message_created"</span><span>,</span><span> </span><span>function</span><span>(</span><span>evt</span><span>)</span><span> </span><span>{</span>
+<span>        </span><span>// Parse the payload</span>
+<span>        </span><span>let</span><span> </span><span>payload</span><span> </span><span>=</span><span> </span><span>JSON</span><span>.</span><span>parse</span><span>(</span><span>evt</span><span>.</span><span>data</span><span>);</span>
+
+<span>        </span><span>// Get and clone our template</span>
+<span>        </span><span>let</span><span> </span><span>template</span><span> </span><span>=</span><span> </span><span>document</span><span>.</span><span>getElementById</span><span>(</span><span>'message'</span><span>);</span>
+<span>        </span><span>let</span><span> </span><span>clone</span><span> </span><span>=</span><span> </span><span>template</span><span>.</span><span>content</span><span>.</span><span>cloneNode</span><span>(</span><span>true</span><span>);</span>
+
+<span>        </span><span>// Update our cloned template</span>
+<span>        </span><span>clone</span><span>.</span><span>querySelector</span><span>(</span><span>'.user'</span><span>).</span><span>innerText</span><span> </span><span>=</span><span> </span><span>payload</span><span>.</span><span>user</span><span>;</span>
+<span>        </span><span>clone</span><span>.</span><span>querySelector</span><span>(</span><span>'.message'</span><span>).</span><span>innerText</span><span> </span><span>=</span><span> </span><span>payload</span><span>.</span><span>text</span><span>;</span>
+
+<span>        </span><span>// Append the cloned template to our list of messages</span>
+<span>        </span><span>document</span><span>.</span><span>getElementById</span><span>(</span><span>'messages'</span><span>).</span><span>appendChild</span><span>(</span><span>clone</span><span>);</span>
+<span>    </span><span>});</span>
+<span>&lt;/</span><span>script</span><span>&gt;</span>
+</code></pre></div>
+
+<p>And that's it! We can now open two browser windows and see the messages appear in real time.</p>
+<p>Check out the repo for the full code where I've also added a simple form for submitting new messages.</p>
+<h3 id="dealing-with-reconnections">Dealing with reconnections</h3>
+<p>One of the nice things about SSE is that it will automatically reconnect if the connection is lost. It even has a
+mechanism for dealing with the fact that the client might have missed some events while it was disconnected.</p>
+<p>This is done by sending a <code>Last-Event-ID</code> header with the request. The value of this header is the <code>id</code> of the last
+event that the client received. The server can then use this to determine which events to send to the client.</p>
+<p>To deal with this we can expand on our <code>stream_messages</code> function and view as follows:</p>
+<div><pre><span></span><code><span>async</span> <span>def</span> <span>stream_messages</span><span>(</span><span>last_id</span><span>:</span> <span>int</span> <span>|</span> <span>None</span> <span>=</span> <span>None</span><span>)</span> <span>-&gt;</span> <span>AsyncGenerator</span><span>[</span><span>str</span><span>,</span> <span>None</span><span>]:</span>
+    <span>connection_params</span> <span>=</span> <span>connection</span><span>.</span><span>get_connection_params</span><span>()</span>
+    <span>connection_params</span><span>.</span><span>pop</span><span>(</span><span>'cursor_factory'</span><span>)</span>
+    <span>aconnection</span> <span>=</span> <span>await</span> <span>psycopg</span><span>.</span><span>AsyncConnection</span><span>.</span><span>connect</span><span>(</span>
+        <span>**</span><span>connection_params</span><span>,</span>
+        <span>autocommit</span><span>=</span><span>True</span><span>,</span>
+    <span>)</span>
+    <span>channel_name</span> <span>=</span> <span>"lobby"</span>
+
+    <span>if</span> <span>last_id</span><span>:</span>
+        <span>messages</span> <span>=</span> <span>ChatMessage</span><span>.</span><span>objects</span><span>.</span><span>filter</span><span>(</span><span>id__gt</span><span>=</span><span>last_id</span><span>)</span>
+        <span>async</span> <span>for</span> <span>message</span> <span>in</span> <span>messages</span><span>:</span>
+            <span>yield</span> <span>f</span><span>"id: </span><span>{</span><span>message</span><span>.</span><span>id</span><span>}</span><span>\n</span><span>event: message_created</span><span>\n</span><span>data: </span><span>{</span><span>message</span><span>.</span><span>as_json</span><span>()</span><span>}</span><span>\n\n</span><span>"</span>
+
+    <span>async</span> <span>with</span> <span>aconnection</span><span>.</span><span>cursor</span><span>()</span> <span>as</span> <span>acursor</span><span>:</span>
+        <span>await</span> <span>acursor</span><span>.</span><span>execute</span><span>(</span><span>f</span><span>"LISTEN </span><span>{</span><span>channel_name</span><span>}</span><span>"</span><span>)</span>
+        <span>gen</span> <span>=</span> <span>aconnection</span><span>.</span><span>notifies</span><span>()</span>
+        <span>async</span> <span>for</span> <span>notify</span> <span>in</span> <span>gen</span><span>:</span>
+            <span>payload</span> <span>=</span> <span>json</span><span>.</span><span>loads</span><span>(</span><span>notify</span><span>.</span><span>payload</span><span>)</span>
+            <span>event</span> <span>=</span> <span>payload</span><span>.</span><span>get</span><span>(</span><span>"event"</span><span>)</span>
+            <span>event_id</span> <span>=</span> <span>payload</span><span>.</span><span>get</span><span>(</span><span>"event_id"</span><span>)</span>
+            <span>data</span> <span>=</span> <span>payload</span><span>.</span><span>get</span><span>(</span><span>"data"</span><span>)</span>
+            <span>yield</span> <span>f</span><span>"id: </span><span>{</span><span>event_id</span><span>}</span><span>\n</span><span>event: </span><span>{</span><span>event</span><span>}</span><span>\n</span><span>data: </span><span>{</span><span>data</span><span>}</span><span>\n\n</span><span>"</span>
+
+
+<span>async</span> <span>def</span> <span>stream_messages_view</span><span>(</span>
+    <span>request</span><span>:</span> <span>HttpRequest</span><span>,</span>
+<span>)</span> <span>-&gt;</span> <span>StreamingHttpResponse</span><span>:</span>
+    <span>last_id</span> <span>=</span> <span>request</span><span>.</span><span>headers</span><span>.</span><span>get</span><span>(</span><span>"Last-Event-ID"</span><span>)</span>
+    <span>return</span> <span>StreamingHttpResponse</span><span>(</span>
+        <span>streaming_content</span><span>=</span><span>stream_messages</span><span>(</span><span>last_id</span><span>=</span><span>last_id</span><span>),</span>
+        <span>content_type</span><span>=</span><span>"text/event-stream"</span><span>,</span>
+    <span>)</span>
+</code></pre></div>
+
+<p>We now send the <code>id</code> of each message, and whenever a (re)connection is made we check if the client sent a <code>Last-Event-ID</code>
+and if so we send all messages with an <code>id</code> greater than that.</p>
+<p>This change does also require some changes to our utility functions and model. Those are to be found in the git repo.</p>
+<h3 id="conclusion">Conclusion</h3>
+<p>Django is boring, which is a good thing, to the degree where it is always the safe option. But with the advances in
+async support it is becoming a viable, and shiny, option for doing real time stuff. Mix in some other solid and boring 
+tech like PostgreSQL and SSE, and you end up with a very solid foundation for building real time applications.</p>
+<h3 id="appendix">Appendix</h3>
+<h4 id="how-to-run-asgi-applications-in-development">How to run ASGI applications in development</h4>
+<p>One thing that took me some time to realise is that the Django runserver is not
+capable of running async views returning <code>StreamingHttpResponse</code>.</p>
+<p>Running the view with the builtin runserver results in the following error:</p>
+<div><pre><span></span><code>.../django/http/response.py:514: Warning: StreamingHttpResponse must
+consume asynchronous iterators in order to serve them synchronously. 
+Use a synchronous iterator instead.
+</code></pre></div>
+
+<p>Fortunately Daphne, the ASGI server which was developed to power Django Channels, has an async runserver which we can use:</p>
+<p>To set this up we'll have to install the <code>daphne</code> package, add <code>daphne</code> to the top of our installed apps, and set
+the <code>ASGI_APPLICATION</code> setting to point to our ASGI application.</p>
+<div><pre><span></span><code><span>INSTALLED_APPS</span> <span>=</span> <span>[</span>
+    <span>"daphne"</span><span>,</span>
+    <span>...</span>
+    <span>"chat"</span><span>,</span>  <span># Our app</span>
+<span>]</span>
+
+<span>ASGI_APPLICATION</span> <span>=</span> <span>"project.asgi.application"</span>
+</code></pre></div>
+
+<p>Now we can just run <code>./manage.py runserver</code> as before and we are async ready!</p>
+<h4 id="difference-between-42-and-421">Difference between 4.2 and 4.2.1</h4>
+<p>The code worked initially in 4.2, but 4.2.1 fixed a regression regarding
+setting a custom cursor in the database configuration.</p>
+<p>In 4.2 we get this from <code>connection.get_connection_params()</code>:</p>
+<div><pre><span></span><code><span>{</span>
+<span>    </span><span>'dbname'</span><span>:</span><span> </span><span>'postgres'</span><span>,</span>
+<span>    </span><span>'user'</span><span>:</span><span> </span><span>'postgres'</span><span>,</span>
+<span>    </span><span>'password'</span><span>:</span><span> </span><span>'postgres'</span><span>,</span>
+<span>    </span><span>'host'</span><span>:</span><span> </span><span>'localhost'</span><span>,</span>
+<span>    </span><span>'port'</span><span>:</span><span> </span><span>5432</span><span>,</span>
+<span>    </span><span>'context'</span><span>:</span><span> </span><span>&lt;</span><span>psycopg</span><span>.</span><span>adapt</span><span>.</span><span>AdaptersMap</span><span> </span><span>object</span><span> </span><span>at</span><span> </span><span>0x7f019cda7a60</span><span>&gt;</span><span>,</span>
+<span>    </span><span>'prepare_threshold'</span><span>:</span><span> </span><span>None</span>
+<span>}</span>
+</code></pre></div>
+
+<p>in 4.2.1 we get this:</p>
+<div><pre><span></span><code><span>{</span>
+<span>    </span><span>'dbname'</span><span>:</span><span> </span><span>'postgres'</span><span>,</span>
+<span>    </span><span>'client_encoding'</span><span>:</span><span> </span><span>'UTF8'</span><span>,</span>
+<span>    </span><span>'cursor_factory'</span><span>:</span><span> </span><span>&lt;</span><span>class</span><span> </span><span>'django.db.backends.postgresql.base.Cursor'</span><span>&gt;</span><span>,</span>
+<span>    </span><span>'user'</span><span>:</span><span> </span><span>'postgres'</span><span>,</span>
+<span>    </span><span>'password'</span><span>:</span><span> </span><span>'postgres'</span><span>,</span>
+<span>    </span><span>'host'</span><span>:</span><span> </span><span>'localhost'</span><span>,</span>
+<span>    </span><span>'port'</span><span>:</span><span> </span><span>'5432'</span><span>,</span>
+<span>    </span><span>'context'</span><span>:</span><span> </span><span>&lt;</span><span>psycopg</span><span>.</span><span>adapt</span><span>.</span><span>AdaptersMap</span><span> </span><span>object</span><span> </span><span>at</span><span> </span><span>0x7f56464bcdd0</span><span>&gt;</span><span>,</span>
+<span>    </span><span>'prepare_threshold'</span><span>:</span><span> </span><span>None</span>
+<span>}</span>
+</code></pre></div>
+
+<p><code>django.db.backends.postgresql.base.Cursor</code> is not async iterable.</p>
+<p>So we can probably try to set our own <code>cursor_factory</code> in settings:</p>
+<div><pre><span></span><code><span>from</span> <span>psycopg</span> <span>import</span> <span>AsyncCursor</span>
+
+<span>DATABASES</span> <span>=</span> <span>{</span>
+    <span>'default'</span><span>:</span> <span>{</span>
+        <span>'ENGINE'</span><span>:</span> <span>'django.db.backends.postgresql'</span><span>,</span>
+        <span>'NAME'</span><span>:</span> <span>'postgres'</span><span>,</span>
+        <span>'USER'</span><span>:</span> <span>'postgres'</span><span>,</span>
+        <span>'PASSWORD'</span><span>:</span> <span>'postgres'</span><span>,</span>
+        <span>'HOST'</span><span>:</span> <span>'localhost'</span><span>,</span>
+        <span>'PORT'</span><span>:</span> <span>'5432'</span><span>,</span>
+        <span>'OPTIONS'</span><span>:</span> <span>{</span>
+            <span>"cursor_factory"</span><span>:</span> <span>AsyncCursor</span>
+        <span>}</span>
+    <span>}</span>
+<span>}</span>
+</code></pre></div>
+
+<p>But alas. For some reason this does not work. I guess that Django does some
+wrapping of the cursor - or maybe I've just encountered a bug. The cursor is at
+least not treated as an async cursor and thus we get the following error:</p>
+<div><pre><span></span><code><span>.../django-sse/venv/lib/python3.11/site-packages/django/db/backends/utils.py:41: </span>
+<span>RuntimeWarning: coroutine 'AsyncCursor.close' was never awaited</span>
+
+<span>  self.close()</span>
+
+<span>RuntimeWarning: Enable tracemalloc to get the object allocation traceback</span>
+
+<span>.../django-sse/venv/lib/python3.11/site-packages/django/db/models/sql/compiler.py:1560:</span>
+<span>RuntimeWarning: coroutine 'AsyncCursor.execute' was never awaited</span>
+
+<span>  cursor.execute(sql, params)</span>
+
+<span>RuntimeWarning: Enable tracemalloc to get the object allocation traceback</span>
+</code></pre></div>
+
+<p>So instead I opted for removing the <code>cursor_factory</code> in the streaming function.
+So that now looks like so:</p>
+<div><pre><span></span><code><span>async</span> <span>def</span> <span>stream_messages</span><span>()</span> <span>-&gt;</span> <span>AsyncGenerator</span><span>[</span><span>str</span><span>,</span> <span>None</span><span>]:</span>
+    <span>connection_params</span> <span>=</span> <span>connection</span><span>.</span><span>get_connection_params</span><span>()</span>
+    <span>connection_params</span><span>.</span><span>pop</span><span>(</span><span>'cursor_factory'</span><span>)</span>
+    <span>aconnection</span> <span>=</span> <span>await</span> <span>psycopg</span><span>.</span><span>AsyncConnection</span><span>.</span><span>connect</span><span>(</span>
+        <span>**</span><span>connection_params</span><span>,</span>
+        <span>autocommit</span><span>=</span><span>True</span><span>,</span>
+    <span>)</span>
+    <span>channel_name</span> <span>=</span> <span>"lobby"</span>
+    <span>async</span> <span>with</span> <span>aconnection</span><span>.</span><span>cursor</span><span>()</span> <span>as</span> <span>acursor</span><span>:</span>
+        <span>print</span><span>(</span><span>type</span><span>(</span><span>acursor</span><span>))</span>
+        <span>await</span> <span>acursor</span><span>.</span><span>execute</span><span>(</span><span>f</span><span>"LISTEN </span><span>{</span><span>channel_name</span><span>}</span><span>"</span><span>)</span>
+        <span>gen</span> <span>=</span> <span>aconnection</span><span>.</span><span>notifies</span><span>()</span>
+        <span>async</span> <span>for</span> <span>notify</span> <span>in</span> <span>gen</span><span>:</span>
+            <span>yield</span> <span>f</span><span>"data: </span><span>{</span><span>notify</span><span>.</span><span>payload</span><span>}</span><span>\n\n</span><span>"</span>
+</code></pre></div>
+
+
+  </div></div>]]>
+            </description>
+            <link>https://valberg.dk/django-sse-postgresql-listen-notify.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-36359376</guid>
+            <pubDate>Fri, 16 Jun 2023 16:28:40 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Reddit is undeleting years worth of comments and posts]]>
             </title>
             <description>
 <![CDATA[
-Score 149 | Comments 77 (<a href="https://news.ycombinator.com/item?id=36357164">thread link</a>) | @tanepiper
+Score 164 | Comments 4 (<a href="https://news.ycombinator.com/item?id=36357164">thread link</a>) | @tanepiper
 <br/>
 June 16, 2023 | https://tane.codes/@tanepiper/110553809293213303 | <a href="https://web.archive.org/web/*/https://tane.codes/@tanepiper/110553809293213303">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -35,11 +475,11 @@ June 16, 2023 | https://tane.codes/@tanepiper/110553809293213303 | <a href="http
         </item>
         <item>
             <title>
-<![CDATA[What I Learned from Two Years of Teaching High School CS]]>
+<![CDATA[Two years of teaching high school CS]]>
             </title>
             <description>
 <![CDATA[
-Score 185 | Comments 155 (<a href="https://news.ycombinator.com/item?id=36355172">thread link</a>) | @csmeyer
+Score 259 | Comments 193 (<a href="https://news.ycombinator.com/item?id=36355172">thread link</a>) | @csmeyer
 <br/>
 June 16, 2023 | https://blog.charliemeyer.co/what-i-learned-from-two-years-of-teaching-high-school-cs/ | <a href="https://web.archive.org/web/*/https://blog.charliemeyer.co/what-i-learned-from-two-years-of-teaching-high-school-cs/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -106,7 +546,7 @@ June 16, 2023 | https://blog.charliemeyer.co/what-i-learned-from-two-years-of-te
             </title>
             <description>
 <![CDATA[
-Score 562 | Comments 322 (<a href="https://news.ycombinator.com/item?id=36354850">thread link</a>) | @kaimac
+Score 646 | Comments 468 (<a href="https://news.ycombinator.com/item?id=36354850">thread link</a>) | @kaimac
 <br/>
 June 16, 2023 | https://kbin.social/m/RedditMigration/t/34112/Heads-up-Reddit-is-quietly-restoring-deleted-AND-overwritten-posts-and | <a href="https://web.archive.org/web/*/https://kbin.social/m/RedditMigration/t/34112/Heads-up-Reddit-is-quietly-restoring-deleted-AND-overwritten-posts-and">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="entry-34112" data-controller="subject preview" data-action="notifications:Notification@window->subject#notification">
@@ -144,7 +584,7 @@ June 16, 2023 | https://kbin.social/m/RedditMigration/t/34112/Heads-up-Reddit-is
             </title>
             <description>
 <![CDATA[
-Score 409 | Comments 246 (<a href="https://news.ycombinator.com/item?id=36354049">thread link</a>) | @dijit
+Score 423 | Comments 260 (<a href="https://news.ycombinator.com/item?id=36354049">thread link</a>) | @dijit
 <br/>
 June 16, 2023 | https://blog.massdriver.cloud/posts/devops-is-bullshit/ | <a href="https://web.archive.org/web/*/https://blog.massdriver.cloud/posts/devops-is-bullshit/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div role="main">
@@ -306,11 +746,11 @@ June 16, 2023 | https://blog.massdriver.cloud/posts/devops-is-bullshit/ | <a hre
         </item>
         <item>
             <title>
-<![CDATA[Put an io_uring on it – Exploiting the Linux Kernel]]>
+<![CDATA[Put an io_uring on it – Exploiting the Linux Kernel (2022)]]>
             </title>
             <description>
 <![CDATA[
-Score 123 | Comments 7 (<a href="https://news.ycombinator.com/item?id=36353845">thread link</a>) | @fragmede
+Score 152 | Comments 19 (<a href="https://news.ycombinator.com/item?id=36353845">thread link</a>) | @fragmede
 <br/>
 June 16, 2023 | https://chompie.rip/Blog+Posts/Put+an+io_uring+on+it+-+Exploiting+the+Linux+Kernel | <a href="https://web.archive.org/web/*/https://chompie.rip/Blog+Posts/Put+an+io_uring+on+it+-+Exploiting+the+Linux+Kernel">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -321,11 +761,11 @@ June 16, 2023 | https://chompie.rip/Blog+Posts/Put+an+io_uring+on+it+-+Exploitin
         </item>
         <item>
             <title>
-<![CDATA[Memory Safety Without Borrow Checking, Reference Counting, or Garbage Collection]]>
+<![CDATA[Memory safety without borrow checking, reference counting, or garbage collection]]>
             </title>
             <description>
 <![CDATA[
-Score 73 | Comments 56 (<a href="https://news.ycombinator.com/item?id=36351415">thread link</a>) | @modernerd
+Score 99 | Comments 70 (<a href="https://news.ycombinator.com/item?id=36351415">thread link</a>) | @modernerd
 <br/>
 June 15, 2023 | https://verdagon.dev/blog/single-ownership-without-borrow-checking-rc-gc | <a href="https://web.archive.org/web/*/https://verdagon.dev/blog/single-ownership-without-borrow-checking-rc-gc">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div class="page">
@@ -352,7 +792,7 @@ June 15, 2023 | https://verdagon.dev/blog/single-ownership-without-borrow-checki
     
 <section>
 <p>
-Single ownership is once of those concepts that's both easier and more powerful than we realize.
+Single ownership is one of those concepts that's both easier and more powerful than we realize.
 </p>
 
 </section>
@@ -1770,970 +2210,10 @@ Tentatively name the Vale Software Foundation.
             </title>
             <description>
 <![CDATA[
-Score 78 | Comments 13 (<a href="https://news.ycombinator.com/item?id=36350789">thread link</a>) | @todsacerdoti
+Score 87 | Comments 14 (<a href="https://news.ycombinator.com/item?id=36350789">thread link</a>) | @todsacerdoti
 <br/>
 June 15, 2023 | http://48k.ca/trsvid.html | <a href="https://web.archive.org/web/*/http://48k.ca/trsvid.html">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content">
-
-
-<p>
-
-Here's a video of trsvid in action:
-
-</p><p>
-<iframe width="640" height="390" src="https://www.youtube.com/embed/Ah9HSCZzQI0" frameborder="0" allowfullscreen=""></iframe>
-</p><p>
-
-What you see there is 60 frame per second, full-screen video.
-Well, on the Model 4.  The Model III manages just over 54 frames/second
-and the Model I just over 51 frames/second.  What you hear is about 15 Khz
-audio with effectively 5 or 6 bits per sample.
-
-</p><h3>Choose Your Adventure</h3><p>
-
-While there's nothing wrong with reading this page straight through, there's
-a lot to cover.  If you've got something particular in mind here's a handy
-list of places to jump ahead.
-
-</p><ul>
-<li><a href="#video">More Videos</a></li>
-<li><a href="#manual">User Manual</a></li>
-<li><a href="#emu">Emulator trsvid</a></li>
-<li><a href="#part">Real Machine with Stock FreHD</a></li>
-<li><a href="#frehd">Real Machine with Enhanced FreHD</a></li>
-<li><a href="#convert">Convert Your Own Videos</a></li>
-<li><a href="#make">Write Your Own Converter</a></li>
-<li><a href="#hack">Hack trsvid Itself</a></li>
-<li><a href="#future">Into the Future</a></li>
-</ul>
-
-<h3><a name="video">More Videos</a></h3><p>
-
-Model 3 playing A-ha's "Take On Me".  By way of a compliment YouTube has
-muted the audio because they think it sounds like the original.  How high
-is trsvid's fidelity?  Enough to be considered copyright infringement!
-
-</p><p>
-<iframe width="640" height="390" src="https://www.youtube.com/embed/CmOwa4f356M" frameborder="0" allowfullscreen=""></iframe>
-</p><p>
-
-Model 3 playing the intro sequence to "Doctor Who" (the 4th Doctor).  Yeah,
-it's the <a href="http://48k.ca/drwho.html">same one I did from floppy disk</a>, but on
-the Model 3 instead of the 4P.
-
-</p><p>
-<iframe width="640" height="390" src="https://www.youtube.com/embed/nHPz9IxGbcw" frameborder="0" allowfullscreen=""></iframe>
-</p><p>
-
-Model 3 playing The Pogue's "Fairytale of New York".
-
-</p><p>Sorry, no video!  Amazingly YouTube considered it too similar in audio
-<em>and</em> video to the original and blocked it.  Banned in every country.
-Scroll down and watch the Model I version which is about the same.  I think
-it got flagged because I had the Model 3 filling most of the frame.
-</p><p>
-
-Model 3 playing a Radio Shack TV ad for its successor the Model 4.
-
-</p><p>
-<iframe width="640" height="390" src="https://www.youtube.com/embed/z_tmeIivaeI" frameborder="0" allowfullscreen=""></iframe>
-</p><p>
-
-Model 3 playing the classic intro sequence to "The Six Million Dollar Man".
-
-</p><p>
-<iframe width="640" height="390" src="https://www.youtube.com/embed/w83T8TJERhs" frameborder="0" allowfullscreen=""></iframe>
-</p><p>
-
-Model 4P playing A-ha's "Take On Me".  No audio because YouTube muted it
-for being a copyright violation.
-
-</p><p>
-<iframe width="640" height="390" src="https://www.youtube.com/embed/qFHoJQZZf0Q" frameborder="0" allowfullscreen=""></iframe>
-</p><p>
-
-Model 4P playing the intro sequence to "Doctor Who" (the 4th Doctor).  Yeah,
-it's the <a href="http://48k.ca/drwho.html">same one I did from floppy disk</a>.
-
-</p><p>
-<iframe width="640" height="390" src="https://www.youtube.com/embed/-7hO708pqTo" frameborder="0" allowfullscreen=""></iframe>
-</p><p>
-
-Same as above but the 4P is playing the Model I version.
-
-</p><p>
-<iframe width="640" height="390" src="https://www.youtube.com/embed/pNO5eF7ccrY" frameborder="0" allowfullscreen=""></iframe>
-</p><p>
-
-Model 4P playing The Pogue's "Fairytale of New York".  Another victory for
-fidelity; they'll let me play it but they get all the money.  Bad deal for
-them because I wasn't getting any money.  Except they'll probably put an
-ad into it so the joke's on me.
-
-</p><p>
-<iframe width="640" height="390" src="https://www.youtube.com/embed/aUeEKbVPyLM" frameborder="0" allowfullscreen=""></iframe>
-</p><p>
-
-Model 4P playing a Radio Shack TV ad for the Model 4.
-
-</p><p>
-<iframe width="640" height="390" src="https://www.youtube.com/embed/NT3cdx6T4w0" frameborder="0" allowfullscreen=""></iframe>
-</p><p>
-
-Same as above but with the ad encoded in ".tv1" format for the Model I.
-
-</p><p>
-<iframe width="640" height="390" src="https://www.youtube.com/embed/mWLUEplbfHI" frameborder="0" allowfullscreen=""></iframe>
-</p><p>
-
-Model 4P playing the classic intro sequence to "The Six Million Dollar Man".
-
-</p><p>
-<iframe width="640" height="390" src="https://www.youtube.com/embed/s5744Gm4BY8" frameborder="0" allowfullscreen=""></iframe>
-</p><p>
-
-Same as above but the ".tv1" version on the Model 4P.
-
-</p><p>
-<iframe width="640" height="390" src="https://www.youtube.com/embed/7ceZ9r2aWlI" frameborder="0" allowfullscreen=""></iframe>
-</p><p>
-
-Model I playing A-ha's "Take On Me".  Once again, muted for sounding too good.
-
-</p><p>
-<iframe width="640" height="390" src="https://www.youtube.com/embed/B1qIX0JnGFk" frameborder="0" allowfullscreen=""></iframe>
-</p><p>
-
-Model I playing the intro sequence to "Doctor Who" (the 4th Doctor).  Yeah,
-it's the <a href="http://48k.ca/drwho.html">same one I did from floppy disk</a>, but on
-the Model I instead of the 4P.
-
-</p><p>
-<iframe width="640" height="390" src="https://www.youtube.com/embed/0JYHoJtOrP0" frameborder="0" allowfullscreen=""></iframe>
-</p><p>
-
-Model I playing The Pogue's "Fairytale of New York".  As before, it sounded
-so nice they put an ad on it.
-
-</p><p>
-<iframe width="640" height="390" src="https://www.youtube.com/embed/KmgHw1UOYEQ" frameborder="0" allowfullscreen=""></iframe>
-</p><p>
-
-Model I playing a Radio Shack TV ad for its grandchild the Model 4.
-
-</p><p>
-<iframe width="640" height="390" src="https://www.youtube.com/embed/X24a5wqCPes" frameborder="0" allowfullscreen=""></iframe>
-</p><p>
-
-Model I playing the classic intro sequence to "The Six Million Dollar Man".
-
-</p><p>
-<iframe width="640" height="390" src="https://www.youtube.com/embed/4V6WSdj2380" frameborder="0" allowfullscreen=""></iframe>
-</p>
-
-<h3><a name="manual">User Manual</a></h3><p>
-
-While getting a TRS-80 <a href="#frehd">set up to play videos</a> is not easy, 
-trsvid itself is simple to use.  It auto-detects your hardware so there's
-only one version of the program <a href="http://48k.ca/trsvid/trsvid.zip">to download</a>.
-
-</p><p>
-If a FreHD hard drive emulator is not attached it will print a message
-to that effect and also list what video file formats your TRS-80 can play:
-<tt>.tv1</tt> and/or <tt>.tv3</tt> and/or <tt>.tv6</tt>.  If you have a FreHD but without the
-enhanced firmware then you'll still be able to browse the SD card for video
-files and see the preview images, you just won't be able to play any of them.
-
-</p><p>
-Once trsvid/cmd is running you can use the up and down arrow keys to select
-from a list of files in the current directory which is displayed on the top
-status line.  Notice the right-angle bracket "&gt;" which denotes the current
-selection. When a video file is selected trsvid will automatically
-display the preview image in the main window and the title of the video
-and playing time in the status line.
-
-</p><p>
-Model I users will notice black bars on the screen when a video preview is
-shown.  But fear not, just tap the left or right arrow key a few times to
-move them out of the way.
-I had the choice between that and rolling static.  I decided to go
-with the bars since it'll give the best display if you move them out of
-the way.
-
-</p><p>
-Directories are shown in the file list with a trailing "/".  Press
-the space-bar to enter a directory.  The special directory entry ".."
-is used to go up to the parent directory.  As well, there is a "-=TRSVID=-"
-entry that will go right to the top of the SD card.  If you want to change
-SD cards, select "-=TRSVID=-", switch cards and then press space-bar.  That
-way trsvid will read the new card.  This is important because if you switch
-cards in any other fashion trsvid will crash or print some message about
-an error talking to FreHD.  There are some rough edges here.
-
-</p><p>
-To play a video simply select it and press space-bar.  Note that trsvid will
-show the preview image of a video even if it cannot play it.  A "&lt;Not playable
-on this TRS-80&gt;" message will be shown if either the video format is
-not supported (for example, a <tt>.tv3</tt> file on a Model I) or if your FreHD
-hard drive emulator does not have the enhanced firmware in which case no
-videos will be playable.
-
-</p><p>
-While a video is playing you can hold the space-bar to pause the video
-until you release the space-bar.  Or press "W" (or almost any key but
-"W" is mnemonic) to pause the video until you press another key.  You
-can press the BREAK key at any time to stop video playback.  When paused
-the video will show a progress bar at the bottom indicating how much of
-the video has been played and a "MM:SS" amount played indicator.  There's
-currently no way to start in the middle of a video or rewind or fast-forward.
-No technical reason why that can't be done, I just got lazy.
-
-</p><p>
-TRS-80 Model I and 3 computers can only output audio through the cassette
-port.  TRS-80 Model 4P computers only have an internal speaker.  Model 4
-computers have both an internal speaker (I think all model 4's do) and a
-cassette port.  So on the Model 4 it will show a "(S)peaker ---&gt; (C)assette"
-line showing where audio output goes.  You press "S" to change to the
-speaker and "C" to change to the cassette port.  You cannot do this when
-a video is playing or even when a video is paused.  Again, pure sloth on
-me, the programmer's part.
-
-</p><p>
-trsvid can only handle about 75 entries per directory.  Use sub-directories
-if, for some amazing reason, you have more video files than that.
-
-</p><p>
-trsvid shows a little information about what TRS-80 Model computer you have,
-what the video refresh rate is (60 or 50 Hz) and the relative CPU speed
-on Model 4 or 4P machines.  Not something you really need to know, but good
-info for our customer support staff.  However, note that only Model 4 machines
-with "CPU: fast" can play <tt>.tv6</tt> files.  Other Model 4's will be limted to
-<tt>.tv1</tt> and <tt>.tv3</tt> videos.
-
-</p><p>
-Since trsvid uses pretty much all the memory and generally takes over the
-machine there's no way to exit back to TRS-DOS or LDOS or whatever DOS.
-You'll just have to reset or power-cycle or trip a circuit-breaker to exit.
-
-</p><p>
-The trsvid player uses Einar Saukas' zx7 compression library.  Not on
-the video data, mind you, but internally to keep the executable size down.
-
-
-</p><h3><a name="emu">Emulator trsvid</a></h3><p>
-
-Most TRS-80 emulators can't run trsvid because they don't emulate a FreHD.
-Best case is that trsvid would run, print a "sorry, no Frehd" sort of message
-and exit back to DOS.  By absolutely no coincidence, my trs80gp emulator works.
-Here's what you'll need:
-</p><ul>
-<li>Some half-decent Windows PC to run the emulator.</li>
-<li>trs80gp: <a href="http://48k.ca/trs80gp/trs80gp-1.9.7.zip">trs80gp-1.9.7.zip</a>
-</li><li>trsvid itself: <a href="http://48k.ca/trsvid/trsvid.zip">trsvid.zip</a></li>
-<li>One or more video files:
-<a href="http://48k.ca/trsvid/tv1.zip">tv1.zip</a>,
-<a href="http://48k.ca/trsvid/tv3.zip">tv3.zip</a>,
-<a href="http://48k.ca/trsvid/tv6.zip">tv6.zip</a>
-</li>
-</ul><p>
-
-Extract files and put </p><tt>trs80gp.exe</tt><p>, </p><tt>trsvid.cmd</tt><p> and one or more of the
-</p><tt>.tv1</tt><p>, </p><tt>.tv3</tt><p> or </p><tt>.tv6</tt><p> files into a directory and then run:
-</p><pre>     trs80gp -m4p -frehd trsvid.cmd
-</pre><p>
-If you'd like to see how it goes on a TRS-80 Model I then use </p><tt>-m1</tt><p> instead
-of </p><tt>-m4p</tt><p>.  Or </p><tt>-m3</tt><p> to see it as it would be on a Model 3.  Though there
-isn't much to it, you may want to read the <a href="#manual">trsvid manual</a>.
-For that matter, couldn't hurt to look at the
-<a href="http://48k.ca/trs80gp.html">trs80gp documentation</a>.
-
-</p><p>
-I daresay the emulator does a reasonable job of showing what the real thing
-is like.  However, the sound quality is worse and the sound pitch will be
-off on the Model 4 machines (this is due to incomplete understanding of
-video wait state timing).  And despite my efforts modern LCD screens are just
-not the same as CRTs.
-
-</p><p>
-The emulator is a good training ground if you want to try
-<a href="#frehd">the real thing</a> and a fast and excellent way to see
-if <a href="http://48k.ca/convert">your own videos</a> are coming out OK.
-
-</p><p>
-You'll notice that FreHD emulator inside trs80gp is essentially treating
-the current directory as the SD card.  Just a word to the wise that while
-trsvid can browse up and down directories it is rather limited in the
-size of directory it can handle.  If you think the directory is truncated
-that is not a bug.  And if the directory path gets too long it will crash.
-And trs80gp won't re-scan directories so don't expect files to show up
-magically if you add them while it is running.
-
-
-
-</p><h3><a name="part">Real Machine with Stock FreHD</a></h3><p>
-
-To actually watch videos on your TRS-80 you'll need
-<a href="#frehd">the enhanced FreHD firmware and special care in copying
-video files</a>.  But trsvid will run with an unenhanced FreHD or no FreHD
-at all.  The latter is useful if you want to find out what video formats
-your TRS-80 could handle.  You'll still get to browse files and see the
-preview images.  Think of it like just watching arcade games when you were
-a kid and didn't have a quarter.  You'll need:
-
-</p><ul>
-<li>A TRS-80 Model I with 48K</li>
-<li><em>or</em> a TRS-80 Model 3 with 48K</li>
-<li><em>or</em> a TRS-80 Model 4 with 64K</li>
-<li>A <a href="http://www.vecoven.com/trs80/trs80.html">FreHD hard drive emulator</a></li>
-<li>trsvid itself: <a href="http://48k.ca/trsvid/trsvid.zip">trsvid.zip</a></li>
-<li>One or more video files:
-<a href="http://48k.ca/trsvid/tv1.zip">tv1.zip</a>,
-<a href="http://48k.ca/trsvid/tv3.zip">tv3.zip</a>,
-<a href="http://48k.ca/trsvid/tv6.zip">tv6.zip</a>
-</li>
-</ul><p>
-
-If you're feeling conservative, just download <a href="http://48k.ca/trsvid/tv1.zip">tv1.zip</a>
-to get video files that will play on any supported TRS-80.  Otherwise you
-can run trsvid/cmd on your TRS-80 first to see which formats it supports
-and therefore which files you need to download and copy to the SD card.
-The zip archives are 30 to 50 MB in size.  Generally considered small by
-today's standards but still far from instantaneous downloads.
-
-</p><p>
-Get trsvid.cmd onto your emulated FreHD hard drive in whatever way you
-usually copy files.  Probably the easiest is to copy trsvid.cmd to the
-SD card you put into the FreHD and use the <tt>import2</tt> utility from within
-TRS-DOS or LDOS to get it onto the emulated hard drive.
-
-</p><p>
-The video files are to be copied onto the SD card.  They do not go onto
-the FreHD emulated hard drive.
-
-</p><p>
-Then just run trsvid and <a href="#manual">read the manual</a> if anything
-is confusing from there on out.
-
-
-</p><h3><a name="frehd">Real Machine with Enhanced FreHD</a></h3><p>
-
-Oh, boy, I'm glad you're here.  Let me tell you this is what all the cool
-kids are doing these days.  And I'm afraid there's a reason it's so cool -- it's
-not going to be easy.  The tricky bit is that your FreHD will need to be
-ugraded to the enhanced firmware and it can't be done via the TRS-80
-itself.  I wish it could but the enhancements required changes to the
-bootloader.  Here's what you'll need:
-
-</p><ul>
-<li>A TRS-80 Model I with 48K</li>
-<li><em>or</em> a TRS-80 Model 3 with 48K</li>
-<li><em>or</em> a TRS-80 Model 4 with 64K</li>
-<li>A <a href="http://www.vecoven.com/trs80/trs80.html">FreHD hard drive emulator</a></li>
-<li>trsvid itself: <a href="http://48k.ca/trsvid/trsvid.zip">trsvid.zip</a> which includes the ehanced FreHD firmware.</li>
-<li>Some way to flash the new firmware to the FreHD's PIC</li>
-<li>A Windows PC and the <a href="https://technet.microsoft.com/en-us/sysinternals/contig.aspx">contig</a>
-utilty.</li>
-<li><em>or</em> some special care when writing files to the SD card.</li>
-<li>One or more video files:
-<a href="http://48k.ca/trsvid/tv1.zip">tv1.zip</a>,
-<a href="http://48k.ca/trsvid/tv3.zip">tv3.zip</a>,
-<a href="http://48k.ca/trsvid/tv6.zip">tv6.zip</a>
-</li>
-</ul><p>
-
-Right up front let me tell you that I'm more than willing to help anybody
-who tries this.  I'm even willing to flash PIC chips for you if that's what
-it takes.  My e-mail address is at the bottom of this page.
-
-</p><p>
-I think it's always best to do the hardest and riskiest part of a project
-first.  So the first thing to do is pull the enhanced FreHD firmware
-FreHD_3.00.hex out of the <a href="http://48k.ca/trsvid/trsvid.zip">trsvid.zip</a> archive.
-Pull the PIC chip (it's the big one) off your FreHD board and flash the
-new firmware on it.  Put the PIC chip back and verify that your FreHD
-still works.  Everything should work the same and <tt>vhdutl (ver)</tt> will
-show it having firmware version <tt>3.00</tt>.
-
-</p><p>
-If "flashing a PIC chip" is meaningless or scary to you, I empathize.  Heck,
-if "pulling a PIC chip" is scary then I'm with you on that.  I've done this
-myself (obviously) but my process is essentially non-repeatable.  You'd be
-better off to mail your chip to me and I'll flash it (uh, but e-mail me first
-before you do so).  If you don't believe me, <a href="#process">read this
-cautionary tale</a>.
-
-</p><p>
-Next, just <tt>import2</tt> or some other method to get trsvid.cmd onto the
-emulated FreHD hard drive.  Then run it so it will show you what video
-file formats (<tt>.tv1, .tv3, .tv6</tt>) your TRS-80 supports.  You're best to
-use the highest numbered format supported.  You only need to do this
-for Model 4 machines.  A Model I can only handle <tt>.tv1</tt> and a Model 3
-can only handle <tt>.tv3</tt>.  A Model 4 might be able to handle <tt>.tv6</tt> or
-maybe only <tt>.tv1</tt> and <tt>.tv3</tt> files.
-
-</p><p>
-Now the only trick is to get the video files onto the SD card.  The
-problem is that for a video file to be playable it must not be fragmented.
-That is, it must be written to the SD card as a contiguous series of sectors.
-
-</p><p>
-If you're using Windows then the <tt>contig</tt> utility will help you out.
-Copy a video file to your SD card (say smdm.tv1) and then run <tt>contig -a</tt>
-on it.  For instance, <tt>contig -a J:smdm.tv1</tt>).  If it reports the file as
-having a single fragment then all is well.  Pop it into your FreHD and try
-and play it.  If not there are a few options.  One is to use <tt>contig</tt> to
-degragment the file with <tt>contig j:smdm.tv1</tt>).  That works, but let me tell
-you it took a long time when I did that once.  Like 15 or 20 minutes.  The
-other option is to put another ocpy of the file onto the SD card and see
-if that copy has only one fragment.  If not, try another copy.  That sounds
-a bit silly but chances are you'll quickly be writing the file into free
-space which hasn't been fragmented so you'll get a contiguous set of sectors.
-Even though it is slow, having contig defrag the file is better than moving
-on to the next method for non-Windows computers.
-
-</p><p>
-I presume Linux has some program that does what contig does on Windows and
-there's probably even one for the Mac, but I don't know what they are.
-But if you start with a freshly formatted SD card then every file copy should
-be contiguous.  So grab an SD card, format it, copy on the files needed
-by the FreHD itself and then copy on the video files.  That should work,
-but there's no way to be sure.  And trsvid itself doesn't have the capability
-of testing the files.  All you can do is try to play them.  Even if the file
-is fragmented it will play fine for a while until the second fragment is hit.
-At that point trsvid will be reading random data and most likely will crash.
-
-</p><p>
-SD cards have little computers in them for managing the flash memory and
-answering sector read/write requests.  They may look like a half stick of gum,
-but they're complicated.  trsvid uses sector streaming to play videos.  This
-isn't a commonly used feature and may not work properly.  I've only had
-one card that I think didn't work, but keep in mind that using a different
-SD card might be the answer if everything else seems in order.
-
-</p><p>
-Congratulations if it works.  If you want to level up even further, then
-<a href="#convert">try converting your own videos</a>.
-
-</p><h4>What's in the enhanced FreHD Firmware?</h4><p>
-
-The enhanced FreHD firmware has three new features:
-
-</p><ol>
-<li>Minimize wait states on data read.</li>
-<li>FAT32 file open returns both file size and starting sector.</li>
-<li>New command to start and stop sector streaming.</li>
-</ol><p>
-
-The wait state minimization was what required a new bootloader.  A stock
-FreHD makes the Z-80 in a Model 4 wait 25 cycles for each data byte.  I found
-that reduced the raw data rate so much that decent video playback was
-simply not viable.  I managed to get that down to 3 wait states.
-
-</p><p>
-Even with that speedup I couldn't make ordinary file reading fast enough.
-The FreHD (correctly) computes and verifies the CRC for each 512 byte
-sector read.  The CRC routine can be considerably sped up but even then
-it was quite a hit.  But having a mode to skip CRC calculation if a file
-were opened in unsafe mode was a reasonable workaround.  After all, I'd
-only be reading files so the worst case was a program crash.  It wouldn't
-cause a problem in the file system itself.  There were still lengthy
-delays whenever the FreHD had to read a new cluster sector to find the
-next data sector.  In other words, every so often a read would take a
-lot longer.  Finally, there was a delay every second 256 byte read because
-the FreHD has to break 512 byte SD card sectors into 256 byte chunks to
-feed to the TRS-80.  I tried a number of different schemes to reduce or
-hide the overhead but the resulting data throughput was still a lot
-lower than I'd like.  And the lengthy and somewhat unpredictatable delays
-between 256 byte reads would greatly complicate and slow down the video
-player itself.
-
-</p><p>
-Fortunately I found the sector streaming command.  I think the
-intent of it was for video cameras and other special-purpose devices that
-needed higher throughput.  I suspect it remains largely unused in recent
-times as ordinary sector reads will suffice as long as your device has
-a decent CPU.  In any case it is perfect for trsvid's needs.  All I had
-to do was have the file open command return the first sector of the file
-and add a command to initiate sector streaming from that sector.  As long
-as the file was not fragmented everything would work perfectly.
-
-</p><p>
-Sector streaming doesn't give a perfect data stream.  After each 512 byte
-sector it sends the CRC (which trsvid ignores, naturally) and then it
-transmits an undetermined number of "stuff" bytes while the SD card
-controller gets the next sector ready.  Based on a few cards I tested
-the number of stuff bytes is usually only a small amount like 10 or so.
-That makes the player surprisingly more complicated but at least the
-effective data rate remains high.
-
-
-</p><h4><a name="process">How not to flash a PIC chip</a></h4><p>
-
-Once I decided I wanted FreHD firmware improvements I went down the
-road of figuring out how to recompile the firmware (a journey in itself)
-and how to flash new firmware on the PIC.  My first step was to carefully
-pry the PIC chip off the board and put a ZIF socket in there.  That makes
-it easy to remove and replace the chip on the PIC board because I'd be
-doing that frequently.  Oh, boy, did I ever.
-
-</p><p>
-Before rebuilding the firmware I better make sure I can flash an existing
-version.  So I did a little research and got some advice from Andrew Quinn.
-I heard that something called a PICkit would do the trick.  I also read a
-lot about how the PICkit 2 was great but Microchip was phasing it out for
-the PICkit 3 so it was hard to get them and their software tending toward
-not working with the old version.  Deciding to save a few bucks I ordered
-a PICkit 3 clone from some random eBay seller.  It came with a little circuit
-board and its own ZIF socket.  Just wire the board up to the PICkit, drop
-the chip in, plug the PICkit to your PC's USB port and run the burning software.
-
-</p><p>
-Again, various Google searches and embedded programming messages boards didn't
-give me a warm and cozy glow.  Most of it were complaints that the old, simple
-burning software wasn't available or didn't work with the PICkit 3 and that
-you had to use Microchip's fancy new MPLAB X IDE which is one of these
-soup-to-nuts things that will compile your C code, assemble your assembler,
-edit your files, link it all up and burn what remains to a PIC.  Great!  But
-all I had was a .hex file.  Nonetheless it wasn't too hard to drill through
-the IDE and make it happy with a mere .hex file.  I also had to tell it exactly
-what PIC chip I had.  Sounds easy but there are a million different PIC chips
-and their names look all the same.
-
-</p><p>
-I can't remmeber exacty what I did next, but let me emphasize very carefully
-that it was all my fault.  Andrew's guidance was nothing but sound.  It seems
-that for reasons no doubt involving electrons and other non-software entities
-the PICkit 3 itself needs to be flashed with firmware depending on what PIC
-it means to program.  The message boards mention this as one of the many faults
-of the PICkit 3 over the PICkit 2.  I don't know if I chose poorly, picked
-the wrong chip, panicked and pulled a cable too soon or what but after a
-failed attempt to flash the PICkit the IDE kept saying that I had no PICkit
-attached.  Fiddling with mysterious IDE settings and generally pleading did
-nothing to resolve this.  My PICkit 3 was bricked.
-
-</p><p>
-Cursing my stupidity and/or luck, I ordered a somewhat more expensive
-but real Microchip brand PICkit 3.  It didn't come with a little board so
-the original wasn't a total loss.  And the message boards assured me that
-with a tiny bit of soldering my new PICkit 3 could be used to flash the
-dead PICkit 3 and bring it back to life.  Maybe someday I'll do that, but
-at the time it just sounded like a new and exciting way to brick my new
-PICkit.
-
-</p><p>
-Fortunately this time around the flash of the PICkit 3 worked.  It was ready
-to program my chip.  I super carefully looked up which of the 5 (of 6) wires
-that came out of the PICkit needed to be hooked up to the pins of the chip.
-Made all the necessary connections, checked them thrice (at least) and tried
-again.  Checked the connections several more times.  After a while I realized
-that I'd wired the PICkit to the wrong row of header pins on the board.  Looking
-at the board again I can't quite see what my mistake was, but it meant that
-the PICkit was wired to pins on the board that didn't go to the chip.
-
-</p><p>
-Once I got that wiring problem sorted out it worked.  Mostly.  I got it to
-burn once or twice but then it said something like "USB isn't giving me enough
-volts to get the job done."  More Googling and UI poking ensues.  While the
-recommended power setting for my PIC was 5 volts it seemed that a lower voltage
-would work.  So I turned the voltage setting in the IDE down to 4.5 V and it
-didn't complain about the power yet still flashed the chip.
-
-</p><p>
-And now it works perfectly.  And by perfectly I mean sometimes it still
-complains about the power but unplugging the USB cable and plugging it back
-in will usually clear up that error.  And sometimes it complains about how
-there's a short detected so it can't do anything.  That just means I haven't
-used it in a few months and have forgotten which way to put in the chip.
-The chip survived!  It also survived being put in backwards to the FreHD
-and didn't even kill the FreHD.  Who says you have to be careful with hardware?
-
-</p><p>
-Anyhow, that's my process for flashing PIC chips.  Give it a try if you
-like, but maybe you should find someone who knows what the hell they're doing.
-
-
-</p><h3><a name="convert">Convert Your Own Videos</a></h3><p>
-
-Awesome as they are, I'm sure you'll tire of the 5 sample videos I provide.
-trsvid includes the utility programs I use to convert video files to its format.
-Most of the heavy lifting is done by a generic video processing tool
-called <a href="https://ffmpeg.org/">ffmpeg</a>.  The rest are some fairly
-simple C programs to marshal the data into .tv1, .tv3 or .tv6 format.
-To do this you'll need:
-
-</p><ul>
-<li>A PC running Windows</li>
-<li><a href="https://ffmpeg.org/">ffmpeg video utility</a></li>
-<li><a href="http://strawberryperl.com/">perl</a></li>
-<li>trsvid: <a href="http://48k.ca/trsvid/trsvid.zip">trsvid.zip</a></li>
-<li>Example data: <a href="http://48k.ca/trsvid/convert-example.zip">convert-example.zip</a></li>
-</ul><p>
-
-If you can compile C programs then I think this is all easily doable
-on Mac or Linux.  They both will have perl already installed and you'll
-find versions of ffmpeg for them in the same place as shown for the PC.
-You'll just need to compile the C programs from trsvid/convert.
-
-</p><p>
-Download and install perl and ffmpeg.  The key thing is to have them
-set up so that both <t>perl and <tt>ffmpeg</tt> are recognized as commands at
-the command prompt.
-
-</t></p><p>
-Unpack convert-example.zip
-
-</p><p>
-From the trsvid/convert directory (inside trsvid.zip) copy mixtv.exe,
-png2strip.exe, strip2txt.exe and tovid.pl so they're in with vidlist.txt
-where you unpacked convert-example.zip
-
-</p><p>
-tovid.pl is oriented towards batch style operation.  By default it will
-convert all the videos listed in a file to all known formats.  As a start
-I suggest just show what it will do to convert one video to .tv1 format with:
-</p><pre>    perl tovid.pl vidlist.txt -v drwho4 -f 1 -n
-</pre><p>
-That will spit out a series of commands that will be run.  To actually convert
-a video just drop the </p><tt>-n</tt><p> flag:
-</p><pre>    perl tovid.pl vidlist.txt -v drwho4 -f 1
-</pre><p>
-All going well that will leave drwho4.tv1 in the </p><tt>converted</tt><p> directory and
-a bunch of temporary files in the </p><tt>tmp</tt><p> directory.  I don't delete the temporary
-files as they're useful for debugging pipeline problems and if you hack
-the </p><tt>tovid.pl</tt><p> perl script or run the commands manually you can speed
-re-processing of a video by skipping any steps that don't change.
-
-</p><p>
-While you can see if that converted video works by running it on your TRS-80,
-I do recommend <a href="#emu">using the trs80gp emulator</a> which will make
-inspecting the output much quicker.
-
-</p><p>
-To convert all the videos listed in vidlist.txt to all formats just run:
-</p><pre>    perl tovid.pl vidlist.txt
-</pre>
-
-<p>
-<tt>tovid.pl</tt> isn't very friendly and doesn't respond very well when things go
-wrong like if ffmpeg decides it really couldn't convert the file.  But for
-the most part it is just a wrapper around the commands themselves to
-automate the process.
-
-</p><p>
-Though it needs to be documented, for now I suggest you look at the vidlist.txt
-file to see how it names the temporary and output directories and how it
-gives the parameters for each video file.  Notice how you can give the title
-and even the preview image to use.  If no preview image is specified one will
-be extracted some number of frames into the video file.
-
-</p><p>
-One feature not shown in the example is specifying an alternate audio track.
-This is important as the trsvid sound is quite noisy so benefits from a
-higher volume.  Especially on the Model 4P with its internal speaker that
-has no volume control so audio tends to be on the quiet side.  The <tt>volume:</tt>
-option will tell <tt>tovid.pl</tt> to have ffmpeg amplify the video's audio volume.
-Don't be shy about turning up the volume as the distortion from clipping tends
-to get lost in the general audio degredation anyways.
-<a href="https://en.wikipedia.org/wiki/Dynamic_range_compression">Dynamic
-range compression</a> can also be quite helpful.  It tends to be referred to
-as simple "compression" in audio editing programs, by the way.
-
-
-</p><h3><a name="make">Write Your Own Converter</a></h3><p>
-
-Converting a video to trsvid format is conceptually pretty simple.  The first
-step is to run a general purpose utility such a ffmpeg to convert the .mp4
-or whatever format video file into raw data.  The video portion is converted
-into a series of .png image files, one for each frame and the audio portion
-is converted into a raw, unsigned 8 bit per sample audio file.  We also rely on
-the converter to resample the audio and video to specific sample rates.  And the
-video frames must be converted to greyscale and downsampled to TRS-80
-resolutions.  The rates and resolutions vary depending on the target format:
-
-</p><center>
-<table>
-<tbody><tr><th></th><th>.tv1</th><th>.tv3</th><th>.tv6</th></tr>
-<tr><td>Resolution&nbsp;&nbsp;</td><td>128 x 48</td><td>128 x 48</td><td>160 x 72</td></tr>
-<tr><td>Frame Rate&nbsp;&nbsp;</td><td>51.5074</td><td>54.47267</td><td>60</td></tr>
-<tr><td>Audio Rate&nbsp;&nbsp;</td><td>14307.0968</td><td>15130.74627</td><td>16200</td></tr>
-</tbody></table>
-</center>
-
-<p>
-The .png files are fed to <tt>png2strip</tt> which converts them to a single file
-of raw grayscale pixels concatenated together.
-
-</p><p>
-The image strip is fed to <tt>strip2txt</tt> which does spatial and time domain
-dithering to convert the grayscale data into monochrome and then outputs
-it as TRS-80 graphics characters.
-
-</p><p>
-Finally, the raw audio data and <tt>strip2txt</tt> output are read by <tt>mixtv</tt> which
-produces the final combined data stream.  It also fills in the file header
-so it has options to set the title and preview image.  See <tt>video-format.txt</tt>
-for information on how the trsvid data file header is organized.
-
-</p><p>
-Running <tt>tovid.pl</tt> with the <tt>-n</tt> flag will show you how ffmpeg is manipulated
-into producing the required output.  It will also show how my utilities are
-used to take that raw data and convert them in to trsvid format files.  Note
-that the grayscale effect seen in preview images is done as a sort of mini
-video conversion of a single image.
-
-</p><p>
-One thing that could defintely use improvement is audio/video sync.  The
-<tt>.tv6</tt> format is OK, but <tt>.tv1</tt> and <tt>.tv3</tt> have very unusual frame rates
-and ffmpeg only supports a few decimal places.  So video and audio get
-out of sync over time.
-
-</p><p>
-If you're generating movies directly through CGI or other means you may want
-to avoid the ffmpeg step and produce raw audio and grayscale PNG frames
-directly.  Or output the strip form of the image data directly.  If you're
-generating TRS-80 graphics (say maybe from emulator screen captures) then
-going straight to <tt>strip2txt</tt> output is best.
-
-</p><p>
-On the other side of things you may have some better ideas on how to convert
-grayscale video into monochrome data.  <tt>strip2txt</tt> does pretty well but is
-hardly the last word.  trsvid is not doing any clever processing.  It merely
-intends to display the frames as fast as it is able.  A more complicated or
-involved grayscale to monochrome process will make no difference to it.
-
-</p><p>
-<tt>mixtv.cpp</tt> is the only existing "documentation" of the low level trsvid
-video format.  But I do note that at a low level the file data is a series
-of interleaved audio and video operations.  There might well be some
-things that can be done beyond simple video playback.
-
-
-</p><h3><a name="hack">Hack trsvid Itself</a></h3><p>
-
-Most of trsvid can be built using <a href="http://48k.ca/zmac.html">zmac</a>.  So you
-just need:
-
-</p><ul>
-<li>zmac: <a href="http://48k.ca/zmac-5nov2016.zip">zmac-5nov2016.zip</a></li>
-<li>trsvid source: <a href="http://48k.ca/trsvid/trsvid.zip">trsvid.zip</a></li>
-</ul><p>
-
-zmac comes with an executable for Windows but also includes source code
-and should easily build for both Mac and Linux.  With zmac.exe on your
-PATH this command will do it:
-</p><pre>    zmac --zmac trsvid.z
-</pre><p>
-And you can immediately test it with <a href="http://48k.ca/trs80gp.html">trs80gp</a>
-if you have it:
-</p><pre>    trs80gp -frehd zout/trsvid.bds
-</pre><p>
-You can also give it </p><tt>trsvid.cmd</tt><p> instead, but using the .bds output
-will enable source level debugging.
-
-</p><p>
-With only zmac you can modify the user interface and the .tv6 player.  The
-<tt>.tv1</tt> and <tt>.tv3</tt> players are generated by a perl script and compressed using
-Einar Saukas' zx7 compressor.  To fully build trsvid you need:
-
-</p><ul>
-<li>zmac: <a href="http://48k.ca/zmac-5nov2016.zip">zmac-5nov2016.zip</a></li>
-<li><a href="http://strawberryperl.com/">perl</a></li>
-<li>trsvid source: <a href="http://48k.ca/trsvid/trsvid.zip">trsvid.zip</a> (includes zx7)</li>
-</ul><p>
-
-From the trsvid download find </p><tt>zx7/src/zx7.exe</tt><p> and make sure it is on your PATH.
-Should be easy to compile on Mac or Linux.  Do a full build with:
-
-</p><pre>    perl mkplay.pl
-    zmac --zmac trsvid.z
-</pre><p>
-
-If you look at mkplay.pl you'll see it mostly just runs genplayer.pl with
-all the different variations of the .tv1 and .tv3 players, assembles the
-resulting assembly file and compresses it with zx7.  You can ignore the </p><tt>p4</tt><p>
-commands it runs as those are just source code commands that are only needed
-if you use Perforce.  mkplay.pl also happens to compress the splash screen.
-
-</p><p>
-The user interface portion of trsvid is pretty straightforward Z-80 code.
-The only really tricky bits are flipping the preview images quickly and
-exactly once per frame.  The Model I variant runs a loop that executes
-in exactly the same number of cycles as a video frame thus it remains in
-sync with the video but doesn't with the relative phase.  This is why the black
-bars appear because the code has no way to know where they are.
-
-</p><p>
-The Model 3 preview displays a single frame, then waits a rough amount of time
-to be guaranteed that the next frame is being displayed by the video.  Since
-video waits are on it can display the next frame and know it won't show up
-too soon.  At that point it can wait on the 30 Hz interrupt to keep in
-sync with the screen.  In short, a simple cheat to maintain 60 Hz sync without
-getting too involved.  If run trs80gp as below you'll see red lines indicating
-when the Z-80 is accessing video memory.  You can see how the video memory
-accesses synchronize.
-</p><pre>    trs80gp -bd -frehd zout/trsvid.bds
-</pre>
-
-<p>
-The Model 4 can get a 60 Hz (or 50 Hz) video interrupt so it simply draws a
-frame quickly and waits for that.
-
-</p><h4>Theory of Operation</h4><p>
-
-While they differ in details, the players for each format are pretty similar.
-Their main function is to read graphics data as quickly as possible and
-put it on the screen.  Nothing but a whole bunch of </p><tt>ini</tt><p> instructions.
-There are two complicating factors:  audio and inter-sector gaps.  The only
-reasonable way I found to play digitized audio with the TRS-80's single bit
-sound is to use
-<a href="https://en.wikipedia.org/wiki/Pulse-width_modulation">Pulse-Width Modulation</a>
-or PWM.  What you do is read the usual amplitude samples from an audio stream
-at some carrier frequency (I use around 15 KHz).  Over that 1/15000 of a second
-interval you turn the audio on for a percentage of time equal to the sample's
-percentage of maximum amplitude.  So for a sample 25% of maximum you turn
-the sound on for 1/60000 of a second and then off for the remaining 3/60000
-of a second.  Due to low-pass filtering (of the hardware? the air? your ears?
-I'm not really sure) this ends up sounding like an actual 25% speaker
-deflection.
-
-</p><p>
-On a (fast) Model 4 the interval is 256 clock cycles.  And I've learned the
-hard way that if the player is not extremely consistent about that interval
-the sound suffers terribly.  And if you should happen to skip an interval
-per frame you get a horrible and loud 60 Hz buzz.  Since the audio only
-has to go on and off in the interval there's quite a bit of idle time.
-During that time we read the graphics bytes and display them on screen.
-The basic video format for <tt>.tv6</tt> is one audio sample byte followed 
-by 8 graphics bytes.  The code reads the audio sample, turns on sound and
-then figures out how long it has until sound must turn off again.  If the
-sample is small then it will just idle for a short period, turn off the
-sound and then do 8 <tt>ini</tt> instructions to display the graphics.
-For a bigger sample it might do two graphics bytes, turn off sound and
-then the remaining 6.
-
-</p><p>
-That's how it works conceptually.  Practically speaking there's no time
-to make decisions.  The code supports 64 audio levels and has 64 different
-chunks of code all ready to handle each case.  To minimize overhead I
-use the fastest dispatch mechanism I know:
-
-</p><pre>    in h,(c)
-    jp (hl)
-</pre><p>
-
-With </p><tt>L</tt><p> register always set to 0 then handler code for each audio
-level is at $0000, $0100, $0200, $0300, ... $3E00, $3F00.  It's a bit awkward
-but amazingly workable.
-
-</p><p>
-The inter-sector gap makes this more difficult.  After the 512 data bytes
-of a sector the SD card needs a little time before it can start outputting
-the next sector.  Try as I might, I couldn't hide this detail in the FreHD.
-So the TRS-80 will see the $FF bytes that occur between sectors until a
-$FE byte appears signalling the start of the next sector.  Since we cannot
-let the audio lapse for even one interval this means we must have some way
-to buffer enough audio data to keep things going until the next sector starts.
-
-</p><p>
-Thus to our original 64 commands we add $40 through $7F which tell the
-player that it must output a sample of $00 through $3F while it is reading
-a few more audio bytes to play back when the gap is hit.  Well, as you
-might suspect, it isn't buffering literal audio data but another of
-a set of commands from $80 through $BF that tell the player to output
-an audio sample of $00 through $3F while is is reading data bytes looking
-for a $FE indicating the next sector is starting at which point we can
-go back to directly executing commands.
-
-</p><p>
-The buffered commands have the special command $C0 at the end.  If we
-don't see a $FE byte before the buffer runs out then $C0 is a loop that
-simply reads until the $FE byte is found and continues on.  Yes, that will
-cause a glitch in the audio but there's nothing to be done about it.  It's
-just a safety valve in the very uncommon occurence that the SD card is
-slow on sending the next sector.
-
-</p><p>
-The "waiting for $FE" commands actually work in two states.  At first they
-continue with <tt>L</tt> set to 0.  But when the $FE is found they load
-<tt>L</tt> with $80.  Now the commands are slightly different.  We still
-must output an audio sample but we don't want to be pulling in the sector
-data.  But we will check the buffer pointer so we know when to go back
-to reading and executing commands from the SD card.
-
-</p><p>
-Of course, there's a bunch of little details in getting this all to
-work smoothly.  After the screen has been filled <tt>HL'</tt> needs to be
-reloaded with the start of screen VRAM.  The SD card sends a two byte
-CRC after the sector data.  That problem is solved by having a few bytes
-unusued in the audio buffering.  <tt>mixtv</tt> sets those bytes to
-whatever value is needed to ensure the CRC does not contain $FE.  Thus
-the CRC is skipped just like the stuff bytes.
-
-</p><p>
-There's one more code to signal that the file is done.  And somewhere in
-there we peek at the keyboard so the video can be stopped or paused.  And
-for no particularly good reason all the codes have 2 added to them.  Some
-more of the unused audio buffer bytes are filled in with a seconds count
-so the pause code can display how far along we are in the video.
-
-</p><p>
-The Model 4 has wait states added when writing to video memory.  Thus the
-timer interval for any commands that write graphics to the screen is
-suitably reduced to account for the extra instruction time.
-
-</p><p>
-The Model I and 3 operate with a slightly longer interval and only have
-time to do 4 bytes per graphics command.  Which is OK because they have
-about 1/2 the number of bytes to display per screen.  They only have
-48K of RAM so cannot use commands lower than $40 which limits them to
-32 levels of audio.  And time is so tight on the Model I that I had to
-settle for some slight variation in the interval durations thus adding
-more noise to the playback.
-
-
-</p><h3><a name="future">Into the Future</a></h3><p>
-
-I'd hoped to define </p><tt>.tv4</tt><p> and </p><tt>.tv5</tt><p> formats that do
-full-screen 160 x 72 video on the slower Model 4 computers.  The idea
-of a </p><tt>.tv2</tt><p> format for Model II computers is a much more ambitious
-goal.  With non graphics character set like the others the video encoder
-would have to make do with matching ASCII and other characters to video
-data.  It has been done on other platforms, but I had enough trouble getting
-simple graphics data to work that I backed away from that challenge.  In
-fact, the project itself was stalled for a long time until I figured out
-how to convert video frames that wasn't a total mess.
-
-</p><p>
-For that matter I'm sure there's quite a bit of room to improve encoding
-of both the graphics and audio.  Maybe the Model I/3/4 should take
-advantage of ASCII characters -- the video formats allow for it.  And I'm
-sure there are even better graphics conversion algorithms out there.  That
-goes double for audio.  Some of the TRS-80 digitized speech is so good
-despite incredibly low bit-rates.  If I could reproduce that in an algorithm
-then it could make for a better and simpler player.
-
-</p><p>
-Part of the fun and challenge of trsvid is using the stock hardware for
-output.  Making use of high-res graphics cards would be an interesting
-challenge.  There's no way you can update the graphics screen at a decent
-frame rate but you could update reasonble subsets.  Makes for a lot of
-hard work in the video converter.  Proper digital audio hardware like
-the <a href="http://www.trs-80.org/orchestra-80/">Orchestra 80</a> would
-vastly improve audio quality.  Heck, it would make the player software
-almost trivial.  Where's the fun in that?
-
-</p><p>
-Perhaps the most tantalizing prospect is using the ethernet capabilities of
-<a href="http://bartlettlabs.com/MISE/">MISE</a> or
-<a href="http://bartlettlabs.com/M3SE/">M3SE</a> expansion hardware.
-Even 10 megabit ethernet has enough bandwidth to feed trsvid.  The only
-question is whether the expanders can deliver that data quickly to the
-TRS-80.  Hack up some server software and maybe we could have a YouTube
-player for the TRS-80.
-
-
-</p><hr><p><em>George Phillips, March 18, 2017,  george -at- 48k.ca</em>
-</p></div></div>]]>
+<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
             </description>
             <link>http://48k.ca/trsvid.html</link>
             <guid isPermaLink="false">hacker-news-small-sites-36350789</guid>
@@ -2745,7 +2225,7 @@ player for the TRS-80.
             </title>
             <description>
 <![CDATA[
-Score 212 | Comments 84 (<a href="https://news.ycombinator.com/item?id=36349208">thread link</a>) | @farazzz
+Score 221 | Comments 100 (<a href="https://news.ycombinator.com/item?id=36349208">thread link</a>) | @farazzz
 <br/>
 June 15, 2023 | https://vadimdemedes.com/posts/generating-income-from-open-source | <a href="https://web.archive.org/web/*/https://vadimdemedes.com/posts/generating-income-from-open-source">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2885,7 +2365,7 @@ June 15, 2023 | https://vadimdemedes.com/posts/generating-income-from-open-sourc
             </title>
             <description>
 <![CDATA[
-Score 300 | Comments 166 (<a href="https://news.ycombinator.com/item?id=36348356">thread link</a>) | @bpierre
+Score 307 | Comments 174 (<a href="https://news.ycombinator.com/item?id=36348356">thread link</a>) | @bpierre
 <br/>
 June 15, 2023 | http://www.graybeardgames.com/download/diablo_pitch.pdf | <a href="https://web.archive.org/web/*/http://www.graybeardgames.com/download/diablo_pitch.pdf">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div �oe="">€öŒA]øýçÏ‰9_ÝŒGƒÀà«ÛOlF•t|ífl5µÞæ"8²36%vLFÔn¸’ÖÞY‰Ò-ßËÖ¢§¼ù€‘2ož™›;^0YÐnÙ°ž@3GnÖ?ñ$†S;\«ÊÚ€éŸ¾˜ø"#¸ù©ƒ &lt;†¸‰´(ØF‘F%}EBì™C‘ÆäS P|î}0&nbsp;‘¬š£]*Cgqg"}ºaÃpË•2™g!ÖFò¥Ûæ$ôjHä‹T�oôÓöM2Ñ¥k»o-WÎ
@@ -3244,7 +2724,7 @@ GÅIì¿³£Žòê(î`¾SöxyG�dÃ¯A’¥W¿Î	í¶°Î´"oísoŸ±è»
             </title>
             <description>
 <![CDATA[
-Score 299 | Comments 190 (<a href="https://news.ycombinator.com/item?id=36348007">thread link</a>) | @greghn
+Score 304 | Comments 193 (<a href="https://news.ycombinator.com/item?id=36348007">thread link</a>) | @greghn
 <br/>
 June 15, 2023 | https://shape-of-code.com/2021/01/17/software-effort-estimation-is-mostly-fake-research/ | <a href="https://web.archive.org/web/*/https://shape-of-code.com/2021/01/17/software-effort-estimation-is-mostly-fake-research/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
@@ -3259,7 +2739,7 @@ June 15, 2023 | https://shape-of-code.com/2021/01/17/software-effort-estimation-
             </title>
             <description>
 <![CDATA[
-Score 577 | Comments 334 (<a href="https://news.ycombinator.com/item?id=36342931">thread link</a>) | @knsv
+Score 582 | Comments 340 (<a href="https://news.ycombinator.com/item?id=36342931">thread link</a>) | @knsv
 <br/>
 June 15, 2023 | https://www.mermaidchart.com/blog/posts/sequence-diagrams-the-good-thing-uml-brought-to-software-development | <a href="https://web.archive.org/web/*/https://www.mermaidchart.com/blog/posts/sequence-diagrams-the-good-thing-uml-brought-to-software-development">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -3695,7 +3175,7 @@ and start your own journey, absolutely free. In the upcoming installment of this
             </title>
             <description>
 <![CDATA[
-Score 109 | Comments 88 (<a href="https://news.ycombinator.com/item?id=36339253">thread link</a>) | @hannob
+Score 109 | Comments 89 (<a href="https://news.ycombinator.com/item?id=36339253">thread link</a>) | @hannob
 <br/>
 June 15, 2023 | https://industrydecarbonization.com/news/cements-future-could-be-a-combination-of-carbon-capture-and-electrification.html | <a href="https://web.archive.org/web/*/https://industrydecarbonization.com/news/cements-future-could-be-a-combination-of-carbon-capture-and-electrification.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><p><b>Cement is an industry where capturing carbon emissions may be necessary. A combination with process heat electrification could be better than CCS alone.</b></p><div><p>Cement is often named the prime example when discussing industries that are difficult to decarbonize. Cement production produces large amounts of carbon dioxide, and most of these emissions come from chemical reactions that cannot be avoided.</p>
@@ -3773,7 +3253,7 @@ Want to read more stories like this? Subscribe for free here:
             </title>
             <description>
 <![CDATA[
-Score 153 | Comments 69 (<a href="https://news.ycombinator.com/item?id=36338365">thread link</a>) | @ingve
+Score 154 | Comments 70 (<a href="https://news.ycombinator.com/item?id=36338365">thread link</a>) | @ingve
 <br/>
 June 15, 2023 | https://fennel.ai/blog/vector-search-in-200-lines-of-rust/ | <a href="https://web.archive.org/web/*/https://fennel.ai/blog/vector-search-in-200-lines-of-rust/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4004,7 +3484,7 @@ June 14, 2023 | https://tlpnetwork.com/news/2023/06/scientists-discover-phosphor
             </title>
             <description>
 <![CDATA[
-Score 59 | Comments 85 (<a href="https://news.ycombinator.com/item?id=36333552">thread link</a>) | @armanhq
+Score 59 | Comments 86 (<a href="https://news.ycombinator.com/item?id=36333552">thread link</a>) | @armanhq
 <br/>
 June 14, 2023 | https://yarn.joinstatecraft.com/books | <a href="https://web.archive.org/web/*/https://yarn.joinstatecraft.com/books">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="__next"><div><main><div><p>The non-profits PEN America and the American Library Association keep a catalog of banned books in the United States up to the 2021-22 academic year. In this 1 academic year alone, 1600+ books were irregularly banned from 138 school districts across America; 3.8 million students have lost access to information in varying degrees as a result. We've expanded the catalog of banned books by scraping open source data from publishers to give us the clearest possible look at common features of these 1,626 irregularly banned books.</p><div><div data-react-scrollama-id="react-scrollama-0"><div><h4> Irregular bans are ideologically driven. </h4><p> They are supplemental to and fall outside of the standard book exclusion process at schools and libraries. Standard exclusions prevent books that promote violent, hateful, or mature/17+” topics from being placed on school bookshelves while irregular bans do not have robust processes and can be influenced by interest groups or local officials. The bans are in effect in 138 school districts and cut off access to information for 3.8M students (7.1% of America's school age year old population). </p></div></div><div data-react-scrollama-id="react-scrollama-1"><div><h4> 45%: Activism and Social Justice </h4><p> The descriptions prominently discuss struggles for civil rights amongst various demographic groups. Movements that question a predominant societal status quo are also featured. While violence and civil unrest are present in some of these books - and used as a basis to ban them, it’s important to note that they are to the end of positive social change. By contrast, large-scale violence is not targeted in a similar fashion; even by the most generous count, books that reflect military violence or war only account for 13 of the 1626 books banned (0.7%). </p></div></div><div data-react-scrollama-id="react-scrollama-2"><div><h4> 24%: LGBTQ+ Specific </h4><p> There is an expectedly heavy overlap between books about LGBTQ+ topics and activism. But venturing beyond that explicit overlap, the LGBTQ+ category overlaps implicitly with topics such as mental health. </p></div></div><div data-react-scrollama-id="react-scrollama-3"><div><h4> 19%: Race and Ethnicity </h4><p> When aggregated, we see that nearly a fifth of the banned books have an explicit minority racial/ethnic group listed as a topic. There is an apparent inconsistency in targeting these books in particular: some of them simply feature a minority protagonist while others make more pointed critiques about coming of age in America (neither justifies a ban). <a href="https://www.oyez.org/cases/1981/80-2043">The lack of guardrails or coherent policy</a> around irregular bans provides room for this inconsistency to grow. </p></div></div><div data-react-scrollama-id="react-scrollama-4"><div><h4> Notable, Historic, and Influential Women </h4><p> Books that feature prominent women in positions of influence and/or STEM fields appear multiple times throughout our dataset and throughout school districts across the country. By our count, there are 115 books in the dataset that feature notable, historic, or influential women.</p></div></div><div data-react-scrollama-id="react-scrollama-5"><div><h4> Only 1.6% Were Given a 17+ Maturity Rating </h4><p> We did briefly entertain the talking point from ban advocates that the bans are largely driven by age-inappropriate content. This viewpoint does not align with publisher-provided maturity ratings nor does it align with the information shared above. </p></div></div></div><div><h2>Final thoughts</h2>
@@ -4027,7 +3507,7 @@ June 14, 2023 | https://yarn.joinstatecraft.com/books | <a href="https://web.arc
             </title>
             <description>
 <![CDATA[
-Score 176 | Comments 123 (<a href="https://news.ycombinator.com/item?id=36333321">thread link</a>) | @tikkun
+Score 178 | Comments 124 (<a href="https://news.ycombinator.com/item?id=36333321">thread link</a>) | @tikkun
 <br/>
 June 14, 2023 | https://llm-utils.org/Nvidia+H100+and+A100+GPUs+-+comparing+available+capacity+at+GPU+cloud+providers | <a href="https://web.archive.org/web/*/https://llm-utils.org/Nvidia+H100+and+A100+GPUs+-+comparing+available+capacity+at+GPU+cloud+providers">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -4042,7 +3522,7 @@ June 14, 2023 | https://llm-utils.org/Nvidia+H100+and+A100+GPUs+-+comparing+avai
             </title>
             <description>
 <![CDATA[
-Score 171 | Comments 131 (<a href="https://news.ycombinator.com/item?id=36333034">thread link</a>) | @whack
+Score 171 | Comments 136 (<a href="https://news.ycombinator.com/item?id=36333034">thread link</a>) | @whack
 <br/>
 June 14, 2023 | https://software.rajivprab.com/2018/04/29/myths-programmers-believe-about-cpu-caches/ | <a href="https://web.archive.org/web/*/https://software.rajivprab.com/2018/04/29/myths-programmers-believe-about-cpu-caches/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4396,176 +3876,7 @@ June 14, 2023 | https://software.rajivprab.com/2018/04/29/myths-programmers-beli
 Score 60 | Comments 52 (<a href="https://news.ycombinator.com/item?id=36332393">thread link</a>) | @mysweetmisery
 <br/>
 June 14, 2023 | https://www.news.upveda.in/2023/06/14/new-york-introduces-bill-requiring-social-media-platforms-to-provide-open-api-access-for-third-party-applications/ | <a href="https://web.archive.org/web/*/https://www.news.upveda.in/2023/06/14/new-york-introduces-bill-requiring-social-media-platforms-to-provide-open-api-access-for-third-party-applications/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
-        
-<h2>The proposed legislation aims to enhance user control, transparency, and accountability in social media</h2>
-
-
-
-<p>Date: May 5, 2023</p>
-
-
-
-<p>In a move aimed at enhancing user control and promoting transparency, a new bill has been introduced in the New York Senate to mandate <a href="https://www.news.upveda.in/tag/social-media/" target="_blank" data-schema-attribute="about" rel="noreferrer noopener">social media</a> platforms to implement an open application programming interface (API). The bill, known as S6686, seeks to provide third-party applications with access to user data at no cost and ensure that certain information is made available to users.</p>
-
-
-
-<p><strong>Key Details:</strong></p>
-
-
-
-<ul>
-<li>Bill Number: <a href="https://www.nysenate.gov/legislation/bills/2023/S6686" target="_blank" data-schema-attribute="about" rel="noreferrer noopener">S6686</a></li>
-
-
-
-<li>Sponsor: <a href="https://www.nysenate.gov/senators/brad-hoylman-sigal" target="_blank" data-schema-attribute="about" rel="noreferrer noopener">Hoylman-Sigal</a></li>
-
-
-
-<li>Current Committee: <a href="https://www.nysenate.gov/committees/internet-and-technology" target="_blank" data-schema-attribute="about" rel="noreferrer noopener">Senate Internet and Technology</a></li>
-
-
-
-<li>Law Section: General Business Law</li>
-
-
-
-<li>Laws Affected: Add Art 42 §§1100 – 1104, Gen Bus L</li>
-</ul>
-
-
-
-<p><strong>Summary of the Bill:</strong></p>
-
-
-
-<ul>
-<li>The bill proposes amending the general business law to enforce social media open application programming.</li>
-
-
-
-<li>It requires social media platforms to implement and maintain a standards-based application programming interface (API) that allows third-party applications to retrieve data at no cost for the benefit of users.</li>
-
-
-
-<li>Social media companies are also required to provide certain information to users and submit API access reports to the Attorney General.</li>
-
-
-
-<li>The bill includes provisions for definitions, required <a href="https://www.news.upveda.in/tag/api-access-charges/" target="_blank" data-schema-attribute="about" rel="noreferrer noopener">API access</a>, API access reports, violations and remedies, and application exemptions based on revenue and user interactions.</li>
-</ul>
-
-
-
-<p><strong>Justification for the Bill:</strong></p>
-
-
-
-<ul>
-<li>Open API access is crucial for public interest research, crisis response, public health, fraud prevention, and protection against online violence and hate speech.</li>
-
-
-
-<li>Allowing third-party access to social media platforms’ APIs empowers users, giving them more control over their experience and the ability to limit hateful rhetoric.</li>
-
-
-
-<li>Transparency and accountability in social media platforms are essential as they have become integral to modern society.</li>
-
-
-
-<li>Users should have the authority to define and enforce their own needs within a platform, beyond the limitations of a company’s internal terms of service and policies.</li>
-</ul>
-
-
-
-<p><strong>Legislative History:</strong></p>
-
-
-
-<ul>
-<li>The bill is newly introduced.</li>
-</ul>
-
-
-
-<p><strong>Fiscal Implications:</strong></p>
-
-
-
-<ul>
-<li>The fiscal impact is yet to be determined.</li>
-</ul>
-
-
-
-<p><strong>Effective Date:</strong></p>
-
-
-
-<ul>
-<li>The bill will take effect 180 days after becoming law.</li>
-</ul>
-
-
-
-<p><strong>The bill includes the following provisions:</strong></p>
-
-
-
-<ol>
-<li><strong>Definitions:</strong> The bill provides definitions for terms such as “application programming interface,” “authorized representative,” “content,” “public or semipublic internet-based service or application,” “social media company,” and “social media platform.”</li>
-
-
-
-<li><strong>Required open API access:</strong> Social media platforms must maintain a standards-based API interface that allows third-party applications to retrieve data, free of charge, for the user’s benefit. This includes accessing a user’s data and settings.</li>
-
-
-
-<li><strong>API access report:</strong> Social media companies are required to submit a semiannual report to the attorney general. The report should include current features of the API, changes made since the previous report, description of responses to additional features, and any denials of API access.</li>
-
-
-
-<li><strong>Violations and remedies:</strong> Violators of the provisions may be subject to injunctions. A company is considered in violation if it <a href="https://www.news.upveda.in/2023/05/31/developer-faces-daunting-20-million-expense-as-reddit-considers-charging-for-api-access/" target="_blank" data-schema-attribute="about" rel="noreferrer noopener">fails to provide or maintain open API access</a>, submit timely reports to the attorney general, or omits/misrepresents information in the report.</li>
-
-
-
-<li><strong>Application:</strong> The bill does not apply to social media companies with less than $100 million in gross revenue or to services with limited user interactions like direct messages, commercial transactions, or reviews.</li>
-</ol>
-
-
-
-<p><em>Authored by Senator Brad Hoylman-Sigal, the bill focuses on social media open application programming and aims to establish standards for API access. It requires social media platforms to maintain a standards-based API that allows third-party applications to retrieve user data and settings. This access would empower users, giving them tools to exercise control over their online experience, such as limiting hateful rhetoric.</em></p>
-
-
-
-<p>Under the proposed legislation, social media companies would be obligated to submit semiannual reports to the attorney general, detailing the features included in the API, any changes made, responses to additional features, and denials of API access. These reports would be made public and accessible in a searchable online repository.</p>
-
-
-
-<p>However, the bill includes exemptions for social media companies generating less than $100 million in gross revenue in the previous year and for services where user interactions are limited to direct messages, commercial transactions, or reviews.</p>
-
-
-
-<p>Supporters of the bill argue that an open API would facilitate public interest research, crisis response, public health initiatives, fraud prevention, and protection against online violence and hate speech. They believe that access to user data is crucial for transparency and accountability, enabling users to define and enforce their own needs beyond a company’s internal terms of service and policies.</p>
-
-
-
-<p>Although the bill is currently in the early stages of the legislative process, proponents are optimistic about its potential to reshape the social media landscape and empower users in New York. If passed, the law would take effect 180 days after becoming official.</p>
-
-
-
-<p>Critics of the bill have expressed concerns about potential privacy and security risks associated with increased third-party access to user data. They argue that stricter regulations and safeguards are necessary to protect user information and ensure responsible data handling.</p>
-
-
-
-<p>The fiscal implications of the bill are yet to be determined, and further deliberations will take place in the Senate Internet and Technology Committee.</p>
-
-
-
-<p>As discussions unfold, the proposed legislation raises important questions about the balance between user control, privacy, and innovation in the realm of social media. The outcome of the bill may serve as a precedent for other jurisdictions grappling with similar concerns.</p>
-    </div></div>]]>
+<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
             </description>
             <link>https://www.news.upveda.in/2023/06/14/new-york-introduces-bill-requiring-social-media-platforms-to-provide-open-api-access-for-third-party-applications/</link>
             <guid isPermaLink="false">hacker-news-small-sites-36332393</guid>
@@ -4903,7 +4214,7 @@ import AsyncAssigns
 Score 71 | Comments 28 (<a href="https://news.ycombinator.com/item?id=36327347">thread link</a>) | @sunguroku
 <br/>
 June 14, 2023 | https://blog.hellolanding.tech/move-fast-avoid-sharp-edges-5d3a07f19a59 | <a href="https://web.archive.org/web/*/https://blog.hellolanding.tech/move-fast-avoid-sharp-edges-5d3a07f19a59">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section><div><div><div><div><div><div><div><div><div><div><div><a href="https://medium.com/@daniel_87679?source=post_page-----5d3a07f19a59--------------------------------" rel="noopener follow"><div><div aria-hidden="false"><div><div><p><img alt="Daniel Klein" src="https://miro.medium.com/v2/resize:fill:88:88/0*M9NQakLrr32xg5wi" width="44" height="44" loading="lazy"></p></div></div></div></div></a><a href="https://blog.hellolanding.tech/?source=post_page-----5d3a07f19a59--------------------------------" rel="noopener  ugc nofollow"><div><div><div aria-hidden="false"><div><div><p><img alt="Landing Engineering" src="https://miro.medium.com/v2/resize:fill:48:48/1*eVsvDhSGcTMgR60ttRZnuQ.png" width="24" height="24" loading="lazy"></p></div></div></div></div></div></a></div></div></div></div></div></div></div><figure><div role="button" tabindex="0"></div></figure><p id="bb8e">Delivering value quickly and safely is a core competency of our software engineering organization at Landing. Our team’s entire mission is to deliver useful products and tools (for our members, partners, and internal staff) as quickly as possible while maintaining high quality (things work correctly) and safety (systems are reliable and protect our users’ data). A significant piece of that value delivery chain is the tooling, automation, and infrastructure involved in building and deploying all this software. In 2022, our team rethought those systems from the ground up and migrated from Heroku to Kubernetes, in conjunction with the Porter platform. This strategic move laid the foundation for a well-oiled machine for building, deploying, and scaling our web applications and services. Now, having caught our breath after the transition, we’re excited to share a bit about our approach, the outcomes we achieved, and the valuable lessons we learned along the way. Let’s dive right in!</p><p id="1e84">You may be wondering, what exactly is Landing? In a nutshell, Landing aims to make living flexible for everyone. Offering freedom from being tied down by a lease, Landing offers our members a vast network of beautifully furnished apartments across the United States. A Landing member can, for example, live in Miami for a month, then transfer to Portland for few weeks, and then try out Boise for awhile, all while enjoying a consistent level of high quality furnishings and accoutrements. Imagine having the freedom to immerse yourself in new cities, knowing that wherever you go, you’ll have a comfortable and stylish home awaiting your arrival.</p><p id="3ee4">From the founding of the company, Landing’s custom applications were hosted on Heroku, providing our lean engineering team with tremendous leverage and a delightful developer experience. Heroku allowed us to defer hiring dedicated DevOps or infrastructure specialists, enabling us to focus on solving core business problems without getting entangled in infrastructure complexities. In short, with Heroku, things <em>just worked</em> — the team could focus on solving business problems instead of fiddling with infrastructure. In the Spring of 2022, as Landing continued to experience rapid growth, we looked around and realized that, for a number reasons such as scalability, cost optimization, and flexibility, staying on Heroku would not be sustainable for Landing in the longer term. Determined to find a solution that aligned with our expanding needs, we embarked on an ambitious project. Our mission was to identify a platform that could scale alongside Landing’s growth, ensuring a smooth migration of all our application infrastructure, from web servers to databases and beyond, without disrupting our operations.</p><p id="ab2d">As we considered our options, our focus centered around optimizing several crucial qualities in the new environment. We prioritized cost efficiency, flexibility, developer experience, and robust security. We aspired to find a platform that would be less expensive than Heroku, with a flatter cost curve as our infrastructure expanded. From a security perspective, we wanted a platform that would allow us to make the right thing the easy thing and allow our engineers to ship safely without getting in their way. Simultaneously, we sought a platform that provided an exceptional developer experience and the flexibility to avoid being locked into a solution that might require another large-scale migration in the future. It became evident that migrating to another pure PaaS (Platform-as-a-Service) like Heroku was not our cup of tea. While products in this segment, such as Render and <a href="https://fly.io/" rel="noopener ugc nofollow" target="_blank">Fly.io</a>, offered exceptional developer experiences, the inherent lock-in risk and potential for future migrations did not align with our long-term vision.</p><p id="4f9d">On the other end of the spectrum, we briefly considered using a managed Kubernetes service directly with a product like Amazon’s Elastic Kubernetes Service (EKS) or Google Kubernetes Engine (GKE), coupled with Helm charts or something similar. However, it was quickly apparent that pursuing this path would require us to hire or cultivate significant Kubernetes expertise within our team or make a LOT of mistakes along the way (or both). Even with a managed Kubernetes (k8s) service involved, without an additional abstraction layer, it was clear that this path would be complicated and painful. We loved the power, flexibility, and ubiquity of Kubernetes, but we also deeply desired a developer experience reminiscent of Heroku. Luckily, as we continued to research our options and build small proof-of-concept demos, we ultimately landed on Porter.</p><p id="1d74"><a href="https://porter.run/" rel="noopener ugc nofollow" target="_blank">Porter</a> is a platform service, maintained and operated by the creators of the <a href="https://github.com/porter-dev/porter" rel="noopener ugc nofollow" target="_blank">open source project of the same name</a>, that provides an abstraction layer on top of managed Kubernetes infrastructure running in your own cloud account. The Porter platform provides a web dashboard along with CLI tooling for creating, deploying, and managing applications on Kubernetes without having to know much about the underlying Kubernetes internals. Furthermore, the Porter team also manages the maintenance and upgrades of our Porter-connected AWS EKS clusters (the platform also supports clusters on GCP and Digital Ocean in addition to AWS).</p><p id="5e54">As we explored options, we realized that Porter presents a wonderful combination of developer experience and flexibility. The web dashboard is practical and easy to understand, and the CLI makes easy things easier and hard things possible. Moreover, the Porter team is constantly absorbing our product feedback and shipping enhancements to the platform. The level of support we have received from Porter is incredible. The most powerful long-term benefit of Porter, however, is that it is ultimately Kubernetes (and Helm charts) under the hood. While we have no intention of outgrowing the platform, knowing that it is rooted in these industry-standard technologies, provides peace of mind. If the need ever arises to scale beyond Porter’s capabilities, the migration effort will be significantly streamlined compared to our previous transition off of Heroku.</p><p id="bede">Over the course of several months in 2022, we executed a project to migrate all of our applications on Heroku over to Porter. In conjunction with this move, we also shifted all of our Heroku Postgres databases to Amazon Aurora Postgres and our Heroku Redis cache instances to Amazon Elasticache. This migration, along with the continuous improvements we are making to our infrastructure and workload creation and management tooling and processes, has established a robust foundation for scaling our engineering teams and infrastructure. These advancements empower us to efficiently support the needs of our growing business and ensure a solid platform for future growth.</p><p id="5039">One of the standout features of the Porter platform is the abstractions it places on top of Kubernetes workloads, making them much easier to manage and understand. In Porter, one manages one or more clusters, with each cluster in Porter mapping to a cluster in the relevant managed Kubernetes service (in our case, EKS). Naturally, we don’t need to worry about how many nodes are in a cluster or what’s running on what nodes — Kubernetes and EKS manage that automatically.</p><p id="0c12">Perhaps the most crucial abstraction within Porter is the concept of applications. Applications can be “web” or “worker” apps, similar to how things look in Heroku. Creating an application in Porter is straightforward: one simply needs to specify a container image repository, the desired number of containers, the allocated RAM and CPU resources per container, and any necessary environment variables. From there, Porter (and k8s under the hood) takes care of fetching the image, configuring the deployment, and keeping everything up and running. Another important concept in Porter is that of Environment Groups. Each Environment Group acts as a bucket for storing environment variables and can be associated with one or more Applications. The last key Porter abstraction is the Job — Jobs are similar to Applications, but instead of running constantly, they run on a schedule or on demand. We have found these useful for scheduled tasks and the like.</p><p id="89bb">Let’s examine a real-world example to illustrate the practical usage of Porter. In our production environment, we utilize Porter to run our Core Ruby on Rails app. In Porter, we have one Web Application responsible for serving web traffic and one Worker Application dedicated to running Sidekiq, with both applications using the same container image and Environment Group. Additionally, we have a Job that runs on-demand before each deployment to execute <code><strong>rails db:migrate</strong></code>. This ensures smooth database migrations as part of our deployment process.</p><p id="cc32">As we transitioned our existing services and infrastructure to Porter and AWS, we began to think about how to streamline the creation of new services. Similarly, given the relatively small size of our engineering organization, we also aimed to provide as much familiar “look and feel” across service codebases as is reasonable. Our goal was to enable engineers to navigate easily between different codebases, quickly grasping how applications are tested, built, and deployed, in order to make engineers as productive as possible, as quickly as possible. Leveraging GitHub Actions for continuous integration and continuous deployment (CI/CD), coupled with Porter’s robust support for GitHub Actions workflows, we embarked on developing a shared ‘lingua franca’ for fundamental development and deployment workflows.</p><p id="bbc3">A fundamental aspect of our approach revolves around the Dockerfile, which serves, as one might expect, as the source of truth for “what do we need in the container to run this app?”. Consequently, every application’s GitHub repository includes a Dockerfile and a GitHub Actions workflow configuration for building the app’s container image from the Dockerfile. This container image represents the deployment unit for applications within Porter. By standardizing the use of Dockerfiles and embracing GitHub Actions workflows, we establish a consistent and repeatable process across the organization, simplifying the deployment pipeline and fostering familiarity among engineers working across different codebases.</p><p id="713a">We have landed on a standardized ‘template’ workflow that is used across the majority of our application repositories for building, testing, and deployment processes. While there might be slight variations from one codebase to another, the workflows are largely consistent throughout our organization. Once an engineer becomes familiar with the workflows in one repo, they can easily navigate and understand the others. Here is an overview of the key components:</p><ul><li id="860b">Whenever changes are pushed to a relevant branch, such as a staging or production branch, we initiate a test run that includes unit tests, code linters, and other code validation tools.</li><li id="37bd">Concurrently, we launch a suite of security scanners, including dependency vulnerability scanning and static code analysis.</li><li id="70aa">In parallel to the aforementioned steps, we initiate the container image build process; this leverages Porter’s tooling to automatically retrieve the necessary environment variables from the corresponding Porter Environment Group. This step also includes a vulnerability scan of the container image once built. Upon successful completion, the image is pushed to the relevant container image repository.</li><li id="fd55">Once the above steps complete successfully, we get to the business of deploying the new code.</li><li id="5d0f">If a database migration, like <code>rails db:migrate</code>, or any other similar job needs to execute prior to deploying the new code, the workflow updates the relevant job to use the new image tag and runs it accordingly.</li><li id="5573">Next, the workflow uses Porter’s tooling to update each relevant application to utilize the new container image tag. Under the hood, this ultimately triggers Kubernetes to roll out new containers (running the new container image) gradually to each application deployment.</li><li id="52aa">In the event of any failures during the preceding steps, the workflow aborts and notifies the relevant application’s dedicated Slack channel.</li><li id="c06b">Conversely, if all the preceding steps succeed, the workflow sends a notification to the Slack channel, informing the team that the new code is live!</li></ul><p id="44ed">In order to help illustrate the key components of this setup for our engineers, along with other shared practices and configurations across codebases, we have created a template repository. This repository contains a minimal application accompanied by all the necessary workflows and tooling for building and deploying the app to Porter. The goal of the template repository is to present only the essential elements, excluding any specifics tied to particular codebases or tech stacks. Engineers can use this repository as a living document to grasp the core concepts of our build, deployment, and validation workflows. Additionally, this repository serves another valuable purpose: when a team wants to launch a new application, all the fundamental bits of these workflows are near at hand, ready to plug into the repo for their new application!</p><p id="5ba3">Furthermore, we have started to push this notion of a standardized experience across codebases to a higher level by developing a standard ‘service launch checklist.’ This checklist outlines all the essential requirements for a new service to be considered ‘production-ready’ at Landing. Alongside the standard build, validation, security, and deployment workflows mentioned earlier, the checklist also expects elements such as a clear developer setup guide, a thorough architecture diagram, the implementation of baseline observability instrumentation, and other aspects that help ensure that the new service will be reliable, maintainable, and secure. Beyond its usefulness for new service rollouts, this checklist also eases the evaluation of <em>existing</em> services to identify gaps, shortcomings, and technical debt that need to be addressed. While we must admit that there is no ‘one size fits all’ solution here, the checklist provides an excellent starting rubric for pragmatically assessing a software service.</p><p id="6307">This approach proves to be effective for several reasons. First of all, the convention and consistency it establishes across codebases are crucial. It empowers engineers to enter an unfamiliar codebase with the safe assumption that the build and deployment workflows for that application are at least similar to those in their “home” codebase. This alleviates a significant cognitive burden, allowing the engineer to focus on understanding the code itself without worrying about the intricacies of deploying it out into the world.</p><p id="f290">The abstractions that Porter provides on top of Kubernetes are also invaluable. Our engineers don’t need in-depth expertise in all the core Kubernetes concepts, even though our workloads run on Kubernetes, because Porter provides friendly abstractions that allow engineers to operate at a higher level, above the k8s weeds.</p><p id="398e">On that note, it’s worth taking a moment to highlight some of the benefits we get “for free” from Kubernetes which are essential for building and operating robust systems. For instance, Kubernetes vigilantly ensures that the desired number of replicas of each application workload is always running. Similarly, if an application container starts consuming excessive memory, Kubernetes automatically restarts it. The practice of “rolling deploys” mentioned earlier, where new containers with the updated container image are gradually introduced into service (and rolled back if necessary), also happens seamlessly thanks to Kubernetes. These are just a few of the best practices of modern software operations that are baked into Kubernetes.</p><p id="cf09">The use of GitHub Actions is another huge asset for our teams. Instead of having to navigate to a different repository or system to understand how the deployment workflow is configured for an application, each engineer can simply navigate to the <code><strong>.github/workflows</strong></code> directory and see it for themselves. They can even contribute pull requests to add updates and improvements to the workflows as they see fit. Since deployments occur through GitHub Actions as well, the workflow logs are conveniently accessible with just a few clicks, right within the system that engineers already spend a significant amount of their time in. To be clear, the specific CI/CD platform at play (in our case GitHub Actions) is less important than the fundamental practices of defining deployment workflows as code and keeping them (and their actual execution) close to the code itself, where the engineers who own the service spend so much of their time.</p><p id="ac59">Our journey to adopt Porter and Kubernetes has already yielded tremendous benefits, but we believe we’re just scratching the surface. We are excited to continue refining and optimizing our infrastructure, tooling, and processes to make our engineers’ lives easier and ultimately better serve our customers. A key focus for us is to continuously assess and enhance the security posture of our cloud environments and applications. By emphasizing the principle of making the right thing the easy thing, the workflows described above have proven to be incredibly powerful in bolstering our security efforts. As we embrace a shift-left approach and integrate more security into our software development lifecycle, the investments we’ve made in our tooling will continue to compound.</p><p id="379d">While it is already relatively straightforward to spin up a new service at Landing using our checklist and standardized tooling, we are committed to making this process even easier and safer moving forward. Additionally, we are determined to improve the speed at which our teams can deliver new features and fixes to our <em>existing</em> services. All in all, we know that the faster our engineers can deliver secure, effective software to solve the problems of our business and delight our customers, the better Landing can execute on our mission to make living flexible for everyone. In writing this post, we realized there are many more topics we would love to explore in the future, so stay tuned for more blog posts from our team. And please don’t hesitate to reach out if you have any questions!</p></div></div></div></div></section></div>]]>
+<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
             </description>
             <link>https://blog.hellolanding.tech/move-fast-avoid-sharp-edges-5d3a07f19a59</link>
             <guid isPermaLink="false">hacker-news-small-sites-36327347</guid>
@@ -4915,7 +4226,7 @@ June 14, 2023 | https://blog.hellolanding.tech/move-fast-avoid-sharp-edges-5d3a0
             </title>
             <description>
 <![CDATA[
-Score 284 | Comments 295 (<a href="https://news.ycombinator.com/item?id=36325958">thread link</a>) | @dmazin
+Score 284 | Comments 298 (<a href="https://news.ycombinator.com/item?id=36325958">thread link</a>) | @dmazin
 <br/>
 June 14, 2023 | https://www.cyberdemon.org/2023/06/14/reddit-moat.html | <a href="https://web.archive.org/web/*/https://www.cyberdemon.org/2023/06/14/reddit-moat.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div itemprop="articleBody">
@@ -4976,7 +4287,7 @@ June 14, 2023 | https://www.cyberdemon.org/2023/06/14/reddit-moat.html | <a href
 Score 121 | Comments 23 (<a href="https://news.ycombinator.com/item?id=36325127">thread link</a>) | @choult
 <br/>
 June 14, 2023 | https://programming.dev/post/34008 | <a href="https://web.archive.org/web/*/https://programming.dev/post/34008">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><div><div><!--!--><div><div><p>I was commenting on a Japanese sub to guide them to Lemmy and my comment becomes â€œ[ Removed by Reddit ]â€� after a few seconds. Was this always the case?</p></div></div><p><label>Hot</label><label>Top</label><label>New</label><label>Old</label></p><p><label>Chat</label></p></div><div><div><div><div><div><div><p><a href="https://programming.dev/create_post?community_id=16">Create a post</a></p><p>You are not logged in. However you can subscribe from another Fediverse account, for example Lemmy or Mastodon. To do this, paste the following into the search field of your instance: <a href="https://programming.dev/cdn-cgi/l/email-protection" data-cfemail="2a0b5e4f4942444546454d536a484f4f424b5d0445584d">[email&nbsp;protected]</a></p></div></div><div><div><ul><li>0 users online</li><li data-tippy-content="1113 active users in the last day">1.11K users / day</li><li data-tippy-content="4449 active users in the last week">4.45K users / week</li><li data-tippy-content="4609 active users in the last month">4.61K users / month</li><li data-tippy-content="4609 active users in the last 6 months">4.61K users / 6 months</li><li>228 subscribers</li><li>534 Posts</li><li>15.4K Comments</li><li><a href="https://programming.dev/modlog/16">Modlog</a></li></ul></div></div></div></div></div></div></div></div></div></div>]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><div><div><!--!--><div><div><p>I was commenting on a Japanese sub to guide them to Lemmy and my comment becomes â€œ[ Removed by Reddit ]â€� after a few seconds. Was this always the case?</p></div></div><p><label>Hot</label><label>Top</label><label>New</label><label>Old</label></p><p><label>Chat</label></p></div><div><div><div><div><div><div><p><a href="https://programming.dev/create_post?community_id=16">Create a post</a></p><p>You are not logged in. However you can subscribe from another Fediverse account, for example Lemmy or Mastodon. To do this, paste the following into the search field of your instance: <a href="https://programming.dev/cdn-cgi/l/email-protection" data-cfemail="a889dccdcbc0c6c7c4c7cfd1e8cacdcdc0c9df86c7dacf">[email&nbsp;protected]</a></p></div></div><div><div><ul><li>0 users online</li><li data-tippy-content="1113 active users in the last day">1.11K users / day</li><li data-tippy-content="4449 active users in the last week">4.45K users / week</li><li data-tippy-content="4609 active users in the last month">4.61K users / month</li><li data-tippy-content="4609 active users in the last 6 months">4.61K users / 6 months</li><li>233 subscribers</li><li>543 Posts</li><li>15.6K Comments</li><li><a href="https://programming.dev/modlog/16">Modlog</a></li></ul></div></div></div></div></div></div></div></div></div></div>]]>
             </description>
             <link>https://programming.dev/post/34008</link>
             <guid isPermaLink="false">hacker-news-small-sites-36325127</guid>
@@ -5783,7 +5094,7 @@ Because they lactose!
             </title>
             <description>
 <![CDATA[
-Score 67 | Comments 55 (<a href="https://news.ycombinator.com/item?id=36323044">thread link</a>) | @luu
+Score 67 | Comments 56 (<a href="https://news.ycombinator.com/item?id=36323044">thread link</a>) | @luu
 <br/>
 June 14, 2023 | https://www.neversaw.us/2020/07/04/career-progression/ | <a href="https://web.archive.org/web/*/https://www.neversaw.us/2020/07/04/career-progression/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content">
@@ -9495,7 +8806,7 @@ June 13, 2023 | https://nami.land/2023/06/11/track-hn-analyze-survival-rate-of-1
             </title>
             <description>
 <![CDATA[
-Score 415 | Comments 250 (<a href="https://news.ycombinator.com/item?id=36312027">thread link</a>) | @mooreds
+Score 416 | Comments 250 (<a href="https://news.ycombinator.com/item?id=36312027">thread link</a>) | @mooreds
 <br/>
 June 13, 2023 | https://www.barbarianmeetscoding.com/boost-your-coding-fu-with-vscode-and-vim/moving-blazingly-fast-with-the-core-vim-motions/ | <a href="https://web.archive.org/web/*/https://www.barbarianmeetscoding.com/boost-your-coding-fu-with-vscode-and-vim/moving-blazingly-fast-with-the-core-vim-motions/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p><strong>Motions (as in movements) are how you move around in Vim</strong>. They are commands that when typed move the cursor around with high speed and precision. There are many of them, and each one is best suited for different types and lengths of movement. I find they work great in tandem with Visual Studio Code native <em>Go To</em> features like <em>Go To File</em> and <em>Go To Symbol</em>.</p>
@@ -9968,7 +9279,7 @@ test.rb:4: syntax error, unexpected `end'
             </title>
             <description>
 <![CDATA[
-Score 383 | Comments 191 (<a href="https://news.ycombinator.com/item?id=36308366">thread link</a>) | @ralgozino
+Score 384 | Comments 192 (<a href="https://news.ycombinator.com/item?id=36308366">thread link</a>) | @ralgozino
 <br/>
 June 13, 2023 | https://johnnydecimal.com/10-19-concepts/11-core/11.01-introduction/ | <a href="https://web.archive.org/web/*/https://johnnydecimal.com/10-19-concepts/11-core/11.01-introduction/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
