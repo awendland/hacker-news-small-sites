@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Sun, 10 Sep 2023 12:23:21 GMT</lastBuildDate>
+        <lastBuildDate>Sun, 10 Sep 2023 16:22:07 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-20.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Sun, 10 Sep 2023 12:23:21 GMT</pubDate>
+        <pubDate>Sun, 10 Sep 2023 16:22:07 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,460 @@
         <ttl>240</ttl>
         <item>
             <title>
-<![CDATA[I Wrote a String Type]]>
+<![CDATA[How does Linux NAT a ping?]]>
             </title>
             <description>
 <![CDATA[
-Score 122 | Comments 44 (<a href="https://news.ycombinator.com/item?id=37451913">thread link</a>) | @todsacerdoti
+Score 69 | Comments 14 (<a href="https://news.ycombinator.com/item?id=37455621">thread link</a>) | @willdaly
+<br/>
+September 10, 2023 | https://devnonsense.com/posts/how-does-linux-nat-a-ping/ | <a href="https://web.archive.org/web/*/https://devnonsense.com/posts/how-does-linux-nat-a-ping/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content"><p>A few months ago, I found myself wondering how a command like <code>ping 1.1.1.1</code> works from within a private network.</p><p>In most private networks, multiple hosts connect to the Internet through a router. For IPv4, the router performs network address translation (NAT) by rewriting the original host’s source address to the router’s public IP address. The router can lookup the correct host for a reply packet based on the packet’s <em>port</em> field, at least for protocols like TCP and UDP.</p><p>But a command like <code>ping</code> doesn’t use TCP or UDP; it uses ICMP, and those packets do <em>not</em> have a port field. So how does NAT work for ICMP packets?</p><p>This led me down a deep rabbit hole: running experiments in network namespaces, capturing packets, reading RFCs, and tracing through the Linux source code. This post summarizes what I did and learned along the way.<sup id="fnref:1"><a href="#fn:1" role="doc-noteref">1</a></sup></p><p><em>Before these experiments, I hadn’t spent much time in the Linux networking code – this is something new I’m learning. If I’ve made any mistakes please <a href="https://devnonsense.com/contact">let me know</a> so I can correct them.</em></p><details open=""><summary><b>Table of contents</b></summary><nav id="TableOfContents"><ul><li><a href="#experiment-setup">Experiment setup</a><ul><li><a href="#step-1-connect-two-clients-to-a-bridge">Step 1: Connect two clients to a bridge</a></li><li><a href="#step-2-connect-natbox-and-server">Step 2: Connect natbox and server</a></li><li><a href="#step-3-configure-routing-and-nat">Step 3: Configure routing and NAT</a></li></ul></li><li><a href="#packet-capture">Packet capture</a></li><li><a href="#rfc-792">RFC 792</a></li><li><a href="#ping-source-code">Ping source code</a></li><li><a href="#id-conflict">ID conflict</a></li><li><a href="#netfilter-conntrack-and-nat">Netfilter, conntrack, and NAT</a></li><li><a href="#bpftrace">bpftrace</a></li><li><a href="#conclusion">Conclusion</a></li></ul></nav></details><h2 id="experiment-setup">Experiment setup</h2><p>One of the best ways to understand Linux networking is through experimentation. These days, it’s easy to run experiments using <a href="https://www.man7.org/linux/man-pages/man7/network_namespaces.7.html">network namespaces</a> to simulate multiple devices on a single Linux machine.</p><p>This is the setup I wanted to test:</p><p><img src="https://devnonsense.com/img/icmp-nat-setup.svg" alt="Diagram showing the setup of the experiment"></p><p>There are two clients (client1 and client2) connected to a router (natbox) performing NAT from private network 192.168.99.0/24 to public network 10.0.100.0/24. The clients, natbox, and server are each separate network namespaces. Once everything is ready, a <code>ping</code> from either client to the server at <code>10.0.100.2</code> should get a reply!</p><p>For these experiments, I used a Fedora 38 Server VM running version 6.2.9 of the Linux kernel. Most of the below commands (<code>ip</code>, <code>iptables</code>, <code>tcpdump</code>, etc.) were run as the root user.<sup id="fnref:2"><a href="#fn:2" role="doc-noteref">2</a></sup></p><h3 id="step-1-connect-two-clients-to-a-bridge">Step 1: Connect two clients to a bridge</h3><p>The first step is to create two clients connected to a bridge, like this:
+<img src="https://devnonsense.com/img/icmp-nat-clients-and-bridge.svg" alt="Diagram showing two clients connected to a bridge"></p><p>To set it up:</p><div><pre tabindex="0"><code data-lang="bash"><span><span><span># Create a network namespace for each client.</span>
+</span></span><span><span>ip netns add <span>"client1"</span>
+</span></span><span><span>ip netns add <span>"client2"</span>
+</span></span><span><span>
+</span></span><span><span><span># Create a virtual bridge.</span>
+</span></span><span><span>ip link add name <span>"br0"</span> <span>type</span> bridge
+</span></span><span><span>ip link <span>set</span> dev <span>"br0"</span> up
+</span></span><span><span>
+</span></span><span><span><span># Disable iptables processing for bridges so rules don't block traffic over br0.</span>
+</span></span><span><span>sysctl -w net.bridge.bridge-nf-call-iptables<span>=</span><span>0</span>
+</span></span><span><span>
+</span></span><span><span><span># Connect client1 to the bridge with a veth pair and assign IP address 192.168.99.1</span>
+</span></span><span><span>ip link add dev <span>"vethclient1"</span> <span>type</span> veth peer name <span>"eth0"</span> netns <span>"client1"</span>
+</span></span><span><span>ip link <span>set</span> <span>"vethclient1"</span> master <span>"br0"</span>
+</span></span><span><span>ip link <span>set</span> <span>"vethclient1"</span> up
+</span></span><span><span>ip -n <span>"client1"</span> addr add dev <span>"eth0"</span> <span>"192.168.99.1/24"</span>
+</span></span><span><span>ip -n <span>"client1"</span> link <span>set</span> dev <span>"eth0"</span> up
+</span></span><span><span>
+</span></span><span><span><span># Same for client2, with IP address 192.168.99.2</span>
+</span></span><span><span>ip link add dev <span>"vethclient2"</span> <span>type</span> veth peer name <span>"eth0"</span> netns <span>"client2"</span>
+</span></span><span><span>ip link <span>set</span> <span>"vethclient2"</span> master <span>"br0"</span>
+</span></span><span><span>ip link <span>set</span> <span>"vethclient2"</span> up
+</span></span><span><span>ip -n <span>"client2"</span> addr add dev <span>"eth0"</span> <span>"192.168.99.2/24"</span>
+</span></span><span><span>ip -n <span>"client2"</span> link <span>set</span> dev <span>"eth0"</span> up
+</span></span></code></pre></div><p>If this worked, then:</p><ul><li><code>ip netns</code> should show <code>client1</code> and <code>client2</code>.</li><li><code>ip -n client1 addr</code> and <code>ip -n client2 addr</code> should show <code>192.168.99.1</code> and <code>192.168.99.2</code> respectively, and the <code>eth0</code> interface should show “state UP”.</li></ul><p>Now the two clients can ping each other over the bridge:</p><div><pre tabindex="0"><code data-lang="bash"><span><span><span># ping client1 -&gt; client2</span>
+</span></span><span><span>ip netns <span>exec</span> client1 ping 192.168.99.2
+</span></span><span><span>
+</span></span><span><span><span># ping client2 -&gt; client1</span>
+</span></span><span><span>ip netns <span>exec</span> client2 ping 192.168.99.1
+</span></span></code></pre></div><h3 id="step-2-connect-natbox-and-server">Step 2: Connect natbox and server</h3><p>Next, create network namespaces for the natbox and server:</p><div><pre tabindex="0"><code data-lang="bash"><span><span>ip netns add <span>"natbox"</span>
+</span></span><span><span>ip netns add <span>"server"</span>
+</span></span></code></pre></div><p>Then connect the natbox to the bridge:</p><div><pre tabindex="0"><code data-lang="bash"><span><span>ip link add dev <span>"vethnatbox"</span> <span>type</span> veth peer name <span>"eth0"</span> netns <span>"natbox"</span>
+</span></span><span><span>ip link <span>set</span> <span>"vethnatbox"</span> master <span>"br0"</span>
+</span></span><span><span>ip link <span>set</span> <span>"vethnatbox"</span> up
+</span></span><span><span>ip -n <span>"natbox"</span> addr add dev <span>"eth0"</span> <span>"192.168.99.3/24"</span>
+</span></span><span><span>ip -n <span>"natbox"</span> link <span>set</span> dev <span>"eth0"</span> up
+</span></span></code></pre></div><p>The natbox needs a second interface in the 10.0.100.0/24 network, so add that and call it “eth1”. Since there’s only one server, there’s no need for a bridge – just connect the natbox and server directly with a veth pair:</p><div><pre tabindex="0"><code data-lang="bash"><span><span>ip -n <span>"natbox"</span> link add <span>"eth1"</span> <span>type</span> veth peer name <span>"eth1"</span> netns <span>"server"</span>
+</span></span><span><span>ip -n <span>"natbox"</span> addr add dev <span>"eth1"</span> <span>"10.0.100.1/24"</span>
+</span></span><span><span>ip -n <span>"natbox"</span> link <span>set</span> dev <span>"eth1"</span> up
+</span></span><span><span>ip -n <span>"server"</span> addr add dev <span>"eth1"</span> <span>"10.0.100.2/24"</span>
+</span></span><span><span>ip -n <span>"server"</span> link <span>set</span> dev <span>"eth1"</span> up
+</span></span></code></pre></div><p>Now the natbox can reach both clients and the server. Test it with ping:</p><div><pre tabindex="0"><code data-lang="bash"><span><span><span># ping natbox -&gt; client1</span>
+</span></span><span><span>ip netns <span>exec</span> natbox ping 192.168.99.1
+</span></span><span><span>
+</span></span><span><span><span># ping natbox -&gt; client2</span>
+</span></span><span><span>ip netns <span>exec</span> natbox ping 192.168.99.2
+</span></span><span><span>
+</span></span><span><span><span># ping natbox -&gt; server</span>
+</span></span><span><span>ip netns <span>exec</span> natbox ping 10.0.100.2
+</span></span></code></pre></div><p>At this point, every network namespace, interface, and veth pair has been created:
+<img src="https://devnonsense.com/img/icmp-nat-setup.svg" alt="Diagram showing the setup of the experiment"></p><p>However, the client cannot yet ping the server because the natbox isn’t forwarding traffic between its interfaces or performing NAT.</p><h3 id="step-3-configure-routing-and-nat">Step 3: Configure routing and NAT</h3><p>Add a default route in each client to send traffic to the natbox:</p><pre tabindex="0"><code>ip -n client1 route add 0.0.0.0/0 via 192.168.99.3
+ip -n client2 route add 0.0.0.0/0 via 192.168.99.3
+</code></pre><p>For security reasons, Linux does not forward packets between interfaces unless specifically enabled. So configure the natbox to forward traffic by setting <code>net.ipv4.ip_forward</code>:</p><div><pre tabindex="0"><code data-lang="bash"><span><span>ip netns <span>exec</span> natbox sysctl <span>"net.ipv4.ip_forward=1"</span>
+</span></span></code></pre></div><p>At this point, packets from a client will reach the server. However, these packets will retain the original source IP in the 192.168.99.0/24 network, so replies from the server back to this IP will go… nowhere. Fix it by configuring the natbox to NAT the traffic from a client IP (in network 192.168.99.0/24) to the natbox’s public IP (10.0.100.1/24). The easiest way to do this is to add a MASQUERADE rule to the iptables “nat” chain:</p><div><pre tabindex="0"><code data-lang="bash"><span><span>ip netns <span>exec</span> natbox iptables -t nat -A POSTROUTING -o eth1 -j MASQUERADE
+</span></span></code></pre></div><p>At last, clients can reach the server through the natbox! Test it with ping:</p><div><pre tabindex="0"><code data-lang="bash"><span><span><span># ping client1 -&gt; server via natbox</span>
+</span></span><span><span>ip netns <span>exec</span> natbox ping 10.0.100.2
+</span></span><span><span>
+</span></span><span><span><span># ping client2 -&gt; server via natbox</span>
+</span></span><span><span>ip netns <span>exec</span> natbox ping 10.0.100.2
+</span></span></code></pre></div><h2 id="packet-capture">Packet capture</h2><p>Now capture ICMP packets from both client and server network namespaces.</p><div><pre tabindex="0"><code data-lang="bash"><span><span>ip netns <span>exec</span> client1 tcpdump -n icmp
+</span></span><span><span>ip netns <span>exec</span> server tcpdump -n icmp
+</span></span></code></pre></div><p>This is the tcpdump for client1:</p><pre tabindex="0"><code>08:01:33.549598 IP 192.168.99.1 &gt; 10.0.100.2: ICMP echo request, id 31428, seq 1, length 64
+08:01:33.549661 IP 10.0.100.2 &gt; 192.168.99.1: ICMP echo reply, id 31428, seq 1, length 64
+08:01:34.610605 IP 192.168.99.1 &gt; 10.0.100.2: ICMP echo request, id 31428, seq 2, length 64
+08:01:34.610654 IP 10.0.100.2 &gt; 192.168.99.1: ICMP echo reply, id 31428, seq 2, length 64
+</code></pre><p>… and the corresponding tcpdump for the server:</p><pre tabindex="0"><code>08:01:33.549643 IP 10.0.100.1 &gt; 10.0.100.2: ICMP echo request, id 31428, seq 1, length 64
+08:01:33.549654 IP 10.0.100.2 &gt; 10.0.100.1: ICMP echo reply, id 31428, seq 1, length 64
+08:01:34.446611 IP 10.0.100.1 &gt; 10.0.100.2: ICMP echo request, id 33391, seq 1, length 64
+08:01:34.446619 IP 10.0.100.2 &gt; 10.0.100.1: ICMP echo reply, id 33391, seq 1, length 64
+08:01:34.610635 IP 10.0.100.1 &gt; 10.0.100.2: ICMP echo request, id 31428, seq 2, length 64
+08:01:34.610646 IP 10.0.100.2 &gt; 10.0.100.1: ICMP echo reply, id 31428, seq 2, length 64
+08:01:35.506411 IP 10.0.100.1 &gt; 10.0.100.2: ICMP echo request, id 33391, seq 2, length 64
+08:01:35.506423 IP 10.0.100.2 &gt; 10.0.100.1: ICMP echo reply, id 33391, seq 2, length 64
+</code></pre><p>These captures show that:</p><ul><li>Traffic is being NAT’d. By the time an ICMP echo request reaches the server (10.0.100.2), its source IP has been rewritten to the IP of the natbox (10.0.100.1).</li><li>Each client has a different “id” field (in the capture above, client1 has ID 31428 and client2 has ID 33391).</li></ul><p>The “id” field seemed like it might allow the natbox to distinguish reply packets destined for each client. But what does the “id” field mean, and how is it chosen?</p><h2 id="rfc-792">RFC 792</h2><p>ICMP is a very, very old protocol. It is defined in <a href="https://datatracker.ietf.org/doc/html/rfc792">RFC 792</a>, which was published in 1981. The RFC specifies the exact structure of an ICMP echo and echo reply message:</p><pre tabindex="0"><code>    0                   1                   2                   3
+    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |     Type      |     Code      |          Checksum             |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |           Identifier          |        Sequence Number        |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |     Data ...
+   +-+-+-+-+-
+</code></pre><p>The “type” field distinguishes an echo request (8) from an echo reply (1). Code is always 0 (I guess it isn’t used for anything?). What about “sequence number” and “identifier”?</p><blockquote><p>If code = 0, an identifier to aid in matching echos and replies,
+may be zero…</p><p>If code = 0, a sequence number to aid in matching echos and
+replies, may be zero…</p><p>The identifier and sequence number may be used by the echo sender
+to aid in matching the replies with the echo requests. For
+example, the identifier might be used like a port in TCP or UDP to
+identify a session, and the sequence number might be incremented
+on each echo request sent. The echoer returns these same values
+in the echo reply.</p></blockquote><p>The RFC doesn’t say anything about how the IDs are actually chosen. That’s not part of the protocol specification, so the next step is to look at an implementation – in this case, the source code for the <code>ping</code> command.</p><h2 id="ping-source-code">Ping source code</h2><p>The <code>ping</code> command is part of the “iputils” package, with source code available at <a href="https://github.com/iputils/iputils">github.com/iputils/iputils</a>. There is a <a href="https://github.com/iputils/iputils/blob/b50711313236696e322b38fb34c0b11cc13cc526/ping/ping.c#L1511-L1519">comment</a> just before <code>ping4_send_probe</code>:</p><div><pre tabindex="0"><code data-lang="c"><span><span><span>/*
+</span></span></span><span><span><span> * pinger --
+</span></span></span><span><span><span> * 	Compose and transmit an ICMP ECHO REQUEST packet.  The IP packet
+</span></span></span><span><span><span> * will be added on by the kernel.  The ID field is a random number,
+</span></span></span><span><span><span> * and the sequence number is an ascending integer.  The first several bytes
+</span></span></span><span><span><span> * of the data portion are used to hold a UNIX "timeval" struct in VAX
+</span></span></span><span><span><span> * byte-order, to compute the round-trip time.
+</span></span></span><span><span><span> */</span>
+</span></span></code></pre></div><p>So <code>ping</code> chooses the identifier randomly. It’s a bit difficult to see where this actually happens in the code, but from what I understand:</p><ol><li>There is a <code>struct ping_rts</code> that has a field <code>ident</code>.</li><li>The <code>ident</code> field <a href="https://github.com/iputils/iputils/blob/b50711313236696e322b38fb34c0b11cc13cc526/ping/ping.c#L327C9-L327C9">defaults to <code>-1</code></a>, but can be <a href="https://github.com/iputils/iputils/blob/b50711313236696e322b38fb34c0b11cc13cc526/ping/ping.c#L375-L378">overridden by the CLI flag “-e”</a> to any value between zero and <code>IDENTIFIER_MAX</code> (0xFFFF).</li><li>When <code>rts-&gt;ident == -1</code>, <code>ping</code> binds to a socket with type <code>SOCK_DGRAM</code> and protocol <code>IPPROTO_ICMP</code>. <a href="https://github.com/iputils/iputils/blob/b50711313236696e322b38fb34c0b11cc13cc526/ping/ping.c#L893-L895">In this configuration, it does not modify <code>source.sin_port</code></a>, so the source port is zero.</li></ol><p>I didn’t find much documentation for how Linux implements <code>SOCK_DGRAM</code> sockets with <code>IPPROTO_ICMP</code>, except for this description from the <a href="https://lore.kernel.org/lkml/20110413113204.GB6948@albatros/T/">mailing list “net: ipv4: add IPPROTO_ICMP socket kind”</a>:</p><blockquote><p>ICMP headers given to send() are checked and sanitized. The type must be
+ICMP_ECHO and the code must be zero (future extensions might relax this,
+see below). <strong>The id is set to the number (local port) of the socket</strong>, the
+checksum is always recomputed.</p></blockquote><p>I suspect that when <code>ping</code> doesn’t specify a source port (<code>source.sin_port == 0</code>), then the Linux kernel chooses a free port at random. This port then gets used as the ID for ICMP packets.</p><h2 id="id-conflict">ID conflict</h2><p>What happens if two <code>ping</code> processes on different hosts both choose the exact same ID? Test it using <code>ping -e</code> to explicitly set the ICMP ID to the same value for both clients:</p><div><pre tabindex="0"><code data-lang="bash"><span><span><span># ping from client1 -&gt; server with ICMP ID 999</span>
+</span></span><span><span>ip netns <span>exec</span> client1 ping 10.0.100.2 -e <span>999</span>
+</span></span><span><span>
+</span></span><span><span><span># ping from client2 -&gt; server with ICMP ID 999</span>
+</span></span><span><span>ip netns <span>exec</span> client2 ping 10.0.100.2 -e <span>999</span>
+</span></span></code></pre></div><p>This time, the packet capture from the server shows something different:</p><pre tabindex="0"><code>10:22:18.807289 IP 10.0.100.1 &gt; 10.0.100.2: ICMP echo request, id 999, seq 1, length 64
+10:22:18.807300 IP 10.0.100.2 &gt; 10.0.100.1: ICMP echo reply, id 999, seq 1, length 64
+10:22:19.838650 IP 10.0.100.1 &gt; 10.0.100.2: ICMP echo request, id 999, seq 2, length 64
+10:22:19.838661 IP 10.0.100.2 &gt; 10.0.100.1: ICMP echo reply, id 999, seq 2, length 64
+10:22:20.011677 IP 10.0.100.1 &gt; 10.0.100.2: ICMP echo request, id 30218, seq 1, length 64
+10:22:20.011687 IP 10.0.100.2 &gt; 10.0.100.1: ICMP echo reply, id 30218, seq 1, length 64
+10:22:20.862591 IP 10.0.100.1 &gt; 10.0.100.2: ICMP echo request, id 999, seq 3, length 64
+10:22:20.862603 IP 10.0.100.2 &gt; 10.0.100.1: ICMP echo reply, id 999, seq 3, length 64
+10:22:21.054598 IP 10.0.100.1 &gt; 10.0.100.2: ICMP echo request, id 30218, seq 2, length 64
+10:22:21.054614 IP 10.0.100.2 &gt; 10.0.100.1: ICMP echo reply, id 30218, seq 2, length 64
+</code></pre><p>One of the clients is using ID 999, but the other one is using ID 30218. Where did that second ID come from? Time to go to the Linux source code.</p><h2 id="netfilter-conntrack-and-nat">Netfilter, conntrack, and NAT</h2><p>The kernel subsystem responsible for implementing iptables rules is called “netfilter.” The iptables MASQUERADE rule is responsible for NAT’ing packets, so the NAT implementation for ICMP must be in netfilter. Grep’ing through the <code>net/netfilter</code> directory in the Linux repository, I found a few places where the ICMP “id” field is used:</p><ul><li>In “nf_nat_core.c” the function <a href="https://elixir.bootlin.com/linux/v6.2.9/source/net/netfilter/nf_nat_core.c#L580"><code>nf_nat_setup_info</code></a> calls <code>get_unique_tuple</code>, which calls <a href="https://elixir.bootlin.com/linux/v6.2.9/source/net/netfilter/nf_nat_core.c#L380"><code>nf_nat_l4proto_unique_tuple</code></a>. There is a switch statement with a case for <code>IPPROTO_ICMP</code>, and a reference to <code>&amp;tuple-&gt;src.u.icmp.id</code>.</li><li>In “nf_nat_proto.c” the function <a href="https://elixir.bootlin.com/linux/v6.2.9/source/net/netfilter/nf_nat_proto.c#L419"><code>nf_nat_manip_pkt</code></a> calls <code>nf_nat_ipv4_manip_pkt</code>, which calls <code>l4proto_manip_pkt</code>. When the protocol is <code>IPPROTO_ICMP</code> this calls <a href="https://elixir.bootlin.com/linux/v6.2.9/source/net/netfilter/nf_nat_proto.c#L223"><code>icmp_manip_pkt</code>, which has a line <code>hdr-&gt;un.echo.id = tuple-&gt;src.u.icmp.id</code></a>.</li></ul><p>In order to NAT packets, netfilter needs to store something called a <em>connection</em>. For TCP, not surprisingly, this represents the TCP connection, uniquely identified by the 5-tuple (src IP, src port, dst IP, dst port, L4 protocol). However, in netfilter the term “connection” has a broader meaning: it can correlate outgoing and incoming packets <em>even for connectionless protocols</em> like UDP and ICMP.</p><p>Examining the <a href="https://elixir.bootlin.com/linux/v6.2.9/source/include/net/netfilter/nf_conntrack.h#L75"><code>nf_conn</code></a> data structure:</p><ul><li><code>nf_conn</code> has a field <code>struct nf_conntrack_tuple_hash tuplehash[IP_CT_DIR_MAX]</code>. There are two tuple hashes, one for outgoing packets and one for incoming packets (<code>IP_CT_DIR_ORIGINAL</code> and <code>IP_CT_DIR_REPLY</code> respectively).</li><li>Each <code>nf_conntrack_tuple_hash</code> has a field <code>nf_conntrack_tuple tuple</code> with the tuple uniquely identifying the connection.</li><li>Each tuple is split into a part that can be manipulated, called <code>src</code>, and a part that is immutable called <code>dst</code>.<ul><li><code>src</code> has type <code>struct nf_conntrack_man</code>, which has an IP address (<code>union nf_inet_addr u3</code>) and protocol-specific fields (<code>union nf_conntrack_man_proto u</code>). For ICMP, the protocol-specific field is <code>__be16 id</code>.</li><li><code>dst</code> has the unmodified IP address as well as the ICMP <code>type</code> and <code>code</code> fields.</li></ul></li></ul><p>Connection tracking and NAT are closely related. To NAT a packet, netfilter needs to “remember” how it modified the outgoing packet so it can reverse those modifications on the reply packet. It does so by representing the modifications in a connection.</p><p>For ICMP, I believe netfilter works like this:</p><ol><li>When natbox receives an ICMP echo, <code>nf_nat_setup_info</code> creates a new connection. This is where it chooses whether it needs to rewrite the source IP address and/or the ICMP id field on the outgoing packet.</li><li>For each incoming and outgoing ICMP packet, the function <code>nf_nat_manip_pkt</code> sets the source IP and ICMP id field to whatever is set in the connection. The argument <code>ip_conntrack_dir dir</code> determines whether the packet is treated as an outgoing echo (rewrite the source IP) or incoming reply (rewrite the destination IP).</li></ol><p><a href="https://elixir.bootlin.com/linux/v6.2.9/source/net/netfilter/nf_nat_core.c#L580"><code>nf_nat_setup_info</code></a> is responsible for choosing the ICMP ID for the NAT’d packets. The NAT rewrites happen in <a href="https://elixir.bootlin.com/linux/v6.2.9/source/net/netfilter/nf_nat_core.c#L504"><code>get_unique_tuple</code></a>.</p><p>Here are the key steps:</p><ol><li>On <a href="https://elixir.bootlin.com/linux/v6.2.9/source/net/netfilter/nf_nat_core.c#L541">line 541</a>, <code>find_best_ips_proto(zone, tuple, range, ct, maniptype)</code> rewrites the source IP address.</li><li>On <a href="https://elixir.bootlin.com/linux/v6.2.9/source/net/netfilter/nf_nat_core.c#L548">lines 548-560</a>, <code>nf_nat_used_tuple(tuple, ct)</code> checks whether the tuple is already being used; if not, the current tuple is returned. This explains why when two clients use <em>different</em> ICMP IDs, those IDs are preserved in the NAT’d packets.</li><li>On <a href="https://elixir.bootlin.com/linux/v6.2.9/source/net/netfilter/nf_nat_core.c#L563">line 563</a>, <code>nf_nat_l4proto_unique_tuple</code> is called to perform protocol-specific NAT (in this case manipulating the ICMP ID field).</li><li>In <code>nf_nat_l4proto_unique_tuple</code> <a href="https://elixir.bootlin.com/linux/v6.2.9/source/net/netfilter/nf_nat_core.c#L393">lines 393-403</a> set <code>keyptr = &amp;tuple-&gt;src.u.icmp.id</code> to choose the ICMP ID field as the “key” to NAT, then jumps to <code>find_free_id</code> at the end of the function.</li><li><code>find_free_id</code> on <a href="https://elixir.bootlin.com/linux/v6.2.9/source/net/netfilter/nf_nat_core.c#L471">line 471</a> calls <code>get_random_u16()</code> to generate a random ID, adjusts the value into the range<sup id="fnref:3"><a href="#fn:3" role="doc-noteref">3</a></sup> of valid ICMP IDs (on <a href="https://elixir.bootlin.com/linux/v6.2.9/source/net/netfilter/nf_nat_core.c#L485">line 485</a>), then checks if it’s used (another call to <code>nf_nat_used_tuple</code> on <a href="https://elixir.bootlin.com/linux/v6.2.9/source/net/netfilter/nf_nat_core.c#L486">line 486</a>).</li><li>If a tuple with the random ID not yet used, then it gets returned. Otherwise, netfilter searches for an unused ID from progressively smaller ranges starting at random offsets (<a href="https://elixir.bootlin.com/linux/v6.2.9/source/net/netfilter/nf_nat_core.c#L483">lines 483-494</a>).</li><li>If an unused tuple cannot be found within a maximum number of attempts, then <a href="https://elixir.bootlin.com/linux/v6.2.9/source/net/netfilter/nf_nat_core.c#L491"><code>nf_nat_l4_proto_unique_tuple</code> returns</a>, leaving the duplicate ID in the connection. Later, <a href="https://elixir.bootlin.com/linux/v6.2.9/source/net/netfilter/nf_nat_core.c#L502">__nf_conntrack_confirm will detect the duplicate and drop the packet</a>.</li></ol><h2 id="bpftrace">bpftrace</h2><p>To verify my understanding of the netfilter code, I used a tool called <a href="https://github.com/iovisor/bpftrace/"><code>bpftrace</code></a>.<sup id="fnref:4"><a href="#fn:4" role="doc-noteref">4</a></sup> After much tinkering, I ended up with this program to trace the kernel functions <code>nf_nat_setup_info</code> and <code>nf_nat_manip_pkt</code>:</p><pre tabindex="0"><code>// from linux/socket.h
+#define AF_INET		2	/* Internet IP Protocol 	*/
+
+// from net/netfilter/nf_nat.h
+enum nf_nat_manip_type {
+	NF_NAT_MANIP_SRC,
+	NF_NAT_MANIP_DST
+};
+
+// from include/uapi/linux/netfilter/nf_conntrack_tuple_common.h
+// Use #define instead of enum so we can use these in bpftrace array indices.
+#define IP_CT_DIR_ORIGINAL 0
+#define IP_CT_DIR_REPLY 1
+
+kprobe:nf_nat_setup_info {
+	// nf_nat_setup_info gets called twice, once in the prerouting chain
+	// to modify the destination (actually a no-op), and once in the output
+	// chain to modify the source (which is what we care about).
+	$mtype = arg2;
+	if ($mtype != NF_NAT_MANIP_SRC) {
+		return;
+	}
+
+	$conn = (struct nf_conn *)arg0;
+	if ($conn-&gt;tuplehash[IP_CT_DIR_ORIGINAL].tuple.dst.protonum == IPPROTO_ICMP) {
+		@setupConn[tid] = $conn;
+	}
+}
+
+kretprobe:nf_nat_setup_info {
+	if (@setupConn[tid] == none) {
+		return;
+	}
+	$conn = (struct nf_conn *)@setupConn[tid];
+	$origTuple = $conn-&gt;tuplehash[IP_CT_DIR_ORIGINAL].tuple;
+	$replyTuple = $conn-&gt;tuplehash[IP_CT_DIR_REPLY].tuple;
+	printf("nf_nat_setup_info: origTuple.addr=%s, origTuple.id=%d, replyTuple.addr=%s, replyTuple.id=%d\n",
+		ntop(AF_INET, $origTuple.src.u3.ip),
+		bswap($origTuple.src.u.icmp.id),
+		ntop(AF_INET, $replyTuple.src.u3.ip),
+		bswap($replyTuple.src.u.icmp.id));
+	delete(@setupConn[tid]);
+}
+
+kprobe:nf_nat_manip_pkt {
+	$mtype = arg2;
+	$skb = (struct sk_buff *)arg0;
+	$iphdr = (struct iphdr *)$skb-&gt;data;
+	$icmphdr = (struct icmphdr *)($skb-&gt;data + $iphdr-&gt;ihl * 4);
+	printf("nf_nat_manip_pkt before: mtype=%d, saddr=%s, daddr=%s, icmp.type=%d, icmp.id=%d\n",
+		$mtype,
+		ntop(AF_INET, $iphdr-&gt;saddr),
+		ntop(AF_INET, $iphdr-&gt;daddr),
+		bswap($icmphdr-&gt;type),
+		bswap($icmphdr-&gt;un.echo.id));
+	@manipType[tid] = $mtype;
+	@manipSkb[tid] = $skb
+}
+
+kretprobe:nf_nat_manip_pkt {
+	$mtype = @manipType[tid];
+	$skb = @manipSkb[tid];
+	$iphdr = (struct iphdr *)$skb-&gt;data;
+	$icmphdr = (struct icmphdr *)($skb-&gt;data + $iphdr-&gt;ihl * 4);
+	printf("nf_nat_manip_pkt after: mtype=%d, saddr=%s, daddr=%s, icmp.type=%d, icmp.id=%d\n",
+		$mtype,
+		ntop(AF_INET, $iphdr-&gt;saddr),
+		ntop(AF_INET, $iphdr-&gt;daddr),
+		bswap($icmphdr-&gt;type),
+		bswap($icmphdr-&gt;un.echo.id));
+	delete(@manipType[tid]);
+	delete(@manipSkb[tid]);
+}
+</code></pre><p>The important parts are:</p><ul><li><p><code>kprobe</code> traces when a kernel function is called, and <code>kretprobe</code> traces when the function returns.</p></li><li><p><code>kretprobe</code> cannot access function arguments directly, so store the arguments in a BPF map on entry and retrieve them on exit. For example, <code>kprobe:nf_nat_setup_info</code> writes the netfilter connection argument to <code>@setupConn[tid]</code> (a BPF map keyed by thread ID). Then <code>kretprobe:nf_nat_setup_info</code> reads the connection from the map and deletes the entry.</p></li><li><p><code>struct sk_buff</code> is how the Linux kernel <a href="https://docs.kernel.org/networking/skbuff.html">represents a packet</a>.</p></li><li><p><code>bswap</code> reverses byte order, which is used to convert from big endian (network byte order) to little endian.</p></li><li><p><code>ntop</code> returns the string representation of an IP address.</p></li><li><p>The BPF program can reference kernel data structures like <code>sk_buff</code> and <code>nf_conn</code> without including any headers. This is the magic of BPF Type Format (BTF) available in recent versions of the Linux kernel.</p></li><li><p>I tested this program on Linux kernel version 6.2.9. It may or may not work on other kernel versions.</p></li></ul><p>To execute the program, I saved the above code to a file called <code>trace.bt</code> then ran <code>bpftrace trace.bt</code> as root. This is what the output looks like with two clients pinging the server using the same ICMP ID (999):</p><pre tabindex="0"><code>$ bpftrace trace.bt
+Attaching 4 probes...
+nf_nat_setup_info: origTuple.addr=192.168.99.1, origTuple.id=999, replyTuple.addr=10.0.100.2, replyTuple.id=999
+nf_nat_manip_pkt before: mtype=0, saddr=192.168.99.1, daddr=10.0.100.2, icmp.type=8, icmp.id=999
+nf_nat_manip_pkt after: mtype=0, saddr=10.0.100.1, daddr=10.0.100.2, icmp.type=8, icmp.id=999
+nf_nat_manip_pkt before: mtype=1, saddr=10.0.100.2, daddr=10.0.100.1, icmp.type=0, icmp.id=999
+nf_nat_manip_pkt after: mtype=1, saddr=10.0.100.2, daddr=192.168.99.1, icmp.type=0, icmp.id=999
+nf_nat_setup_info: origTuple.addr=192.168.99.2, origTuple.id=999, replyTuple.addr=10.0.100.2, replyTuple.id=32809
+nf_nat_manip_pkt before: mtype=0, saddr=192.168.99.2, daddr=10.0.100.2, icmp.type=8, icmp.id=999
+nf_nat_manip_pkt after: mtype=0, saddr=10.0.100.1, daddr=10.0.100.2, icmp.type=8, icmp.id=32809
+nf_nat_manip_pkt before: mtype=1, saddr=10.0.100.2, daddr=10.0.100.1, icmp.type=0, icmp.id=32809
+nf_nat_manip_pkt after: mtype=1, saddr=10.0.100.2, daddr=192.168.99.2, icmp.type=0, icmp.id=999
+</code></pre><p>The output shows that <code>nf_nat_setup_info</code> gets called twice, once for each client.<sup id="fnref:5"><a href="#fn:5" role="doc-noteref">5</a></sup> For the first client (IP 192.168.99.1), both the original and reply tuple have the ICMP ID sent by the client (999). For the second client (IP 192.168.99.2), however, the reply tuple has been <em>rewritten</em> to ID 32809. For both clients, the source IP address has been rewritten to the IP of the natbox (10.0.100.2).</p><p>Once <code>nf_nat_setup_info</code> has created the connection, <code>nf_nat_manip_pkt</code> modifies the echo and echo reply ICMP packets. For the echo packet, <code>mtype=0</code> (<code>NF_NAT_MANIP_SRC</code>) because the source IP is rewritten. Likewise, the reply packet has <code>mtype=1</code> (<code>NF_NAT_MANIP_DST</code>) to rewrite the destination IP of the incoming reply back to the original client IP.</p><h2 id="conclusion">Conclusion</h2><p>So that is how Linux NATs a ping! In the end, maybe the answer isn’t very surprising – and, in fact, I discovered much later that most of this behavior is documented in the <a href="https://netfilter.org/documentation/HOWTO/netfilter-hacking-HOWTO-4.html#ss4.4">Netfilter Hacking HOWTO</a>. But it was a fun journey, and it’s nice to know exactly where this magic happens in the code.</p></div></div>]]>
+            </description>
+            <link>https://devnonsense.com/posts/how-does-linux-nat-a-ping/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-37455621</guid>
+            <pubDate>Sun, 10 Sep 2023 13:28:25 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[“Make” as a Static Site Generator (2022)]]>
+            </title>
+            <description>
+<![CDATA[
+Score 152 | Comments 80 (<a href="https://news.ycombinator.com/item?id=37454853">thread link</a>) | @bundie
+<br/>
+September 10, 2023 | https://www.karl.berlin/static-site.html | <a href="https://web.archive.org/web/*/https://www.karl.berlin/static-site.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+
+<p>Static site generators are in fashion for good reasons. The resulting pages are easy to host, fast and extremely low on maintenance while being sufficient for many use cases.
+As I learned when <a href="https://www.karl.berlin/blog.html">setting up my blog</a>, writing a simple script myself is faster and more satisfying than learning one of the other site builders and customizing it to my needs.
+This time, I only need a plain site without automatically updated timestamps or an RSS-feed, so I can go even simpler than by blog script.</p>
+<h2>Basic setup</h2>
+<p>To get the site into a working state, I require the following functionality:</p>
+
+<ul>
+<li>All input files reside in the <code>source</code> directory, in the same layout as I want them in the output.</li>
+<li>During processing, add a header to all HTML files.</li>
+<li>Copy all other files to the <code>build</code> directory as they are.</li>
+</ul>
+<p>Each of these points results in one rule in the Makefile:</p>
+<pre><code># The `build` target depends on all output files in the `build` directory. It
+# does not do anything by itself, but causes one of the following rules to be
+# applied for each file.
+build: $(patsubst source/%,build/%,$(shell find source -type f))
+
+# For each .html file do `cat header.html $input &gt; $output`.
+build/%.html: source/%.html header.html Makefile
+	@mkdir -p $(dir $@)
+	cat header.html $&lt; &gt; $@
+
+# Copy all other files without changes.
+build/%: source/%
+	cp $&lt; $@
+</code></pre>
+<p>With a corresponding <code>header.html</code> and these rules in place, calling <code>make build</code> will create a <code>build</code> directory that can be browsed locally or uploaded to any web server.</p>
+<h2>Variations</h2>
+<p>This is really all you need, but the real strength of this approach is that it is so simple, that you can trivially extend it to fit different needs. Let me show you a few examples!</p>
+<h3>Mark Current Page</h3>
+<p>It is helpful to highlight the current page in the navigation so that the visitor sees where he is within the site at a glance. To do this, we search for the link within the navigation and replace the link with a highlighted version. The specifics vary depending on your markup. I'm using the following code to add the <code>current</code> class to the link tag:</p>
+<pre><code>build/%.html: source/%.html header.html Makefile
+	@mkdir -p $(dir $@)
+	sed -E 's|(href="$(subst source,,$&lt;))|class="current" \1|' header.html | cat - $&lt; &gt; $@
+</code></pre>
+<h3>Generate Page From Markdown</h3>
+<p>If you dislike writing HTML or if you have existing content in markdown format, you can pipe your markdown content through a markdown-to-HTML converter of you choice (I like <a href="https://github.com/karlb/smu">smu</a>).</p>
+<pre><code>build/%.html: source/%.html header.html Makefile
+	@mkdir -p $(dir $@)
+	smu $&lt; | cat header.html - &gt; $@
+</code></pre>
+<p>Since we still assume that <code>build/foo.html</code> is built from <code>source/foo.html</code>, you should keep the <code>.html</code> suffix for the markdown files or modify the rules to look for <code>.md</code> files as input.</p>
+<h2>Little Helpers</h2>
+<p>You can not only modify the site generation itself. Convenience features can also be added as additional make targets.</p>
+<h3>Serve Site Locally</h3>
+<p>Not all sites can be accurately previewed by opening the local files in your browser.
+The most common reason for this is using absolute links instead of relative ones.
+In those cases, you will want to run a small test web server locally to preview your site.
+Python is already installed on many systems and comes with a web server this is suitable for the task.</p>
+<pre><code>serve:
+	python -m http.server -d build
+</code></pre>
+<h3>Rebuild on Change</h3>
+<p>If you work a lot on your site, manually rebuilding after each change is a hassle.
+Just use <a href="https://eradman.com/entrproject/"><code>entr</code></a> (or <a href="https://linux.die.net/man/1/inotifywait"><code>inotifywait</code></a> if you want to avoid the dependency) to rebuild automatically when a file in the source directory changes.</p>
+<pre><code>watch:
+	find source header.html Makefile | entr make build
+</code></pre>
+<h3>Upload to GitHub Pages</h3>
+<p>I store my repositories on GitHub, so using GitHub Pages to host the resulting HTML is a natural choice.
+Getting the commands just right so that you don't have to care about git details when publishing is a bit tricky, but easy enough in the end.
+The approach is based on <a href="https://sangsoonam.github.io/2019/02/08/using-git-worktree-to-deploy-github-pages.html">Sangsoo Nam's post</a>.</p>
+<pre><code>deploy:
+	git worktree add public_html gh-pages
+	cp -rf build/* public_html
+	cd public_html &amp;&amp; \
+	  git add --all &amp;&amp; \
+	  git commit -m "Deploy to github pages" &amp;&amp; \
+	  git push origin gh-pages
+	git worktree remove public_html
+</code></pre>
+<h2>Summary</h2>
+<p>Having your own static site generator in only six simple lines in a Makefile is great!
+There are no exotic dependencies, nothing to maintain and you can quickly adapt it to your needs.
+A page I built using this approach is available at <a href="https://github.com/karlb/astridbartel.de">https://github.com/karlb/astridbartel.de</a> and can serve as a real world example.</p>
+<small>Written on 2022-06-14.</small>
+</div></div>]]>
+            </description>
+            <link>https://www.karl.berlin/static-site.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-37454853</guid>
+            <pubDate>Sun, 10 Sep 2023 11:30:29 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[I wired up my bike's GPS to order me pizza during a gravel race]]>
+            </title>
+            <description>
+<![CDATA[
+Score 135 | Comments 31 (<a href="https://news.ycombinator.com/item?id=37454766">thread link</a>) | @nxten
+<br/>
+September 10, 2023 | https://steele.blue/geofence-pizza-ordering/ | <a href="https://web.archive.org/web/*/https://steele.blue/geofence-pizza-ordering/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>As harvest season begins here in the Midwest, I once again celebrate by grinding Nebraska gravel at the <a href="https://www.gravel-worlds.com/the-long-voyage">Gravel Worlds Long Voyage</a> bike race.
+As in previous years (<a href="https://steele.blue/gravel-worlds">2021</a>) (<a href="https://steele.blue/serverless-bike-gps">2022</a>), I spent more time writing code for a marginally-useful project than I did training. But hey, I finished!</p>
+<p><span>
+      <a href="https://steele.blue/static/9edd5fd38a7e5307edffcc6c56066780/b4e28/matt-gw.jpg" target="_blank" rel="noopener">
+    <span></span>
+  <picture>
+          <source srcset="https://steele.blue/static/9edd5fd38a7e5307edffcc6c56066780/3e828/matt-gw.webp 192w,
+https://steele.blue/static/9edd5fd38a7e5307edffcc6c56066780/e6f2f/matt-gw.webp 384w,
+https://steele.blue/static/9edd5fd38a7e5307edffcc6c56066780/8b983/matt-gw.webp 768w,
+https://steele.blue/static/9edd5fd38a7e5307edffcc6c56066780/b2d4b/matt-gw.webp 1152w,
+https://steele.blue/static/9edd5fd38a7e5307edffcc6c56066780/0abaa/matt-gw.webp 1536w,
+https://steele.blue/static/9edd5fd38a7e5307edffcc6c56066780/11d0e/matt-gw.webp 4005w" sizes="(max-width: 768px) 100vw, 768px" type="image/webp">
+          <source srcset="https://steele.blue/static/9edd5fd38a7e5307edffcc6c56066780/7809d/matt-gw.jpg 192w,
+https://steele.blue/static/9edd5fd38a7e5307edffcc6c56066780/4ecad/matt-gw.jpg 384w,
+https://steele.blue/static/9edd5fd38a7e5307edffcc6c56066780/212bf/matt-gw.jpg 768w,
+https://steele.blue/static/9edd5fd38a7e5307edffcc6c56066780/5ef17/matt-gw.jpg 1152w,
+https://steele.blue/static/9edd5fd38a7e5307edffcc6c56066780/ac99c/matt-gw.jpg 1536w,
+https://steele.blue/static/9edd5fd38a7e5307edffcc6c56066780/b4e28/matt-gw.jpg 4005w" sizes="(max-width: 768px) 100vw, 768px" type="image/jpeg">
+          <img src="https://steele.blue/static/9edd5fd38a7e5307edffcc6c56066780/212bf/matt-gw.jpg" alt="Matt riding on Gravel Worlds" title="" loading="lazy" decoding="async">
+        </picture>
+  </a>
+    </span></p>
+<h2>Fueled by Pizza</h2>
+<p>My goal this year involved optimizing my food choices during the race: pizza from <a href="https://www.caseys.com/">Casey's General Store</a>.
+These convenience stores are S-Tier options when out in the middle of nowhere.
+In addition to snacks and drinks, most Casey's have a kitchen, and have pretty decent grab 'n go slices of pizza.</p>
+<p><span>
+      <a href="https://steele.blue/static/7a9200edb092ed758a6ad507f4287d98/6aca1/self-serve-pizza.jpg" target="_blank" rel="noopener">
+    <span></span>
+  <picture>
+          <source srcset="https://steele.blue/static/7a9200edb092ed758a6ad507f4287d98/3e828/self-serve-pizza.webp 192w,
+https://steele.blue/static/7a9200edb092ed758a6ad507f4287d98/e6f2f/self-serve-pizza.webp 384w,
+https://steele.blue/static/7a9200edb092ed758a6ad507f4287d98/c1dc5/self-serve-pizza.webp 650w" sizes="(max-width: 650px) 100vw, 650px" type="image/webp">
+          <source srcset="https://steele.blue/static/7a9200edb092ed758a6ad507f4287d98/7809d/self-serve-pizza.jpg 192w,
+https://steele.blue/static/7a9200edb092ed758a6ad507f4287d98/4ecad/self-serve-pizza.jpg 384w,
+https://steele.blue/static/7a9200edb092ed758a6ad507f4287d98/6aca1/self-serve-pizza.jpg 650w" sizes="(max-width: 650px) 100vw, 650px" type="image/jpeg">
+          <img src="https://steele.blue/static/7a9200edb092ed758a6ad507f4287d98/6aca1/self-serve-pizza.jpg" alt="A sample of the pizza on offer at a Casey's" title="" loading="lazy" decoding="async">
+        </picture>
+  </a>
+    </span></p>
+<p>My problem: last year, there were so many faster riders ahead of me, that <strong>all the pizza was taken by the time I made it to the stops.</strong> This is an outrage!</p>
+<p>This year, I knew I had to do better. But with time winding down on improving my fitness, I had to resort to the latent superpower of software hackery.
+My thought: <strong>why not have a fresh pizza ordered ahead of time, scheduled precisely for when I arrived?</strong></p>
+<p>More precisely, I could write a script that ordered a pizza for me, GPS-triggered by my bike leaving a geofence about an hour from the stop. Building this <a href="https://steele.blue/serverless-bike-gps">on top of the serverless GPS tracker I made last year</a> should fit into the architecture pretty well.</p>
+<h2>Casey's Pizza API When</h2>
+<p><span>
+      <a href="https://steele.blue/static/f1fdd6640cd5211fda59075e28ff7c6e/e185b/pizza-diagram.png" target="_blank" rel="noopener">
+    <span></span>
+  <picture>
+          <source srcset="https://steele.blue/static/f1fdd6640cd5211fda59075e28ff7c6e/3e828/pizza-diagram.webp 192w,
+https://steele.blue/static/f1fdd6640cd5211fda59075e28ff7c6e/e6f2f/pizza-diagram.webp 384w,
+https://steele.blue/static/f1fdd6640cd5211fda59075e28ff7c6e/c0989/pizza-diagram.webp 691w" sizes="(max-width: 691px) 100vw, 691px" type="image/webp">
+          <source srcset="https://steele.blue/static/f1fdd6640cd5211fda59075e28ff7c6e/8514f/pizza-diagram.png 192w,
+https://steele.blue/static/f1fdd6640cd5211fda59075e28ff7c6e/804b2/pizza-diagram.png 384w,
+https://steele.blue/static/f1fdd6640cd5211fda59075e28ff7c6e/e185b/pizza-diagram.png 691w" sizes="(max-width: 691px) 100vw, 691px" type="image/png">
+          <img src="https://steele.blue/static/f1fdd6640cd5211fda59075e28ff7c6e/e185b/pizza-diagram.png" alt="Architecture diagram" title="" loading="lazy" decoding="async">
+        </picture>
+  </a>
+    </span></p>
+<p>The overall design: I setup a geofence within the AWS Location service, which was monitoring my GPS tracker.
+When my tracker exited the geofence, it would trigger a Lambda function that calculates an ETA for my next stop, and orders the pizza.</p>
+<p>The problem: Casey's doesn't have a public API for online ordering.
+So I had to resort to alternate approaches. More specifically, I fell back to <strong>screen scraping the website</strong>, everyone's favorite hack.
+I've had to screen-scrape for other projects (such as <a href="https://steele.blue/secret-strava">updating privacy on Strava activities</a>), but since Casey's website was a complex React app that rendered everything on the client, I had to use a more powerful scraper; this time powered by <a href="https://playwright.dev/">Playwright</a>.</p>
+<p>Getting Playwright to run in a Lambda was An Experience. Full writeup <a href="https://steele.blue/playwright-on-lambda">here</a>.</p>
+<p>To keep track of the status, I also setup a push notification to be delivered to my phone (and watch) on a success or failure. Configuring Web Push to work on iOS devices is probably worthy of its own post.</p>
+<h2>Pizza False Positive</h2>
+<p>I had the triggering geofence configured around mile 180 of the race, with the pizza setup to be delivered at mile 200.</p>
+<p><span>
+      <a href="https://steele.blue/static/e1196b964a5d4a318c649926731f0d76/b17f8/pizza-watch.jpg" target="_blank" rel="noopener">
+    <span></span>
+  <picture>
+          <source srcset="https://steele.blue/static/e1196b964a5d4a318c649926731f0d76/3e828/pizza-watch.webp 192w,
+https://steele.blue/static/e1196b964a5d4a318c649926731f0d76/e6f2f/pizza-watch.webp 384w,
+https://steele.blue/static/e1196b964a5d4a318c649926731f0d76/8b983/pizza-watch.webp 768w,
+https://steele.blue/static/e1196b964a5d4a318c649926731f0d76/b2d4b/pizza-watch.webp 1152w,
+https://steele.blue/static/e1196b964a5d4a318c649926731f0d76/0abaa/pizza-watch.webp 1536w,
+https://steele.blue/static/e1196b964a5d4a318c649926731f0d76/fad48/pizza-watch.webp 1600w" sizes="(max-width: 768px) 100vw, 768px" type="image/webp">
+          <source srcset="https://steele.blue/static/e1196b964a5d4a318c649926731f0d76/7809d/pizza-watch.jpg 192w,
+https://steele.blue/static/e1196b964a5d4a318c649926731f0d76/4ecad/pizza-watch.jpg 384w,
+https://steele.blue/static/e1196b964a5d4a318c649926731f0d76/212bf/pizza-watch.jpg 768w,
+https://steele.blue/static/e1196b964a5d4a318c649926731f0d76/5ef17/pizza-watch.jpg 1152w,
+https://steele.blue/static/e1196b964a5d4a318c649926731f0d76/ac99c/pizza-watch.jpg 1536w,
+https://steele.blue/static/e1196b964a5d4a318c649926731f0d76/b17f8/pizza-watch.jpg 1600w" sizes="(max-width: 768px) 100vw, 768px" type="image/jpeg">
+          <img src="https://steele.blue/static/e1196b964a5d4a318c649926731f0d76/212bf/pizza-watch.jpg" alt="A push notification indicating pizza was delivered" title="" loading="lazy" decoding="async">
+        </picture>
+  </a>
+    </span></p>
+<p>As I left the geofence, I got a push notification on my watch saying that the pizza had been successfully ordered.</p>
+<p>But when I made it to the stop, <strong>there was nothing at the counter, and they had no record of an order</strong>. And sure enough, I checked my account, and no order had been placed.
+<strong>False positive.</strong></p>
+<p>There were a few pre-made slices available, so I picked those up. They left a bitter taste in my mouth, not just because they weren't especially fresh. Through the rest of the 300-mile race, all I could think about was what might have went wrong with my function.</p>
+<p><span>
+      <a href="https://steele.blue/static/dc526fd97ae4db5306832ed8945751be/b17f8/pizza-slices.jpg" target="_blank" rel="noopener">
+    <span></span>
+  <picture>
+          <source srcset="https://steele.blue/static/dc526fd97ae4db5306832ed8945751be/3e828/pizza-slices.webp 192w,
+https://steele.blue/static/dc526fd97ae4db5306832ed8945751be/e6f2f/pizza-slices.webp 384w,
+https://steele.blue/static/dc526fd97ae4db5306832ed8945751be/8b983/pizza-slices.webp 768w,
+https://steele.blue/static/dc526fd97ae4db5306832ed8945751be/b2d4b/pizza-slices.webp 1152w,
+https://steele.blue/static/dc526fd97ae4db5306832ed8945751be/0abaa/pizza-slices.webp 1536w,
+https://steele.blue/static/dc526fd97ae4db5306832ed8945751be/fad48/pizza-slices.webp 1600w" sizes="(max-width: 768px) 100vw, 768px" type="image/webp">
+          <source srcset="https://steele.blue/static/dc526fd97ae4db5306832ed8945751be/7809d/pizza-slices.jpg 192w,
+https://steele.blue/static/dc526fd97ae4db5306832ed8945751be/4ecad/pizza-slices.jpg 384w,
+https://steele.blue/static/dc526fd97ae4db5306832ed8945751be/212bf/pizza-slices.jpg 768w,
+https://steele.blue/static/dc526fd97ae4db5306832ed8945751be/5ef17/pizza-slices.jpg 1152w,
+https://steele.blue/static/dc526fd97ae4db5306832ed8945751be/ac99c/pizza-slices.jpg 1536w,
+https://steele.blue/static/dc526fd97ae4db5306832ed8945751be/b17f8/pizza-slices.jpg 1600w" sizes="(max-width: 768px) 100vw, 768px" type="image/jpeg">
+          <img src="https://steele.blue/static/dc526fd97ae4db5306832ed8945751be/212bf/pizza-slices.jpg" alt="A pair of dirty legs, eating slices of pre-made pizza" title="" loading="lazy" decoding="async">
+        </picture>
+  </a>
+    </span></p>
+<p>After finishing the race, I made it to a computer and quickly checked the logs to see what had gone wrong. But to my chagrin, there was nothing in the logs indicating what caused the failure; it was just a silent success. I had nothing to go on to try and debug.</p>
+<p>A few days later, I enhanced the Lambda to capture a video of the browser in action and upload it to an S3 bucket for analysis. Running a test of the updated behavior, <strong>it finally worked</strong>. I picked up a fresh Hawaiian pizza, and we enjoyed the pie from the comfort of our home.</p>
+<p>I'm still not entirely sure why it worked. My going theory is that the Lambda had terminated processing as soon as the final <code>form.submit()</code> went through in the embedded Playwright browser. It's quite possible that the online ordering website saw that the browser never received a Success response, and didn't fully process the order.
+My guess is that the additional time spent processing and uploading the video gave the browser sufficient time to clean up properly, with serendipity in timing.</p>
+<h2>Pizza Lessons</h2>
+<p>While I was bummed the pizza ordering functionality didn't run, I think it's in a good spot to try again in upcoming races.
+I also learned a lot while building this out:</p>
+<ul>
+<li>Consistently screen-scraping a React client-side app with a browser running in the cloud: possible, but boy howdy is it finicky. If I were to redo project, I may opt for reverse engineering one of their native apps, focusing on triggering their APIs directly</li>
+<li>Having a good workflow to simulate geospatial behavior is necessary. At first, I setup a geofence around my house for testing, but having to leave for a walk at 11pm gets pretty old, pretty fast</li>
+<li>That said, don't skimp on real-world testing. Prior to the race, I was mostly testing the function by running it on my local workstation, not in a Lambda. The successes of the local functions gave me false confidence that everything was working as expected</li>
+<li>If you're worried about running out of Casey's pizza during a gravel race, another option is to just let the groups ahead of you get more than 30 minutes ahead, so they have plenty of time to make more slices</li>
+</ul>
+<p>The code is available on GitHub: <a href="https://github.com/mattdsteele/spot-tracker-tracker/tree/main/pizza-function">https://github.com/mattdsteele/spot-tracker-tracker/tree/main/pizza-function</a></p></div></div>]]>
+            </description>
+            <link>https://steele.blue/geofence-pizza-ordering/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-37454766</guid>
+            <pubDate>Sun, 10 Sep 2023 11:12:13 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[I wrote a string type]]>
+            </title>
+            <description>
+<![CDATA[
+Score 157 | Comments 62 (<a href="https://news.ycombinator.com/item?id=37451913">thread link</a>) | @todsacerdoti
 <br/>
 September 9, 2023 | https://mcyoung.xyz/2023/08/09/yarns/ | <a href="https://web.archive.org/web/*/https://mcyoung.xyz/2023/08/09/yarns/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div> <p><span> <span> <a href="https://mcyoung.xyz/tags.html#dark-arts">#dark-arts</a> <a href="https://mcyoung.xyz/tags.html#pointers">#pointers</a> <a href="https://mcyoung.xyz/tags.html#rust">#rust</a> </span> <span> 2023-08-09 </span> </span></p> <p>I write compilers for fun. I can’t help it. Consequently, I also write a lot of parsers. In systems programming, it’s usually a good idea to try to share memory rather than reuse it, so as such my AST types tend to look like this.</p> <div><figure><pre><code data-lang="rust"><span>pub</span> <span>enum</span> <span>Expr</span><span>&lt;</span><span>'src</span><span>&gt;</span> <span>{</span>
@@ -303,7 +752,7 @@ ascii: n  o  t     U  T  F  -  8</code></pre></figure></div> <p>Escapes are rela
             </title>
             <description>
 <![CDATA[
-Score 76 | Comments 67 (<a href="https://news.ycombinator.com/item?id=37448554">thread link</a>) | @netdoll
+Score 82 | Comments 81 (<a href="https://news.ycombinator.com/item?id=37448554">thread link</a>) | @netdoll
 <br/>
 September 9, 2023 | https://mycophobia.org/desktop_gui_minimalism.html | <a href="https://web.archive.org/web/*/https://mycophobia.org/desktop_gui_minimalism.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -339,7 +788,7 @@ September 9, 2023 | https://mycophobia.org/desktop_gui_minimalism.html | <a href
             </title>
             <description>
 <![CDATA[
-Score 28 | Comments 54 (<a href="https://news.ycombinator.com/item?id=37448476">thread link</a>) | @chrismatic
+Score 28 | Comments 53 (<a href="https://news.ycombinator.com/item?id=37448476">thread link</a>) | @chrismatic
 <br/>
 September 9, 2023 | https://www.climatedrift.com/p/lab-grown-meat-is-not-a-climate-solution | <a href="https://web.archive.org/web/*/https://www.climatedrift.com/p/lab-grown-meat-is-not-a-climate-solution">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><article><div><div><div dir="auto"><p><em><span>Welcome to </span><strong>Climate Drift</strong><span> - the place where we break down climate solutions and how to find your role in the race to net zero. </span><br><span>If you haven’t subscribed, join here: </span></em></p><p><em><span>Hi there! 👋</span><p><span>Skander here. While I am at The Drop we will feature some guest posts by our  readers, friends, and family. </span></p><p><span>Starting off will be Christoph, a great engineer &amp; founder, diving into lab-grown meat - and why he doesn’t consider it a climate solution.</span><br><span>Follow Chris on </span><a href="https://twitter.com/chrismatisch" rel="">Twitter</a><span>.</span></p><p><span>Let’s dive in 🌊</span><br><span>Skander</span></p><p><span>PS: If you want to write a guest post too, just ping us at guest@climatedrift.com</span></p></em></p><p>Greetings fellow climate drifters 👋,</p><p>my name is Christoph and I am a software engineer and recovering founder. I am currently studying climate policy and in particular how to improve it with the use of AI.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb9ca0175-fdb0-4c5e-ab74-179f9fd4ea0d_6000x3150.jpeg" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb9ca0175-fdb0-4c5e-ab74-179f9fd4ea0d_6000x3150.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb9ca0175-fdb0-4c5e-ab74-179f9fd4ea0d_6000x3150.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb9ca0175-fdb0-4c5e-ab74-179f9fd4ea0d_6000x3150.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb9ca0175-fdb0-4c5e-ab74-179f9fd4ea0d_6000x3150.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb9ca0175-fdb0-4c5e-ab74-179f9fd4ea0d_6000x3150.jpeg" width="1456" height="764" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/b9ca0175-fdb0-4c5e-ab74-179f9fd4ea0d_6000x3150.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:764,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:3401927,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/jpeg&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:true,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb9ca0175-fdb0-4c5e-ab74-179f9fd4ea0d_6000x3150.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb9ca0175-fdb0-4c5e-ab74-179f9fd4ea0d_6000x3150.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb9ca0175-fdb0-4c5e-ab74-179f9fd4ea0d_6000x3150.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb9ca0175-fdb0-4c5e-ab74-179f9fd4ea0d_6000x3150.jpeg 1456w" sizes="100vw" fetchpriority="high"></picture></div></a></figure></div><p><span>Few topics spark as much controversy in the climate debate as the assertion that we need to cut our meat consumption if we want to reach our climate targets. On some primal level going for the burger on your plate is a much more outrageous act than going for your car. So it’s no surprise that technical-minded people have been looking for a panacea in the form of lab-grown meat. And the pitch is alluring: </span><strong>If</strong><span> the plan works out the burger is safe and we get to reduce our emissions. We get to have our cake and eat it, too.</span></p><p><span>However that “</span><strong>if</strong><span>” is doing a lot of work in this sentence. So today we will have a look at the bear take on lab-grown meat: It might be viable at some point but too late and too ineffectual to be considered a Climate Solution. Even worse: It could distract from the real issue much in the same way that CDR (Carbon Dioxide Removal) is already being used by Big Oil to prevent actual mitigation.</span></p><p>But before we get there we need to establish why we need to urgently reduce our dependence on livestock farming.</p><blockquote><p><span>This section is entirely based on the IPCC AR5 report on food security (Chapter 5). The IPCC reports are </span><strong>the</strong><span> authoritative scientific meta-reviews of all things climate.</span></p></blockquote><p><span>Let us start by ripping off the band-aid: Livestock farming is a major driver in deforestation and methane emissions causing about 15% of human greenhouse gas emissions (</span><a href="https://www.fao.org/news/story/en/item/197623/icode/" rel="">source</a><span>). This means we need to drastically reduce the emissions from this sector if we want to have a realistic shot at achieving our climate goals. There are a few nuances here to be aware of:</span></p><p><strong>Not all meat is created equal. </strong><span>Cattle are a complete outlier, accounting for 65–77% of livestock-based emissions. Even in the absence of climate change, they are pretty inefficient. For example, one study found that “replacing beef in the USA diet with poultry can meet the caloric and protein demands of about 120 to 140 million additional people consuming the average American diet” (IPCC AR5&nbsp; 5.3.4).</span></p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fbdb1ad26-03c4-419f-8c5d-18d3ca57f824_6000x6445.jpeg" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fbdb1ad26-03c4-419f-8c5d-18d3ca57f824_6000x6445.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fbdb1ad26-03c4-419f-8c5d-18d3ca57f824_6000x6445.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fbdb1ad26-03c4-419f-8c5d-18d3ca57f824_6000x6445.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fbdb1ad26-03c4-419f-8c5d-18d3ca57f824_6000x6445.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fbdb1ad26-03c4-419f-8c5d-18d3ca57f824_6000x6445.jpeg" width="1456" height="1564" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/bdb1ad26-03c4-419f-8c5d-18d3ca57f824_6000x6445.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:1564,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:18454625,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/jpeg&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fbdb1ad26-03c4-419f-8c5d-18d3ca57f824_6000x6445.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fbdb1ad26-03c4-419f-8c5d-18d3ca57f824_6000x6445.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fbdb1ad26-03c4-419f-8c5d-18d3ca57f824_6000x6445.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fbdb1ad26-03c4-419f-8c5d-18d3ca57f824_6000x6445.jpeg 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p><strong>Not all carnivores are created equal.</strong><span> While most cattle emissions are generated in developing countries, they are not the ones to benefit. Citizens in developed nations consume on average four times as much dairy and three times as much meat than those living in developing nations. This means that not only should richer countries lead the charge on this issue, but it also implies that any meat substitute must be affordable on a global scale.</span></p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F092df708-5349-4ed0-bad6-a0fc1a0ac9f7_6000x4690.jpeg" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F092df708-5349-4ed0-bad6-a0fc1a0ac9f7_6000x4690.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F092df708-5349-4ed0-bad6-a0fc1a0ac9f7_6000x4690.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F092df708-5349-4ed0-bad6-a0fc1a0ac9f7_6000x4690.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F092df708-5349-4ed0-bad6-a0fc1a0ac9f7_6000x4690.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F092df708-5349-4ed0-bad6-a0fc1a0ac9f7_6000x4690.jpeg" width="1456" height="1138" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/092df708-5349-4ed0-bad6-a0fc1a0ac9f7_6000x4690.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:1138,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:11408576,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/jpeg&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F092df708-5349-4ed0-bad6-a0fc1a0ac9f7_6000x4690.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F092df708-5349-4ed0-bad6-a0fc1a0ac9f7_6000x4690.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F092df708-5349-4ed0-bad6-a0fc1a0ac9f7_6000x4690.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F092df708-5349-4ed0-bad6-a0fc1a0ac9f7_6000x4690.jpeg 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p><strong>It’s not just the climate.</strong><span> Meat and dairy also exert pressure on increasingly unstable freshwater resources. Beyond that, there are well-known issues regarding health and the ethics of industrial farming.</span></p><p><strong>You don’t have to go fully vegan</strong><span>. As you can see in the graph below even moderate reductions can go a long way. With a shift in culture and an increase in substitute products, cutting down on meat has never been easier. However, the cattle industry has taken a page from big oil and is currently waging an </span><a href="https://www.theguardian.com/environment/2023/may/03/beef-industry-public-relations-messaging-machine" rel="">all-out public relations war</a><span> against any type of regulation.</span></p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F45343fe6-4faa-40f5-97ee-2443fe12c756_6000x3695.jpeg" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F45343fe6-4faa-40f5-97ee-2443fe12c756_6000x3695.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F45343fe6-4faa-40f5-97ee-2443fe12c756_6000x3695.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F45343fe6-4faa-40f5-97ee-2443fe12c756_6000x3695.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F45343fe6-4faa-40f5-97ee-2443fe12c756_6000x3695.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F45343fe6-4faa-40f5-97ee-2443fe12c756_6000x3695.jpeg" width="1456" height="897" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/45343fe6-4faa-40f5-97ee-2443fe12c756_6000x3695.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:897,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:7347530,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/jpeg&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F45343fe6-4faa-40f5-97ee-2443fe12c756_6000x3695.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F45343fe6-4faa-40f5-97ee-2443fe12c756_6000x3695.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F45343fe6-4faa-40f5-97ee-2443fe12c756_6000x3695.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F45343fe6-4faa-40f5-97ee-2443fe12c756_6000x3695.jpeg 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p>This is where the argument for lab-grown meat comes into play: We need to get people to switch, but the threshold seems high. So let’s offer them a product that is nearly identical but can be powered by green energy.</p><p>Sofar lab-grown meat has arguably followed the trajectory of many paradigm-shifting technologies: While the first public trial for a single beef patty cost $300,000 in 2013, startups and billions of funding have since managed to wrangle the price below $100. There is no doubt that this is an exciting consumer product backed by a wealth of money, talent, and interest. However, the only question in the climate context is whether or not they can significantly mitigate meat-based emissions within the next ten to twenty years or so.</p><p><strong>The answer to that question is: No</strong><span>. It is very unlikely that lab-grown meat will achieve anywhere near the economies of scale needed to make a reasonable dent in global meat consumption. According to Joe Fassler who wrote an excellent article on this question in thecounter, the outlook might be even more dire:</span></p><p>“Splashy headlines have long overshadowed inconvenient truths about biology and economics. Now, extensive new research suggests the industry may be on a billion-dollar crash course with reality.” - Joe Fassler, thecounter</p><p><span>While I highly recommend that you read </span><a href="https://thecounter.org/lab-grown-cultivated-meat-cost-at-scale/amp/" rel="">the article</a><span> I will now briefly summarize how he arrived at such an extreme conclusion.</span></p><p><strong>It doesn’t scale.</strong><span> One of the chief proponents of lab-grown meat, the Good Food Institute (GFI), commissioned a techno-economic analysis (TEA) to project what the production of cell-cultivated meat in 2030 might look like. They imagine a facility that would use huge bioreactors to produce 10,000 metric tons of meat per year at an upfront capital cost of $450 million. 10,000 metric tons might sound like a lot until you learn that it would only amount to 0.002% of meat production in the US. Further, due to the high capital expenditure, investors would have to lock themself into 30-year repayment terms to keep the price per kilogram competitive - this is why supporters of the technology are calling for substantial public investments. So investors are faced with the “choice” of either throwing away absurd amounts of money to maybe make the tiniest dent in our meat production or to make a profit with a niche luxury product.&nbsp;</span></p><p><strong>It might not even work. </strong><span>Even if they get built, these plants might not ever actually end up producing these quantities of meat. While animal cells double at a rate of once every 24 hours, bacteria do so once every 20 minutes. This means that these facilities effectively require a pharma-grade sterile environment to prevent minor contaminations from ruining days and tons worth of cell cultures. The entire pharma industry currently boasts a bioreactor volume three times as large as the facility imagined but composed of much smaller installations. No one knows if it is even possible to do this at the proposed scale and it might not even end up working at all.&nbsp;</span></p><p>Or to quote Dr. Humbird the lead author of another industry-funded TEA: “Clearly, I don’t think cultured meat has legs [...] I think I make that clear in the paper, if not in such colloquial terms. But it seems like a bunch of hooey to me.”</p><p><strong>People might still reject it. </strong><span>The key selling point of lab-grown meat is that it aims to taste just like the real deal, without all the downsides. But taste alone might not be enough to win everyone over. Even if we nail the technical aspects, there's evidence to suggest that a sizeable chunk of people won't make the switch. It turns out that when people don’t reduce their meat consumption they do so for a variety of cultural and economic reasons, taste just being one of them. This is before we even get into legitimate health concerns or the potential of anti-tech social panics such as those that we saw during the pandemic.</span></p><p>Okay, so it seems that lab-grown meat has some issues that might prevent it from being a player in the landscape of Climate Tech. But do we have alternatives and if so how are they doing? Yes, we do, but unfortunately, we are not on track to meet our goals.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7b4dea06-e215-4dd9-a395-de8010f73127_6000x4690.jpeg" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7b4dea06-e215-4dd9-a395-de8010f73127_6000x4690.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7b4dea06-e215-4dd9-a395-de8010f73127_6000x4690.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7b4dea06-e215-4dd9-a395-de8010f73127_6000x4690.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7b4dea06-e215-4dd9-a395-de8010f73127_6000x4690.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7b4dea06-e215-4dd9-a395-de8010f73127_6000x4690.jpeg" width="1456" height="1138" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/7b4dea06-e215-4dd9-a395-de8010f73127_6000x4690.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:1138,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:11416252,&quot;alt&quot;:&quot;Figure showing the projected vs needed reduction in ruminant meat consumption to reach our climate goals. We need to accelerate by a factor of 5.&quot;,&quot;title&quot;:null,&quot;type&quot;:&quot;image/jpeg&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="Figure showing the projected vs needed reduction in ruminant meat consumption to reach our climate goals. We need to accelerate by a factor of 5." title="Figure showing the projected vs needed reduction in ruminant meat consumption to reach our climate goals. We need to accelerate by a factor of 5." srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7b4dea06-e215-4dd9-a395-de8010f73127_6000x4690.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7b4dea06-e215-4dd9-a395-de8010f73127_6000x4690.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7b4dea06-e215-4dd9-a395-de8010f73127_6000x4690.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7b4dea06-e215-4dd9-a395-de8010f73127_6000x4690.jpeg 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p><strong>Policy. </strong><span>As with all things climate-related the key lies in pricing in the negative externality which means covering meat and dairy under existing or new carbon pricing schemes. There are however quite a few political challenges here that need to be overcome with carefully crafted policy: Revenues need to be appropriately recycled to consumers so as to not make meat eating a privilege of the rich. Further, agricultural lobbies - which hold a lot of sway in the EU for instance - must be carefully involved in order to prevent them from blocking the process outright.&nbsp;</span></p><p>In the meantime, governments might opt for more indirect yet targeted measures such as the upcoming EU Deforestation regulation which flat-out bans products that have caused any form of forest degradation. Soft measures such as awareness campaigns and subsidies for alternatives are also a part of the mix.</p><p><strong>Market</strong><span>. The good news is that we are already starting to cut down on our livestock emissions. It is just not happening fast enough. While there is both a strong cultural momentum and an explosion of meat substitute products more effort is needed. Stay tuned for an in-depth analysis here at ClimateDrift.</span></p><p>To summarize; while the solutions we have are imperfect they completely outmatch lab-grown meat for the simple virtue that we know their issues while the former is full of unknowns. Beyond that, we can already measure the GHG impact of alternatives in megatons of CO2 equivalents which cannot be said for lab-grown meat.</p><p>Now advocates of lab-grown meat will have a few objections to the points I raised earlier which I will address here:</p><p><strong>We tend to be myopic when it comes to frontier innovation. Just look at the price drop of DNA sequencing or solar panels!</strong></p><p><span>As Skander has </span><a href="https://www.climatedrift.com/p/how-solar-got-cheap" rel="">pointed out before</a><span> not every technology is solar panels. In fact, we have also heard this argument being made for crypto, self-driving cars, or going to Mars. Sure they might overpromise for years and some of them might end up changing the world. Once lab-grown meat beats all the odds I will happily attach a clarification to this article. But when it comes to the climate this is a bet we cannot afford to make, especially, in the presence of superior alternatives.</span></p><p><strong>It does not have to be this black and white. We can push for dietary changes while still advocating for lab-grown meat.</strong></p><p>While I agree that progress is not a zero-sum game the same cannot be said for the amount of political willpower and investment available for fighting climate change. Every inch of legislation is currently hard-fought and the resulting public budgets are thus limited. Even worse; governments that are being lobbied by big meat might be tempted into using public investments in lab-grown meat as a way to greenwash their policies. We are seeing this play out with CDR so it is not as unlikely as you might think.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F387b3937-cd3b-403f-bc5c-8bd1637b1017_6000x4160.jpeg" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F387b3937-cd3b-403f-bc5c-8bd1637b1017_6000x4160.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F387b3937-cd3b-403f-bc5c-8bd1637b1017_6000x4160.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F387b3937-cd3b-403f-bc5c-8bd1637b1017_6000x4160.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F387b3937-cd3b-403f-bc5c-8bd1637b1017_6000x4160.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F387b3937-cd3b-403f-bc5c-8bd1637b1017_6000x4160.jpeg" width="1456" height="1009" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/387b3937-cd3b-403f-bc5c-8bd1637b1017_6000x4160.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:1009,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:11189290,&quot;alt&quot;:&quot;2100 warming projections given different scenarios. The graph shows that there is a significant gap between both implementations and pledges and reductions that are actually needed to achieve \&quot;positive\&quot; scenarios such as the 1.5 degree target.&quot;,&quot;title&quot;:null,&quot;type&quot;:&quot;image/jpeg&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="2100 warming projections given different scenarios. The graph shows that there is a significant gap between both implementations and pledges and reductions that are actually needed to achieve &quot;positive&quot; scenarios such as the 1.5 degree target." title="2100 warming projections given different scenarios. The graph shows that there is a significant gap between both implementations and pledges and reductions that are actually needed to achieve &quot;positive&quot; scenarios such as the 1.5 degree target." srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F387b3937-cd3b-403f-bc5c-8bd1637b1017_6000x4160.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F387b3937-cd3b-403f-bc5c-8bd1637b1017_6000x4160.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F387b3937-cd3b-403f-bc5c-8bd1637b1017_6000x4160.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F387b3937-cd3b-403f-bc5c-8bd1637b1017_6000x4160.jpeg 1456w" sizes="100vw" loading="lazy"></picture></div></a><figcaption>Emissions need to start falling now and they need to fall fast.</figcaption></figure></div><p>To sum it up: Lab-grown meat is not a climate solution because it seems very unlikely that it can mitigate farming-based GHG emissions. It would be different if it were our only option, but it’s not. None of this is to say that this is not an interesting niche product that you can be excited about. But we must be careful about what we promote as “Climate Tech” because it impacts the way we allocate both private and public funding. The stakes are simply too high.</p><p><span>See you next time,</span><br><span>Christoph</span></p><p><em><span>Thank you, Chris, if you liked his perspective follow him on </span><a href="https://twitter.com/chrismatisch" rel="">Twitter</a><span> and give him props. If you disagree, follow him too and state (nicely) why you disagree.</span><br><span>Comments are always welcome.</span><p><span>And if you are a lab-grown meat proponent, founder, or investor, and want to share your perspective, our guest posts are open for you.</span></p><p><span>See you tomorrow, </span><br><span>Skander</span></p></em></p></div></div></div></article></div></div></div>]]>
@@ -354,7 +803,7 @@ September 9, 2023 | https://www.climatedrift.com/p/lab-grown-meat-is-not-a-clima
             </title>
             <description>
 <![CDATA[
-Score 138 | Comments 128 (<a href="https://news.ycombinator.com/item?id=37448460">thread link</a>) | @jdon
+Score 142 | Comments 136 (<a href="https://news.ycombinator.com/item?id=37448460">thread link</a>) | @jdon
 <br/>
 September 9, 2023 | https://notgull.net/why-you-want-async/ | <a href="https://web.archive.org/web/*/https://notgull.net/why-you-want-async/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -492,7 +941,7 @@ September 9, 2023 | https://notgull.net/why-you-want-async/ | <a href="https://w
             </title>
             <description>
 <![CDATA[
-Score 37 | Comments 57 (<a href="https://news.ycombinator.com/item?id=37445905">thread link</a>) | @dndndnd
+Score 39 | Comments 65 (<a href="https://news.ycombinator.com/item?id=37445905">thread link</a>) | @dndndnd
 <br/>
 September 9, 2023 | https://synthical.com/feed/simple | <a href="https://web.archive.org/web/*/https://synthical.com/feed/simple">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -503,11 +952,57 @@ September 9, 2023 | https://synthical.com/feed/simple | <a href="https://web.arc
         </item>
         <item>
             <title>
+<![CDATA[My mental model of Clojure transducers]]>
+            </title>
+            <description>
+<![CDATA[
+Score 25 | Comments 6 (<a href="https://news.ycombinator.com/item?id=37444946">thread link</a>) | @nathell
+<br/>
+September 9, 2023 | https://blog.danieljanus.pl/2023/09/09/transducers/ | <a href="https://web.archive.org/web/*/https://blog.danieljanus.pl/2023/09/09/transducers/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><h2 id="intro">Intro</h2><p>I’ve been programming in Clojure for a long time, but I haven’t been using transducers much. I learned to mechanically transform <code>(into [] (map f coll))</code> to <code>(into [] (map f) coll)</code> for a slight performance gain, but not much beyond that. Recently, however, I’ve found myself refactoring transducers-based code at work, which prompted me to get back to speed.</p><p>I found Eero Helenius’ article <a href="https://dev.solita.fi/2021/10/14/grokking-clojure-transducers.html">“Grokking Clojure transducers”</a> a great help in that. To me, it’s much more approachable than the <a href="https://clojure.org/reference/transducers">official documentation</a> – in a large part because it shows you how to build transducers from the ground up, and this method of learning profoundly resonates with me. I highly recommend it. However, it’s also useful to have a visual intuition of how transducers work, a mental model that hints at the big picture without zooming into the details too much. In this post, I’d like to share mine and illustrate it with a REPL session. (Spoiler alert: there’s <a href="https://github.com/clojure/core.async">core.async</a> ahead, but in low quantities.)</p><h2 id="pictures">Pictures</h2><p>Imagine data flowing through a conveyor belt. Say, infinitely repeating integers from 1 to 5:</p><p><img src="https://blog.danieljanus.pl/img/blog/conveyor-belt.svg" alt="Conveyor belt"></p><p>I’m using the abstract term “conveyor belt”, rather than “sequence” or something like this, to avoid associations with any implementation details. Just pieces of data, one after another. These data may be anything; they may flow infinitely or stop at some point; may or may not all exist in memory at the same time. Doesn’t matter. That’s the beauty of transducers: they completely abstract away the implementation of sequentiality.</p><p>So, what is a transducer, intuitively? It’s a mechanism for <em>transforming conveyor belts into other conveyor belts</em>.</p><p>For example, <code>(map inc)</code> is a transducer that says: “take this conveyor belt and produce one where every number is incremented”. Applying it to the above belt yields this one:</p><p><img src="https://blog.danieljanus.pl/img/blog/conveyor-belt-2.svg" alt="Conveyor belt, transformed"></p><p>An important thing about transducers is that they’re <em>composable</em>. To understand that, imagine further transforming the above belt by removing all the odd numbers. Intuitively, that’s what <code>(remove odd?)</code> does:</p><p><img src="https://blog.danieljanus.pl/img/blog/conveyor-belt-3.svg" alt="Conveyor belt, transformed again"></p><p>(I’ve left the spacing between boxes the same as before, because it helps me visualise <code>(remove odd?)</code> better. I imagine an invisible gnome sitting above the belt, watching carefully all the boxes that pass below it, and snatching greedily every one that happens to contain an odd number.)</p><p>Composability means that Clojure lets you say <code>(comp (map inc) (remove odd?))</code> to mean the transducer that transforms the first belt to the third one. By putting together two simple building blocks, we produced a more complex one – that it itself reusable and can be used as another building block in an ever more complex data pipeline.</p><p>Notice we <em>still</em> haven’t said anything about the actual representation of the data, but are already able to model complex processes. We can then apply them to actual data, whether it’s a simple vector-to-vector transformation within the same JVM, or listening to a topic on a Kafka cluster, summarizing the incoming data and sending them to a data warehouse.</p><h2 id="code">Code</h2><p>OK, enough handwaving, time for a demo. Let’s fire up a REPL and load core.async (I’m assuming you’ve added it to your dependencies already). I won’t reproduce here the resulting values of expressions we evaluate (they’re mostly <code>nil</code>s anyway), but I will reproduce output from the REPL (as comments).</p><pre><code>(<span>require</span> '[clojure.core.async <span>:refer</span> [chan &lt;!! &gt;!! thread close!]])
+</code></pre><p>Why core.async? Because I find it a great way to implement a conveyor belt that you can play with interactively. This can help you understand how the various Clojure-provided transducers work. For the noncognoscenti: core.async is a Clojure library that allows you to implement concurrent processes that communicate over <em>channels</em>. By default, that communication is synchronous, meaning that if a process tries to read from a channel, it blocks until another process writes something to that channel.</p><p>As it happens, we can pass a transducer to the function that creates channels, <code>chan</code>. It will put the invisible gnomes to work on values that pass through the channel. So you can view that channel as a conveyor belt!</p><p>For easy tinkering, we can do this:</p><pre><code>(<span>defn</span> <span>transformed-belt</span> [xf]
+  (<span><span>let</span></span> [ch (<span>chan</span> <span>1</span> xf)]
+    (<span>thread</span>
+      (<span><span>loop</span></span> []
+        (<span>when-some</span> [value (<span>&lt;!!</span> ch)]
+          (<span>println</span> <span>"Value:"</span> (<span>pr-str</span> value)))
+          (<span><span>recur</span></span>)))
+    ch))
+</code></pre><p>This fires up a process working at the receiving end of the conveyor belt. It will print out any transformed values as soon as they become available. Typing at the REPL, we will assume the role of producer, putting data on the belt.</p><p>Like this:</p><pre><code>(<span>def</span> <span>b</span> (<span>transformed-belt</span> (<span><span>map</span></span> inc)))
+(<span>&gt;!!</span> b <span>2</span>)
+
+(<span>&gt;!!</span> b <span>42</span>)
+
+</code></pre><p>It works! We’re putting in numbers, and out come the incremented ones.</p><p>When we’re done experimenting with the belt, we need to <code>close!</code> it. This will cause the worker thread to shutdown.</p><pre><code>(<span>close!</span> b)
+</code></pre><p>We can now experiment with something more complex, like that combined transducer we’ve talked about before:</p><pre><code>(<span>def</span> <span>b</span> (<span>transformed-belt</span> (<span><span>comp</span></span> (<span><span>map</span></span> inc) (<span><span>remove</span></span> odd?))))
+(<span>&gt;!!</span> b <span>1</span>)
+
+(<span>&gt;!!</span> b <span>2</span>)
+(<span>&gt;!!</span> b <span>3</span>)
+
+</code></pre><p>We got the transformed 1 and 3, but the intermediate value for 2 was odd, so it was snatched by the gnome and we never saw it.</p><p>There’s even more fun to be had! Let’s try <code>(partition-all 3)</code>:</p><pre><code>(<span>close!</span> b)
+(<span>def</span> <span>b</span> (<span>transformed-belt</span> (<span>partition-all</span> <span>3</span>)))
+(<span>&gt;!!</span> b <span>1</span>)
+</code></pre><p>Nothing…</p><pre><code>(<span>&gt;!!</span> b <span>2</span>)
+</code></pre><p>Still nothing…</p><pre><code>(<span>&gt;!!</span> b <span>3</span>)
+
+</code></pre><p>Blammo! Our gnome is now packaging together incoming items into bundles of three, caching them in the interim while the bundle is not complete yet. But if we close the input prematurely, it will acknowledge and produce the incomplete bundle:</p><pre><code>(<span>&gt;!!</span> b <span>4</span>)
+(<span>&gt;!!</span> b <span>5</span>)
+(<span>close!</span> b)
+
+</code></pre><p>In fact, <code>partition-all</code> is what prompted me to write this post. That code at work I mentioned actually included a transducer composition that had a <code>(net.cgrand.xforms/into [])</code> in it. That transducer (from Christophe Grand’s <a href="https://github.com/cgrand/xforms/">xforms</a> library) accumulates data until there’s nothing more to accumulate, and then emits all of it as one large vector. By replacing it with <code>partition-all</code>, I altered the downstream processing to handle multiple smaller batches rather than one huge batch, improving the system’s latency.</p><p>A small change for a huge win. Clojure continues to amaze me.</p><p>Plus, it’s fun to make JS-less animations in SVG. :)</p></div></div></div>]]>
+            </description>
+            <link>https://blog.danieljanus.pl/2023/09/09/transducers/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-37444946</guid>
+            <pubDate>Sat, 09 Sep 2023 13:10:05 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Bare-Metal Kubernetes, Part I: Talos on Hetzner]]>
             </title>
             <description>
 <![CDATA[
-Score 200 | Comments 73 (<a href="https://news.ycombinator.com/item?id=37443404">thread link</a>) | @MathiasPius
+Score 201 | Comments 73 (<a href="https://news.ycombinator.com/item?id=37443404">thread link</a>) | @MathiasPius
 <br/>
 September 9, 2023 | https://datavirke.dk/posts/bare-metal-kubernetes-part-1-talos-on-hetzner/ | <a href="https://web.archive.org/web/*/https://datavirke.dk/posts/bare-metal-kubernetes-part-1-talos-on-hetzner/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -762,7 +1257,7 @@ Covers provisioning of the first server, installation of Talos Linux and configu
             </title>
             <description>
 <![CDATA[
-Score 24 | Comments 8 (<a href="https://news.ycombinator.com/item?id=37443252">thread link</a>) | @codyd51
+Score 27 | Comments 9 (<a href="https://news.ycombinator.com/item?id=37443252">thread link</a>) | @codyd51
 <br/>
 September 9, 2023 | https://axleos.com/making-a-newsletter-backend/ | <a href="https://web.archive.org/web/*/https://axleos.com/making-a-newsletter-backend/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -855,7 +1350,7 @@ September 9, 2023 | https://axleos.com/making-a-newsletter-backend/ | <a href="h
             </title>
             <description>
 <![CDATA[
-Score 183 | Comments 23 (<a href="https://news.ycombinator.com/item?id=37442810">thread link</a>) | @cpeterso
+Score 184 | Comments 23 (<a href="https://news.ycombinator.com/item?id=37442810">thread link</a>) | @cpeterso
 <br/>
 September 8, 2023 | http://cm.bell-labs.co/who/dmr/chist.html | <a href="https://web.archive.org/web/*/http://cm.bell-labs.co/who/dmr/chist.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
@@ -2269,7 +2764,7 @@ September 8, 2023 | https://www.abc.net.au/news/2023-09-09/wildfires-portugal-gr
             </title>
             <description>
 <![CDATA[
-Score 226 | Comments 143 (<a href="https://news.ycombinator.com/item?id=37440104">thread link</a>) | @nullagent
+Score 226 | Comments 145 (<a href="https://news.ycombinator.com/item?id=37440104">thread link</a>) | @nullagent
 <br/>
 September 8, 2023 | https://blog.dataparty.xyz/blog/snoop-unto-them/ | <a href="https://web.archive.org/web/*/https://blog.dataparty.xyz/blog/snoop-unto-them/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><p>03. September 2023</p><div>
@@ -2617,7 +3112,7 @@ Thanks for the thoughts; unfortunately I'm not configured to receive personal do
             </title>
             <description>
 <![CDATA[
-Score 78 | Comments 43 (<a href="https://news.ycombinator.com/item?id=37438842">thread link</a>) | @adm_
+Score 78 | Comments 44 (<a href="https://news.ycombinator.com/item?id=37438842">thread link</a>) | @adm_
 <br/>
 September 8, 2023 | https://david.rothlis.net/emacs/howtolearn.html | <a href="https://web.archive.org/web/*/https://david.rothlis.net/emacs/howtolearn.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content2">
@@ -2728,7 +3223,7 @@ September 8, 2023 | https://www.enricobassetti.it/2023/09/cve-2023-4809-freebsd-
             </title>
             <description>
 <![CDATA[
-Score 676 | Comments 592 (<a href="https://news.ycombinator.com/item?id=37435515">thread link</a>) | @mrkline
+Score 680 | Comments 592 (<a href="https://news.ycombinator.com/item?id=37435515">thread link</a>) | @mrkline
 <br/>
 September 8, 2023 | https://bitbashing.io/async-rust.html | <a href="https://web.archive.org/web/*/https://bitbashing.io/async-rust.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -3041,7 +3536,7 @@ We can save it for the 99% of our projects that
             </title>
             <description>
 <![CDATA[
-Score 140 | Comments 122 (<a href="https://news.ycombinator.com/item?id=37435215">thread link</a>) | @giuliomagnifico
+Score 141 | Comments 122 (<a href="https://news.ycombinator.com/item?id=37435215">thread link</a>) | @giuliomagnifico
 <br/>
 September 8, 2023 | https://www.ecu.edu.au/newsroom/articles/research/move-over-lithium-ion-zinc-air-batteries-a-cheaper-and-safer-alternative | <a href="https://web.archive.org/web/*/https://www.ecu.edu.au/newsroom/articles/research/move-over-lithium-ion-zinc-air-batteries-a-cheaper-and-safer-alternative">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="mainContent">
@@ -3093,7 +3588,7 @@ September 8, 2023 | https://www.ecu.edu.au/newsroom/articles/research/move-over-
             </title>
             <description>
 <![CDATA[
-Score 53 | Comments 84 (<a href="https://news.ycombinator.com/item?id=37435089">thread link</a>) | @oldschoolib
+Score 53 | Comments 86 (<a href="https://news.ycombinator.com/item?id=37435089">thread link</a>) | @oldschoolib
 <br/>
 September 8, 2023 | https://www.pamelajhobart.com/housewives-are-one-surprising-solution-to-millennial-burnout/ | <a href="https://web.archive.org/web/*/https://www.pamelajhobart.com/housewives-are-one-surprising-solution-to-millennial-burnout/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -3171,7 +3666,7 @@ Also mother of 3, Miata driver, and DIY manicure aficionado. </p>
             </title>
             <description>
 <![CDATA[
-Score 256 | Comments 37 (<a href="https://news.ycombinator.com/item?id=37434381">thread link</a>) | @geox
+Score 257 | Comments 37 (<a href="https://news.ycombinator.com/item?id=37434381">thread link</a>) | @geox
 <br/>
 September 8, 2023 | https://www.birmingham.ac.uk/news/2023/bees-struggle-to-find-flowers-because-of-air-pollution | <a href="https://web.archive.org/web/*/https://www.birmingham.ac.uk/news/2023/bees-struggle-to-find-flowers-because-of-air-pollution">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><div type="news"><figure><img src="https://www.birmingham.ac.uk/media-library/header-images/pexels-pixabay-65656.x37fbec8c.jpg" alt="A bee on a purple flower." srcset="https://www.birmingham.ac.uk/media-library/header-images/pexels-pixabay-65656.x37fbec8c.jpg?w=200 200w,https://www.birmingham.ac.uk/media-library/header-images/pexels-pixabay-65656.x37fbec8c.jpg?w=400 400w,https://www.birmingham.ac.uk/media-library/header-images/pexels-pixabay-65656.x37fbec8c.jpg?w=600 600w,https://www.birmingham.ac.uk/media-library/header-images/pexels-pixabay-65656.x37fbec8c.jpg?w=800 800w,https://www.birmingham.ac.uk/media-library/header-images/pexels-pixabay-65656.x37fbec8c.jpg?w=1000 1000w,https://www.birmingham.ac.uk/media-library/header-images/pexels-pixabay-65656.x37fbec8c.jpg?w=1200 1200w,https://www.birmingham.ac.uk/media-library/header-images/pexels-pixabay-65656.x37fbec8c.jpg?w=1400 1400w,https://www.birmingham.ac.uk/media-library/header-images/pexels-pixabay-65656.x37fbec8c.jpg?w=1600 1600w,https://www.birmingham.ac.uk/media-library/header-images/pexels-pixabay-65656.x37fbec8c.jpg?w=1800 1800w,https://www.birmingham.ac.uk/media-library/header-images/pexels-pixabay-65656.x37fbec8c.jpg?w=2000 2000w"><figcaption><span>Photo credit: Pixabay. </span></figcaption></figure><p><span><p>A research team comprising the UK Centre for Ecology &amp; Hydrology (UKCEH) and the Universities of Birmingham, Reading, Surrey and Southern Queensland, found that ozone substantially changes the size and scent of floral odour plumes given off by flowers, and that it reduced honeybees' ability to recognise odours by up to 90% from just a few metres away.<em> </em></p>
@@ -3195,7 +3690,7 @@ September 8, 2023 | https://www.birmingham.ac.uk/news/2023/bees-struggle-to-find
             </title>
             <description>
 <![CDATA[
-Score 61 | Comments 33 (<a href="https://news.ycombinator.com/item?id=37433743">thread link</a>) | @Dowwie
+Score 62 | Comments 33 (<a href="https://news.ycombinator.com/item?id=37433743">thread link</a>) | @Dowwie
 <br/>
 September 8, 2023 | https://about.honywen.com/publication/2023ase/# | <a href="https://web.archive.org/web/*/https://about.honywen.com/publication/2023ase/#">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -3532,7 +4027,7 @@ We can't wait to see how the community takes Vanna to new heights. Your contribu
             </title>
             <description>
 <![CDATA[
-Score 217 | Comments 73 (<a href="https://news.ycombinator.com/item?id=37431560">thread link</a>) | @brunoluiz
+Score 221 | Comments 73 (<a href="https://news.ycombinator.com/item?id=37431560">thread link</a>) | @brunoluiz
 <br/>
 September 8, 2023 | https://jpcamara.com/2023/04/12/pgbouncer-is-useful.html | <a href="https://web.archive.org/web/*/https://jpcamara.com/2023/04/12/pgbouncer-is-useful.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section><p><img src="https://cdn.uploads.micro.blog/98548/2023/e0723a5982.png" alt=""></p>
@@ -4200,7 +4695,7 @@ ROLLBACK; -- no notification is sent
             </title>
             <description>
 <![CDATA[
-Score 32 | Comments 3 (<a href="https://news.ycombinator.com/item?id=37431541">thread link</a>) | @slyall
+Score 40 | Comments 5 (<a href="https://news.ycombinator.com/item?id=37431541">thread link</a>) | @slyall
 <br/>
 September 8, 2023 | https://richard.hulse.nz/2023/09/08/digital-strategy-at-rnz-2005-2016-part-four/ | <a href="https://web.archive.org/web/*/https://richard.hulse.nz/2023/09/08/digital-strategy-at-rnz-2005-2016-part-four/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4729,7 +5224,7 @@ September 8, 2023 | https://richard.hulse.nz/2023/09/08/digital-strategy-at-rnz-
             </title>
             <description>
 <![CDATA[
-Score 26 | Comments 17 (<a href="https://news.ycombinator.com/item?id=37431496">thread link</a>) | @Eduard
+Score 31 | Comments 24 (<a href="https://news.ycombinator.com/item?id=37431496">thread link</a>) | @Eduard
 <br/>
 September 8, 2023 | https://www.smartermarx.com/t/chromostereopsis/650 | <a href="https://web.archive.org/web/*/https://www.smartermarx.com/t/chromostereopsis/650">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="post_1">
@@ -4974,7 +5469,7 @@ would become just unbearable.</p><hr><p>Want to read what other people have to s
             </title>
             <description>
 <![CDATA[
-Score 164 | Comments 102 (<a href="https://news.ycombinator.com/item?id=37422705">thread link</a>) | @mooreds
+Score 165 | Comments 103 (<a href="https://news.ycombinator.com/item?id=37422705">thread link</a>) | @mooreds
 <br/>
 September 7, 2023 | https://railsatscale.com/2023-08-29-ruby-outperforms-c/ | <a href="https://web.archive.org/web/*/https://railsatscale.com/2023-08-29-ruby-outperforms-c/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div aria-label="Content">
@@ -5319,7 +5814,7 @@ It would be really great to see TinyGQL’s parser used in the GraphQL gem so th
             </title>
             <description>
 <![CDATA[
-Score 22 | Comments 15 (<a href="https://news.ycombinator.com/item?id=37422355">thread link</a>) | @EntICOnc
+Score 22 | Comments 16 (<a href="https://news.ycombinator.com/item?id=37422355">thread link</a>) | @EntICOnc
 <br/>
 September 7, 2023 | https://krishnanchandra.com/posts/regex-catastrophic-backtracking/ | <a href="https://web.archive.org/web/*/https://krishnanchandra.com/posts/regex-catastrophic-backtracking/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -6521,10 +7016,10 @@ September 7, 2023 | https://www.okdoomer.io/nobodys-driving/ | <a href="https://
             </title>
             <description>
 <![CDATA[
-Score 175 | Comments 166 (<a href="https://news.ycombinator.com/item?id=37415812">thread link</a>) | @qsantos
+Score 176 | Comments 166 (<a href="https://news.ycombinator.com/item?id=37415812">thread link</a>) | @qsantos
 <br/>
 September 7, 2023 | https://gal.hagever.com/posts/my-node-js-is-a-bit-rusty | <a href="https://web.archive.org/web/*/https://gal.hagever.com/posts/my-node-js-is-a-bit-rusty">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article><p><span>This blog post has been residing in "draft" mode for quite a while now. I've finally decided to just publish it. As such, a few things might be a bit off, but... that's life, isn't it? I'm eager to hear what you think.</span></p><p>Back in 2020, my team at Wix launched a new internal product called CDN Stats. As the name suggests, CDN Stats is a platform that displays and aggregates data and statistics derived from Wix's CDN.</p><p>That same year, I delivered a presentation about an experiment I conducted. This experiment, which involved rewriting a single module into a native Node.js add-on using Rust, resulted in a staggering 25x performance improvement.</p><p><img src="https://s3.us-west-2.amazonaws.com/secure.notion-static.com/99be2ad5-1edf-4cac-968f-9e7866e506bf/Untitled.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&amp;X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&amp;X-Amz-Credential=AKIAT73L2G45EIPT3X45%2F20230910%2Fus-west-2%2Fs3%2Faws4_request&amp;X-Amz-Date=20230910T121520Z&amp;X-Amz-Expires=3600&amp;X-Amz-Signature=85633cf49c0bd580c94afddea2d774eaba1117cf576b3ac3246fc4894655433f&amp;X-Amz-SignedHeaders=host&amp;x-id=GetObject" alt="CDN stats screenshot from the talk."><span>CDN stats screenshot from the talk.</span></p><p>This platform empowers front-end developers at Wix by providing real-time data on the usage of their compiled assets by our customers, including:</p><ul><li>Platforms</li><li>Downloads (per platform)</li><li>Response size (transfer size)</li></ul><p>These metrics allow front-end developers to identify which bundles need optimization and the urgency of these optimizations. It helped us rectify a critical issue that we might have otherwise overlooked: due to a human error, one of our primary JavaScript assets ballooned to 33MB(!) because it inlined uncompressed SVG without externalizing it or even dynamically importing it.</p><p>This project seems fairly straightforward, doesn't it? All we're doing is counting and summing up some values! Toss in some indices in the database, present it with a data table, and voila. But is it really that simple?</p><h2>How does that work?</h2><p>In order to populate the data table, we need to sift through the CDN logs. These are tab-separated values files (TSV) stored in Amazon S3. We're talking about ~290k files per day, which can amount to 200GB.</p><p>So, every day, we download the TSV files from the previous day, parse them into meaningful information, and store this data in our database. We accomplish this by enqueuing each log file into a job queue. This strategy allows us to parallelize the process and utilize <em>25 instances</em> to parse the log files within approximately <em>3 hours</em> each day.</p><p>Then, every few hours, we generate an aggregation <em>for the previous week</em>. This process takes around ~1 hour and is primarily executed in the database using a MongoDB aggregation.</p><p>The MongoDB query was <a href="https://twitter.com/galstar/status/1384874486814724096">pretty intense</a>.</p><p><span>You may be thinking, "Isn't that a problem AWS Athena can solve?" and you'd be absolutely right. However, let's set that aside for now. It simply wasn't an option we were able to utilize at the time.</span></p><h2>So What's the Problem?</h2><p>Parsing gigabytes of TSV files might seem like a tedious task. Investing so much time and resources on it... well, it's not exactly a joy. To be brutally honest: having 25 Node.js instances running for three hours to parse 200GB of data seems like an indication that something isn't quite right.</p><p>The solution that eventually worked was not our first attempt. Initially, we tried using the internal Wix Serverless framework. We processed all log files concurrently (and aggregated them using <code>Promise.all</code>, isn't that delightful?). However, to our surprise, we soon ran into out-of-memory issues, even when using utilities like <a href="https://www.npmjs.com/package/p-limit"><code>p-limit</code></a> to limit ourselves to just two jobs in parallel. So, it was back to the drawing board for us.</p><p>Our second approach involved migrating the same code, verbatim, to the Wix Node.js platform, which runs on Docker containers in a Kubernetes cluster. We still encountered out-of-memory issues, leading us to reduce the number of files processed in parallel. Eventually, we got it to work—however, it was disappointingly slow. Processing a single day's worth of data took more than a day. Clearly, this was not a scalable solution!</p><p>So, we decided to try the job queue pattern. By scaling our servers to 25 containers, we managed to achieve a more reasonable processing time. But, can we truly consider running 25 instances to be <em>reasonable</em>?</p><p><strong>Perhaps it's time to consider that JavaScript may be the problem.</strong> There might be certain issues that JavaScript simply can't solve efficiently, especially when the work is primarily CPU and memory bound—areas where Node.js doesn't excel.</p><p>But why is that so?</p><h2>Node.js is a Garbage Collected VM</h2><p>Node.js is a remarkable piece of technology. It fosters innovation and enables countless developers to accomplish tasks and deliver products. Unlike languages such as C and C++, JavaScript does not require explicit memory management. Everything is handled by the runtime—in this case, a VM known as V8.</p><p>V8 determines when to free up memory. This is how many languages are designed to optimize the developer experience. However, for certain applications, explicit memory usage is unavoidable.</p><p>Let's analyze what (approximately) transpires when we execute our simplified TSV parsing code:</p><pre data-shiki="true"><code><span><span>for</span><span> </span><span>await</span><span> (</span><span>const</span><span> </span><span>line</span><span> </span><span>of</span><span> readlineStream) {</span></span>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article><p><span>This blog post has been residing in "draft" mode for quite a while now. I've finally decided to just publish it. As such, a few things might be a bit off, but... that's life, isn't it? I'm eager to hear what you think.</span></p><p>Back in 2020, my team at Wix launched a new internal product called CDN Stats. As the name suggests, CDN Stats is a platform that displays and aggregates data and statistics derived from Wix's CDN.</p><p>That same year, I delivered a presentation about an experiment I conducted. This experiment, which involved rewriting a single module into a native Node.js add-on using Rust, resulted in a staggering 25x performance improvement.</p><p><img src="https://s3.us-west-2.amazonaws.com/secure.notion-static.com/99be2ad5-1edf-4cac-968f-9e7866e506bf/Untitled.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&amp;X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&amp;X-Amz-Credential=AKIAT73L2G45EIPT3X45%2F20230910%2Fus-west-2%2Fs3%2Faws4_request&amp;X-Amz-Date=20230910T161843Z&amp;X-Amz-Expires=3600&amp;X-Amz-Signature=9198c0ac63300b050ad0ec034c4107227a0870ebaeaf5836d48bcdd6bd683127&amp;X-Amz-SignedHeaders=host&amp;x-id=GetObject" alt="CDN stats screenshot from the talk."><span>CDN stats screenshot from the talk.</span></p><p>This platform empowers front-end developers at Wix by providing real-time data on the usage of their compiled assets by our customers, including:</p><ul><li>Platforms</li><li>Downloads (per platform)</li><li>Response size (transfer size)</li></ul><p>These metrics allow front-end developers to identify which bundles need optimization and the urgency of these optimizations. It helped us rectify a critical issue that we might have otherwise overlooked: due to a human error, one of our primary JavaScript assets ballooned to 33MB(!) because it inlined uncompressed SVG without externalizing it or even dynamically importing it.</p><p>This project seems fairly straightforward, doesn't it? All we're doing is counting and summing up some values! Toss in some indices in the database, present it with a data table, and voila. But is it really that simple?</p><h2>How does that work?</h2><p>In order to populate the data table, we need to sift through the CDN logs. These are tab-separated values files (TSV) stored in Amazon S3. We're talking about ~290k files per day, which can amount to 200GB.</p><p>So, every day, we download the TSV files from the previous day, parse them into meaningful information, and store this data in our database. We accomplish this by enqueuing each log file into a job queue. This strategy allows us to parallelize the process and utilize <em>25 instances</em> to parse the log files within approximately <em>3 hours</em> each day.</p><p>Then, every few hours, we generate an aggregation <em>for the previous week</em>. This process takes around ~1 hour and is primarily executed in the database using a MongoDB aggregation.</p><p>The MongoDB query was <a href="https://twitter.com/galstar/status/1384874486814724096">pretty intense</a>.</p><p><span>You may be thinking, "Isn't that a problem AWS Athena can solve?" and you'd be absolutely right. However, let's set that aside for now. It simply wasn't an option we were able to utilize at the time.</span></p><h2>So What's the Problem?</h2><p>Parsing gigabytes of TSV files might seem like a tedious task. Investing so much time and resources on it... well, it's not exactly a joy. To be brutally honest: having 25 Node.js instances running for three hours to parse 200GB of data seems like an indication that something isn't quite right.</p><p>The solution that eventually worked was not our first attempt. Initially, we tried using the internal Wix Serverless framework. We processed all log files concurrently (and aggregated them using <code>Promise.all</code>, isn't that delightful?). However, to our surprise, we soon ran into out-of-memory issues, even when using utilities like <a href="https://www.npmjs.com/package/p-limit"><code>p-limit</code></a> to limit ourselves to just two jobs in parallel. So, it was back to the drawing board for us.</p><p>Our second approach involved migrating the same code, verbatim, to the Wix Node.js platform, which runs on Docker containers in a Kubernetes cluster. We still encountered out-of-memory issues, leading us to reduce the number of files processed in parallel. Eventually, we got it to work—however, it was disappointingly slow. Processing a single day's worth of data took more than a day. Clearly, this was not a scalable solution!</p><p>So, we decided to try the job queue pattern. By scaling our servers to 25 containers, we managed to achieve a more reasonable processing time. But, can we truly consider running 25 instances to be <em>reasonable</em>?</p><p><strong>Perhaps it's time to consider that JavaScript may be the problem.</strong> There might be certain issues that JavaScript simply can't solve efficiently, especially when the work is primarily CPU and memory bound—areas where Node.js doesn't excel.</p><p>But why is that so?</p><h2>Node.js is a Garbage Collected VM</h2><p>Node.js is a remarkable piece of technology. It fosters innovation and enables countless developers to accomplish tasks and deliver products. Unlike languages such as C and C++, JavaScript does not require explicit memory management. Everything is handled by the runtime—in this case, a VM known as V8.</p><p>V8 determines when to free up memory. This is how many languages are designed to optimize the developer experience. However, for certain applications, explicit memory usage is unavoidable.</p><p>Let's analyze what (approximately) transpires when we execute our simplified TSV parsing code:</p><pre data-shiki="true"><code><span><span>for</span><span> </span><span>await</span><span> (</span><span>const</span><span> </span><span>line</span><span> </span><span>of</span><span> readlineStream) {</span></span>
 <span><span>  </span><span>const</span><span> </span><span>fields</span><span> </span><span>=</span><span> </span><span>line</span><span>.split</span><span>(</span><span>'\t'</span><span>);</span></span>
 <span><span>  </span><span>const</span><span> </span><span>httpStatus</span><span> </span><span>=</span><span> </span><span>Number</span><span>(fields[</span><span>5</span><span>]);</span></span>
 <span><span>  </span><span>if</span><span> (httpStatus </span><span>&lt;</span><span> </span><span>200</span><span> </span><span>||</span><span> httpStatus </span><span>&gt;</span><span> </span><span>299</span><span>) </span><span>continue</span><span>;</span></span>
@@ -6562,7 +7057,7 @@ September 7, 2023 | https://gal.hagever.com/posts/my-node-js-is-a-bit-rusty | <a
 <span><span>  </span><span>const</span><span> </span><span>stream</span><span> </span><span>=</span><span> </span><span>fs</span><span>.createReadStream</span><span>(</span><span>'../SOME_BIG_FIXTURE'</span><span>);</span></span>
 <span><span>  </span><span>const</span><span> </span><span>values</span><span> </span><span>=</span><span> </span><span>await</span><span> </span><span>jsParser</span><span>.runAsync</span><span>([stream]);</span></span>
 <span><span>  </span><span>assert</span><span>.ok</span><span>(</span><span>values</span><span>.</span><span>length</span><span> </span><span>&gt;</span><span> </span><span>0</span><span>)</span></span>
-<span><span>});</span></span></code></pre><p>and ran it. The results were impressive:</p><p><img src="https://s3.us-west-2.amazonaws.com/secure.notion-static.com/cc580a60-25ed-46cf-a1e1-f1f094c90b0e/Untitled.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&amp;X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&amp;X-Amz-Credential=AKIAT73L2G45EIPT3X45%2F20230910%2Fus-west-2%2Fs3%2Faws4_request&amp;X-Amz-Date=20230910T121520Z&amp;X-Amz-Expires=3600&amp;X-Amz-Signature=d80530379819a0eaa8503ac8646928567d64b690ae3f91d90d7d04db3dc6a41f&amp;X-Amz-SignedHeaders=host&amp;x-id=GetObject" alt="a screenshot from the CLI output of the benchmarking tool"><span>a screenshot from the CLI output of the benchmarking tool</span></p><p><img src="https://s3.us-west-2.amazonaws.com/secure.notion-static.com/866c4ca6-29a1-420b-9983-290179f1f58b/Untitled.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&amp;X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&amp;X-Amz-Credential=AKIAT73L2G45EIPT3X45%2F20230910%2Fus-west-2%2Fs3%2Faws4_request&amp;X-Amz-Date=20230910T121520Z&amp;X-Amz-Expires=3600&amp;X-Amz-Signature=7d2bf0689e6911174f133b4ad67df2a73e393c1687c40523d99199eb9f402ecb&amp;X-Amz-SignedHeaders=host&amp;x-id=GetObject" alt="a screenshot from the web UI of the benchmarking tool"><span>a screenshot from the web UI of the benchmarking tool</span></p><p>The results in plain text were as follows:</p><ul><li>JavaScript parser<ul><li>5878ms of overall runtime</li><li>6.49sec CPU time</li><li><em>381mb of memory usage</em></li></ul></li><li>Rust parser<ul><li>1145ms of overall runtime</li><li>3.25sec CPU time</li><li><em>1.75mb of memory usage</em></li></ul></li></ul><p>While there is a significant difference in times, the most glaring disparity lies in memory usage. This difference enables us to process <em>more files in parallel</em>. And that's a huge advantage.</p><h2>Previewing a Deployment</h2><p>The Wix deployment preview model is based on ephemeral Kubernetes pods that can be manually requested for a specific commit. The ingress proxy can then direct traffic to these special pods given a specific header. This is great for testing something as innovative as this project, so we decided to try running a preview deployment using the Rust parser instead of the JavaScript one.</p><p>We ran a benchmark a few times. We processed the same 190,000 log files, using the following infrastructure:</p><ul><li>JavaScript implementation with 25 instances, which finished in ~3 hours.</li><li>Rust implementation with one deploy preview instance, completing in ~2.5 hours.</li></ul><p>This does not include any database I/O (since the deploy preview instance is read-only), but:</p><ul><li>There are far fewer insertions in the Rust implementation because we can process more files simultaneously. This enhances our aggregation and reduces the number of records to be pushed to the database.</li><li>We could modify our implementation to store the data directly in a simple storage like S3, and then have a separate job that transfers the data directly to the database. This would allow us to separate computational work from network work.</li></ul><p>Assuming the times were the same, the Rust implementation used only 1/25 of the resources available to the JavaScript implementation. That's a 2500% performance boost! Even if we do need to add the MongoDB insertions, which may take some extra time, we would still be looking at a boost of 2000%? 1900%? Either way, it's a significant win.</p><p><img src="https://s3.us-west-2.amazonaws.com/secure.notion-static.com/853061dd-45dd-4788-8670-0becf29831d2/Untitled.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&amp;X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&amp;X-Amz-Credential=AKIAT73L2G45EIPT3X45%2F20230910%2Fus-west-2%2Fs3%2Faws4_request&amp;X-Amz-Date=20230910T121520Z&amp;X-Amz-Expires=3600&amp;X-Amz-Signature=1438f4e7d838fdf2792421fa0f2d7aeb48f68038d9c265d3ff219b0e4f3c182c&amp;X-Amz-SignedHeaders=host&amp;x-id=GetObject" alt="Figure #0"></p><h2>So, What's the Takeaway?</h2><p>It seems that choosing the right tool for the job is essential. Some tasks are well-suited to JavaScript, while others are not. Although Rust is a language that's more challenging to master, we can still encapsulate the logic and distribute it in such a way that users don't mind using it. We can see this trend across the JavaScript ecosystem: Next.js replaced their use of Babel with SWC and may soon use Turbopack by default (fingers crossed). Esbuild, a popular choice for bundling and transforming TypeScript or modern JS to JavaScript, is written in Golang. It's simply faster, which is always beneficial.</p><p>So, I suppose my takeaway here is... use whatever makes you happy, and if something is too slow, profile it first, then encapsulate it, and then—perhaps—consider rewriting it in Rust. 😈</p></article></div>]]>
+<span><span>});</span></span></code></pre><p>and ran it. The results were impressive:</p><p><img src="https://s3.us-west-2.amazonaws.com/secure.notion-static.com/cc580a60-25ed-46cf-a1e1-f1f094c90b0e/Untitled.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&amp;X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&amp;X-Amz-Credential=AKIAT73L2G45EIPT3X45%2F20230910%2Fus-west-2%2Fs3%2Faws4_request&amp;X-Amz-Date=20230910T161843Z&amp;X-Amz-Expires=3600&amp;X-Amz-Signature=5260deabb315536b691ee9b80c156f73cbc672b4c3265b9957fce70e764b4b87&amp;X-Amz-SignedHeaders=host&amp;x-id=GetObject" alt="a screenshot from the CLI output of the benchmarking tool"><span>a screenshot from the CLI output of the benchmarking tool</span></p><p><img src="https://s3.us-west-2.amazonaws.com/secure.notion-static.com/866c4ca6-29a1-420b-9983-290179f1f58b/Untitled.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&amp;X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&amp;X-Amz-Credential=AKIAT73L2G45EIPT3X45%2F20230910%2Fus-west-2%2Fs3%2Faws4_request&amp;X-Amz-Date=20230910T161843Z&amp;X-Amz-Expires=3600&amp;X-Amz-Signature=938c64705c59aea054c8f991aff7627242ac805f77f88aee0b173547828d0f79&amp;X-Amz-SignedHeaders=host&amp;x-id=GetObject" alt="a screenshot from the web UI of the benchmarking tool"><span>a screenshot from the web UI of the benchmarking tool</span></p><p>The results in plain text were as follows:</p><ul><li>JavaScript parser<ul><li>5878ms of overall runtime</li><li>6.49sec CPU time</li><li><em>381mb of memory usage</em></li></ul></li><li>Rust parser<ul><li>1145ms of overall runtime</li><li>3.25sec CPU time</li><li><em>1.75mb of memory usage</em></li></ul></li></ul><p>While there is a significant difference in times, the most glaring disparity lies in memory usage. This difference enables us to process <em>more files in parallel</em>. And that's a huge advantage.</p><h2>Previewing a Deployment</h2><p>The Wix deployment preview model is based on ephemeral Kubernetes pods that can be manually requested for a specific commit. The ingress proxy can then direct traffic to these special pods given a specific header. This is great for testing something as innovative as this project, so we decided to try running a preview deployment using the Rust parser instead of the JavaScript one.</p><p>We ran a benchmark a few times. We processed the same 190,000 log files, using the following infrastructure:</p><ul><li>JavaScript implementation with 25 instances, which finished in ~3 hours.</li><li>Rust implementation with one deploy preview instance, completing in ~2.5 hours.</li></ul><p>This does not include any database I/O (since the deploy preview instance is read-only), but:</p><ul><li>There are far fewer insertions in the Rust implementation because we can process more files simultaneously. This enhances our aggregation and reduces the number of records to be pushed to the database.</li><li>We could modify our implementation to store the data directly in a simple storage like S3, and then have a separate job that transfers the data directly to the database. This would allow us to separate computational work from network work.</li></ul><p>Assuming the times were the same, the Rust implementation used only 1/25 of the resources available to the JavaScript implementation. That's a 2500% performance boost! Even if we do need to add the MongoDB insertions, which may take some extra time, we would still be looking at a boost of 2000%? 1900%? Either way, it's a significant win.</p><p><img src="https://s3.us-west-2.amazonaws.com/secure.notion-static.com/853061dd-45dd-4788-8670-0becf29831d2/Untitled.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&amp;X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&amp;X-Amz-Credential=AKIAT73L2G45EIPT3X45%2F20230910%2Fus-west-2%2Fs3%2Faws4_request&amp;X-Amz-Date=20230910T161843Z&amp;X-Amz-Expires=3600&amp;X-Amz-Signature=c9403203f79b3d6658147a8d1202530838a5d3fe5f9840bfd98af31abdc3b6d5&amp;X-Amz-SignedHeaders=host&amp;x-id=GetObject" alt="Figure #0"></p><h2>So, What's the Takeaway?</h2><p>It seems that choosing the right tool for the job is essential. Some tasks are well-suited to JavaScript, while others are not. Although Rust is a language that's more challenging to master, we can still encapsulate the logic and distribute it in such a way that users don't mind using it. We can see this trend across the JavaScript ecosystem: Next.js replaced their use of Babel with SWC and may soon use Turbopack by default (fingers crossed). Esbuild, a popular choice for bundling and transforming TypeScript or modern JS to JavaScript, is written in Golang. It's simply faster, which is always beneficial.</p><p>So, I suppose my takeaway here is... use whatever makes you happy, and if something is too slow, profile it first, then encapsulate it, and then—perhaps—consider rewriting it in Rust. 😈</p></article></div>]]>
             </description>
             <link>https://gal.hagever.com/posts/my-node-js-is-a-bit-rusty</link>
             <guid isPermaLink="false">hacker-news-small-sites-37415812</guid>
