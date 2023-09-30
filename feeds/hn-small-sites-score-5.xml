@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Fri, 29 Sep 2023 20:20:31 GMT</lastBuildDate>
+        <lastBuildDate>Sat, 30 Sep 2023 00:25:47 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-5.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Fri, 29 Sep 2023 20:20:31 GMT</pubDate>
+        <pubDate>Sat, 30 Sep 2023 00:25:47 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,214 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Refactoring Nginx Worker Processes to Be Multi-Threaded]]>
+            </title>
+            <description>
+<![CDATA[
+Score 6 | Comments 0 (<a href="https://news.ycombinator.com/item?id=37707578">thread link</a>) | @eyberg
+<br/>
+September 29, 2023 | https://nanovms.com/dev/tutorials/refactoring-nginx-worker-processes-multi-threaded | <a href="https://web.archive.org/web/*/https://nanovms.com/dev/tutorials/refactoring-nginx-worker-processes-multi-threaded">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+
+<p>We've supported nginx running as a unikernel as-is w/no patches for a
+long time but it still utilizes 90s style worker processes, so
+naturally we cut patches to convert them to threads and instantly got a
+free performance boost.
+</p>
+
+<p>Let's step back in time though to understand why nginx works this way.
+Nginx was released in 2004 but work started around 2002. Back then the
+dominant webserver on linux was apache.
+</p>
+
+<p>
+While the Intel Pentium 4 was released in 2000 it wasn't until 2002 that
+we had the first Northwood processors with SMP.
+</p>
+
+<center><h4>The beaver is out of detox.</h4></center>
+
+<p>Then in late December of 2003 (almost 2004) Linux 2.6 landed with NPTL
+which, threads as we know them in linux today, finally landed.</p>
+
+<p>It wasn't just the lack of availability of consumer SMP enabled
+processors or NPTL that was problematic at this time though. For sure we
+needed those but those were just enablers.</p>
+
+<p>The programming idioms that were used in webservers before this time
+reflected the architecture and libraries available. It also reflected
+the reality of that time period. CGI and its infinite
+number of permutations was a very common method of serving up traffic.
+In it's simplest form a http request would come in and the webserver would
+quite literally fork/exec a whole new program to serve each request
+including db setup and all the other associated startup costs. For those
+not around during this time period, you could imagine how bad from a
+performance and security viewpoint this was. This
+would later evolve to pre-forking a handful of worker processes which
+were persistent and shuttle data along either unix sockets or through a
+local tcp connection. Even though this style of infrastructure solved
+the backend scaling problem there was still the problem of the
+front-end and thus it was common, for systems that could support it, to
+have multiple worker processes in front as well and that is what the
+'worker processes' variable in the nginx config files still does up to today.</p>
+
+<h3>Enter unikernels.</h3>
+
+<p>Unikernels are single process by nature and so are not allowed
+architecturally to pre-fork processes on their own. This is by design.
+To scale these you must either pre-spawn unikernels to the same number
+you'd have as pre-forking your processes, or you can rely on the software
+in question's ability to use threads. If you are using something like
+go, rust, java, etc. you can scale pretty far on one vm simply because
+you have access to threads. Modern machines have hundreds of threads
+available and we can only see this trend continuing.</p>
+
+<p>Writing code to use multiple processes when an underlying language can
+use multiple threads is problematic and wasteful on many fronts. With large heaps
+spawning new processes (such as taking a database dump as some
+applications will do) can be very expensive and can also cause issues
+with GC enabled languages. Multiple processes are inherently unsafe from
+a security point of view and that's ignoring the sheer amount of code
+you'll see in various scripting languages that will wrap command after
+command after command in highly unsafe calls. Finally, the complexity
+that is introduced into multiple process paradigms is very high with
+signaling, shared memory cause they can't access the same heap, dealing
+with existing resources (connections) that can't go into a new process upon creation, etc.</p>
+
+<p>It's a paradigm that worked for us in the past, but with newer languages such
+as GO and Rust, along with a wide collection of existing language
+support, it simply is not something that is advisable any longer.
+Even the scripting languages are starting to jump ship and those are
+inherently single-process/single-thread by design, and I feel with
+the embrace of isolates those languages will eventually go full bore
+here. Although, arguably this is a much tougher task because of how
+these languages actually work.</p>
+
+<p>For instance it's fairly easy to make a
+multi-threaded webserver that runs something like php but when you want
+to run wordpress on it now you have to go in and re-write large portions
+of wordpress because codebases like that assume you are in a single
+thread environment and have never had to deal with issues such as global
+vars everywhere. I'm sure your comp sci professor told you in CS53 to
+avoid globals but unfortuantely that's just not real life.</p>
+
+<p>One just needs to peruse some of the prs from projects like <a href="https://github.com/roadrunner-server/roadrunner/issues/64">roadrunner</a>:</p>
+
+<p>"You are not able to pass more than one request through the WP. Since WP
+treats the request as a global instance it will cache its values inside
+the config and other functions. This makes impossible to reuse already
+initiated application. This is caused by the fact that WP does not use
+any request/response abstraction."</p>
+
+<p>or by looking at <a href="https://github.com/swoole/swoole-src/issues/4119">swoole</a>:</p>
+
+<p>"I'd like to know if its
+possible to run WordPress on Swoole?</p>
+
+<p>No, there are a lot of global variables and other problems in WordPress"</p>
+
+<p>Back to nginx. So why can't we scale with threads here since it is
+written in c? Well, as I'm about to show you - we absolutely can and
+sometimes it doesn't even take that much code to do so.</p>
+
+<p>Early on Nginx distinguished itself by having an event driven
+architecture using epoll but it still would spawn multiple frontend
+listener processes.</p>
+
+
+<h3>Refactoring Nginx</h3>
+
+<p>We decided to look at the worker_processes setting first as that is the
+main setting that is stubbed out in the default configs of any nginx
+package you might find on the <a href="https://repo.ops.city/">ops
+package repository</a>. You might have noticed that nginx has a 'thread_pool'
+setting, <a href="https://www.nginx.com/blog/thread-pools-boost-performance-9x/">in which Nginx notes a 9X improvement</a>, although that only deals with a few calls such as read and sendfile.</p>
+
+<p>One of the major problems with code that has been written to work as
+multiple processes vs multiple threads is the gratuitous use of
+global/static variables. You'll see this a lot in projects like this, but it's also one
+of the main problems with scripting languages as well. If you are
+working in a codebase that is built around multiple processes chances
+are there isn't any thread usage, or if there is it is very isolated as
+mixing the two can be very problematic. So what you'll find is that in the
+multi-process program having globals/statics everywhere isn't a huge
+issue, at least when it comes to shared state since there is none - each
+new process will have its own. This is actually slightly a lie though as
+we'll point out because then you start using things like shared memory
+between processes, or shuttling data back and forth on unix sockets or
+issuing signals to other processes to "do something". When you convert these to threads,
+however, now you have to think about that and that's what makes people
+shy away from ever doing the conversion on legacy codebases. This was
+actually <a href="https://www.postgresql.org/message-id/31cc6df9-53fe-3cd9-af5b-ac0d801163f4%40iki.fi">brought
+up on the postgres mailing list recently</a> and we even got in on the
+action and cut a <a href="https://nanovms.com/dev/tutorials/running-postgres-as-a-unikernel">unikernel for postgres</a>.</p>
+
+<p>Luckily for us, we have a simple replacement where we can prefix these variables with the <a href="https://gcc.gnu.org/onlinedocs/gcc/Thread-Local.html">__thread keyword</a> indicating that we want each variable to be allocated per each thread.</p>
+
+<p>I should state that this enables us to quickly convert nginx over but
+that doesn't mean that if someone wanted to further enhance the code it
+might behoove them to refactor the code under these new assumptions.
+Simply replacing one pattern with another almost never gets you optimal
+architecture. Typically in cases like this you'll want to rethink how
+the architecture works. For instance in this case instead of just
+plugging in _thread everywhere why not encapsulate that info explicitly?
+If you end up going down this route with nginx
+or something else please let us know!</p>
+
+<p>Another change we made was, in a multiple process configuration there is
+typically a master process that deals with coordination amongst the
+child processes. So removing the signaling for that was done. We ended
+up adding a new ngx_master_cycle to faciliate copying the contents of
+ngx_cycle_t.</p>
+
+<p>Nginx used to pass data through unix sockets but that is not necessary
+in a multi-thread setup so we removed those and instead added support to
+get the channel fds from the ngx_processes array which we left as
+is.</p>
+
+<p>We got rid of the setuid/gid calls for a few reasons. One, they utilize
+xidcmd which can be racy and two, we stub them any.</p>
+
+<p>You can apply the <a href="https://github.com/nanovms/nginx">patches</a> yourself against a recent version of nginx
+(1.25.2 as of this writing):</p>
+
+<pre><code>git apply 0001-ngx_spawn_process-disable-non-blocking-operation-on-.patch
+git apply 0002-Worker-processes-convert-to-worker-threads.patch</code></pre>
+
+<p>Or you can just run the package we built:</p>
+
+<pre><code>ops pkg load eyberg/nginx-mt:1.25.2 --nanos-version=042cf2f -p 8084</code></pre>
+
+<p>I should also state as people have already asked - I wouldn't expect
+Nginx or F5 to pull this into their mainline. Nginx has been around for
+almost 20 years and so has a considerably large existing userbase, who,
+for a portion these changes would not work for. That's ok.</p>
+
+<p>This also points to our way of thinking. Having a new kernel that
+embraces certain characteristics doesn't diminish from the fact that there
+is a large swath of software out there that is decades old that may or
+may not conform to different patterns. There is a lot of software out
+there that is just like the roads and bridges that should be repaired. Going in and making these changes
+though allow broader community adoption for existing brown-field
+software yet at the same time encourages others to consider making more
+unikernel-native software. Not only do we get immediate improvements for
+a lot of existing software by provisioning them as unikernels, software
+that is explicitly made for unikernels can actually express themselves
+in a manner that the older software can't.</p>
+
+            </div></div>]]>
+            </description>
+            <link>https://nanovms.com/dev/tutorials/refactoring-nginx-worker-processes-multi-threaded</link>
+            <guid isPermaLink="false">hacker-news-small-sites-37707578</guid>
+            <pubDate>Fri, 29 Sep 2023 17:33:45 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Show HN: RISC-V assembly tabletop board game (hack your opponent)]]>
             </title>
             <description>
 <![CDATA[
-Score 166 | Comments 18 (<a href="https://news.ycombinator.com/item?id=37704760">thread link</a>) | @throwaway71271
+Score 225 | Comments 28 (<a href="https://news.ycombinator.com/item?id=37704760">thread link</a>) | @throwaway71271
 <br/>
 September 29, 2023 | https://punkx.org/overflow/ | <a href="https://web.archive.org/web/*/https://punkx.org/overflow/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
@@ -366,11 +569,231 @@ September 29, 2023 | https://punkx.org/overflow/ | <a href="https://web.archive.
         </item>
         <item>
             <title>
+<![CDATA[I closed a lot of browser tabs (2021)]]>
+            </title>
+            <description>
+<![CDATA[
+Score 6 | Comments 2 (<a href="https://news.ycombinator.com/item?id=37703217">thread link</a>) | @rrampage
+<br/>
+September 29, 2023 | https://rjbs.cloud/blog/2021/08/i-closed-a-lot-of-browser-tabs/ | <a href="https://web.archive.org/web/*/https://rjbs.cloud/blog/2021/08/i-closed-a-lot-of-browser-tabs/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+    <p>I am widely admired at work for my ability to have many, many browser tabs
+open.  (That, at least, is what I take from the frequent shouts of “holy cow,
+man, look at your browser!”)  Nonetheless, I have long thought that it would be
+worth getting my total tab count down.  I have tabs open for a bunch of
+reasons.</p>
+
+<ul>
+  <li>document I meant to read eventually</li>
+  <li>document I meant to read in time for some meeting</li>
+  <li>web application I always keep open</li>
+  <li>thing I am in the middle of working on but should finish at some point</li>
+  <li>thing I was reading or editing but am basically done with</li>
+  <li>duplicate tab of any of the above</li>
+</ul>
+
+<p>One problem here is that once the count of tabs is large enough, “clean up
+tabs” starts with a whole step of “figure out which tab is what kind of tab”.
+Can I just close it because I’m done?  Is it a thing I should read?  Soon?
+Someday?  I need to improve my real time habits: closing things when done,
+grouping things by purpose, and so on.  Until then, though, I need to see when
+I’ve let things get out of control.</p>
+
+<p>For years, I’ve thought, “I should visualize my tab count over time.”  Once or
+twice I even wrote programs to help, but about a week ago I finally made the
+whole thing go.  When I Tweeted about it, I got a couple “how’d you do thats?”,
+so I thought I’d write it up.  It’s simple, except sort of not.</p>
+
+<p>Here’s the output:</p>
+
+<p><img src="https://rjbs.cloud/assets/tab-count-graph.png" alt="a graph of my browser tabs"></p>
+
+<p>If you can’t tell, this graph is generated by
+<a href="https://en.wikipedia.org/wiki/Grafana">Grafana</a>, a data visualizer that can
+produce graphs and many other visualizations of data from all kinds of systems.
+So, I needed to set up Grafana.  That was easy, I used their free cloud
+hosting, but setting up Grafana on a Linode is also dead simple.  Basically,
+you install and tell it where to get the data.  There are a lot of Grafana
+tutorials.</p>
+
+<p>I have my Grafana pointed at Prometheus.  Prometheus is a <a href="https://en.wikipedia.org/wiki/Time_series_database">time series
+database</a> that gathers data
+by hitting HTTP endpoints.  To grossly simplify, if you want your application
+to expose metrics to be gathered and later analyzed, you give it HTTP listener
+that replies with data in a specific format.  There are a lot of Prometheus
+tutorials.</p>
+
+<p>What I needed to do was to provide an HTTP service that would provide tab
+counts.  I picked the simplest possible way to provide that count, meaning a
+response like this:</p>
+
+<div><div><pre><code>Content-Type: text/plain
+
+chrome_open_tabs 234
+</code></pre></div></div>
+
+<p><strong>First problem</strong>: how to count tabs?</p>
+
+<p>When I originally looked at doing this, years ago, I was using Firefox.  I tend
+to switch back and forth between Chrome and Firefox every few years.  In
+Firefox, it was pretty easy to get tab counts.  In the profile directory,
+there’s a file called something like <code>sessionstore-backups/recovery.jsonlz4</code>.
+The exact place this lives has changed over time, but generally there has been
+a JSON file in your profile that you could read to see tabs.</p>
+
+<p>Chrome stores its sessions in a seemingly obnoxious binary format called SSNS.
+I looked at decoding it and groaned.  I knew I could write a browser extension
+to get at the tab counts, but I had a vague sense of unease about two things.
+First, I wasn’t sure I’d have any means to embed a web server in Chrome to
+serve this data.  That meant I’d want to write the data to a file to be server
+by something else.  That gets to my second concern:  I doubted I’d be able to
+reliably write the tab count to a file from an extension.</p>
+
+<p>I had a flash of inspiration, though.  If, by some great mercy, Chrome was
+automatable by AppleScript, I could make a go of it.  I opened up the macOS
+Script Editor, hit Cmd-Shift-O to “Open Dictionary”, and looked for Google
+Chrome.  It was there!  Its automation suite is tiny, but it exposes windows
+and tabs.  I was able to write this AppleScript:</p>
+
+<div><div><pre><code><span>set</span><span> </span><span>tabcount</span><span> </span><span>to</span><span> </span><span>0</span><span>
+</span><span>if</span><span> </span><span>application</span><span> </span><span>"Google Chrome"</span><span> </span><span>is</span><span> </span><span>running</span><span> </span><span>then</span><span>
+  </span><span>tell</span><span> </span><span>application</span><span> </span><span>"Google Chrome"</span><span>
+    </span><span>repeat</span><span> </span><span>with</span><span> </span><span>w</span><span> </span><span>in</span><span> </span><span>windows</span><span>
+      </span><span>set</span><span> </span><span>tabcount</span><span> </span><span>to</span><span> </span><span>tabcount</span><span> </span><span>+</span><span> </span><span>(</span><span>count</span><span> </span><span>of</span><span> </span><span>tabs</span><span> </span><span>of</span><span> </span><span>w</span><span>)</span><span>
+    </span><span>end</span><span> </span><span>repeat</span><span>
+  </span><span>end</span><span> </span><span>tell</span><span>
+</span><span>end</span><span> </span><span>if</span><span>
+</span></code></pre></div></div>
+
+<p>AppleScript is weird, but I have had decent success in using it for lots of
+little tasks in the past.  These days, what I tend to do is prove something
+will work in AppleScript, then port it to JavaScript, using JXA.  JXA is
+“JavaScript for Automation”, which is just “what if you could write JavaScript
+instead of AppleScript to do the same stuff?”  This is pretty appealing!
+JavaScript is a much less weird language, and you can combine your macOS
+automation with other code you’ve written in JavaScript.</p>
+
+<p>It’s not perfect, though.  The objects you get to represent AppleScriptable
+entities are pretty clumsy.  They don’t let you get a list of their properties,
+and if you make a guess, it won’t help much.  <code>object.foo</code> will always evaluate
+to a function, but that function may throw a “no such function” exception when
+called.  Array-like objects aren’t iterable, so you’ll do a lot of looping over
+indexes instead of iterating over value.  Still, this isn’t so bad:</p>
+
+<div><div><pre><code><span>let</span> <span>tabcount</span> <span>=</span> <span>0</span><span>;</span>
+<span>const</span> <span>Chrome</span> <span>=</span> <span>new</span> <span>Application</span><span>(</span><span>"</span><span>Google Chrome</span><span>"</span><span>);</span>
+
+<span>if</span> <span>(</span><span>Chrome</span><span>.</span><span>running</span><span>())</span> <span>{</span>
+  <span>for</span> <span>(</span><span>i</span> <span>in</span> <span>Chrome</span><span>.</span><span>windows</span><span>)</span> <span>{</span>
+    <span>tabcount</span> <span>+=</span> <span>Chrome</span><span>.</span><span>windows</span><span>[</span><span>i</span><span>].</span><span>tabs</span><span>.</span><span>length</span><span>;</span>
+  <span>}</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>That “check if Chrome is running” step is important.  On one hand, it would be
+nice to act like quitting Chrome didn’t really eliminate the mental weight of
+its tabs.  On the other, using AppleScript to talk to an application that isn’t
+running will launch that application, and I sure don’t want that.</p>
+
+<p><strong>Second problem</strong>: how to spin up the HTTP service?</p>
+
+<p>Now I had a means to count tabs.  The code I actually wrote was a little
+different, because I gathered an array of per-window tab counts, in case I
+wanted to graph that, too, but it was a lot like code above.  Now I needed to
+get it running regularly.  The most obvious option for this was to have it run
+under <a href="https://en.wikipedia.org/wiki/Launchd">launchd</a>, the macOS service
+manager.  This would be very sensible, but would require I think about launchd
+configuration, which I don’t like doing.  I thought about setting up
+<a href="https://en.wikipedia.org/wiki/Daemontools">daemontools</a> to run things out of
+my home directory.  I’d have to run it from launchd, but having set that up
+once, I wouldn’t have to think about it again.  I didn’t even want to think
+about it once, thought!</p>
+
+<p>I had another weird realization.  I use a program called
+<a href="https://www.hammerspoon.org/">Hammerspoon</a>, which is sort of an all-purpose
+tool for doing macOS automation.  I use it to inject some menu bar icons that
+reorganize my desktop or run timers, and to set up keyboard shortcuts for a few
+things.  Among its many other functions, it has facilities for embedded HTTP
+service.  It can <em>also</em> run JavaScript using JXA.  I wrote this:</p>
+
+<div><div><pre><code><span>tabulator</span> <span>=</span> <span>hs</span><span>.</span><span>httpserver</span><span>.</span><span>new</span><span>()</span>
+<span>tabulator</span><span>:</span><span>setPort</span><span>(</span><span>9876</span><span>)</span>
+<span>tabulator</span><span>:</span><span>setCallback</span><span>(</span><span>function</span> <span>(</span><span>method</span><span>,</span> <span>path</span><span>,</span> <span>headers</span><span>,</span> <span>body</span><span>)</span>
+  <span>if</span> <span>(</span><span>method</span> <span>==</span> <span>"GET"</span><span>)</span> <span>and</span> <span>(</span><span>path</span> <span>==</span> <span>"/metrics"</span><span>)</span> <span>then</span>
+    <span>bool</span><span>,</span> <span>tabcounts</span><span>,</span> <span>descriptor</span> <span>=</span> <span>hs</span><span>.</span><span>osascript</span><span>.</span><span>javascript</span><span>(</span><span>[[
+      const Chrome  = new Application(
+        "/Applications/Google Chrome.app"
+      );
+
+      let tabCounts = [];
+
+      if (Chrome.running()) {
+        for (i in Chrome.windows) {
+          tabCounts.push(Chrome.windows[i].tabs.length);
+        }
+
+        tabCounts.sort((a,b) =&gt; b - a);
+      }
+
+      tabCounts;
+    ]]</span><span>)</span>
+
+    <span>if</span> <span>not</span> <span>bool</span> <span>then</span>
+      <span>return</span> <span>"Error\n"</span><span>,</span> <span>500</span><span>,</span> <span>{}</span>
+    <span>end</span>
+
+    <span>local</span> <span>sum</span> <span>=</span> <span>0</span>
+    <span>for</span> <span>i</span><span>,</span> <span>tabs</span> <span>in</span> <span>ipairs</span><span>(</span><span>tabcounts</span><span>)</span> <span>do</span>
+      <span>sum</span> <span>=</span> <span>sum</span> <span>+</span> <span>tabs</span>
+    <span>end</span>
+
+    <span>return</span> <span>"chrome_open_tabs "</span> <span>..</span> <span>sum</span> <span>..</span> <span>"</span><span>\n</span><span>"</span><span>,</span> <span>200</span><span>,</span> <span>{}</span>
+  <span>else</span>
+    <span>return</span> <span>"No good.\n"</span><span>,</span> <span>404</span><span>,</span> <span>{}</span>
+  <span>end</span>
+<span>end</span><span>)</span>
+
+<span>tabulator</span><span>:</span><span>start</span><span>()</span>
+</code></pre></div></div>
+
+<p>This creates a new HTTP listener on port 9876.  If it receives a GET request
+for <code>/metrics</code>, it runs my JXA to ask Chrome (if running) about its tab count.
+The <code>hs.osascript.javascript</code> function returns a tuple, and the second item in
+it is the final statement of the JavaScript code, where we’ve ended with
+<code>tabCounts</code>.  If the code ran without an error, I return my metrics in a 200
+response.</p>
+
+<p>To collect this locally and not let just anybody on the internet trigger this
+JavaScript running, I have a locally running Prometheus instance on my MacBook.
+It hits this endpoint and then relays the results to my Prometheus instance in
+the cloud.  Grafana looks at that and shows me my tab count.  When it’s in the
+red, I sigh, look through my tabs, and close what I can.</p>
+
+<p>You can see my tab count crashing a few times.  First, I closed obvious
+duplicates or dead documents.  Later, I finished easy tasks represented by open
+tabs.  On the weekend, I read a lot of backlogged articles and closed them.
+Now I’m around 30 tabs, which seems like it’s probably about the right number
+for me.</p>
+
+<p>I meant to build this to help me get better at doing things in Prometheus and
+Grafana, but I think mostly it was just sort of fun weird general purpose
+programming, and I enjoyed it.  It was a nice reminder that lots of tedious
+problems have silly solutions.</p>
+
+
+  </div></div>]]>
+            </description>
+            <link>https://rjbs.cloud/blog/2021/08/i-closed-a-lot-of-browser-tabs/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-37703217</guid>
+            <pubDate>Fri, 29 Sep 2023 12:46:54 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Compile-time safety for enumerations in Go]]>
             </title>
             <description>
 <![CDATA[
-Score 41 | Comments 52 (<a href="https://news.ycombinator.com/item?id=37703175">thread link</a>) | @varankinv
+Score 52 | Comments 70 (<a href="https://news.ycombinator.com/item?id=37703175">thread link</a>) | @varankinv
 <br/>
 September 29, 2023 | https://vladimir.varank.in/notes/2023/09/compile-time-safety-for-enumerations-in-go/ | <a href="https://web.archive.org/web/*/https://vladimir.varank.in/notes/2023/09/compile-time-safety-for-enumerations-in-go/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><header></header><p>Last month, a colleague of mine asked how to reason about enumerated values (“enums”) in Go. They wanted to benefit from Go’s type-safety and to prevent users from misusing the package.</p><p>For an imaginary example, that enumerates possible colours, the snippet below shows how we typically implement this:</p><pre tabindex="0"><code>type Color string
@@ -451,10 +874,10 @@ mycolor does not implement color.Color (missing method xxxProtected)
             </title>
             <description>
 <![CDATA[
-Score 12 | Comments 1 (<a href="https://news.ycombinator.com/item?id=37703137">thread link</a>) | @adrian_mrd
+Score 13 | Comments 1 (<a href="https://news.ycombinator.com/item?id=37703137">thread link</a>) | @adrian_mrd
 <br/>
 September 29, 2023 | https://www.abc.net.au/news/2023-09-29/federal-court-blocks-online-piracy-foxtel-disney/102917554 | <a href="https://web.archive.org/web/*/https://www.abc.net.au/news/2023-09-29/federal-court-blocks-online-piracy-foxtel-disney/102917554">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="body"><div data-component="LayoutContainer"><div><div><p>Australia’s Federal Court has ordered the blocking of an updated set of domains as the battle over online piracy continues.</p><p>The two injunctions, requested by four media companies, will require&nbsp;internet service providers (ISPs) to block the new&nbsp;domains for three years from Friday.</p><p>Copyright law expert Andrew Christie says it's a continuation of Australia's approach to clamping down on "rampant"&nbsp;copyright infringement.</p><p>"This is all about blocking sites, it's not about going after those downloading the films," he said.</p><p>"It's too difficult to go after individual downloaders and what [copyright owners] really want is to deal with this problem upstream."</p><p><a href="https://www.judgments.fedcourt.gov.au/judgments/Judgments/fca/single/2023/2023fca1167" data-component="Link">The judgement</a>, which was handed down Friday, revealed&nbsp;the latest list&nbsp;of&nbsp;domains to be blocked by ISPs.</p><p>Foxtel requested that 117 domains be blocked.</p><p>Roadshow, Disney and Village Roadshow jointly requested that 122 domains be blocked.</p><p>These two rulings extend a series of earlier injunctions from 2020, and apply to 49 Australian ISPs.</p><p>In 2018, amendments to the Copyright Act were made to streamline efforts to combat online copyright infringement.</p><p>Former communications minister Paul Fletcher said at the time: "Australia’s piracy rate still remains higher than in countries with strong copyright enforcement frameworks."</p><p>"There is still a proportion of Australian users who seek out infringing sites&nbsp;and there are still pathways for them to get to these sites, including blocked sites," he said.</p></div></div><p><span data-component="Text">Posted<!-- -->&nbsp;</span><time data-component="ScreenReaderOnly" datetime="2023-09-29T05:38:25.000Z">14 hours ago</time><time data-component="Text">Fri 29 Sep 2023 at 5:38am</time></p></div></div></div>]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="body"><div data-component="LayoutContainer"><div><div><p>Australia’s Federal Court has ordered the blocking of an updated set of domains as the battle over online piracy continues.</p><p>The two injunctions, requested by four media companies, will require&nbsp;internet service providers (ISPs) to block the new&nbsp;domains for three years from Friday.</p><p>Copyright law expert Andrew Christie says it's a continuation of Australia's approach to clamping down on "rampant"&nbsp;copyright infringement.</p><p>"This is all about blocking sites, it's not about going after those downloading the films," he said.</p><p>"It's too difficult to go after individual downloaders and what [copyright owners] really want is to deal with this problem upstream."</p><p><a href="https://www.judgments.fedcourt.gov.au/judgments/Judgments/fca/single/2023/2023fca1167" data-component="Link">The judgement</a>, which was handed down Friday, revealed&nbsp;the latest list&nbsp;of&nbsp;domains to be blocked by ISPs.</p><p>Foxtel requested that 117 domains be blocked.</p><p>Roadshow, Disney and Village Roadshow jointly requested that 122 domains be blocked.</p><p>These two rulings extend a series of earlier injunctions from 2020, and apply to 49 Australian ISPs.</p><p>In 2018, amendments to the Copyright Act were made to streamline efforts to combat online copyright infringement.</p><p>Former communications minister Paul Fletcher said at the time: "Australia’s piracy rate still remains higher than in countries with strong copyright enforcement frameworks."</p><p>"There is still a proportion of Australian users who seek out infringing sites&nbsp;and there are still pathways for them to get to these sites, including blocked sites," he said.</p></div></div><p><span data-component="Text">Posted<!-- -->&nbsp;</span><time data-component="ScreenReaderOnly" datetime="2023-09-29T05:38:25.000Z">18 hours ago</time><time data-component="Text">Fri 29 Sep 2023 at 5:38am</time></p></div></div></div>]]>
             </description>
             <link>https://www.abc.net.au/news/2023-09-29/federal-court-blocks-online-piracy-foxtel-disney/102917554</link>
             <guid isPermaLink="false">hacker-news-small-sites-37703137</guid>
@@ -466,7 +889,7 @@ September 29, 2023 | https://www.abc.net.au/news/2023-09-29/federal-court-blocks
             </title>
             <description>
 <![CDATA[
-Score 28 | Comments 1 (<a href="https://news.ycombinator.com/item?id=37703033">thread link</a>) | @jfantl
+Score 33 | Comments 2 (<a href="https://news.ycombinator.com/item?id=37703033">thread link</a>) | @jfantl
 <br/>
 September 29, 2023 | https://jasonfantl.com/posts/Decentralized-Dynamic-Cluster-Identification/ | <a href="https://web.archive.org/web/*/https://jasonfantl.com/posts/Decentralized-Dynamic-Cluster-Identification/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><h2 id="problem-statement"><span>Problem Statement</span><a href="#problem-statement"><i></i></a></h2><p>Today we create a scalable dynamic decentralized cluster identification protocol. An example to explain:</p><p><a href="https://jasonfantl.com/assets/img/posts/ClusterID/intro_shrunk.gif"><img data-src="/assets/img/posts/ClusterID/intro_shrunk.gif" alt="Color spreading through a network" width="500" data-proofer-ignore=""></a></p><p>We have a large number of drones (the colored circles) which can communicate with other nearby drones (communication is represented by expanding blue circles). We wish to assign a cluster ID (color) to all the drones in a cluster, a cluster being a connected set of drones (all drones which can communicate with each other, either directly or indirectly through other drones). I think of this like using the paint bucket in photoshop, coloring a single node/droid and watching it spread through the graph/network across the links, repeating with a different color on an uncolored node, and so on, until all nodes are colored.</p><p>But we want to avoid using an all-seeing entity such as ourselves, we want the drones to color themselves.</p><p>It must be decentralized, but that’s not all. It must be dynamic, meaning it can adapt to clusters that split or join together. We also want it to be scalable, consider potentially having millions of drones. Here are some reasonable constraints for scalability:</p><ul><li>The drones have limited memory, this means no storing the entire topology.</li><li>The communication links have limited capacity, this means we can’t have every node flood filling the network all the time.</li></ul><p>But anything else is acceptable, as long as nothing scales with the network size. For example, if you want to store the list of all two hops from yourself, that’s fine, since it wont grow with the network (assuming networks expand outward rather then getting more dense).</p><h2 id="an-easier-problem"><span>An Easier Problem</span><a href="#an-easier-problem"><i></i></a></h2><p>Drones within a cluster must negotiate a cluster ID with all the other drones in their cluster, even the ones they aren’t directly connected too. Let’s ignore all the other requirements and use this as a simple problem to start with, how can a cluster of drones (not moving) agree on a value when they can only communicate with their neighbors? Give it a try before moving on.</p><p>One solution is to have every drone broadcast a random number, then have each drone pass along any received message to its neighbors, as well as storing the message for itself, then stopping when no more messages have been received for a long period of time. At the end of this, everyone will have the same set of numbers (since every message was passed along to everyone in the cluster), which we will call the cluster ID.</p><p><a href="https://jasonfantl.com/assets/img/posts/ClusterID/passingOn_shrunk.gif"><img data-src="/assets/img/posts/ClusterID/passingOn_shrunk.gif" alt="Boids passing information within a cluster" width="200" data-proofer-ignore=""></a></p><p>Here we show each drone picking a random number (its color), and flood filling the network (the blue expanding circle). Below each drone we show the list of received messages. This results in all drones within a cluster sharing the same set of received colors. But this is not a scalable solution, can you see why? Think of millions of drones in a cluster, what goes wrong?</p><h2 id="scaling"><span>Scaling</span><a href="#scaling"><i></i></a></h2><p>The last solution doesn’t scale for two reasons:</p><ul><li>Every drone has to store a number from every other drone, so local memory is required to scale with network size.</li><li>Every drone will have its message passed over every link, so the link usage is scaling with network size.</li></ul><p>Rather then first communicating all the numbers and taking the set, let’s use the highest value as the cluster ID. This also allows us to prune incoming values when we receive an ID lower then the highest we have seen so far. When a drone receives a new number, it will either be higher then its current value, in which case it updates its value and passes it on, or the value is lower, in which case it can ignore it. Now a drone only has to store a single value at a time, and the links will quickly stop being used by any small numbers, which are immediately ignored.</p><p><a href="https://jasonfantl.com/assets/img/posts/ClusterID/passingOnMax_shrunk.gif"><img data-src="/assets/img/posts/ClusterID/passingOnMax_shrunk.gif" alt="Boids passing information within a cluster" width="200" data-proofer-ignore=""></a></p><p>We see here how everyone quickly agrees on a value, and different values for different clusters. This solves the scalability issue, but doesn’t meet our requirement for dynamic clusters. Imagine if a cluster follows this process, <em>then</em> splits apart, the two clusters have no way of knowing they need to restart the process.</p><h2 id="dynamic-clusters"><span>Dynamic Clusters</span><a href="#dynamic-clusters"><i></i></a></h2><p>How does a drone know when it has left the cluster or joined a new one? Again, take a moment to consider before moving on.</p><p>If the drone that announced the highest number keeps track of that fact, then they can consider themselves the clusters leader drone (this does not account for ties/duplicates, which we will go over later). The leader will periodically send out Keep-Alive messages like <code>You are in cluster 14</code>. This is all we need for drones to detect leaving and entering clusters.</p><p>When a drone leaves a cluster, they will no longer receive the Keep-Alive signal, which tells them they have left. When a drone hears two conflicting Keep-Alive signals like <code>You are cluster 14</code> and <code>You are cluster 61</code>, it knows it has combined with a second cluster.</p><p>When a drone hears from two conflicting leaders, it will choose the one with the higher numbered cluster ID. This also means the leader from the cluster with a smaller ID must now become a follower.</p><p>When leaving a cluster, a drone will assume it is on its own and elect itself the leader of its own cluster. If a drone left the old cluster with other drones, then all the drones in this new splinter cluster will temporarily elect themselves leaders, but only for a moment. Each new leader will announce their cluster ID, and then all but one drone will become a follower since only one drone picked the highest ID.</p><p><a href="https://jasonfantl.com/assets/img/posts/ClusterID/seperate_together_shrunk.gif"><img data-src="/assets/img/posts/ClusterID/seperate_together_shrunk.gif" alt="Boids as a cluster separating and reforming" height="500" data-proofer-ignore=""></a></p><p>Here we started with a cluster of 4 drones which have a cluster ID represented as red. The cluster splits, causing the two left drones to stop hearing broadcasts from the red cluster leader (leaders are indicated with a bold outline). The two separated drones now elect themselves leaders and broadcast their new cluster ID. One of the new leaders hears the others larger cluster ID and joins that cluster, in this case the blue cluster. This process repeats at a larger scale when the two clusters rejoin.</p><p>After speeding up the process and letting it run in a less controlled environment, we get the following.</p><p><a href="https://jasonfantl.com/assets/img/posts/ClusterID/final_shrunk.gif"><img data-src="/assets/img/posts/ClusterID/final_shrunk.gif" alt="Boids running the protocol in real time" height="500" data-proofer-ignore=""></a></p><p>And the pseudo code being run on each drone is below. It doesn’t include logic to ignore messages that have already been seen, which needs to be added so you don’t get cycles of broadcasts (which likely looks like adding a nonce to each message and a queue of recently seen nonces to ignore).</p><div file="Protocol Pseudo Code"><p><code><table><tbody><tr><td><pre>1
@@ -511,7 +934,7 @@ September 29, 2023 | https://jasonfantl.com/posts/Decentralized-Dynamic-Cluster-
             </title>
             <description>
 <![CDATA[
-Score 18 | Comments 6 (<a href="https://news.ycombinator.com/item?id=37702751">thread link</a>) | @anticlickwise
+Score 18 | Comments 7 (<a href="https://news.ycombinator.com/item?id=37702751">thread link</a>) | @anticlickwise
 <br/>
 September 29, 2023 | https://proxiesapi.com/articles/web-scraping-using-chatgpt-complete-guide-with-examples | <a href="https://web.archive.org/web/*/https://proxiesapi.com/articles/web-scraping-using-chatgpt-complete-guide-with-examples">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -810,7 +1233,7 @@ print(f"Data has been written to {csv_file_path}")
             </title>
             <description>
 <![CDATA[
-Score 39 | Comments 1 (<a href="https://news.ycombinator.com/item?id=37702194">thread link</a>) | @gregsadetsky
+Score 43 | Comments 1 (<a href="https://news.ycombinator.com/item?id=37702194">thread link</a>) | @gregsadetsky
 <br/>
 September 29, 2023 | https://lincoln.swaine-moore.is/blue | <a href="https://web.archive.org/web/*/https://lincoln.swaine-moore.is/blue">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -833,7 +1256,7 @@ September 29, 2023 | https://lincoln.swaine-moore.is/blue | <a href="https://web
             </title>
             <description>
 <![CDATA[
-Score 70 | Comments 22 (<a href="https://news.ycombinator.com/item?id=37701691">thread link</a>) | @zorked
+Score 76 | Comments 24 (<a href="https://news.ycombinator.com/item?id=37701691">thread link</a>) | @zorked
 <br/>
 September 29, 2023 | https://www.propelauth.com/post/generating-chess-puzzles-with-genetic-algorithms | <a href="https://web.archive.org/web/*/https://www.propelauth.com/post/generating-chess-puzzles-with-genetic-algorithms">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section>
@@ -994,7 +1417,7 @@ September 29, 2023 | https://www.sarus.tech/post/how-advances-in-genai-change-th
             </title>
             <description>
 <![CDATA[
-Score 11 | Comments 1 (<a href="https://news.ycombinator.com/item?id=37700526">thread link</a>) | @asicsp
+Score 13 | Comments 1 (<a href="https://news.ycombinator.com/item?id=37700526">thread link</a>) | @asicsp
 <br/>
 September 29, 2023 | https://orlp.net/blog/subtraction-is-functionally-complete/ | <a href="https://web.archive.org/web/*/https://orlp.net/blog/subtraction-is-functionally-complete/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -1333,7 +1756,7 @@ September 28, 2023 | https://seanmonstar.com/post/66832922686/was-async-fn-a-mis
             </title>
             <description>
 <![CDATA[
-Score 40 | Comments 54 (<a href="https://news.ycombinator.com/item?id=37698842">thread link</a>) | @cyb0rg0
+Score 40 | Comments 55 (<a href="https://news.ycombinator.com/item?id=37698842">thread link</a>) | @cyb0rg0
 <br/>
 September 28, 2023 | https://makopool.com/subgoals.html | <a href="https://web.archive.org/web/*/https://makopool.com/subgoals.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="main">
@@ -1383,7 +1806,7 @@ September 28, 2023 | https://www.stoneageherbalist.com/p/the-maori-genocide-of-t
             </title>
             <description>
 <![CDATA[
-Score 9 | Comments 12 (<a href="https://news.ycombinator.com/item?id=37697753">thread link</a>) | @happybuy
+Score 9 | Comments 15 (<a href="https://news.ycombinator.com/item?id=37697753">thread link</a>) | @happybuy
 <br/>
 September 28, 2023 | https://www.magiclasso.co/insights/apple-google-search-partnership/ | <a href="https://web.archive.org/web/*/https://www.magiclasso.co/insights/apple-google-search-partnership/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1454,6 +1877,21 @@ September 28, 2023 | https://www.magiclasso.co/insights/apple-google-search-part
             <link>https://www.magiclasso.co/insights/apple-google-search-partnership/</link>
             <guid isPermaLink="false">hacker-news-small-sites-37697753</guid>
             <pubDate>Fri, 29 Sep 2023 00:18:51 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Australian authors' works feature in Books3 pirated ebooks used to train AI]]>
+            </title>
+            <description>
+<![CDATA[
+Score 6 | Comments 0 (<a href="https://news.ycombinator.com/item?id=37697365">thread link</a>) | @elahieh
+<br/>
+September 28, 2023 | https://www.abc.net.au/news/2023-09-29/australian-authors-copyright-books3-generative-i-chatgpt/102914538 | <a href="https://web.archive.org/web/*/https://www.abc.net.au/news/2023-09-29/australian-authors-copyright-books3-generative-i-chatgpt/102914538">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><p>Australian authors including Peter Carey, Helen Garner, Tim Winton, Jane Harper and Miles Franklin have been swept up in a Silicon-Valley-based AI scandal.</p><p>Analysis of a dataset of pirated ebooks, known as Books3, has revealed works by some of the world's most successful authors, including John Grisham, Colleen Hoover and Stephen King, have been used to train generative AI.</p><p>"[We know] AI systems are trained by ingesting vast amounts of text … scraped from the internet," says Olivia Lanchester, CEO of the Australian Society of Authors (ASA).</p><p>"But the lack of transparency over what has been used to train generative AI means that authors haven't known whether their works have been used."</p><p>Now, many do know —&nbsp;and they are furious.</p><p>"We have been receiving phone calls and emails from Australian authors who've been dismayed and outraged to learn that their works have been appropriated without their permission," Lanchester says.</p><p>Literary fiction by <a href="https://www.abc.net.au/news/2023-03-25/margaret-atwood-interview-old-babes-in-the-wood-handmaids-tale/102136052" data-component="ContentLink" data-uri="coremedia://article/102136052">Margaret Atwood</a>, Zadie Smith and <a href="https://www.abc.net.au/news/2022-12-27/barbara-kingsolver-demon-copperhead-appalachia-opioid-crisis/101792232" data-component="ContentLink" data-uri="coremedia://article/101792232">Barbara Kingsolve</a>r, and books by Australian authors Geraldine Brooks, <a href="https://www.abc.net.au/news/2022-09-04/liane-moriarty-author-books-apples-never-fall-big-little-lies/101395312" data-component="ContentLink" data-uri="coremedia://article/101395312">Liane Moriarty</a>, Markus Zuzak and <a href="https://www.abc.net.au/news/2022-11-27/robbie-arnott-tasmanian-author-limberlost-climate-anxiety/101693712" data-component="ContentLink" data-uri="coremedia://article/101693712">Robbie Arnott</a> also feature in the collection.</p><h2 data-component="Heading">What is Books3 and what happened?</h2><p>In September, The Atlantic <a href="https://www.theatlantic.com/technology/archive/2023/09/books3-database-generative-ai-training-copyright-infringement/675363/" data-component="Link" target="_blank" rel="noopener noreferrer">published a tool</a> to search Books3 after reporter Alex Reisner identified author information for 183,000 of the 191,000 ISBNs he extracted from the dataset, used to train Meta's LLaMA, Bloomberg's BloombergGPT and EleutherAI's GPT-J.</p><p>The Books3 creator, Shaun Presser, <a href="https://www.theatlantic.com/technology/archive/2023/08/books3-ai-meta-llama-pirated-books/675063/" data-component="Link" target="_blank" rel="noopener noreferrer">told The Atlantic</a> he developed the dataset as a high-quality training resource for other independent developers to allow them to compete with tech giants such as OpenAI, which is believed to have trained ChatGPT using mystery datasets known as Books1 and Books2.</p><h2 data-component="Heading">The Silicon Valley way</h2><p>Irish-born crime writer Dervla McTiernan was incensed to learn her bestselling crime novel, The Ruin (2018), was one of the thousands in the collection.</p><p>"It's outright theft. People who stole all of these books … did it for the purposes of making money," she says.</p><figure role="group" data-component="VerticalArticleFigure" aria-labelledby="102914666" data-uri="coremedia://imageproxy/102914666"><img alt="Portrait of Irish crime writer Dervla McTiernan, standing in front of a bridge and river" sizes="(max-width: 543px) 543px," srcset="https://live-production.wcms.abc-cdn.net.au/5f91310e053106a8e96191c9b418f127?impolicy=wcms_crop_resize&amp;cropH=1348&amp;cropW=1794&amp;xPos=68&amp;yPos=0&amp;width=862&amp;height=647 543w, https://live-production.wcms.abc-cdn.net.au/5f91310e053106a8e96191c9b418f127?impolicy=wcms_crop_resize&amp;cropH=1332&amp;cropW=2000&amp;xPos=0&amp;yPos=5&amp;width=862&amp;height=575" src="https://live-production.wcms.abc-cdn.net.au/5f91310e053106a8e96191c9b418f127?impolicy=wcms_crop_resize&amp;cropH=1332&amp;cropW=2000&amp;xPos=0&amp;yPos=5&amp;width=862&amp;height=575" loading="lazy" data-component="Image" data-lazy="true"><p><figcaption id="102914666" data-component="VerticalArticleFigure__figcaption" aria-live="polite"> <!-- -->Companies like OpenAI and Meta "are 100 per cent acting in their own self interest," says McTiernan, the author of four novels.<span data-component="Byline"><span data-component="Text">(<span>Supplied: HarperCollins/Julia Dunin</span>)</span></span></figcaption></p></figure><p>McTiernan, who lives in Perth, believes the companies knew the dataset contained stolen material.</p><p>"They knew they were using pirated books, and they did so with gross indifference, and I think that's characteristic of the mentality of people who work in this industry," she says.</p><p>"It was Facebook that had the motto … 'move fast and break things'. Well, we're the things that are being broken, and we're not very happy about it."</p><h2 data-component="Heading">Weren't there other options?</h2><p>Professor Toby Walsh, Chief Scientist at UNSW's AI Institute, is one of Australia's leading AI experts.</p><p>He was disappointed to find one of his books, Machines Behaving Badly: The Morality of AI (2022), in the Books3 dataset.</p><p>"If you just want to train a chatbot to speak English, there are tens of thousands of books that are out of copyright that they could have used," he says.</p><p>"It's typical of the cavalier way that people in Silicon Valley treat people's intellectual property."</p><figure role="group" data-component="VerticalArticleFigure" aria-labelledby="102914696" data-uri="coremedia://imageproxy/102914696"><img alt="A white woman with long blonde hair and a light blue top with dark spots smiles at the camera" sizes="(max-width: 543px) 543px," srcset="https://live-production.wcms.abc-cdn.net.au/7a09a94c271833a77ac0c734b3aa7b2d?impolicy=wcms_crop_resize&amp;cropH=720&amp;cropW=960&amp;xPos=0&amp;yPos=280&amp;width=862&amp;height=647 543w, https://live-production.wcms.abc-cdn.net.au/7a09a94c271833a77ac0c734b3aa7b2d?impolicy=wcms_crop_resize&amp;cropH=960&amp;cropW=960&amp;xPos=0&amp;yPos=318&amp;width=862&amp;height=862" src="https://live-production.wcms.abc-cdn.net.au/7a09a94c271833a77ac0c734b3aa7b2d?impolicy=wcms_crop_resize&amp;cropH=960&amp;cropW=960&amp;xPos=0&amp;yPos=318&amp;width=862&amp;height=862" loading="lazy" data-component="Image" data-lazy="true"><p><figcaption id="102914696" data-component="VerticalArticleFigure__figcaption" aria-live="polite"> <!-- -->Lanchester says more than 30 authors affected by the Books3 scandal have contacted the ASA.<span data-component="Byline"><span data-component="Text">(<span>Supplied: Olivia Lanchester</span>)</span></span></figcaption></p></figure><p>Lanchester agrees.</p><p>"AI developers could have trained their systems on works that are in the public domain, or they could have sought a license from the copyright owners, but instead, they've ingested copyright works without seeking permission," she says.</p><p>"This has been done disregarding copyright laws, and it's treating authors' works as though they're a public commodity, which ignores the fact that there's a real cost of creation and that licensing is how authors earn a living."</p><p>Lanchester says the ASA is not "anti-technology" but argues that tech companies should acknowledge the value of the authors' work in the development of generative AI tools.</p><p>"They couldn't have built the AI systems they've built without high-quality inputs, and there was a real opportunity for authors' works to be licensed and for the creative and intellectual labour to be recognised.&nbsp;Instead, their works have just been appropriated," she says.</p><h2 data-component="Heading">Legal ramifications for AI overreach</h2><p>Tech giants, including Meta and OpenAI, face several lawsuits in the US over their alleged use of authors' work without their permission.</p><p>Two authors, Mona Awad and Paul Tremblay, filed a lawsuit against Open AI in July, claiming OpenAI used their copyrighted books to train ChatGPT without their consent. They say the AI tool generates "very accurate summaries" of their work.</p><p>Other lawsuits have been filed against the tech companies by comedian Sarah Silverman and Michael Chabon, who won the 2001 Pulitzer Prize for Fiction for his novel The Amazing Adventures of Kavalier &amp; Clay.</p><p>In September, a group of high-profile authors, including George RR Martin, Jodi Picoult, John Grisham and Roxane Gay, filed a joint suit with the Authors Guild against OpenAI.</p><p>While the suit accuses the company of "systemic theft" and "mass copyright infringement", OpenAI and Meta have claimed their use of authors' work amounts to "fair use".</p><p>"This is a new way of using people's copyrighted material, and the courts have yet to decide whether it's fair use, whether it's within the bounds of the law or not," says Walsh.</p><h2 data-component="Heading">A meaningful threat</h2><p>Lanchester says generative AI poses a direct threat to authors' livelihoods.</p><p>"We're concerned that the market is going to be flooded with inferior AI-generated content.</p><p>"A market crowded with AI material doesn't serve anyone. It makes discoverability harder for professional writers and lowers quality for consumers."</p><figure role="group" data-component="VerticalArticleFigure" aria-labelledby="102915142" data-uri="coremedia://imageproxy/102915142"><img alt="A picture of different apps on a phone including ChatGPT" sizes="(max-width: 543px) 543px," srcset="https://live-production.wcms.abc-cdn.net.au/d8f554b090531034ce9da3a92aac72db?impolicy=wcms_crop_resize&amp;cropH=1415&amp;cropW=1887&amp;xPos=116&amp;yPos=0&amp;width=862&amp;height=647 543w, https://live-production.wcms.abc-cdn.net.au/d8f554b090531034ce9da3a92aac72db?impolicy=wcms_crop_resize&amp;cropH=1413&amp;cropW=2119&amp;xPos=0&amp;yPos=1&amp;width=862&amp;height=575" src="https://live-production.wcms.abc-cdn.net.au/d8f554b090531034ce9da3a92aac72db?impolicy=wcms_crop_resize&amp;cropH=1413&amp;cropW=2119&amp;xPos=0&amp;yPos=1&amp;width=862&amp;height=575" loading="lazy" data-component="Image" data-lazy="true"><p><figcaption id="102915142" data-component="VerticalArticleFigure__figcaption" aria-live="polite"> <!-- -->OpenAI, the tech giant behind AI-powered language model ChatGPT, is valued at US$90 billion.&nbsp;<span data-component="Byline"><span data-component="Text">(<span>Getty Images: Stockcam</span>)</span></span></figcaption></p></figure><p>McTiernan also questions the viability of a literary career in a marketplace dominated by AI.</p><p>McTiernan says ChatGPT might be a "bad writer" now, but she worries that in three to five years, generative AI tools will be able to create works similar in character to contemporary authors that will be offered in direct competition with their original novels.</p><p>"If [tech companies like Amazon, Apple and Meta] are able to generate their own books and stories, why would they sell anything else? Why would they give prominence in the market to any sort of competing efforts? I don't see why they would."</p><h2 data-component="Heading">What will Australian authors do next?</h2><p>Writing is already a precarious occupation in Australia, where the average annual income for an author is $18,200.</p><p>While McTiernan says the writers she has spoken to "would love to have the opportunity to take action", for many, it is not an option.</p><p>"[Given] what authors are earning as a general rule in Australia, how many authors are in a position to fund or even contribute to the costs of litigation? Very few," McTiernan says.</p><p>"This is, again, one of the situations we find these days where these massive wealthy companies can take this sort of action, almost with impunity, because they know the people that they're damaging most are not in a position to take action against them."</p><p>Lanchester says ASA intends to continue to advocate for authors.</p><p>"We are advocating to the government and hoping there will be a pathway forward to negotiate licensing solutions with the tech sector," she says.</p><p>"We're watching the US litigation brought by the Authors Guild with real interest and absolutely cheering those authors on, and … we're trying to get a handle on the number of Australian authors affected. We think that there will be many.</p><p>"It's incredibly difficult because there are complex legal and jurisdictional issues to grapple with."</p><p>While Professor Walsh concedes the risks posed by AI may require specific regulation, he says existing laws governing intellectual property and privacy could be applied "more forcibly to the tech space" to rein in unlawful conduct.</p><p>"I'm not sure that now the tech industry is such … a large component of our lives whether it can be left to be the free-for-all, to be the Wild West that it has been for the last 20 years."</p></div></div><p><span data-component="Text">Posted<!-- -->&nbsp;</span><time data-component="ScreenReaderOnly" datetime="2023-09-28T22:50:09.000Z">28 Sep 2023</time><time data-component="Text">Thu 28 Sep 2023 at 10:50pm</time>, <span data-component="Text">updated<!-- -->&nbsp;</span><time data-component="ScreenReaderOnly" datetime="2023-09-29T01:11:22.000Z">23 hours ago</time><time data-component="Text">Fri 29 Sep 2023 at 1:11am</time></p></div>]]>
+            </description>
+            <link>https://www.abc.net.au/news/2023-09-29/australian-authors-copyright-books3-generative-i-chatgpt/102914538</link>
+            <guid isPermaLink="false">hacker-news-small-sites-37697365</guid>
+            <pubDate>Thu, 28 Sep 2023 23:33:59 GMT</pubDate>
         </item>
         <item>
             <title>
@@ -1531,7 +1969,7 @@ September 28, 2023 | https://blog.arguflow.ai/posts/enron-unleashed-semantic-sea
             </title>
             <description>
 <![CDATA[
-Score 141 | Comments 102 (<a href="https://news.ycombinator.com/item?id=37697030">thread link</a>) | @tech234a
+Score 142 | Comments 104 (<a href="https://news.ycombinator.com/item?id=37697030">thread link</a>) | @tech234a
 <br/>
 September 28, 2023 | https://this.alicorn.gay/post/729670550209937408/discord-as-a-filehost-will-no-longer-be-possible | <a href="https://web.archive.org/web/*/https://this.alicorn.gay/post/729670550209937408/discord-as-a-filehost-will-no-longer-be-possible">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div id="posts"><article id="729670550209937408"><div><p><h3>discord as a filehost will no longer be possible by the end of the year</h3></p><div><h2>EDIT: AS IN LINKING TO STUFF ISN’T GOING TO WORK. YOU CAN’T USE IT TO PERMANENTLY EMBED IMAGES IN AO3 OR TOYHOUSE OR WHAT HAVE YOU. THE LINKS THEMSELVES WILL EXPIRE AFTER 24 HOURS, BUT YOUR FILES AREN’T GOING TO BE DELETED FROM YOUR SERVERS</h2><p>if you haven’t noticed, copying a link for a file now appends special parameters to the end. these are a request signature, which indicates a specific request for that file. this request will expires after a few hours, so files will no longer be permanently available through a specific url. </p><p>while they are not currently necessary to view the file, they will be by the end of the year, assuming nothing changes.</p><p>please check that any websites you rely on are not hosting files through cdn.discordapp.com, and if they are, please archive those files through the IA using web.archive.org/save</p><p>thank you for your time</p></div></div></article></div></div></div>]]>
@@ -1600,8 +2038,10 @@ September 28, 2023 | https://blog.aryn.ai/aryn-bringing-generative-ai-to-opensea
 <li>
 <a href="https://github.com/aryn-ai/sycamore" target="_blank" title="Link: https://github.com/aryn-ai/sycamore">Sycamore GitHub</a></li>
 <li>
-<a href="https://docs.aryn.ai/" target="_blank" title="Link: https://docs.aryn.ai">Documentation</a></li>
-<li><a href="https://www.8vc.com/resources/the-other-90-introducing-the-aryn-8vc-partnership" target="_blank" title="Link: https://www.8vc.com/resources/the-other-90-introducing-the-aryn-8vc-partnershiphttps://">8VC investment announcement</a></li>
+<a href="https://www.prweb.com/releases/aryn-releases-new-open-source-conversational-search-stack-301942138.html" target="_blank">Press release</a></li>
+<li>
+<a href="https://docs.aryn.ai/" target="_blank">Documentation</a></li>
+<li><a href="https://www.8vc.com/resources/the-other-90-introducing-the-aryn-8vc-partnership" target="_blank">8VC investment announcement</a></li>
 <a href="https://www.8vc.com/resources/the-other-90-introducing-the-aryn-8vc-partnership" target="_blank">
 </a>
 </ul><p><a href="https://www.computerhistory.org/collections/catalog/102702111" target="_blank">[1] SQL was created by Don Chamberlin and Ray Boyce.</a></p><br></div>
@@ -1614,11 +2054,11 @@ September 28, 2023 | https://blog.aryn.ai/aryn-bringing-generative-ai-to-opensea
         </item>
         <item>
             <title>
-<![CDATA[Think Again, Al Jolson: Japan’s Silent Movie Culture Is Still Going Strong]]>
+<![CDATA[Japan’s silent movie culture is still going]]>
             </title>
             <description>
 <![CDATA[
-Score 22 | Comments 6 (<a href="https://news.ycombinator.com/item?id=37694094">thread link</a>) | @lermontov
+Score 56 | Comments 17 (<a href="https://news.ycombinator.com/item?id=37694094">thread link</a>) | @lermontov
 <br/>
 September 28, 2023 | https://petertasker.asia/articles/culture/think-again-al-jolson-japans-silent-movie-culture-is-still-going-strong/ | <a href="https://web.archive.org/web/*/https://petertasker.asia/articles/culture/think-again-al-jolson-japans-silent-movie-culture-is-still-going-strong/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div itemprop="mainEntityOfPage">
@@ -1682,7 +2122,7 @@ September 28, 2023 | https://www.joinprospect.com/blog/modawell-interview | <a h
             </title>
             <description>
 <![CDATA[
-Score 1475 | Comments 600 (<a href="https://news.ycombinator.com/item?id=37691232">thread link</a>) | @jamesbvaughan
+Score 1522 | Comments 618 (<a href="https://news.ycombinator.com/item?id=37691232">thread link</a>) | @jamesbvaughan
 <br/>
 September 28, 2023 | https://jamesbvaughan.com/southwest-wifi/ | <a href="https://web.archive.org/web/*/https://jamesbvaughan.com/southwest-wifi/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1928,7 +2368,7 @@ the framework’s usability and for suggestions for improvement. Contact us at
             </title>
             <description>
 <![CDATA[
-Score 28 | Comments 8 (<a href="https://news.ycombinator.com/item?id=37690023">thread link</a>) | @georgecmu
+Score 29 | Comments 8 (<a href="https://news.ycombinator.com/item?id=37690023">thread link</a>) | @georgecmu
 <br/>
 September 28, 2023 | https://benedum.org/about-us/mr-benedums-will/ | <a href="https://web.archive.org/web/*/https://benedum.org/about-us/mr-benedums-will/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><p><em>Written just two years before his death in 1959, this statement reflects Mr. Benedum’s charitable intentions:</em></p><div><p>The disposition of a not inconsiderable estate is never an easy assignment.</p>
@@ -1957,7 +2397,7 @@ on the 15th day of June 1957</em></p></div></div>]]>
             </title>
             <description>
 <![CDATA[
-Score 142 | Comments 44 (<a href="https://news.ycombinator.com/item?id=37688341">thread link</a>) | @ingve
+Score 145 | Comments 44 (<a href="https://news.ycombinator.com/item?id=37688341">thread link</a>) | @ingve
 <br/>
 September 28, 2023 | https://swiftrocks.com/how-async-await-works-internally-in-swift | <a href="https://web.archive.org/web/*/https://swiftrocks.com/how-async-await-works-internally-in-swift">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -3038,7 +3478,7 @@ September 28, 2023 | https://swiftrocks.com/how-async-await-works-internally-in-
             </title>
             <description>
 <![CDATA[
-Score 67 | Comments 32 (<a href="https://news.ycombinator.com/item?id=37688340">thread link</a>) | @voxadam
+Score 69 | Comments 33 (<a href="https://news.ycombinator.com/item?id=37688340">thread link</a>) | @voxadam
 <br/>
 September 28, 2023 | https://www.tamikothiel.com/theory/cm_txts/di-frames.html | <a href="https://web.archive.org/web/*/https://www.tamikothiel.com/theory/cm_txts/di-frames.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -3230,7 +3670,7 @@ Registrar Abuse Contact Phone: +1.6174443076</code></pre><h2 id="it-seems-safe-t
             </title>
             <description>
 <![CDATA[
-Score 163 | Comments 87 (<a href="https://news.ycombinator.com/item?id=37686633">thread link</a>) | @Fudgel
+Score 164 | Comments 88 (<a href="https://news.ycombinator.com/item?id=37686633">thread link</a>) | @Fudgel
 <br/>
 September 28, 2023 | https://effectivetypescript.com/2023/09/27/closure-compiler/ | <a href="https://web.archive.org/web/*/https://effectivetypescript.com/2023/09/27/closure-compiler/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -3355,7 +3795,7 @@ September 28, 2023 | https://effectivetypescript.com/2023/09/27/closure-compiler
             </title>
             <description>
 <![CDATA[
-Score 31 | Comments 8 (<a href="https://news.ycombinator.com/item?id=37685662">thread link</a>) | @teleforce
+Score 32 | Comments 8 (<a href="https://news.ycombinator.com/item?id=37685662">thread link</a>) | @teleforce
 <br/>
 September 27, 2023 | https://www.forlinx.net//industrial-news/arm-cortex-a-series-processor-performance-344.html | <a href="https://web.archive.org/web/*/https://www.forlinx.net//industrial-news/arm-cortex-a-series-processor-performance-344.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div> 
@@ -3826,7 +4266,7 @@ September 27, 2023 | https://www.tech-knowhow.com/2023/09/rasperry-pi-5-specs-an
             </title>
             <description>
 <![CDATA[
-Score 6 | Comments 1 (<a href="https://news.ycombinator.com/item?id=37684835">thread link</a>) | @kuter
+Score 7 | Comments 2 (<a href="https://news.ycombinator.com/item?id=37684835">thread link</a>) | @kuter
 <br/>
 September 27, 2023 | https://kuterdinel.com/writing-a-very-simple-jit-compiler-in-about-1000-lines-of-c.html | <a href="https://web.archive.org/web/*/https://kuterdinel.com/writing-a-very-simple-jit-compiler-in-about-1000-lines-of-c.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="center">
@@ -3919,15 +4359,11 @@ September 27, 2023 | https://kuterdinel.com/writing-a-very-simple-jit-compiler-i
 <span>        </span><span>size_t</span><span> </span><span>argCount</span><span> </span><span>=</span><span> </span><span>0</span><span>;</span>
 <span>        </span><span>argument_info_t</span><span> </span><span>arguments</span><span>[</span><span>MAX_ARGUMENTS</span><span>];</span>
 <span>        </span><span>// Parse the argument list.</span>
-<span>        </span><span>bool</span><span> </span><span>first_arg</span><span> </span><span>=</span><span> </span><span>true</span><span>;</span>
 <span>        </span><span>while</span><span> </span><span>(</span><span>**</span><span>reader</span><span> </span><span>!=</span><span> </span><span>')'</span><span>)</span><span> </span><span>{</span>
 <span>            </span><span>// If this is the first argument, we don't expect to have a comma here since commas go between arguments.</span>
-<span>            </span><span>if</span><span> </span><span>(</span><span>!</span><span>first_arg</span><span>)</span><span> </span><span>{</span>
+<span>            </span><span>if</span><span> </span><span>(</span><span>argCount</span><span> </span><span>!=</span><span> </span><span>0</span><span> </span><span>)</span><span> </span><span>{</span>
 <span>                </span><span>assert_compilation</span><span>(</span><span>**</span><span>reader</span><span> </span><span>==</span><span> </span><span>','</span><span>);</span><span>  </span><span>// check the comma separation for the argument list.</span>
 <span>                </span><span>(</span><span>*</span><span>reader</span><span>)</span><span>++</span><span>;</span>
-<span>            </span><span>}</span><span> </span><span>else</span><span> </span><span>{</span>
-<span>                </span><span>first_arg</span><span> </span><span>=</span><span> </span><span>false</span><span>;</span>
-<span>            </span><span>}</span>
 <span>            </span><span>...</span>
 <span>            </span><span>arguments</span><span>[</span><span>argCount</span><span>++</span><span>]</span><span> </span><span>=</span><span> </span><span>parse_arg</span><span>(</span><span>reader</span><span>);</span><span>  </span><span>// Parse the name of the argument.</span>
 <span>            </span><span>...</span>
@@ -4612,7 +5048,7 @@ To implement the <code>break</code> statement, we need to insert a jump to the p
             </title>
             <description>
 <![CDATA[
-Score 10 | Comments 2 (<a href="https://news.ycombinator.com/item?id=37683611">thread link</a>) | @miyajoinbrix
+Score 10 | Comments 3 (<a href="https://news.ycombinator.com/item?id=37683611">thread link</a>) | @miyajoinbrix
 <br/>
 September 27, 2023 | https://hireright.pro/jobviz | <a href="https://web.archive.org/web/*/https://hireright.pro/jobviz">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -4937,7 +5373,7 @@ September 27, 2023 | https://taro.codes/posts/2023-08-23-temporal-api/ | <a href
             </title>
             <description>
 <![CDATA[
-Score 17 | Comments 1 (<a href="https://news.ycombinator.com/item?id=37675614">thread link</a>) | @nosferalatu____
+Score 18 | Comments 1 (<a href="https://news.ycombinator.com/item?id=37675614">thread link</a>) | @nosferalatu____
 <br/>
 September 27, 2023 | https://nosferalatu.com/./DerivativesLogarithmsTransforms.html | <a href="https://web.archive.org/web/*/https://nosferalatu.com/./DerivativesLogarithmsTransforms.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -5317,7 +5753,7 @@ September 27, 2023 | https://www.applieddivinitystudies.com/sf-crime-2/ | <a hre
             </title>
             <description>
 <![CDATA[
-Score 316 | Comments 51 (<a href="https://news.ycombinator.com/item?id=37670938">thread link</a>) | @ingve
+Score 317 | Comments 51 (<a href="https://news.ycombinator.com/item?id=37670938">thread link</a>) | @ingve
 <br/>
 September 26, 2023 | https://www.timdbg.com/posts/writing-a-debugger-from-scratch-part-5/ | <a href="https://web.archive.org/web/*/https://www.timdbg.com/posts/writing-a-debugger-from-scratch-part-5/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><article><div><p>(New to this series? Consider starting from <a href="https://www.timdbg.com/posts/writing-a-debugger-from-scratch-part-1">part 1</a>)</p><p>At the end of the <a href="https://www.timdbg.com/posts/writing-a-debugger-from-scratch-part-4">last post</a>, we started to get some interesting functionality with the ability to resolve addresses to names in a module. This was the last functionality missing before we could implement breakpoints! This part adds the ability for DbgRs to set hardware breakpoints.</p><p>The code for this post is in the <a href="https://github.com/TimMisiak/dbgrs/tree/part5">part5 branch on github</a>. You can also view the <a href="https://github.com/TimMisiak/dbgrs/compare/part4...part5">changes from part4</a>. If you see any mistakes or ways to improve the code, feel free to <a href="https://github.com/TimMisiak/dbgrs/issues">create issues</a> on the GitHub repo or submit a PR.</p><p>I’ve been trying to keep DbgRs as simple as possible, avoiding extra architectural layers to keep the concepts as clear and concise as possible, but now that it has grown a bit, we need a little bit of cleanup to keep things easy to understand. I’ll just cover these changes briefly and then we’ll get to breakpoints.</p><p>The biggest change is that I moved all of the code dealing with <a href="https://learn.microsoft.com/en-us/windows/win32/api/debugapi/nf-debugapi-waitfordebugeventex">WaitForDebugEventEx</a> into a new file, <a href="https://github.com/TimMisiak/dbgrs/blob/part5/src/event.rs">event.rs</a>. A single public function allows waiting for the next debug event, and returns a new <code>DebugEvent</code> enum instead of the raw win32 <code>DEBUG_EVENT</code> type.</p><div><pre tabindex="0"><code data-lang="rust"><span><span><span>pub</span> <span>enum</span> <span>DebugEvent</span> {
@@ -5629,7 +6065,7 @@ September 26, 2023 | https://opentofu.org/blog/why-should-i-care-about-opentofu/
             </title>
             <description>
 <![CDATA[
-Score 53 | Comments 26 (<a href="https://news.ycombinator.com/item?id=37667981">thread link</a>) | @stefanpie
+Score 54 | Comments 26 (<a href="https://news.ycombinator.com/item?id=37667981">thread link</a>) | @stefanpie
 <br/>
 September 26, 2023 | https://www.ifte.de/books/eda/index.html | <a href="https://web.archive.org/web/*/https://www.ifte.de/books/eda/index.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
