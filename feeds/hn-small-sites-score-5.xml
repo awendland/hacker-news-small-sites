@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Thu, 05 Oct 2023 16:22:47 GMT</lastBuildDate>
+        <lastBuildDate>Thu, 05 Oct 2023 20:20:37 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-5.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Thu, 05 Oct 2023 16:22:47 GMT</pubDate>
+        <pubDate>Thu, 05 Oct 2023 20:20:37 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -18,6 +18,814 @@
 <![CDATA[me@alexwendland.com (Alex Wendland)]]>
         </managingEditor>
         <ttl>240</ttl>
+        <item>
+            <title>
+<![CDATA[How fast are Linux pipes anyway?]]>
+            </title>
+            <description>
+<![CDATA[
+Score 59 | Comments 7 (<a href="https://news.ycombinator.com/item?id=37782493">thread link</a>) | @SEJeff
+<br/>
+October 5, 2023 | https://mazzo.li/posts/fast-pipes.html | <a href="https://web.archive.org/web/*/https://mazzo.li/posts/fast-pipes.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="wrapper">
+
+
+
+<div>
+<p>In this post, we will explore how Unix pipes are implemented in Linux by iteratively optimizing a test program that writes and reads data through a pipe.<a href="#fn1" id="fnref1" role="doc-noteref"><sup>1</sup></a></p>
+<p>We will begin with a simple program with a throughput of around 3.5GiB/s, and improve its performance twentyfold. The improvements will be informed by profiling the program using Linux’s <a href="https://en.wikipedia.org/wiki/Perf_(Linux)"><code>perf</code> tooling</a>.<a href="#fn2" id="fnref2" role="doc-noteref"><sup>2</sup></a> The code <a href="https://github.com/bitonic/pipes-speed-test">is available on GitHub</a>.</p>
+<div>
+<figure>
+<img src="https://mazzo.li/assets/images/fast-pipe-chart.svg" alt="Chart showing the performance of our pipe test programs.">
+
+</figure>
+</div>
+<!--
+This exercise won't be of much practical use --- we shouldn't be using pipes for high-performance inter-process communication anyway. However, it will shed some light on common themes when dealing with IO and the kernel, and on how one can go about identifying what's slow.
+-->
+<p>The post was inspired by reading <a href="https://codegolf.stackexchange.com/questions/215216/high-throughput-fizz-buzz/236630#236630">a highly optimized FizzBuzz program</a>, which pushes output to a pipe at a rate of ~35GiB/s on my laptop.<a href="#fn3" id="fnref3" role="doc-noteref"><sup>3</sup></a> Our first goal will be to match that speed, explaining every step as we go along. We’ll also add an additional performance-improving measure, which is not needed in FizzBuzz since the bottleneck is actually computing the output, not IO, at least on my machine.</p>
+<p>We will proceed as follows:</p>
+<ol type="1">
+<li><a href="#first-version">A first slow version of our pipe test bench;</a></li>
+<li><a href="#trouble-with-write">How pipes are implemented internally, and why writing and reading from them is slow;</a></li>
+<li><a href="#splicing">How the <code>vmsplice</code> and <code>splice</code> syscalls let us get around some (but not all!) of the slowness;</a></li>
+<li><a href="#paging">A description of Linux paging, leading up to a faster version using huge pages;</a></li>
+<li><a href="#busy-loop">The final optimization, replacing polling with busy looping;</a></li>
+<li><a href="#closing-thoughts">Some closing thoughts.</a></li>
+</ol>
+<p>Section 4 is the heaviest on Linux kernel internals, so it might be interesting even if you’re familiar with the other topics treated in the post. For readers not familiar with the topics treated, only basic knowledge of C is assumed.</p>
+<p>Let’s begin!</p>
+</div>
+<section role="doc-endnotes">
+<ol>
+<li id="fn1" role="doc-endnote"><p>This will be similar in style to my <a href="https://mazzo.li/posts/vectorized-atan2.html"><code>atan2f</code> performance investigation</a>, although the program in question will only be useful for learning.</p>
+<p>Moreover, we will optimize code at a different level. While tuning <code>atan2f</code> consisted in micro-optimizations guided by the assembly output, tuning our pipe program will involve looking at <code>perf</code> events and reducing various sorts of kernel overhead.<a href="#fnref1" role="doc-backlink">↩︎</a></p></li>
+<li id="fn2" role="doc-endnote"><p>The tests were run on an Intel Skylake i7-8550U CPU, and on Linux 5.17.</p>
+<p>Your mileage <em>will</em> vary, since the Linux internals that power the programs described in this post have been under constant change for the past couple of years, and will probably continue to be tweaked in future releases. Keep reading for more details!<a href="#fnref2" role="doc-backlink">↩︎</a></p></li>
+<li id="fn3" role="doc-endnote"><p>“FizzBuzz” is an allegedly common coding interview question.</p>
+<p>The details are not relevant to this blog post, but they are explained in the link. I have personally never been asked it, but I have it on good authority that it does happen!<a href="#fnref3" role="doc-backlink">↩︎</a></p></li>
+</ol>
+</section>
+<h2 id="first-version">The challenge, and a slow first version <a href="#first-version">#</a></h2>
+<div>
+<p>First of all, let’s start with measuring the performance of <a href="https://codegolf.stackexchange.com/questions/215216/high-throughput-fizz-buzz/236630#236630">the fabled FizzBuzz program</a>, following the rules laid down by the StackOverflow post:</p>
+<pre><code>% ./fizzbuzz | pv &gt;/dev/null
+ 422GiB 0:00:16 [36.2GiB/s]</code></pre>
+<p><code>pv</code> is “pipe viewer”, <a href="http://www.ivarch.com/programs/pv.shtml">a handy utility</a> to measure the throughput of data flowing through a pipe. So <code>fizzbuzz</code> is producing output at a rate of 36GiB/s.</p>
+<p><code>fizzbuzz</code> writes the output in blocks as big as the L2 cache, to strike a good balance between cheap access to memory and minimizing IO overhead.</p>
+</div>
+<div>
+<p>On my machine, the L2 cache is 256KiB. Throughout this post, we’ll also output blocks of 256KiB, but without “computing” anything. Essentially, we’ll try to measure the upper bound for programs writing to a pipe with a reasonable buffer size.<a href="#fn4" id="fnref4" role="doc-noteref"><sup>4</sup></a></p>
+<p>While <code>fizzbuzz</code> uses <code>pv</code> to measure speed, our setup will be slightly different: we’ll implement the programs on both ends of the pipe. This is so that we fully control the code involved in pushing and pulling data from the pipe.</p>
+</div>
+<section role="doc-endnotes">
+<ol start="4">
+<li id="fn4" role="doc-endnote"><p>While we fix the buffer size, the numbers are actually not wildly different if we use different buffer sizes, given that other bottlenecks kick in.<a href="#fnref4" role="doc-backlink">↩︎</a></p></li>
+</ol>
+</section>
+<div>
+<p>The code is available <a href="https://github.com/bitonic/pipes-speed-test">in my <code>pipes-speed-test</code> repo</a>. <code>write.cpp</code> implements the writing, and <code>read.cpp</code> the reading. <code>write</code> repeatedly writes the same 256KiB forever. <code>read</code> reads through 10GiB of data and terminates, printing the throughput in GiB/s. Both executables accept a variety of command line options to change their behavior.</p>
+<p>The first attempt at reading and writing from pipes will be using the <a href="https://linux.die.net/man/2/write"><code>write</code></a> and <a href="https://linux.die.net/man/2/read"><code>read</code></a> syscalls, using the same buffer size as <code>fizzbuzz</code>. Here’s a view of the writing end:</p>
+</div>
+<div id="cb2"><pre><code><span id="cb2-1"><span>int</span> main<span>()</span> <span>{</span></span>
+<span id="cb2-2">  <span>size_t</span> buf_size <span>=</span> <span>1</span> <span>&lt;&lt;</span> <span>18</span><span>;</span> <span>// 256KiB</span></span>
+<span id="cb2-3">  <span>char</span><span>*</span> buf <span>=</span> <span>(</span><span>char</span><span>*)</span> malloc<span>(</span>buf_size<span>);</span></span>
+<span id="cb2-4">  memset<span>((</span><span>void</span><span>*)</span>buf<span>,</span> <span>'X'</span><span>,</span> buf_size<span>);</span> <span>// output Xs</span></span>
+<span id="cb2-5">  <span>while</span> <span>(</span><span>true</span><span>)</span> <span>{</span></span>
+<span id="cb2-6">    <span>size_t</span> remaining <span>=</span> buf_size<span>;</span></span>
+<span id="cb2-7">    <span>while</span> <span>(</span>remaining <span>&gt;</span> <span>0</span><span>)</span> <span>{</span></span>
+<span id="cb2-8">      <span>// Keep invoking `write` until we've written the entirety</span></span>
+<span id="cb2-9">      <span>// of the buffer. Remember that write returns how much</span></span>
+<span id="cb2-10">      <span>// it could write into the destination -- in this case,</span></span>
+<span id="cb2-11">      <span>// our pipe.</span></span>
+<span id="cb2-12">      <span>ssize_t</span> written <span>=</span> write<span>(</span></span>
+<span id="cb2-13">        STDOUT_FILENO<span>,</span> buf <span>+</span> <span>(</span>buf_size <span>-</span> remaining<span>),</span> remaining</span>
+<span id="cb2-14">      <span>);</span></span>
+<span id="cb2-15">      remaining <span>-=</span> written<span>;</span></span>
+<span id="cb2-16">    <span>}</span></span>
+<span id="cb2-17">  <span>}</span></span>
+<span id="cb2-18"><span>}</span></span></code></pre></div>
+<div>
+<p>This snippet and following ones omit all error checking for brevity.<a href="#fn5" id="fnref5" role="doc-noteref"><sup>5</sup></a> The <code>memset</code> ensures that the output will be printable, but also plays another role, as we’ll discuss later.</p>
+<p>The work is all done by the <code>write</code> call, the rest is making sure that the whole buffer is written. The read end is very similar, but <code>read</code>ing data into <code>buf</code>, and terminating when enough has been read.</p>
+<p>After building, the code from the repo can be run as follows:</p>
+</div>
+<section role="doc-endnotes">
+<ol start="5">
+<li id="fn5" role="doc-endnote"><p>Feel free to refer to <a href="https://github.com/bitonic/pipes-speed-test">the repo</a> for the gory details.</p>
+<p>More generally, I won’t reproduce the code verbatim here, since the details are unimportant. I will instead post snippets of code representative of what is going on.<a href="#fnref5" role="doc-backlink">↩︎</a></p></li>
+</ol>
+</section>
+<pre><code>% ./write | ./read
+3.7GiB/s, 256KiB buffer, 40960 iterations (10GiB piped)</code></pre>
+<p>We’re writing the same 256KiB buffer filled with <code>'X'</code>s 40960 times, and measuring the throughput. What’s worrying is that we’re 10 times slower than <code>fizzbuzz</code>! And we’re not doing any work, just writing bytes to the pipe.</p>
+<p>It turns out that we can’t get much faster than this by using <code>write</code> and <code>read</code>.</p>
+<h2 id="trouble-with-write">The trouble with <code>write</code> <a href="#trouble-with-write">#</a></h2>
+<div>
+<p>To find out what our program is spending time on, we can use <a href="https://en.wikipedia.org/wiki/Perf_(Linux)"><code>perf</code></a>:<a href="#fn6" id="fnref6" role="doc-noteref"><sup>6</sup></a> <a href="#fn7" id="fnref7" role="doc-noteref"><sup>7</sup></a></p>
+<pre><code>% perf record -g sh -c './write | ./read'
+3.2GiB/s, 256KiB buffer, 40960 iterations (10GiB piped)
+[ perf record: Woken up 6 times to write data ]
+[ perf record: Captured and wrote 2.851 MB perf.data (21201 samples) ]</code></pre>
+<p>The <code>-g</code> instructs perf to record call graphs: this will allow us to take a top-down look at where time is being spent.</p>
+<p>We can take a look at where time is spent using <code>perf report</code>. Here is a lightly redacted excerpt, breaking down where <code>write</code> spends its time:<a href="#fn8" id="fnref8" role="doc-noteref"><sup>8</sup></a></p>
+<pre><code>% perf report -g --symbol-filter=write
+-   48.05%     0.05%  write    libc-2.33.so       [.] __GI___libc_write
+   - 48.04% __GI___libc_write
+      - 47.69% entry_SYSCALL_64_after_hwframe
+         - do_syscall_64
+            - 47.54% ksys_write
+               - 47.40% vfs_write
+                  - 47.23% new_sync_write
+                     - pipe_write
+                        + 24.08% copy_page_from_iter
+                        + 11.76% __alloc_pages
+                        + 4.32% schedule
+                        + 2.98% __wake_up_common_lock
+                          0.95% _raw_spin_lock_irq
+                          0.74% alloc_pages
+                          0.66% prepare_to_wait_event
+</code></pre>
+<p>47% of the time is spent in <code>pipe_write</code>, which is what <code>write</code> resolves to if we’re writing to a pipe. This is not surprising — we’re spending roughly half of the time writing, and the other half reading.</p>
+<p>Within <code>pipe_write</code>, 3/4 of the time is spent copying or allocating pages (<code>copy_page_from_iter</code> and <code>__alloc_pages</code>). If we already have an idea of how communication between the kernel and userspace works this might make some sense. Regardless, to fully understand what’s happening we must first understand how pipes work.</p>
+</div>
+<section role="doc-endnotes">
+<ol start="6">
+<li id="fn6" role="doc-endnote"><p>Note that here we’re profiling a shell invocation including both the pipe reading and writing — <code>perf record</code> follows all child processes by default.<a href="#fnref6" role="doc-backlink">↩︎</a></p></li>
+<li id="fn7" role="doc-endnote"><p>When profiling this program, I noticed that the <code>perf</code> output was being polluted by information from the <a href="https://facebookmicrosites.github.io/psi/docs/overview">“Pressure Stall Information” infrastructure (PSI)</a>.</p>
+<p>Therefore the numbers are taken from a kernel compiled with PSI disabled. This can be achieved by putting <code>CONFIG_PSI=n</code> in the kernel build configuration. In NixOS:</p>
+<pre><code>boot.kernelPatches = [{
+  name = "disable-psi";
+  patch = null;
+  extraConfig = '' 
+    PSI n 
+  '';
+}];</code></pre>
+<p>Moreover, the kernel debug symbols must be present for <code>perf</code> to correctly show where time is spent while in syscalls. How to install the symbols varies from distro to distro. In recent NixOS versions they are installed by default.<a href="#fnref7" role="doc-backlink">↩︎</a></p></li>
+<li id="fn8" role="doc-endnote"><p>In <code>perf report</code> you can use <code>+</code> to expand a call graph, assuming you ran <code>perf record -g</code>.<a href="#fnref8" role="doc-backlink">↩︎</a></p></li>
+</ol>
+</section>
+<h3 id="what-are-pipes-made-of">What are pipes made of? <a href="#what-are-pipes-made-of">#</a></h3>
+<p>The data structure holding a pipe can be found in <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/include/linux/pipe_fs_i.h#L34"><code>include/linux/pipe_fs_i.h</code></a>, and the operations on it in <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/fs/pipe.c"><code>fs/pipe.c</code></a>.</p>
+<p>A Linux pipe is a <a href="https://en.wikipedia.org/wiki/Circular_buffer">ring buffer</a> holding references to pages where the data is written to and read from:</p>
+<p><img src="https://mazzo.li/assets/images/fast-pipes-pipe-ring.png"></p>
+<p>In the image above the ring buffer has 8 slots, but we might have more or less, the default being 16. Each page is 4KiB on x86-64, but might be of different sizes on other architectures. In total, this pipe can hold at most 32KiB of data. This is a key point: every pipe has an upper bound on the total amount of data it can hold before it’s full.</p>
+<p>The shaded part of the diagram represents the current pipe data, the non-shaded part the empty space in the pipe.</p>
+<p>Somewhat counterintuitively, <code>head</code> stores the write-end of the pipe. That is, writers will write into the buffer pointed at by <code>head</code>, and increase <code>head</code> accordingly if they need to move onto the next buffer. Within the write buffer, <code>len</code> stores how much we’ve written in it.</p>
+<p>Conversely, <code>tail</code> stores the read-end of the pipe: readers will start consuming the pipe from there. <code>offset</code> indicates where to start reading from.</p>
+<p>Note that <code>tail</code> can appear <em>after</em> <code>head</code>, like in the picture, since we’re working with a circular/ring buffer. Also note that some slots might be unused when we haven’t filled the pipe completely — the <code>NULL</code> cells in the middle. If the pipe is full (no <code>NULL</code>s and no free space in the pages), <code>write</code> will block. If the pipe is empty (all <code>NULL</code>s), <code>read</code> will block.</p>
+<p>Here’s an abridged version of the C data structures in <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/include/linux/pipe_fs_i.h#L34"><code>pipe_fs_i.h</code></a>:</p>
+<div id="cb7"><pre><code><span id="cb7-1"><span>struct</span> pipe_inode_info <span>{</span></span>
+<span id="cb7-2">  <span>unsigned</span> <span>int</span> head<span>;</span></span>
+<span id="cb7-3">  <span>unsigned</span> <span>int</span> tail<span>;</span></span>
+<span id="cb7-4">  <span>struct</span> pipe_buffer <span>*</span>bufs<span>;</span></span>
+<span id="cb7-5"><span>};</span></span>
+<span id="cb7-6"></span>
+<span id="cb7-7"><span>struct</span> pipe_buffer <span>{</span></span>
+<span id="cb7-8">  <span>struct</span> page <span>*</span>page<span>;</span></span>
+<span id="cb7-9">  <span>unsigned</span> <span>int</span> offset<span>,</span> len<span>;</span></span>
+<span id="cb7-10"><span>};</span></span></code></pre></div>
+<p>We’re omitting many fields here, and we’re not explainining what <code>struct page</code> contains yet, but this is the key data structure to understanding how reading and writing from a pipe happens.</p>
+<h3 id="reading-and-writing-to-pipes">Reading and writing to pipes <a href="#reading-and-writing-to-pipes">#</a></h3>
+<p>Let’s now go to <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/fs/pipe.c#L416">the definition of <code>pipe_write</code></a>, to try and make sense of the <code>perf</code> output shown before.</p>
+<p>Here is a simplified explanation of how <code>pipe_write</code> works:</p>
+<ol type="1">
+<li>If the pipe is already full, <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/fs/pipe.c#L561">wait for space</a> and restart;</li>
+<li>If the buffer currently pointed at by <code>head</code> has space, <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/fs/pipe.c#L457">fill that space first</a>;</li>
+<li><a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/fs/pipe.c#L577">While there’s free slots</a>, and <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/fs/pipe.c#L542">there are remaining bytes to write</a>, <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/fs/pipe.c#L496">allocate new pages</a> and <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/fs/pipe.c#L532">fill them</a>, updating <code>head</code>.</li>
+</ol>
+<div>
+<figure>
+<img src="https://mazzo.li/assets/images/write-to-pipe.svg" alt="What happens to a pipe when we write to it.">
+
+</figure>
+</div>
+<div>
+<p>The operations described above are protected by a lock, which <code>pipe_write</code> <a href="https://github.com/torvalds/linux/blob/2c85ebc57b3e1817b6ce1a6b703928e113a90442/fs/pipe.c#L416">acquires</a> and releases as necessary.</p>
+<p><code>pipe_read</code> is the mirror image of <code>pipe_write</code>, except that we consume pages, free them when we’ve fully read them, and update <code>tail</code>.<a href="#fn9" id="fnref9" role="doc-noteref"><sup>9</sup></a></p>
+<p>So, we now have a quite unpleasant picture of what is going on:</p>
+<ul>
+<li>We copy each page twice, once from user memory to the kernel, and back again to the kernel to user memory;</li>
+<li>The copying is done one 4KiB page at a time, interspersed with other activity, such as the synchronization between read and write, and page allocation and freeing;</li>
+<li>We are working with memory that might not be contiguous, since we’re constantly allocating new pages;</li>
+<li>We’re acquiring and releasing the pipe lock.</li>
+</ul>
+<p>On this machine, sequential RAM reading clocks at around 16GiB/s:</p>
+</div>
+<section role="doc-endnotes">
+<ol start="9">
+<li id="fn9" role="doc-endnote"><p>One single “spare page” called <code>tmp_page</code> is actually kept around by <code>pipe_read</code>, and reused by <code>pipe_write</code>.</p>
+<p>However, since this is always only a single page, I couldn’t leverage it to achieve higher performance given that the page reuse is counteracted by fixed overhead when calling <code>pipe_write</code> and <code>pipe_read</code>.<a href="#fnref9" role="doc-backlink">↩︎</a></p></li>
+</ol>
+</section>
+<pre><code>% sysbench memory --memory-block-size=1G --memory-oper=read --threads=1 run
+...
+102400.00 MiB transferred (15921.22 MiB/sec)</code></pre>
+<p>Given all the fiddliness listed above, a 4x slowdown compared to single-threaded sequential RAM speed is not that surprising.</p>
+<p>Tweaking the buffer size or the pipe size to reduce the amount of syscall and synchronization overhead, or tuning other parameters will not get us very far. Luckily, there is a way to get around the slowness of <code>write</code> and of <code>read</code> altogether.</p>
+<h2 id="splicing">Splicing to the rescue <a href="#splicing">#</a></h2>
+<p>This copying of buffers from user memory to the kernel and back is a frequent thorn in the side of people needing to do fast IO. One common solution is to just cut the kernel out of the picture and perform IO operations directly. For example we might interact directly with a network card and bypass the kernel for low-latency networking.</p>
+<p>In general when we write to a socket, or a file, or in our case a pipe, we’re first writing to a buffer somewhere in the kernel, and then let the kernel do its work. In the case of pipes, the pipe <em>is</em> a series of buffers in the kernel. All this copying is undesirable if we’re in the business of performance.</p>
+<div>
+<p>Luckily, Linux includes system calls to speed things up when we want to move data to and from pipes, without copying. Specifically:</p>
+<ul>
+<li><a href="https://man7.org/linux/man-pages/man2/splice.2.html"><code>splice</code></a> moves data from a pipe to a file descriptor, and vice-versa.</li>
+<li><a href="https://man7.org/linux/man-pages/man2/vmsplice.2.html"><code>vmsplice</code></a> moves data from user memory into a pipe.<a href="#fn10" id="fnref10" role="doc-noteref"><sup>10</sup></a></li>
+</ul>
+<p>Crucially, both operations work without copying anything.</p>
+<p>Now that we know how pipes work, we can already vaguely imagine how the two operations function: they just “grab” an existing buffer from somewhere and put it into the pipe ring buffer, or the reverse, rather than allocating new pages as needed:</p>
+<p><img src="https://mazzo.li/assets/images/vmsplice-intuition.svg"></p>
+</div>
+<section role="doc-endnotes">
+<ol start="10">
+<li id="fn10" role="doc-endnote"><p>Technically, <code>vmsplice</code> also supports transferring data in the other direction, although not in a useful way. As the <a href="https://man7.org/linux/man-pages/man2/vmsplice.2.html">man page</a> states:</p>
+<blockquote>
+<p><code>vmsplice</code> really supports true splicing only from user memory to a pipe. In the opposite direction, it actually just copies the data to user space.</p>
+</blockquote>
+<a href="#fnref10" role="doc-backlink">↩︎</a></li>
+</ol>
+</section>
+<p>We’ll soon see exactly how this works.</p>
+<h3 id="splicing-in-practice">Splicing in practice <a href="#splicing-in-practice">#</a></h3>
+<p>Let’s replace <code>write</code> with <code>vmsplice</code>. This is the signature for <code>vmsplice</code>:</p>
+<div id="cb9"><pre><code><span id="cb9-1"><span>struct</span> iovec <span>{</span></span>
+<span id="cb9-2">  <span>void</span>  <span>*</span>iov_base<span>;</span> <span>// Starting address</span></span>
+<span id="cb9-3">  <span>size_t</span> iov_len<span>;</span>  <span>// Number of bytes</span></span>
+<span id="cb9-4"><span>};</span></span>
+<span id="cb9-5"></span>
+<span id="cb9-6"><span>// Returns how much we've spliced into the pipe</span></span>
+<span id="cb9-7"><span>ssize_t</span> vmsplice<span>(</span></span>
+<span id="cb9-8">  <span>int</span> fd<span>,</span> <span>const</span> <span>struct</span> iovec <span>*</span>iov<span>,</span> <span>size_t</span> nr_segs<span>,</span> <span>unsigned</span> <span>int</span> flags</span>
+<span id="cb9-9"><span>);</span></span></code></pre></div>
+<div>
+<p><code>fd</code> is the target pipe, <code>struct iovec *iov</code> is an array of buffers we’ll be moving to the pipe. Note that <code>vmsplice</code> returns how much was “spliced” into the pipe, which might not be the full amount, much like how <code>write</code> returns how much was written. Remember that pipes are bounded by how many slots they have in the ring buffer, and <code>vmsplice</code> is not exempt from this restriction.</p>
+<p>We also need to be a bit careful when using <code>vmsplice</code>. Since the user memory is moved to the pipe without copying, we must ensure that the read-end consumes it before we can reuse the spliced buffer.</p>
+<p>For this reason <code>fizzbuzz</code> uses a double buffering scheme, which works as follows:</p>
+<ol type="1">
+<li>Split the 256KiB buffer in two;</li>
+<li>Set the pipe size to 128KiB, this will have the effect of setting the pipe ring buffer to have 128KiB/4KiB = 32 slots;</li>
+<li>Alternate between writing to the first half-buffer and using <code>vmsplice</code> to move it to the pipe and doing the same with the other half.</li>
+</ol>
+<p>The fact that the pipe size is set to 128KiB, and that we wait for <code>vmsplice</code> to fully output one 128KiB buffer, ensures that by the time we’re done with one iteration of <code>vmsplice</code> we <em>know</em> that the the previous buffer has been fully read — otherwise we would not have been able to fully <code>vmsplice</code> the new 128KiB buffer into the 128KiB pipe.</p>
+<p>Now, we’re not actually writing anything to the buffers, but we’ll keep the double buffering scheme since a similar scheme would be required for any program actually writing content.<a href="#fn11" id="fnref11" role="doc-noteref"><sup>11</sup></a></p>
+<p>Our write loop now looks something like this:</p>
+</div>
+<section role="doc-endnotes">
+<ol start="11">
+<li id="fn11" role="doc-endnote"><p>Travis Downs <a href="https://news.ycombinator.com/item?id=31596169">pointed out</a> that this scheme might still be unsafe, since the page could be spliced further, therefore extending its lifetime. This problem is also present in the original FizzBuzz post.</p>
+<p>It’s actually not entirely clear to me whether <code>vmsplice</code> without <code>SPLICE_F_GIFT</code> is actually unsafe — the man page for <code>vmsplice</code> implies it shouldn’t be. However, it’s definitely the case that particular care is needed to achieve zero copy piping while maintaining safety.</p>
+<p>In the test program the reading end splices the pipe into <code>/dev/null</code>, so it could be that the kernel knows that the pages can be spliced without copying, but I have not verified whether this is what’s actually happening.<a href="#fnref11" role="doc-backlink">↩︎</a></p></li>
+</ol>
+</section>
+<div id="cb10"><pre><code><span id="cb10-1"><span>int</span> main<span>()</span> <span>{</span></span>
+<span id="cb10-2">  <span>size_t</span> buf_size <span>=</span> <span>1</span> <span>&lt;&lt;</span> <span>18</span><span>;</span> <span>// 256KiB</span></span>
+<span id="cb10-3">  <span>char</span><span>*</span> buf <span>=</span> malloc<span>(</span>buf_size<span>);</span></span>
+<span id="cb10-4">  memset<span>((</span><span>void</span><span>*)</span>buf<span>,</span> <span>'X'</span><span>,</span> buf_size<span>);</span> <span>// output Xs</span></span>
+<span id="cb10-5">  <span>char</span><span>*</span> bufs<span>[</span><span>2</span><span>]</span> <span>=</span> <span>{</span> buf<span>,</span> buf <span>+</span> buf_size<span>/</span><span>2</span> <span>};</span></span>
+<span id="cb10-6">  <span>int</span> buf_ix <span>=</span> <span>0</span><span>;</span></span>
+<span id="cb10-7">  <span>// Flip between the two buffers, splicing until we're done.</span></span>
+<span id="cb10-8">  <span>while</span> <span>(</span><span>true</span><span>)</span> <span>{</span></span>
+<span id="cb10-9">    <span>struct</span> iovec bufvec <span>=</span> <span>{</span></span>
+<span id="cb10-10">      <span>.</span>iov_base <span>=</span> bufs<span>[</span>buf_ix<span>],</span></span>
+<span id="cb10-11">      <span>.</span>iov_len <span>=</span> buf_size<span>/</span><span>2</span></span>
+<span id="cb10-12">    <span>};</span></span>
+<span id="cb10-13">    buf_ix <span>=</span> <span>(</span>buf_ix <span>+</span> <span>1</span><span>)</span> <span>%</span> <span>2</span><span>;</span></span>
+<span id="cb10-14">    <span>while</span> <span>(</span>bufvec<span>.</span>iov_len <span>&gt;</span> <span>0</span><span>)</span> <span>{</span></span>
+<span id="cb10-15">      <span>ssize_t</span> ret <span>=</span> vmsplice<span>(</span>STDOUT_FILENO<span>,</span> <span>&amp;</span>bufvec<span>,</span> <span>1</span><span>,</span> <span>0</span><span>);</span></span>
+<span id="cb10-16">      bufvec<span>.</span>iov_base <span>=</span> <span>(</span><span>void</span><span>*)</span> <span>(((</span><span>char</span><span>*)</span> bufvec<span>.</span>iov_base<span>)</span> <span>+</span> ret<span>);</span></span>
+<span id="cb10-17">      bufvec<span>.</span>iov_len <span>-=</span> ret<span>;</span></span>
+<span id="cb10-18">    <span>}</span></span>
+<span id="cb10-19">  <span>}</span></span>
+<span id="cb10-20"><span>}</span></span></code></pre></div>
+<p>Here are the results writing with <code>vmsplice</code>, rather than <code>write</code>:</p>
+<pre><code>% ./write --write_with_vmsplice | ./read
+12.7GiB/s, 256KiB buffer, 40960 iterations (10GiB piped)</code></pre>
+<p>This reduces by half the amount of copying we need to do, and already improves our througput more than threefold — to 12.7GiB/s. Changing the read end to use <code>splice</code>, we eliminate all copying, and get another 2.5x speedup:</p>
+<pre><code>% ./write --write_with_vmsplice | ./read --read_with_splice
+32.8GiB/s, 256KiB buffer, 40960 iterations (10GiB piped)</code></pre>
+<h2 id="paging">Fishing for pages <a href="#paging">#</a></h2>
+<p>What next? Let’s ask <code>perf</code>:</p>
+<pre><code>% perf record -g sh -c './write --write_with_vmsplice | ./read --read_with_splice'
+33.4GiB/s, 256KiB buffer, 40960 iterations (10GiB piped)
+[ perf record: Woken up 1 times to write data ]
+[ perf record: Captured and wrote 0.305 MB perf.data (2413 samples) ]
+% perf report --symbol-filter=vmsplice
+-   49.59%     0.38%  write    libc-2.33.so       [.] vmsplice
+   - 49.46% vmsplice
+      - 45.17% entry_SYSCALL_64_after_hwframe
+         - do_syscall_64
+            - 44.30% __do_sys_vmsplice
+               + 17.88% iov_iter_get_pages
+               + 16.57% __mutex_lock.constprop.0
+                 3.89% add_to_pipe
+                 1.17% iov_iter_advance
+                 0.82% mutex_unlock
+                 0.75% pipe_lock
+        2.01% __entry_text_start
+        1.45% syscall_return_via_sysret</code></pre>
+<div>
+<p>The lion’s share of the time is taken by locking the pipe for writing (<code>__mutex_lock.constprop.0</code>), and by moving the pages into the pipe (<code>iov_iter_get_pages</code>). There isn’t so much we can do about the locking, but we <em>can</em> improve the performance of <code>iov_iter_get_pages</code>.</p>
+<p>As the name suggests, <code>iov_iter_get_pages</code> turns the <code>struct iovec</code>s we feed into <code>vmsplice</code> into <code>struct page</code>s to put into the pipe. To understand what this function actually does, and how to speed it up, we must first take a detour into how the CPU and Linux organize pages.</p>
+</div>
+<h3 id="a-whirlwind-tour-of-paging">A whirlwind tour of paging <a href="#a-whirlwind-tour-of-paging">#</a></h3>
+<div>
+<p>As you might be aware of, processes do not refer to locations in RAM directly: instead, the are assigned <em>virtual</em> memory addresses, which get resolved to <em>physical</em> addresses. This abstraction is known as <a href="https://en.wikipedia.org/wiki/Virtual_memory"><em>virtual memory</em></a>, and has all sorts of advantages we won’t cover here — the most obvious being that it significantly simplifies running multiple processes competing for the same physical memory.</p>
+<p>In any case, whenever we execute a program and we load/store from/to memory, the CPU needs to convert our virtual address to a physical address. Storing a mapping from every virtual address to every corresponding physical address would be impratical. Therefore memory is split up in uniformly sized chunks, called <em>pages</em>, and virtual pages are mapped to physical pages:<a href="#fn12" id="fnref12" role="doc-noteref"><sup>12</sup></a></p>
+<p><img src="https://mazzo.li/assets/images/virtual-phsyical.svg"></p>
+<p>There’s nothing special about 4KiB: each architecture picks a size, based on various tradeoffs — some of which we’ll soon explore.</p>
+<p>To make this a bit more precise, let’s imagine allocating 10000 bytes using <code>malloc</code>:</p>
+<div id="cb14"><pre><code><span id="cb14-1"><span>void</span><span>*</span> buf <span>=</span> malloc<span>(</span><span>10000</span><span>);</span></span>
+<span id="cb14-2">printf<span>(</span><span>"%p</span><span>\n</span><span>"</span><span>,</span> buf<span>);</span>          <span>// 0x6f42430</span></span></code></pre></div>
+</div>
+<section role="doc-endnotes">
+<ol start="12">
+<li id="fn12" role="doc-endnote"><p>Here we’re presenting a simplified model where physical memory is a simple flat, linear sequence. Reality is <a href="https://lwn.net/Articles/789304/">a bit more complicated</a>, but the simple model will do for our purposes.<a href="#fnref12" role="doc-backlink">↩︎</a></p></li>
+</ol>
+</section>
+<div>
+<p>As we use them, our 10k bytes will look contiguous in virtual memory, but will be mapped to 3 not necessarily contiguous physical pages:<a href="#fn13" id="fnref13" role="doc-noteref"><sup>13</sup></a></p>
+<p><img src="https://mazzo.li/assets/images/example-allocation.svg"></p>
+</div>
+<section role="doc-endnotes">
+<ol start="13">
+<li id="fn13" role="doc-endnote"><p>You can inspect the physical address assigned to the current process’ virtual pages by reading <code>/proc/self/pagemap</code>, <a href="https://mazzo.li/posts/check-huge-page.html">as illustrated in a previous post on this blog</a>, and multiplying the “page frame number” by the page size.<a href="#fnref13" role="doc-backlink">↩︎</a></p></li>
+</ol>
+</section>
+<div>
+<p>One of the tasks of the kernel is to manage this mapping, which is embodied in a data structure called the <em>page table</em>. The CPU specifies how the page table looks (since it needs to understand it), and the kernel manipulates it as needed. On x86-64 the page table is a 4-level, 512-way tree, which itself lives in memory.<a href="#fn14" id="fnref14" role="doc-noteref"><sup>14</sup></a> Each node of this tree is (you guessed it!) 4KiB wide, with each entry within the node leading to the next level being 8 bytes (4KiB/8bytes = 512). The entries contain the address of the next node, along with other metadata.</p>
+<p>We have one page table per process — or in other words, each process has a reserved virtual address space. When the kernel context-switches to a process, it sets the special register CR3 to the <em>physical</em> address of the root of this tree.<a href="#fn15" id="fnref15" role="doc-noteref"><sup>15</sup></a> Then whenever a virtual address needs to be converted to a physical address, the CPU splits up the address in sections, and uses them to walk this tree and compute the physical address.</p>
+<p>To make these concepts less abstract, here’s a visual depiction of how the virtual address <code>0x0000f2705af953c0</code> might be resolved to a physical address:</p>
+<p><img src="https://mazzo.li/assets/images/virtual-address-resolution.svg"></p>
+</div>
+<section role="doc-endnotes">
+<ol start="14">
+<li id="fn14" role="doc-endnote"><p>Intel extended the page table to consist of <a href="https://en.wikipedia.org/wiki/Intel_5-level_paging">5 levels</a> starting from Ice Lake, thereby increasing the maximum addressable memory from 256TiB to 128PiB. However this capability has to explicitly enabled, since some programs rely on the upper 16 bits of pointers to be unused.<a href="#fnref14" role="doc-backlink">↩︎</a></p></li>
+<li id="fn15" role="doc-endnote"><p>The addresses within the page table must be physical, otherwise we’d have infinite loop on our hands.<a href="#fnref15" role="doc-backlink">↩︎</a></p></li>
+</ol>
+</section>
+<div>
+<p>The search starts from the first level, called the “page global directory”, or PGD, the physical location of which is stored in CR3. The first 16 bits of the address are unused.<a href="#fn16" id="fnref16" role="doc-noteref"><sup>16</sup></a> We use the next 9 bits the PGD entry, and traverse down to the second level, “page upper directory”, or PUD. The next 9 bits are used to select an entry from the PUD. The process repeats for the next two levels, PMD (“page middle directory”), and PTE (“page table entry”). The PTE tells where the actual physical page we’re looking for is, and then we use the last 12 bits to find the offset inside the page.</p>
+<p>The sparse structure of the page table allows the mapping to be gradually built up as new pages are needed. Whenever a process needs memory, the page table will be updated with a new entry by the kernel.</p>
+</div>
+<section role="doc-endnotes">
+<ol start="16">
+<li id="fn16" role="doc-endnote"><p>Note that the highest 16 bits are unused: this means that each process can address at most <span>2^{48}-1</span> bytes, or 256TiB, of physical memory.<a href="#fnref16" role="doc-backlink">↩︎</a></p></li>
+</ol>
+</section>
+<h3 id="the-role-of-struct-page">The role of <code>struct page</code> <a href="#the-role-of-struct-page">#</a></h3>
+<div>
+<p>The <code>struct page</code> data structure is a key piece of this machinery: it is what the kernel uses to refer to a single <em>physical</em> page, storing its physical address and all sorts of other metadata about it.<a href="#fn17" id="fnref17" role="doc-noteref"><sup>17</sup></a> For instance we can get a <code>struct page</code> from the information contained in the PTE (the last level of the page table described above). In general it is used pervasively in all code handling page-related matters.</p>
+<p>In the case of pipes, <code>struct page</code> is used to hold their data in the ring buffer, as we’re already seen:</p>
+<div id="cb15"><pre><code><span id="cb15-1"><span>struct</span> pipe_inode_info <span>{</span></span>
+<span id="cb15-2">  <span>unsigned</span> <span>int</span> head<span>;</span></span>
+<span id="cb15-3">  <span>unsigned</span> <span>int</span> tail<span>;</span></span>
+<span id="cb15-4">  <span>struct</span> pipe_buffer <span>*</span>bufs<span>;</span></span>
+<span id="cb15-5"><span>};</span></span>
+<span id="cb15-6"></span>
+<span id="cb15-7"><span>struct</span> pipe_buffer <span>{</span></span>
+<span id="cb15-8">  <span>struct</span> page <span>*</span>page<span>;</span></span>
+<span id="cb15-9">  <span>unsigned</span> <span>int</span> offset<span>,</span> len<span>;</span></span>
+<span id="cb15-10"><span>};</span></span></code></pre></div>
+</div>
+<section role="doc-endnotes">
+<ol start="17">
+<li id="fn17" role="doc-endnote"><p><code>struct page</code> might also refer to yet-to-be-allocated physical pages, which do not have a physical address yet, and other page-related abstractions. Think of them as fairly abstract references to physical pages, but not necessarily references to an <em>allocated</em> physical page.</p>
+<p>This subtle point will be relevant in a later sidenote 🫠.<a href="#fnref17" role="doc-backlink">↩︎</a></p></li>
+</ol>
+</section>
+<p>However, <code>vmsplice</code> accepts <em>virtual</em> memory as input, while <code>struct page</code> refers to <em>physical</em> memory directly.</p>
+<p>Therefore we need turn arbitrary chunks of virtual memory into a bunch of <code>struct page</code>s. This is exactly what <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/lib/iov_iter.c#L1518"><code>iov_iter_get_pages</code></a> does, and where we’re spending half of our time:</p>
+<div id="cb16"><pre><code><span id="cb16-1"><span>ssize_t</span> iov_iter_get_pages<span>(</span></span>
+<span id="cb16-2">  <span>struct</span> iov_iter <span>*</span>i<span>,</span>  <span>// input: a sized buffer in virtual memory</span></span>
+<span id="cb16-3">  <span>struct</span> page <span>**</span>pages<span>,</span> <span>// output: the list of pages which back the input buffers</span></span>
+<span id="cb16-4">  <span>size_t</span> maxsize<span>,</span>      <span>// maximum number of bytes to get</span></span>
+<span id="cb16-5">  <span>unsigned</span> maxpages<span>,</span>   <span>// maximum number of pages to get</span></span>
+<span id="cb16-6">  <span>size_t</span> <span>*</span>start        <span>// offset into first page, if the input buffer wasn't page-aligned</span></span>
+<span id="cb16-7"><span>);</span></span></code></pre></div>
+<p><code>struct iov_iter</code> is a Linux kernel data structure representing various ways of walking through chunks of memory, including <code>struct iovec</code>. In our case, it will point to a 128KiB buffer. <code>vmsplice</code> will use <code>iov_iter_get_pages</code> to turn the input buffer into a bunch of <code>struct page</code>s, and hold on to them. Now that you know how paging works, you might vaguely imagine how <code>iov_iter_get_pages</code> works as well, but we’ll explain it in detail in the next section.</p>
+<p>We’ve rapidly gone through a lot of new concepts, so to recap:</p>
+<ul>
+<li>Modern CPUs use virtual memory for their processes;</li>
+<li>Memory is organized in regularly-sized pages;</li>
+<li>The CPU translates virtual addresses into physical addresses using a page table mapping virtual pages to physical pages;</li>
+<li>The kernel adds and removes entries to the page table as necessary;</li>
+<li>Pipes are made out of references to physical pages, so <code>vmsplice</code> must convert virtual memory ranges into physical pages, and hold on to them.</li>
+</ul>
+<h3 id="the-cost-of-getting-pages">The cost of getting pages <a href="#the-cost-of-getting-pages">#</a></h3>
+<div>
+<p>The time spent in <code>iov_iter_get_pages</code> is really entirely spent in another function, <code>get_user_pages_fast</code>:</p>
+<pre><code>% perf report -g --symbol-filter=iov_iter_get_pages
+-   17.08%     0.17%  write    [kernel.kallsyms]  [k] iov_iter_get_pages
+   - 16.91% iov_iter_get_pages
+      - 16.88% internal_get_user_pages_fast
+           11.22% try_grab_compound_head
+</code></pre>
+<p><a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/mm/gup.c#L2944"><code>get_user_pages_fast</code></a> is a more bare-bones version of <code>iov_iter_get_pages</code>:</p>
+<div id="cb18"><pre><code><span id="cb18-1"><span>int</span> get_user_pages_fast<span>(</span></span>
+<span id="cb18-2">  <span>// virtual address, page aligned</span></span>
+<span id="cb18-3">  <span>unsigned</span> <span>long</span> start<span>,</span></span>
+<span id="cb18-4">  <span>// number of pages to retrieve</span></span>
+<span id="cb18-5">  <span>int</span> nr_pages<span>,</span></span>
+<span id="cb18-6">  <span>// flags, the meaning of which we won't get into</span></span>
+<span id="cb18-7">  <span>unsigned</span> <span>int</span> gup_flags<span>,</span></span>
+<span id="cb18-8">  <span>// output physical pages</span></span>
+<span id="cb18-9">  <span>struct</span> page <span>**</span>pages</span>
+<span id="cb18-10"><span>)</span></span></code></pre></div>
+<p>Here “user” (as opposed to “kernel”) refers to the fact that we’re turning virtual pages into references to physical pages.</p>
+<p>To get our <code>struct page</code>s, <code>get_user_pages_fast</code> does exactly what the CPU would do, but in software: it walks the page table to collect all the physical pages, storing the results in <code>struct page</code>s. In our case, we have a 128KiB buffer, and 4KiB pages, so we’ll have <code>nr_pages = 32</code>.<a href="#fn18" id="fnref18" role="doc-noteref"><sup>18</sup></a> <code>get_user_pages_fast</code> will need to walk the page table tree collecting 32 leaves, and storing the result in 32 <code>struct page</code>s.</p>
+<p><code>get_user_pages_fast</code> also needs to make sure that the physical page is not repurposed until the caller doesn’t need it anymore. This is achieved in the kernel using a reference count <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/include/linux/mm_types.h#L187">stored in <code>struct page</code></a>, which is used to know when a physical page can be released and repurposed in the future. The caller of <code>get_user_pages_fast</code> must, at some point, release the pages again with <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/include/linux/mm.h#L1222"><code>put_page</code></a>, which will decrease the reference count.</p>
+<p>Finally, <code>get_user_pages_fast</code> behaves differently depending on whether virtual addresses are already in the page table. This is where the <code>_fast</code> suffix comes from: the kernel will first try to get an already existing page table entry and corresponding <code>struct page</code> by just walking the page table, which is relatively cheap, and fall back to producing a <code>struct page</code> by other, more expensive means otherwise. The fact that we <code>memset</code> the memory at the beginning will ensure that we never end up in the “slow” path of <code>get_user_pages_fast</code>, since the page table entries will be created as our buffer is filled with <code>'X'</code>s.<a href="#fn19" id="fnref19" role="doc-noteref"><sup>19</sup></a></p>
+<p>Note that the <code>get_user_pages</code> family of functions is not only useful for pipes — in fact, it is central in many drivers. A typical use is related to the kernel bypass we mentioned: a driver for a network card might use it to turn some user memory region into a physical page, then communicate the physical page location to the network card, and have the network card interact directly with that memory region without kernel involvement.</p>
+</div>
+<section role="doc-endnotes">
+<ol start="18">
+<li id="fn18" role="doc-endnote"><p>Actually, the pipe code <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/fs/splice.c#L1174">happens to always call <code>get_user_pages_fast</code> with <code>nr_pages = 16</code></a>, looping if necessary, presumably so that a small static buffer can be used. But it is an implementation detail, and the total number of spliced pages will still be 32.<a href="#fnref18" role="doc-backlink">↩︎</a></p></li>
+<li id="fn19" role="doc-endnote"><p>Subtleties follow, not needed to understand the rest of the post!</p>
+<p>If the page table does not contain the entry we’re looking for, <code>get_user_pages_fast</code> still needs to return a <code>struct page</code>. The most obvious way to do so would be to create the right page table entry, and then return the corresponding <code>struct page</code>.</p>
+<p>However <code>get_user_pages_fast</code> will only do so if it’s asked to get <code>struct page</code> for the purpose of writing into it. Otherwise it will <em>not</em> update the page table, instead returning a <code>struct page</code> giving us a reference to a yet-to-be-allocated physical page. This is exactly what happens in the case of <code>vmsplice</code>, since we just need to produce a <code>struct page</code> for the purpose of filling the pipe, without actually writing any memory.</p>
+<p>Or in other words, allocating the page is delayed until we actually need to. This saves allocating the physical page, but will cause the slow path of <code>get_user_pages_fast</code> to be called repeatedly if the page is never faulted in by other means.</p>
+<p>Therefore, if we do <em>not</em> <code>memset</code> before, and therefore do not fault the pages into the page table “manually”, not only we would end up in the slow path the first time we call <code>get_user_pages_fast</code>, but also all successive invocations, resulting in a significant slowdown (25GiB/s rather than 30GiB/s):</p>
+<pre><code>% ./write --write_with_vmsplice --dont_touch_pages | ./read --read_with_splice
+25.0GiB/s, 256KiB buffer, 40960 iterations (10GiB piped)</code></pre>
+<p>Moreover, this behavior does <em>not</em> manifest itself when using huge pages: in that case <code>get_user_pages_fast</code> <em>will</em> properly fault the pages in when the virtual memory range passed in would be backed by huge pages.</p>
+<p>If this is all very confusing, don’t worry, <code>get_user_pages</code> and friends seem to be a very tricky corner of the kernel, <a href="https://lwn.net/Kernel/Index/#Memory_management-get_user_pages">even for</a> <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/Documentation/core-api/pin_user_pages.rst">kernel developers</a>.<a href="#fnref19" role="doc-backlink">↩︎</a></p></li>
+</ol>
+</section>
+<h3 id="huge-pages">Huge pages <a href="#huge-pages">#</a></h3>
+<div>
+<p>Up to now we’ve presented pages as always being of the same size — 4KiB on x86-64. However, many CPU architectures, including x86-64, include larger page sizes. In the case of x86-64, we not only have 4KiB pages (the “standard” size), but also 2MiB and even 1GiB pages (“huge” pages). In the rest of the post we’ll only deal with 2MiB huge pages, since 1GiB pages are fairly uncommon, and overkill for our task anyway.</p>
+<div>
+<table>
+<thead>
+<tr>
+<th>Architecture</th>
+<th>Smallest page size</th>
+<th>Larger page sizes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>x86</td>
+<td>4KiB</td>
+<td>2MiB, 4MiB</td>
+</tr>
+<tr>
+<td>x86-64</td>
+<td>4KiB</td>
+<td>2MiB, 1GiB<a href="#fn20" id="fnref20" role="doc-noteref"><sup>20</sup></a></td>
+</tr>
+<tr>
+<td>ARMv7</td>
+<td>4KiB</td>
+<td>64KiB, 1MiB, 16MiB</td>
+</tr>
+<tr>
+<td>ARMv8</td>
+<td>4KiB</td>
+<td>16KiB, 64KiB</td>
+</tr>
+<tr>
+<td>RISCV32</td>
+<td>4KiB</td>
+<td>4MiB</td>
+</tr>
+<tr>
+<td>RISCV64</td>
+<td>4KiB</td>
+<td>2MiB, 1GiB, 512GiB, 256 TiB</td>
+</tr>
+<tr>
+<td>Power ISA</td>
+<td>8KiB</td>
+<td>64 KiB, 16 MiB, 16 GiB</td>
+</tr>
+</tbody>
+</table>
+<p><small>Page sizes available on architectures commonly used today, from <a href="https://en.wikipedia.org/wiki/Page_(computer_memory)#Multiple_page_sizes">Wikipedia</a>.</small></p>
+</div>
+<p>The main advantage of huge pages is that bookkeeping is cheaper, since there’s fewer of them needed to cover the same amount of memory. Moreover other operations are cheaper too, such as resolving a virtual address to a physical address, since one level less of page table is needed: instead of having a 12-bit offset into the page, we’ll have a 21-bit offset, and one less page table level.</p>
+</div>
+<section role="doc-endnotes">
+<ol start="20">
+<li id="fn20" role="doc-endnote"><p>Only when the CPU has <code>PDPE1GB</code> flag.<a href="#fnref20" role="doc-backlink">↩︎</a></p></li>
+</ol>
+</section>
+<div>
+<p>This relieves pressure on the parts of the CPUs that handle this conversion, leading to performance improvements in many circumstances.<a href="#fn21" id="fnref21" role="doc-noteref"><sup>21</sup></a> However, in our case, the pressure is not on the hardware that walks the page table, but on its software counterpart which runs in the kernel.</p>
+<p>On Linux, we can allocate a 2MiB huge page <a href="https://mazzo.li/posts/check-huge-page.html">in a variety of ways</a>, such as by allocating memory aligned to 2MiB and then using <code>madvise</code> to tell the kernel to use huge pages for the provided buffer:</p>
+<div id="cb20"><pre><code><span id="cb20-1"><span>void</span><span>*</span> buf <span>=</span> aligned_alloc<span>(</span><span>1</span> <span>&lt;&lt;</span> <span>21</span><span>,</span> size<span>);</span></span>
+<span id="cb20-2">madvise<span>(</span>buf<span>,</span> size<span>,</span> MADV_HUGEPAGE<span>)</span></span></code></pre></div>
+<p>Switching to huge pages in our program yields another ~50% improvement:</p>
+<pre><code>% ./write --write_with_vmsplice --huge_page | ./read --read_with_splice
+51.0GiB/s, 256KiB buffer, 40960 iterations (10GiB piped)</code></pre>
+</div>
+<section role="doc-endnotes">
+<ol start="21">
+<li id="fn21" role="doc-endnote"><p>For instance, the CPU includes dedicated hardware to cache parts of the page table, the “translation lookaside buffer” (TLB). The TLB is flushed at every context switch (every time we change the contents of CR3).</p>
+<p>Huge pages can significantly reduce TLB misses, since a single entry for a 2MiB page covers 512 times more memory compared to a 4KiB page.<a href="#fnref21" role="doc-backlink">↩︎</a></p></li>
+</ol>
+</section>
+<div>
+<p>However, the reason for the improvements is not totally obvious. Naively, we might think that by using huge pages <code>struct page</code> will just refer to a 2MiB page, rather than 4KiB.</p>
+<p>Sadly this is <em>not</em> the case: the kernel code assumes everywhere that a <code>struct page</code> refers to a page of the “standard” size for the current architecture. The way this works for huge pages (and in general for what Linux calls “compound pages”) is that a “head” <code>struct page</code> contains the actual information about the backing physical page, with successive “tail” pages just containing a pointer to the head page.</p>
+<p>So to represent 2MiB huge page we’ll have 1 “head” <code>struct page</code>, and up to 511 “tail” <code>struct page</code>s. Or in the case of our 128KiB buffer, 31 tail <code>struct page</code>s:<a href="#fn22" id="fnref22" role="doc-noteref"><sup>22</sup></a></p>
+<p><img src="https://mazzo.li/assets/images/head-tail-pages.svg"></p>
+<p>Even if we need all these <code>struct page</code>s, the code generating it ends up significantly faster. Instead of traversing the page table multiple times, once the first entry is found, the following <code>struct page</code>s can be <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/mm/gup.c#L2457">generated in a simple loop</a>. Hence the performance improvement!</p>
+</div>
+<section role="doc-endnotes">
+<ol start="22">
+<li id="fn22" role="doc-endnote"><p>If you’re thinking “that’s horrible!”, you’re not alone.</p>
+<p>Various efforts are underway to simplify and/or optimize this situation.</p>
+<p>Recent kernels (from 5.17 onwards) <a href="https://lwn.net/Articles/849538/">include a new type</a>, <code>struct folio</code>, identifying head pages explicitly. This reduces the need for checking whether a <code>struct page</code> is a head page or tail page at runtime, yielding performance improvements.</p>
+<p><a href="https://lwn.net/Articles/839737/">Other efforts</a> aim to outright remove the extra <code>struct page</code>s, although I’m not up to date on how that is going.<a href="#fnref22" role="doc-backlink">↩︎</a></p></li>
+</ol>
+</section>
+<h2 id="busy-loop">Busy looping <a href="#busy-loop">#</a></h2>
+<p>We’re almost done, I promise! Let’s look at <code>perf</code> output once again:</p>
+<pre><code>-   46.91%     0.38%  write    libc-2.33.so       [.] vmsplice
+   - 46.84% vmsplice
+      - 43.15% entry_SYSCALL_64_after_hwframe
+         - do_syscall_64
+            - 41.80% __do_sys_vmsplice
+               + 14.90% wait_for_space
+               + 8.27% __wake_up_common_lock
+                 4.40% add_to_pipe
+               + 4.24% iov_iter_get_pages
+               + 3.92% __mutex_lock.constprop.0
+                 1.81% iov_iter_advance
+               + 0.55% import_iovec
+            + 0.76% syscall_exit_to_user_mode
+        1.54% syscall_return_via_sysret
+        1.49% __entry_text_start
+</code></pre>
+<p>We’re now spending a significant amount of time waiting for the pipe to be writeable (<code>wait_for_space</code>), and waking up readers which were waiting for the pipe to have content (<code>__wake_up_common_lock</code>).</p>
+<p>To sidestep these synchronization costs, we can ask <code>vmsplice</code> to return if the pipe cannot be written to, and busy loop until it is — and the same when reading with <code>splice</code>:</p>
+<div id="cb23"><pre><code><span id="cb23-1"><span>...</span></span>
+<span id="cb23-2"><span>// SPLICE_F_NONBLOCK will cause `vmsplice` to return immediately</span></span>
+<span id="cb23-3"><span>// if we can't write to the pipe, returning EAGAIN</span></span>
+<span id="cb23-4"><span>ssize_t</span> ret <span>=</span> vmsplice<span>(</span>STDOUT_FILENO<span>,</span> <span>&amp;</span>bufvec<span>,</span> <span>1</span><span>,</span> SPLICE_F_NONBLOCK<span>);</span></span>
+<span id="cb23-5"><span>if</span> <span>(</span>ret <span>&lt;</span> <span>0</span> <span>&amp;&amp;</span> errno <span>==</span> EAGAIN<span>)</span> <span>{</span></span>
+<span id="cb23-6">  <span>continue</span><span>;</span> <span>// busy loop if not ready to write</span></span>
+<span id="cb23-7"><span>}</span></span>
+<span id="cb23-8"><span>...</span></span></code></pre></div>
+<p>By busy looping we get another 25% performance increase:</p>
+<pre><code>% ./write --write_with_vmsplice --huge_page --busy_loop | ./read --read_with_splice --busy_loop
+62.5GiB/s, 256KiB buffer, 40960 iterations (10GiB piped)</code></pre>
+<p>Obviously busy looping comes at the cost of fully occupying a CPU core waiting for <code>vmsplice</code> to be ready. But often this compromise is worth it, and in fact it is a common pattern for high-performance server applications: we trade off possibly wasteful CPU utilization for better latency and/or throughput.</p>
+<p>In our case, this concludes our optimization journey for our little synthetic benchmark, from 3.5GiB/s to 65GiB/s.</p>
+<h2 id="closing-thoughts">Closing thoughts <a href="#closing-thoughts">#</a></h2>
+<p>We’ve systematically improved the performance of our program by looking at the <code>perf</code> output and the Linux source. Pipes and splicing in particular aren’t really hot topics when it comes to high-performance programming, but the themes we’ve touched upon are: zero-copy operations, ring buffers, paging &amp; virtual memory, synchronization overhead.</p>
+<p>There are some details and interesting topics I left out, but this blog post was already spiraling out of control and becoming too long:</p>
+<ul>
+<li><p>In the actual code, the buffers are allocated separatedly, to reduce page table contention by placing them in different page table entries (something that the FizzBuzz program also does).</p>
+<p>Remember that when a page table entry is taken with <code>get_user_pages</code>, its refcount is increased, and decreased on <code>put_page</code>. If we use two page table entries for the two buffers, rather than one page table entry for both of them, we have less contention when modifying the refcount.</p></li>
+<li><p>The tests are ran by pinning the <code>./write</code> and <code>./read</code> processes to two cores with <code>taskset</code>.</p></li>
+<li><p>The code in the repo contains many other options I played with, but did not end up talking about since they were irrelevant or not interesting enough.</p></li>
+<li><p>The repo also contains <a href="https://github.com/bitonic/pipes-speed-test/blob/master/get-user-pages.cpp">a synthetic benchmark</a> for <code>get_user_pages_fast</code>, which can be used to measure exactly how much slower it runs with or without huge pages.</p></li>
+<li><p>Splicing in general is a slightly dubious/<a href="https://dirtypipe.cm4all.com/">dangerous</a> concept, <a href="https://lwn.net/Articles/896267/">which continues to annoy</a> to kernel developers.</p></li>
+</ul>
+<p>Please let me know if this post was helpful, interesting, or unclear!</p>
+<h2 id="acknowledgements">Acknowledgements <a href="#acknowledgements">#</a></h2>
+<p>Many thanks to <a href="https://scvalex.net/">Alexandru Scvorţov</a>, Max Staudt, Alex Appetiti, Alex Sayers, Stephen Lavelle, Peter Cawley, and Niklas Hambüchen for reviewing drafts of this post. Max Staudt also helped me understand some subtleties of <code>get_user_pages</code>.</p>
+
+
+
+
+
+
+</div></div>]]>
+            </description>
+            <link>https://mazzo.li/posts/fast-pipes.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-37782493</guid>
+            <pubDate>Thu, 05 Oct 2023 18:49:29 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[The Future of Work(ers): Building Collective Power in the Era of Remote Work]]>
+            </title>
+            <description>
+<![CDATA[
+Score 6 | Comments 0 (<a href="https://news.ycombinator.com/item?id=37781670">thread link</a>) | @amaunions
+<br/>
+October 5, 2023 | https://workerorganizing.org/future-of-work-tech-remote-union-7268/ | <a href="https://web.archive.org/web/*/https://workerorganizing.org/future-of-work-tech-remote-union-7268/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-id="3004a76e" data-element_type="widget" data-widget_type="theme-post-content.default">
+<div>
+<p>For years, tech companies have advertised the “future of work” as one that is remote, driven by a geographically disparate workforce. The COVID-19 pandemic accelerated this transition into an increasingly distributed workforce. Now more than ever, traditional offices have given way to remote work. And why not? Executives, founders, and venture capitalists have provided countless articles, interviews, and podcasts about this remote and distributed workforce becoming the very future of work itself.&nbsp;</p>
+<p>These modern-day robber barons often paint a picture of a utopian, futuristic workplace. Workers can work when, where, and however they want. They can be with their families, travel, work from coffee shops, decide to work mornings or nights, weekdays, or weekends — it’s the ultimate freedom. Employers, no longer in need of a centralized office, can cut out traditional expenses, such as rent and utilities. They can hire workers from anywhere in the world. Skills, expertise and talent are not bound by arbitrary borders on a map. Remote companies are free to hire “the best of the best” from anywhere in the world — so long as they have access and means to afford reliable internet.</p>
+<p>Since the COVID-19 pandemic began, this move to remote work has been accelerated. At the height of the pandemic, companies forced jobs from traditional on-site offices to our kitchen tables and couches. While we see some companies currently implementing “return to office” policies, as real estate leases expire and the bosses realize they can outsource and deskill traditionally white-collar office jobs, we will continue to see more and more of the working class working from home. On its surface, this move to remote work seems like a change from which both workers and employers will benefit. However, what’s often left out of these “future of work” conversations and even more crucial for the vast majority of us is the ​future of​ the ​workers themselves.</p>
+<p>Even the most progressive companies are not immune from traditional workplace antagonisms. At the end of the day, no matter how lofty a company’s mission statement may be, the bosses and investors are driven by profit. This motive directly conflicts with the workers’ rightful desire for fair compensation, dignity, and a voice in the workplace. As the dust settles and power dynamics between employer and employee are reestablished, this future in which remote and hybrid work is the norm will be​ ripe for exploitation by the bosses of the workers bound by its constraints.</p>
+<h2>Remote Work and Organizing in Isolation</h2>
+<p>Organizing a workplace is hindered the moment that the <a href="https://workerorganizing.org/remote-workplace-organizer-training-7273/">workforce goes remote</a>. Workers lose conversations around the water cooler, on the loading dock, or in the break room. While they may have social meetings over Zoom, they no longer have the in-person happy hour after work to engage in conversation with their colleagues or the coffee break to vent, commiserate, and let off steam.</p>
+<p>These may seem like trivial things — and some of us won’t particularly miss happy hours after work — but removing these organic interactions with coworkers also removes opportunities for workers to candidly share how they feel about work, their boss, their workplace, or their industry in general.</p>
+<p>Early socialists, workers, and union organizers in the labor movement met at taverns and pubs to discuss working conditions. These conversations laid the foundation for organized labor. These informal and often impromptu discussions are a necessary step in any attempts of worker organizing. Yet most, if not all, of these worker-to-worker interactions in a traditional workplace are removed as soon as a company goes remote.</p>
+<p>Many managers and executives pride themselves on having an “open door policy” in which employees are encouraged to share their thoughts with management. Yet even when management is willing to listen, they can — and often will — push public conversations into private, one-to-one conversations. And just in doing that, the workers’ biggest strength — their solidarity in numbers — is gone and fledgling talks of worker organization are easily dismissed well before they can acquire momentum to reach the majority of workers. There’s a reason those early activists met at the tavern without the boss.</p>
+<p>More recently, tools like employee engagement surveys have become popular with companies to request feedback from workers in an attempt to quantify employee sentiment. In theory, these surveys allow workers to collectively share their candid and honest feedback about the workplace. On its surface, this may seem like a good thing. And it ​could​ be.</p>
+<p>But the intent and usage of tools like employee engagement surveys may be far more insidious than appears at first glance. Using the data acquired through these surveys, companies can find which areas, demographics, or departments of the workforce are most dissatisfied. And they can then stamp out attempts to organize.​ ​In fact, <a href="https://onezero.medium.com/companies-are-using-employee-survey-data-to-predict-and-squash-union-organizing-a7e28a8c2158">some companies are already doing just that​</a>.</p>
+<p>By enforcing usage of company-provided communication platforms and devices, employers are further able to shift the balance of power in their favor. On company platforms, where conversations can be easily monitored and controlled, employees can have their access cut at a moment’s notice. And just like that, they’re disconnected and cut off from their co-workers.</p>
+<h2>The World Wide Workplace</h2>
+<p>Karl Marx and Friedrich Engels talked of <a href="https://en.wikipedia.org/wiki/Reserve_army_of_labour">the reserve army of labor</a>. This term refers to the unemployed and under-employed members of a capitalist society. This reserve army is not an unfortunate side effect of capitalism — its existence is by design. So long as there are job-seekers, employers can leverage the threat of termination and replacement to bring their employees to heel.</p>
+<p>When we expand the pool of labor beyond the commutable radius of a workplace through remote work, we exponentially multiply this reserve army of labor. No longer are we pitted against fellow workers in just our local job market, but we’re pitted against each other in a worldwide reserve army of labor. With a finite number of jobs to fill and a rapidly growing pool of labor to pull from, the competition within the job market will grow.</p>
+<p>Now that bosses are pulling from a global pool of labor, this will not only affect workers on a local level but increase exploitation worldwide. Hiring practices, potentially under the guise of diversity and inclusion, will be optimized to draw candidates from lower cost-of-living areas through increasingly precarious employment terms. Sites like <a href="https://www.upwork.com/resources/what-is-the-gig-economy">Upwork</a> and <a href="https://www.flexjobs.com/blog/post/remote-side-jobs-done-from-home-hiring-now-2/">FlexJobs</a> are already trying to become the Uber and Lyft of traditionally “white collar” jobs by replacing good paying, full-time jobs with contract and temporary work. This is the digital equivalent of off-shoring and outsourcing manufacturing jobs.</p>
+<p>Employers are already benefiting from and exploiting workers in this distributed workplace. The Bloomberg 2020 presidential campaign hired a firm called ProCom, which ​<a href="https://www.npr.org/2019/12/24/791194618/bloomberg-campaign-vendor-used-prison-labor-to-make-presidential-campaign-calls">used prison labor to make campaign phone calls​</a>. ​Corporations in the United States <a href="http://america.aljazeera.com/features/2014/3/mexico-s-call-centers.html">exploit deportees in the Global South​ for their “American-sounding” voices</a> in call centers. How do we ensure employers don’t further exploit those who are most vulnerable in the name of cutting costs?</p>
+<h2>Automation, Productivity, and Justifying our Existence</h2>
+<p>This future of work that bosses are selling to us comes with a full benefits package, including the promise of increased productivity. We live in a time in which workers are more productive than ever. Through the advancement of technology and innovation, we have the means to produce basic necessities for every single person on the planet. Yet we don’t. We instead search endlessly for the latest “simple trick” or “workflow hack” to increase our individual productivity. For what purpose?</p>
+<p>We need to stop asking how to be more productive and start asking who benefits from our productivity and why. Instead of chasing productivity hacks to justify our individual existence among the reserve army of labor, we need to focus our collective strength on building a future of work that provides for all.</p>
+<p>Further, as bosses reduce us to simple metrics, the very tasks those metrics represent may soon become automated or deskilled themselves. And for every task that bosses automate, the less they need for our labor. This should be celebrated. We could all work fewer hours. We could share the burden of providing basic human needs and extend basic necessities to everyone. ​We could free ourselves of the 40-hour workweek.​ We could use this newly found freedom to pursue passions, spend time with family, and contribute to our communities.</p>
+<p>Decreased demand for labor ​could​ allow for all workers to remain gainfully employed while working fewer hours. But that will not happen within our current system. This fierce competition for a shrinking number of jobs will be exploited by the bosses to the detriment of the workers. Instead of collectively sharing in the benefits of automation, the deskilling of work will pressure us to work harder and longer hours to meet ever-increasing expectations of output and productivity.</p>
+<p>Without a deliberate and collective approach to organizing in this workplace of the future, we will instead be forced to justify our “privilege” to overwork in order to be underpaid by a handful of CEOs. Inequality will continue to increase and all but the venture capitalists, C-level executives, and shareholders will feel the devastating effects of this ever-increasing divide.</p>
+<h2>Company Cult(ure)</h2>
+<p>Companies often promote a strong company ​culture that includes a mission statement or list of values that are supposed to guide their decisions. More often, these mission statements are instead used to justify company decisions that are made to the detriment of the worker. If a worker asks for material improvement in their day-to-day job, those demands can be dismissed with a reference to a nebulous mission statement.</p>
+<p>Don’t be fooled. Your workplace is not your family. You are expendable to your boss. The employee-employer dynamic has more in common with an abusive relationship than a family. The next time your boss references a company mission statement, ask yourself if the intent is genuine — or if they are trying to dismiss your concerns and guilt you into complacency.</p>
+<p>This culture within the <a href="https://workerorganizing.org/tech-workers-deserve-a-union-6904/">tech industry</a> is driven by an idolization of CEOs, “visionaries,” and even the venture capitalists who simply got lucky when they funded the latest shiny app. This idolization is dangerous. It allows individuals to make decisions that impact not only their employees but also the people who use and rely on the products and services they create. This lionization of unelected and unaccountable individuals gives unmitigated power to people who are often not best-suited to make decisions in the best interest of others.</p>
+<p>How can a CEO truly know what’s in the best interest of the workers? Or the users of their service? How many “thought leaders” in the tech world were simply in the right place at the right time? How many simply had the privilege and safety net to invest in an idea? An idea that may not have even been theirs to begin with?</p>
+<p>Such great power into so few hands directly conflicts with any sense of democracy in the workplace. The CEOs, venture capitalists, and board members reign supreme over the workers. Workers fight amongst themselves for the “right” to work for their glorified oppressors.</p>
+<blockquote>
+<p><em>“Be wary of great leaders. Hope that there are many, many small leaders.”</em></p>
+<cite>—Pete Seeger</cite></blockquote>
+<p>We need to stop this idolization and instead start holding these CEOs and venture capitalists accountable for their decisions. ​We need to bring democracy into the workplace through rank-and-file organizing.</p>
+<h2>Labor Movement 2.0</h2>
+<p>The future of work is one that could be bright for all of us. We don’t need to accept the dystopian workplace of the future ruled by the bosses. Rather, we must relentlessly reject the status quo handed to us from the top down and harness the unrealized potential we have amongst ourselves. ​We can win the future of work.</p>
+<p>We can all work fewer hours while ensuring we all have our basic human needs met. We can free ourselves to pursue life beyond the confines of the workplace as we know it. We can work towards a fair and just workplace that works for all people, everywhere. But in order to get there, and in order to prevent the alternate, darker timeline, we need to organize together and build collective power. Without our brain and muscle not a single wheel can turn, nor can a single line of code be written. ​At the end of the day, we don’t need CEOs. They need us.</p>
+<p>It starts small. It starts by talking with your co-workers. It starts with the realization that our strength is in our collective voice and action. It starts with questioning the status quo. It starts with potentially uncomfortable conversations. ​It starts with all of us​. ​We all need to become workplace organizers.</p>
+<blockquote>
+<p><em>“I am not a Labor Leader; I do not want you to follow me or anyone else; if you are looking for a Moses to lead you out of this capitalist wilderness, you will stay right where you are. I would not lead you into the promised land if I could, because if I led you in, someone else would lead you out. You must use your heads as well as your hands, and get yourself out of your present condition.”</em></p>
+<cite>—Eugene V. Debs</cite></blockquote>
+<p>We must reject any “future of work” that does not include an equally comprehensive future of workers’ rights and organized labor. This future of work must be driven and democratically decided by us, the workers. All of us are stronger than any of us. But only if we are organized.</p>
+<h2>Tech Workers Are Fighting Back</h2>
+<p>No one is coming to save us. We have to do it ourselves. We all have a role to play in this resurgent labor movement. And across the country and around the world, workers are coming to do just that, by organizing for a greater say in their workplace. Workers at Google are building collective power through the <a href="https://www.alphabetworkersunion.org/">Alphabet Workers Union</a>. <a href="https://www.techworkersunion-1010.org/community">Tech Workers Union 1010</a> is supporting campaigns in many workplaces across the country. Here at EWOC, we’re <a href="https://workerorganizing.org/support/tech-workers/">supporting workers in tech</a> and across every industry. And for the first time, Labor Notes will be holding a <a href="https://labornotes.org/techcon2023">Tech Organizing Conference</a> in New York City in October.</p>
+<p>We’re up against some giants with almost as much money as they have arrogance. But just as the landscape of work itself is changing, so too will the landscape of worker organizing. Across workplaces and across industries, we can learn from and stand with each other. Let’s come together and build a future of work that works for all of us. We have a world to win.</p>
+</div>
+</div></div>]]>
+            </description>
+            <link>https://workerorganizing.org/future-of-work-tech-remote-union-7268/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-37781670</guid>
+            <pubDate>Thu, 05 Oct 2023 17:49:13 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Rerun 0.9 – a framework for visualizing streams of multimodal data]]>
+            </title>
+            <description>
+<![CDATA[
+Score 48 | Comments 10 (<a href="https://news.ycombinator.com/item?id=37781244">thread link</a>) | @Tycho87
+<br/>
+October 5, 2023 | https://www.rerun.io/blog/release-0.9 | <a href="https://web.archive.org/web/*/https://www.rerun.io/blog/release-0.9">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="__next"><div><div><div><p>We’re building a fast and easy to use general framework for handling and visualizing streams of multimodal data. This is a big undertaking, and the way we’re getting there is by starting with a fast and easy to use visualizer for computer vision, and then making it more capable and extensible piece by piece.</p>
+<p>Rerun 0.9.0 is released two months after 0.8.0, but it’s been even longer coming. It includes the foundation of the coming C++ SDK, our most asked for feature by far. In order to maintain great and consistent APIs across Rust, Python, C++, and any future languages, we’ve rebuilt much of Rerun's data infrastructure around a new code generation framework.</p>
+<p>0.9 also adds support for logging markdown, a new in-viewer getting started experience, and as always, a bunch of performance improvements.</p>
+<p><iframe src="https://player.vimeo.com/video/870834549?autoplay=1&amp;loop=1&amp;autopause=0&amp;background=1&amp;muted=1&amp;ratio=1440:1080&amp;transparent=false&amp;dnt=1" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen=""></iframe></p>
+<p><em>Load example recordings, including descriptions of how they were made, directly in the viewer.</em></p>
+<p>This has all been a huge lift, but what I’m most excited about are our redesigned APIs and what they pave the way for in future releases.
+From this release on, we’ll start to expose more and more of Rerun's underlying infrastructure, starting with the core data model, a hierarchical and time varying Entity Component System (ECS).</p>
+<p>To ease the transition for Python users, we've marked the old APIs as deprecated in 0.9 with migration instructions in the warning messages. The old API will be removed completely in 0.10. Check out the <a href="https://www.rerun.io/docs/reference/migration-0-9">migration guide</a> for more details on updating your code.</p>
+<h2 id="a-more-type-centric-logging-api">A more type centric logging API<!-- --> <a href="#a-more-type-centric-logging-api"></a></h2>
+<p>At the heart of Rerun is the ability to handle streams of multimodal data, e.g. images, tensors, point clouds, and text. To get data out of your programs and ready to be visualized, you log it with the Rerun SDK. Rerun handles everything needed to make that work. It doesn't matter if the data source and visualization are in the same process or the data is coming in real-time from multiple devices.</p>
+<p>The ease of use, expressiveness, and extensibility of these APIs are core to the usefulness of Rerun. On a first glance, the API changes introduced in 0.9 are very small. For example, here is how you might log a single colored point cloud, represented by two 3xN numpy arrays of positions and colors.</p>
+<p>Old Python API</p>
+<pre><p><code><span>rr</span><span>.</span><span>log_points</span><span>(</span><span>"example/points"</span><span>,</span> positions<span>,</span> colors<span>=</span>colors<span>)</span>
+</code></p></pre>
+<p>New Python API</p>
+<pre><p><code><span>rr</span><span>.</span><span>log</span><span>(</span><span>"example/points"</span><span>,</span> <span>rr</span><span>.</span><span>Points3D</span><span>(</span>positions<span>,</span> colors<span>=</span>colors<span>)</span><span>)</span>
+</code></p></pre>
+<p>Both these log calls take the same user data. The difference is in the data type information, which is moved from the function name <code>rr.log_points</code> to a type, <code>rr.Points3D</code> that wraps the logged data. This new structure both opens up for more direct control of the underlying ECS and for more ergonomic logging of your own objects.</p>
+<h2 id="lower-level-control-of-entity-components">Lower level control of Entity Components<!-- --> <a href="#lower-level-control-of-entity-components"></a></h2>
+<p>Rerun comes with a set of <a href="https://www.rerun.io/docs/reference/types/archetypes">built in archetypes</a> like <code>rr.Points3D</code> , <code>rr.Image</code>, and <code>rr.Tensor</code>. An archetype defines a bundle of component batches that the Rerun Viewer knows how to interpret, such that Rerun will just <strong><em>do the right thing™️</em></strong> when you log it. In this case, that’s one component batch for positions and one for colors.</p>
+<pre><p><code><span>rr</span><span>.</span><span>log</span><span>(</span><span>"example/points"</span><span>,</span> <span>rr</span><span>.</span><span>Points3D</span><span>(</span>positions<span>,</span> colors<span>=</span>colors<span>)</span><span>)</span>
+
+<span>rr</span><span>.</span><span>log</span><span>(</span><span>"example/points"</span><span>,</span> <span>rr</span><span>.</span><span>Points3D</span><span>(</span>positions<span>,</span> colors<span>=</span>colors<span>)</span><span>.</span>as_component_batches<span>(</span><span>)</span><span>)</span>
+
+<span>rr</span><span>.</span><span>log</span><span>(</span><span>"example/points"</span><span>,</span> <span>[</span><span>rr</span><span>.</span><span>Points3D</span><span>.</span>indicator<span>(</span><span>)</span><span>,</span>
+                          <span>rr</span><span>.</span><span>components</span><span>.</span>Position3DBatch<span>(</span>positions<span>)</span><span>,</span>
+                          <span>rr</span><span>.</span><span>components</span><span>.</span>ColorBatch<span>(</span>rgb<span>=</span>colors<span>)</span><span>]</span><span>)</span>
+</code></p></pre>
+<h3 id="partial-updates-using-the-component-level-api">Partial updates using the component level API<!-- --> <a href="#partial-updates-using-the-component-level-api"></a></h3>
+<p>In most cases, you’ll want to stick to the high level archetype API, but directly setting single components gives a lot of control, which can matter. For instance, a common use case is meshes where only the vertex positions change over time.
+Logging the whole mesh for each change adds a lot of overhead. For example:</p>
+<pre><p><code><span>import</span> numpy <span>as</span> np
+<span>import</span> rerun <span>as</span> rr  
+
+<span>rr</span><span>.</span><span>init</span><span>(</span><span>"rerun_example_mesh3d_partial_updates"</span><span>,</span> spawn<span>=</span><span>True</span><span>)</span>
+
+vertex_positions <span>=</span> np<span>.</span>array<span>(</span><span>[</span><span>[</span><span>-</span><span>1.0</span><span>,</span> <span>0.0</span><span>,</span> <span>0.0</span><span>]</span><span>,</span> <span>[</span><span>1.0</span><span>,</span> <span>0.0</span><span>,</span> <span>0.0</span><span>]</span><span>,</span> <span>[</span><span>0.0</span><span>,</span> <span>1.0</span><span>,</span> <span>0.0</span><span>]</span><span>]</span><span>,</span> dtype<span>=</span>np<span>.</span>float32<span>)</span>
+
+
+<span>rr</span><span>.</span><span>set_time_sequence</span><span>(</span><span>"frame"</span><span>,</span> <span>0</span><span>)</span>
+<span>rr</span><span>.</span><span>log</span><span>(</span>
+    <span>"triangle"</span><span>,</span>
+    <span>rr</span><span>.</span><span>Mesh3D</span><span>(</span>
+        vertex_positions<span>,</span>
+        vertex_normals<span>=</span><span>[</span><span>0.0</span><span>,</span> <span>0.0</span><span>,</span> <span>1.0</span><span>]</span><span>,</span>
+        vertex_colors<span>=</span><span>[</span><span>[</span><span>255</span><span>,</span> <span>0</span><span>,</span> <span>0</span><span>]</span><span>,</span> <span>[</span><span>0</span><span>,</span> <span>255</span><span>,</span> <span>0</span><span>]</span><span>,</span> <span>[</span><span>0</span><span>,</span> <span>0</span><span>,</span> <span>255</span><span>]</span><span>]</span><span>,</span>
+    <span>)</span><span>,</span>
+<span>)</span>
+
+
+factors <span>=</span> np<span>.</span><span>abs</span><span>(</span>np<span>.</span>sin<span>(</span>np<span>.</span>arange<span>(</span><span>1</span><span>,</span> <span>300</span><span>,</span> dtype<span>=</span>np<span>.</span>float32<span>)</span> <span>*</span> <span>0.04</span><span>)</span><span>)</span>
+<span>for</span> i<span>,</span> factor <span>in</span> <span>enumerate</span><span>(</span>factors<span>)</span><span>:</span>
+    <span>rr</span><span>.</span><span>set_time_sequence</span><span>(</span><span>"frame"</span><span>,</span> i<span>)</span>
+    <span>rr</span><span>.</span><span>log</span><span>(</span><span>"triangle"</span><span>,</span> <span>[</span><span>rr</span><span>.</span><span>components</span><span>.</span>Position3DBatch<span>(</span>vertex_positions <span>*</span> factor<span>)</span><span>]</span><span>)</span>
+</code></p></pre>
+<p><iframe src="https://player.vimeo.com/video/866772278?autoplay=1&amp;loop=1&amp;autopause=0&amp;background=1&amp;muted=1&amp;ratio=1440:1080&amp;transparent=false&amp;dnt=1" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen=""></iframe></p>
+<h3 id="interpret-the-same-data-in-several-ways-using-the-component-level-api">Interpret the same data in several ways using the component level API<!-- --> <a href="#interpret-the-same-data-in-several-ways-using-the-component-level-api"></a></h3>
+<p>The component level API gives you the ability to interpret the same data as multiple types.
+We do that by logging multiple indicator components, which tell the Rerun Viewer "hey, this entity should be interpreted as type X".
+In this example we interpret an entity as bott a colored triangle and as three colored points.</p>
+<pre><p><code><span>import</span> rerun <span>as</span> rr
+
+<span>rr</span><span>.</span><span>init</span><span>(</span><span>"rerun_example_manual_indicator"</span><span>,</span> spawn<span>=</span><span>True</span><span>)</span>
+
+
+
+<span>rr</span><span>.</span><span>log</span><span>(</span>
+    <span>"points_and_mesh"</span><span>,</span>
+    <span>[</span>
+        <span>rr</span><span>.</span><span>Points3D</span><span>.</span>indicator<span>(</span><span>)</span><span>,</span>
+        <span>rr</span><span>.</span><span>Mesh3D</span><span>.</span>indicator<span>(</span><span>)</span><span>,</span>
+        <span>rr</span><span>.</span><span>components</span><span>.</span>Position3DBatch<span>(</span><span>[</span><span>[</span><span>0.0</span><span>,</span> <span>0.0</span><span>,</span> <span>0.0</span><span>]</span><span>,</span> <span>[</span><span>10.0</span><span>,</span> <span>0.0</span><span>,</span> <span>0.0</span><span>]</span><span>,</span> <span>[</span><span>0.0</span><span>,</span> <span>10.0</span><span>,</span> <span>0.0</span><span>]</span><span>]</span><span>)</span><span>,</span>
+        <span>rr</span><span>.</span><span>components</span><span>.</span>ColorBatch<span>(</span><span>[</span><span>[</span><span>1.0</span><span>,</span> <span>0.0</span><span>,</span> <span>0.0</span><span>]</span><span>,</span> <span>[</span><span>0.0</span><span>,</span> <span>1.0</span><span>,</span> <span>0.0</span><span>]</span><span>,</span> <span>[</span><span>0.0</span><span>,</span> <span>0.0</span><span>,</span> <span>1.0</span><span>]</span><span>]</span><span>)</span><span>,</span>
+        <span>rr</span><span>.</span><span>components</span><span>.</span>RadiusBatch<span>(</span><span>[</span><span>1.0</span><span>]</span><span>)</span><span>,</span>
+    <span>]</span><span>,</span>
+<span>)</span>
+</code></p></pre>
+<p><iframe src="https://player.vimeo.com/video/870604519?autoplay=1&amp;loop=1&amp;autopause=0&amp;background=1&amp;muted=1&amp;ratio=1440:1080&amp;transparent=false&amp;dnt=1" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen=""></iframe></p>
+<h2 id="using-your-own-types-with-rerun">Using your own types with Rerun<!-- --> <a href="#using-your-own-types-with-rerun"></a></h2>
+<p>The new type oriented API also makes logging data from your own objects more ergonomic. For example, you might have your very own point cloud class.</p>
+<pre><p><code><span>@dataclass</span>
+<span>class</span> <span>LabeledPoints</span><span>:</span>
+    points<span>:</span> np<span>.</span>ndarray
+    labels<span>:</span> List<span>[</span><span>str</span><span>]</span><span>)</span>
+</code></p></pre>
+<p>All you need to do is implement <code>as_component_batches()</code> and you can pass them directly to <code>rr.log</code>. The simplest possible way is to use the matching Rerun archetype’s <code>as_component_batches</code> method like below but you can also get as fancy as you like with custom components and archetypes. Check out the guide on <a href="https://www.rerun.io/blog/docs/howto/extend/custom-data">using Rerun with custom data</a> for more details.</p>
+<pre><p><code><span>@dataclass</span>
+<span>class</span> <span>LabeledPoints</span><span>:</span>
+    points<span>:</span> np<span>.</span>ndarray
+    labels<span>:</span> List<span>[</span><span>str</span><span>]</span><span>)</span>
+    
+    <span>def</span> <span>as_component_batches</span><span>(</span>self<span>)</span> <span>-</span><span>&gt;</span> Iterable<span>[</span><span>rr</span><span>.</span><span>ComponentBatch</span><span>]</span><span>:</span>
+        <span>return</span> <span>rr</span><span>.</span><span>Points3D</span><span>(</span>positions<span>=</span>self<span>.</span>points<span>,</span> labels<span>=</span>self<span>.</span>labels<span>)</span><span>.</span>as_component_batches<span>(</span><span>)</span>
+<span>.</span><span>.</span><span>.</span>
+
+classified <span>=</span> my_points_classifier<span>(</span><span>.</span><span>.</span><span>.</span><span>)</span>  
+<span>rr</span><span>.</span><span>log</span><span>(</span><span>"points/classified"</span><span>,</span> classified<span>)</span>
+</code></p></pre>
+<p>The main takeaway here is that with 0.9 and the new type oriented API,
+it becomes a lot easier to use Rerun with your own data types.</p>
+<h2 id="how-it-paves-the-way-for-the-future">How it paves the way for the future<!-- --> <a href="#how-it-paves-the-way-for-the-future"></a></h2>
+<p>Although this release brings a lot of great updates, it's perhaps the future features it paves the way for that are the most exciting.</p>
+<h3 id="c-sdk">C++ SDK<!-- --> <a href="#c-sdk"></a></h3>
+<p>Getting data from C++ environments into Rerun was the motivating factor behind
+the move to our own code generation framework. A large amount of
+production systems in robotics, computer vision and gaming are built in C++ and we're
+incredibly excited to soon bring Rerun to all those developers.</p>
+<h3 id="building-visualizations-inline">Building visualizations inline<!-- --> <a href="#building-visualizations-inline"></a></h3>
+<p>Rerun started out making the hard case, where you stream data out of multiple processes and visualize it live, easy.
+The downside so far has been that in simpler cases, like in jupyter notebooks, using Rerun is more convoluted than it should be.</p>
+<p>Even when time is not a factor and you have all your data right there and just want to draw it,
+you currently have to go through the indirection of logging it first.</p>
+<p>The new APIs introduced in 0.9, pave the way for a clean way of just drawing data inline without logging.
+We'll start rolling that out together with the ability to control layout and visualization options
+from the SDK later in the year once C++ has landed.</p>
+<h3 id="generating-your-own-rerun-sdk-extensions">Generating your own Rerun SDK extensions<!-- --> <a href="#generating-your-own-rerun-sdk-extensions"></a></h3>
+<p>Our new code generation framework is still a bit immature, but it's been a design goal from the start
+to let users use it to generate their own stand alone extensions to the Rerun SDK.
+We hope once it's had time to mature, it will
+be useful to both teams with their own proprietary data formats and for other projects
+that want to make interfacing with Rerun as easy as possible for their users.</p>
+<h2 id="let-us-know-what-you-think">Let us know what you think<!-- --> <a href="#let-us-know-what-you-think"></a></h2>
+<p>We're incredibly excited to hear what you think about these changes.
+Join us on <a href="https://github.com/rerun-io/rerun">Github</a> or <a href="https://discord.gg/PXtCgFBSmH">Discord</a>
+and let us know how 0.9 works for you and what you'd like to see in the future.</p>
+<p>If you're an existing Rerun user and have any questions or need any help migrating to the new APIs,
+send us a ping on Discord or elsewhere and we'll be happy to get on a call and help you out.</p></div></div></div></div></div>]]>
+            </description>
+            <link>https://www.rerun.io/blog/release-0.9</link>
+            <guid isPermaLink="false">hacker-news-small-sites-37781244</guid>
+            <pubDate>Thu, 05 Oct 2023 17:15:12 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Why you should join: Anrok]]>
+            </title>
+            <description>
+<![CDATA[
+Score 6 | Comments 0 (<a href="https://news.ycombinator.com/item?id=37779211">thread link</a>) | @sam-prospect
+<br/>
+October 5, 2023 | https://www.joinprospect.com/blog/anrok-deep-dive | <a href="https://web.archive.org/web/*/https://www.joinprospect.com/blog/anrok-deep-dive">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><main data-component="BlogLayout" data-source-file="layout.tsx"><article data-component="BlogPage" data-source-file="page.tsx"><header><p><span>By Eric Zhou and Usman Hanif</span><span>·</span><span>Oct 04, 2023</span></p></header><section><p><h2>Introduction</h2></p><p>The year is 2016.</p><p>You’re at the helm of a flourishing eCommerce venture. Sales are pouring in, and thanks to 1992’s <span>Quill Corp. v. North Dakota</span>, there’s <strong>no sales tax</strong> on the vast majority of your online transactions.</p><p>Life is good - it’s a lucrative time to be an online business.</p><p>But far from the high-tech hustle of Silicon Valley and nestled amongst the prairies of South Dakota, a storm is brewing — one that’s set to redefine online business and dramatically change the entire country’s tax code.</p></section>
+<section><p><h2>Background</h2></p><p>In 2016, South Dakota Attorney General Marty Jackley helped introduce the <span>South Dakota Sales Tax Fairness Act</span>.</p><p>The goal of the law was simple: make it possible for South Dakota to tax online sales by creating a "sales tax nexus," which just means some connection between a seller and a state. This would require online sellers to register and collect sales tax for South Dakota.</p><p>Until then, many online purchases in the U.S. didn't have sales tax thanks to the 1992 Supreme Court case <span>Quill Corp. v. North Dakota</span>. <span>Quill</span> essentially said only businesses with a <span>physical</span> presence in a state had to collect sales tax. Jackley's law aimed to change this: it allowed South Dakota to collect sales tax from online sellers even if they didn't have offices, warehouses, or salespeople in the state.</p><p>As anticipated, the law was met with significant resistance, particularly from online retail giants.</p><p>Wayfair, the online furniture and homegoods giant, disliked it enough that they took their objections to the Supreme Court.</p><p>But in the landmark 2018 decision <span>South Dakota v. Wayfair</span>, America’s highest court sided with South Dakota. This ruling overturned Quill's physical presence rule, enabling <span>every</span> state to establish their own sales tax nexus requirements, whether based on a company's physical location, the number of transactions, or the amount of sales revenue in a state.</p><p>By the following year, almost every single state had capitalized on this newfound latitude, enacting laws that defined their own economic nexus criteria. Almost overnight, a complex labyrinth of approximately <strong>10,000 different tax rates</strong> across 45 states and Washington D.C. sprung up, turning sales tax compliance into a logistical nightmare.</p><p>In New York, electronically downloaded software and SaaS became taxable whereas digital books and other digital goods didn’t. In Colorado, the exact opposite was true. In California, you had to pay sales tax if a California business even referred a customer to your site.</p><p>Across the country, sales tax compliance went from a non-issue to a pressing concern that had finance departments of all sizes on high alert.</p></section>
+<section><p><h2>Enter: Anrok</h2></p><p>Miles away in the heart of Silicon Valley, far removed from the changes taking place in South Dakota, Airtable product manager Michelle Valentine never imagined she’d worry about the intricacies of state sales tax rates and economic nexuses.</p><p>But one morning, while on a run with a friend who headed the financial department of a tech firm, Michelle heard about the mounting stress caused by the new, complex landscape of sales tax compliance. Intrigued but alarmed for her friend, she began to check in with other colleagues and contacts.</p><p>It quickly became clear that this wasn't just one company's problem; <strong>it was an industry-wide crisis that had finance departments scrambling to adapt.</strong></p><p>Realizing the urgency and scale of the issue, Michelle made a dramatic life choice.</p><p>She and her Airtable teammate Kannan left their lucrative jobs to tackle the growing problem head-on. Together, they founded Anrok, a startup designed to navigate the labyrinthine world of sales tax compliance that had become a nightmare for businesses across the country.</p></section>
+<section><p><h2>The product</h2></p><p><img alt="Anrok dashboard mockup" data-element="Image" data-source-file="anrok-deep-dive-blog.tsx" fetchpriority="high" width="700" height="500" decoding="async" data-nimg="1" srcset="https://www.joinprospect.com/_next/image?url=%2Fimages%2Fanrok-dash.png&amp;w=750&amp;q=75 1x, https://www.joinprospect.com/_next/image?url=%2Fimages%2Fanrok-dash.png&amp;w=1920&amp;q=75 2x" src="https://www.joinprospect.com/_next/image?url=%2Fimages%2Fanrok-dash.png&amp;w=1920&amp;q=75"></p><p>Anrok offers an end-to-end sales tax compliance platform, making it easy for any startup to navigate the increasingly intricate landscape of local sales tax compliance.</p><p>Beyond helping you manage <span>existing</span> sales taxes, Anrok goes a step further and also helps you avoid triggering <span>future</span> sales taxes through smart notifications about potential new tax obligations.</p><p>More concretely, Anrok’s offers three major value propositions:</p><br><span>Comprehensive Monitoring</span><ul><li><strong>• Centralized Monitoring</strong>: Gain full visibility into existing tax exposure—regionally, nationally, and even internationally—in one place.</li><li><strong>• One-Click Registration</strong>: Simplify your legal obligations with quick registration options. In the U.S., Anrok handles this for free, even in complex jurisdictions like home-rule cities that have their own tax codes.</li></ul><br><span>Smart Tracking and Notifications</span><ul><li><strong>• Employee Impact</strong>: Keep tabs on how your remote workforce affects your sales tax liability.</li><li><strong>• Real-Time Alerts</strong>: Stay ahead of the curve with smart notifications on when new tax obligations arise, such as when hiring remote employees.</li></ul><br><span>Effortless Connection</span><ul><li><strong>• No-Code Integrations</strong>: Jumpstart your compliance journey with easy import features for transactions and employee locations. Seamlessly map your products to the correct tax codes.</li><li><strong>• Integrated Billing</strong>: Anrok works in tandem with your existing billing and payment platforms to calculate precise sales tax during checkout or invoice generation.</li></ul><p>Instead of hiring an expensive accounting firm or juggling all 10,000 sales tax rates in-house, startups now had an easy and affordable way to manage and optimize their taxes.</p><p>The product was a gamechanger, and proved <strong>highly popular</strong> with founders.</p></section>
+<section><p><h2>Traction</h2></p><p>In their funding announcement, Anrok revealed that they’d grown revenue more than <strong>sevenfold</strong> between 2020 and 2021. Additionally, they reported having over 100 customers, a number that’s likely increased significantly since. Just two years after launch, their clients already include major companies like Anthropic, Front, Vanta, Gem, Productboard, AgentSync, Sense, Persona, Pave, Statsig, and Notion.</p><p>On the back of all this growth, they’ve raised over $24M from <strong>Sequoia Capital</strong> and <strong>Index Ventures,</strong> who co-led both their Seed and Series A rounds.</p></section>
+<section><p><h2>Business Model</h2></p><p>The company offers two main plans with a flat monthly rate.</p><br><u>The Starter Plan: $499/ month</u><ul><li>• Global exposure monitoring, tax calculation, filing and remittance, and exemption certificates</li><li>• Sales tax calculator</li><li>• No-code integrations with popular billing systems such as Quickbooks, Stripe, Xero, and Chargebee. </li><li>• For teams that are distributed, the Starter Plan also offers physical nexus tracking through integrations with Rippling, Gusto, BambooHR, and more. </li></ul><br><u>The Core Plan: $999 per month</u><ul><li>• Everything in the Starter Plan  </li><li>• Global exposure modeling tool, ongoing tax and compliance support</li><li>• Integrations with NetSuite and Salesforce </li><li>• Support for multiple entities</li><li>• API technical consultations</li></ul></section>
+<section><p><h2>Market Sizing</h2></p><p>Every SaaS merchant grapples with these new sales tax regulations, meaning every SaaS company is a potential Anrok customer.</p><p>That’s <span>a lot</span> of potential customers.</p><p>Today, there are over <strong><a href="https://explodingtopics.com/blog/number-of-saas-companies">18,000</a></strong> SaaS companies operating within the U.S., the average of which serves <strong><a href="https://colorlib.com/wp/saas-statistics/">36,000 customers</a></strong>. These figures are set to rise: by 2028, the global SaaS market is projected to soar to <strong><a href="https://www.selecthub.com/business-intelligence/enterprise-reporting/saas-reporting-tools/#:~:text=According%20to%20Fortune%20Business%20insights,within%20your%20SaaS%20reporting%20platform.">$716.52 billion</a></strong>, expanding at a <strong><a href="https://www.selecthub.com/business-intelligence/enterprise-reporting/saas-reporting-tools/#:~:text=According%20to%20Fortune%20Business%20insights,within%20your%20SaaS%20reporting%20platform.">CAGR of 27.5%</a></strong>. In the U.S. alone, SaaS revenue is expected to reach $118.10 billion in 2022 and surge to <strong><a href="https://www.statista.com/outlook/tmo/public-cloud/software-as-a-service/united-states">$167.30 billion by 2027, with a CAGR of 7.21%</a></strong>.</p><p>Many of these companies would find Anrok useful: monitoring and identifying sales tax alone costs an estimated $1,740 and 16 hours per month. There is room for Anrok to solve more sales tax problems and grow their annual contract values. Businesses spend an average of <a href="https://www.avalara.com/blog/en/north-america/2023/01/how-to-increase-efficiency-and-reduce-costs-through-sales-tax-automation.html">147 hours and over $14,000</a> per month on the full span of sales tax compliance (including filing, accounting, remittance), with 21% reporting expenditures exceeding $50,000. SMBs typically employ two to five people to manage this.</p><p>Given the ongoing complexities of tax regulations, companies are spending an average of <a href="https://fastspring.com/blog/infographic-taxes-software-saas-digital-content/">250 hours a year researching tax updates</a>.</p><p>Anrok would automate all of this, enabling founders to spend more time on their own products and businesses.</p></section>
+<section><p><h2>Working at Anrok</h2></p><p><img alt="Anrok team picture" data-element="Image" data-source-file="anrok-deep-dive-blog.tsx" fetchpriority="high" width="700" height="500" decoding="async" data-nimg="1" srcset="https://www.joinprospect.com/_next/image?url=%2Fimages%2Fanrok-culture.png&amp;w=750&amp;q=75 1x, https://www.joinprospect.com/_next/image?url=%2Fimages%2Fanrok-culture.png&amp;w=1920&amp;q=75 2x" src="https://www.joinprospect.com/_next/image?url=%2Fimages%2Fanrok-culture.png&amp;w=1920&amp;q=75"></p><p>Anrok's success is understandable when you consider the caliber of their team.</p><br><u>Benefits &amp; Culture Highlight</u><ul><li>• Employees can choose between remote work or collaborating at the San Francisco HQ  </li><li>• Company-wide winter break</li><li>• Annual learning and development stipend</li><li>• Quarterly team-wide offsite </li></ul></section>
+<section><p><h2>Key Risks &amp; Opportunities</h2></p><p>Anrok’s biggest opportunity lies in how they stand to index all of SaaS growth.</p><p>Every SaaS company, regardless of size, has to deal with the United States’ enormously complex web of 10,000 codes across 45 states. Anrok is well positioned to solve the new customer pain created by this regulatory change.</p><p>We’ve seen this story before: Oscar Health did extremely well by launching shortly after the passage of the Affordable Care Act.</p><p>Nonetheless, Anrok is far from the only contender in the space. Major players include:</p><br><strong><u>Tax Firms</u></strong><p><strong>Large Tax Consultancies</strong>: Many companies burdened with substantial sales tax compliance challenges typically turn to renowned tax firms for solutions. Notable names include Deloitte, KPMG, Ernst &amp; Young, and PwC.</p><p><strong>CPAs and Groups</strong>: Smaller businesses often favor CPAs or consortiums of them. These options, while more tailored to smaller operations, can be on the pricier side. Additionally, they generally offer services aligned with the tax collection period, rather than continuous compliance management.</p><p><strong><u>Startups</u></strong> - The tax compliance landscape has recently been invigorated by emerging startups, each bringing unique value propositions.</p><p><strong>Zamp</strong> is strategically targeting e-commerce, with a specialized API for platforms like Shopify and Amazon. Their investors include Valor Equity Partners, Soma Capital, and Day One Ventures.</p><p><strong>Quaderno</strong> has been noted for its premium pricing, which might be a barrier for some businesses. They were recently acquired by Visma, a Norwegian software company.</p><br><strong><u>Big Tech</u></strong><p><strong>Stripe</strong>: Without a doubt, Stripe stands out as a heavyweight in the industry. After its acquisition of TaxJar, it fortified its position in the tax compliance landscape.</p><p>However, Stripe Tax only handles transactions processed through its own platform. This limitation might not be ideal for burgeoning startups with layered financial operations. Such companies frequently employ a range of payment systems—ACH, Stripe, and occasionally Braintree being among the top choices.</p><p>Additionally, these startups might lean on subscription management tools such as Chargebee, Chargify, or SaaSOptics to cater to more intricate subscription models. Given this intricate web of financial transactions, a comprehensive solution like Anrok can prove invaluable.</p><p><strong>Thomson Reuters’ ONESOURCE Indirect Tax</strong>: This is a seasoned solution that has been catering to the needs of various businesses, ensuring they remain compliant with indirect tax requirements.</p></section>
+<section><p><h2>Conclusion</h2></p><p>The golden age of tax-free e-commerce might never come back, but staying compliant doesn’t have to be a nightmare.</p><p>Anrok is helping SaaS companies everywhere track, manage, and optimize their sales tax exposure.</p><p>They’re growing fast and hiring <a href="https://www.anrok.com/careers?ashby_jid=006ac43b-0a0a-4ccc-9170-0482abed125e">Software Engineers</a>, <a href="https://www.anrok.com/careers?ashby_jid=49c62b5c-a751-4913-b816-8c18b6246460">Account Executives</a>, and <a href="https://www.anrok.com/careers?ashby_jid=6b08ceab-e602-4be6-9440-5e652d0c4d10">Growth Professionals</a>.</p></section></article></main></div></div>]]>
+            </description>
+            <link>https://www.joinprospect.com/blog/anrok-deep-dive</link>
+            <guid isPermaLink="false">hacker-news-small-sites-37779211</guid>
+            <pubDate>Thu, 05 Oct 2023 14:41:24 GMT</pubDate>
+        </item>
         <item>
             <title>
 <![CDATA[Pg_bm25: Elastic-Quality Full Text Search Inside Postgres]]>
@@ -95,7 +903,7 @@ by an additional 2x.</p>
 <p>More detailed benchmark results can be found in the extension <a href="https://github.com/paradedb/paradedb/tree/dev/pg_bm25#benchmarks" target="_blank" rel="noreferrer">README</a>.</p>
 <h2 id="wrapping-up"><span>Wrapping Up</span></h2>
 <p><code>pg_bm25</code> is ready for use today. There are two ways to try it: <a href="https://github.com/paradedb/paradedb/tree/dev/pg_bm25#installation" target="_blank" rel="noreferrer">installing it</a> inside an existing, self-hosted Postgres instance,
-or <a href="https://github.com/paradedb/paradedb#self-hosted" target="_blank" rel="noreferrer">running the Postgres Docker image</a>.</p>
+or <a href="https://github.com/paradedb/paradedb#from-self-hosted-postgres" target="_blank" rel="noreferrer">running the Postgres Docker image</a>.</p>
 <p><code>pg_bm25</code> is open-source and licensed under AGPL. If you’d like to contribute, the best place to start is our
 <a href="https://join.slack.com/t/paradedbcommunity/shared_invite/zt-217mordsh-ielS6BiZf7VW3rqKBFgAlQ" target="_blank" rel="noreferrer">Slack community</a>. And please don’t hesitate to show your support by
 <a href="https://github.com/paradedb/paradedb" target="_blank" rel="noreferrer">giving us a star</a>!</p></div></div>]]>
@@ -110,7 +918,7 @@ or <a href="https://github.com/paradedb/paradedb#self-hosted" target="_blank" re
             </title>
             <description>
 <![CDATA[
-Score 7 | Comments 2 (<a href="https://news.ycombinator.com/item?id=37778156">thread link</a>) | @donnygreenberg
+Score 8 | Comments 2 (<a href="https://news.ycombinator.com/item?id=37778156">thread link</a>) | @donnygreenberg
 <br/>
 October 5, 2023 | https://www.run.house/blog/orchestration-and-execution | <a href="https://web.archive.org/web/*/https://www.run.house/blog/orchestration-and-execution">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><h2 id="first-can-we-stop-pretending-ml-development-is-fine">First, can we stop pretending ML development is fine?</h2><p>I have too many conversations with ML engineers about infra overhead which proceed like this: They say things are fine, it took some time to determine their execution flow but now it works. I ask how they execute their in-progress ML code. They say it’s pretty simple, they commit and push to version control, which CD picks up and packages into a new docker container, which then is either submitted to an ML pipeline orchestrator or Kubernetes cluster, which runs when it runs. All together, 45 minutes, 2 hours or more. I ask whether it’s annoying to have to constantly be committing in-progress code into version control, when they really just want to run once to iterate or debug. Then the wheels start turning…</p><p>This, plus 10x longer feedback cycles and CUDA errors:</p><div><p><img alt="A tweet by Hamel Husain that says, &quot;Developing CI jobs is a programming experience from hell    - 5 min feedback cycles - Can only debug with print statements - No good way to replicate the target environment with confidence locally&quot;" loading="lazy" width="1176" height="422" decoding="async" data-nimg="1" sizes="(max-width: 900px) 100vw, 1000px" srcset="https://cdn.sanity.io/images/cefqallt/production/541ee2a90c710719d555db805a6ef288b55e764f-1176x422.jpg?w=640&amp;q=92 640w, https://cdn.sanity.io/images/cefqallt/production/541ee2a90c710719d555db805a6ef288b55e764f-1176x422.jpg?w=750&amp;q=92 750w, https://cdn.sanity.io/images/cefqallt/production/541ee2a90c710719d555db805a6ef288b55e764f-1176x422.jpg?w=828&amp;q=92 828w, https://cdn.sanity.io/images/cefqallt/production/541ee2a90c710719d555db805a6ef288b55e764f-1176x422.jpg?w=1080&amp;q=92 1080w, https://cdn.sanity.io/images/cefqallt/production/541ee2a90c710719d555db805a6ef288b55e764f-1176x422.jpg?w=1200&amp;q=92 1200w, https://cdn.sanity.io/images/cefqallt/production/541ee2a90c710719d555db805a6ef288b55e764f-1176x422.jpg?w=1920&amp;q=92 1920w, https://cdn.sanity.io/images/cefqallt/production/541ee2a90c710719d555db805a6ef288b55e764f-1176x422.jpg?w=2048&amp;q=92 2048w, https://cdn.sanity.io/images/cefqallt/production/541ee2a90c710719d555db805a6ef288b55e764f-1176x422.jpg?w=3840&amp;q=92 3840w" src="https://cdn.sanity.io/images/cefqallt/production/541ee2a90c710719d555db805a6ef288b55e764f-1176x422.jpg?w=3840&amp;q=92"></p></div><p>This is not only a matter of DevX or iteration speed, but the velocity of an ML team as a whole. When I point out how poor this dev experience is, and that we should be able to run on our compute directly, I sometimes hear the objection that this packaging process is crucial to “maintain separation between dev and production!” That’s why it takes an hour or two to add a print statement, and 3-6 months to package their research or iteration code for production by translating it into containers and ML pipelines.</p><p>The rest of the development world relies on staging - flags and canaries - to flip from dev to QA to prod. This versioning is a *human* decision of quality and readiness, not some abstract matter of “prod-iness” of the code based on how much it’s packaged. The above misunderstanding, conflating packaging with release staging, was baked into the design of the 2018-2022 MLOps wave as an implicit suggestion that “research to production” meant a march from “unpackaged to packaged.” Yes, many ML teams have some semblance of staging. Some use versions in a model registry like Sagemaker’s, Weights &amp; Biases’, or MLFlow’s to have this control if only for model inference services, but leaving the question unanswered for virtually everything else. Some attach dev, QA, and prod tags to hacky config files in MLFlow or Weights &amp; Biases which point to the commit, dependencies, and or data sources which define that version of an artifact or service. Most are relying on the implicit conversion of code into containers or MLOps DSLs - ML pipelines, inference services, feature store queries - to define production. There is no mystery “research-to-production” slowdown. It’s packaging, and doing all future work on that code through the packaged form. The mystery is why we still even talk about it.</p><p>Packaging, in both the individual and team velocity breakdowns above, is not a problem in and of itself. Containers and pipelines are crucial in modern ML. The problem is when we over-package in a way that strongly couples our systems together. And it’s a sick joke that many of the peskiest situations in ML - PyTorch CUDA debugging, exporting models for serving, and distributed training setup - smell like problems that should be solved with more Docker. Luckily, there’s a clear way to draw the line so we can use packaging at its best, and leave the DevX and team drag behind.</p><h2 id="a-path-forward-splitting-ml-infra-into-what-and-how">A Path Forward: Splitting ML infra into <em>what</em> and <em>how</em></h2><p>I’ve written <a href="https://www.run.house/blog/a-pytorch-approach-to-ml-infrastructure" target="_blank" rel="noopener noreferrer">in the past</a> about how we got here and why ML’s de facto packaging approach, docker+pipelines, doesn’t make ML or distributed code as i<em>dempotent</em> as once advertised. I think we can all agree that the days of claiming that wrapping things in docker containers and ML pipelines allows you to run your code locally and then ship it anywhere were hilarious and behind us. Now I’d like to talk about the path forward for ML infra - separating the concerns of <em>orchestration</em> from <em>execution</em> - and why this shift is already well underway.</p><p>Orchestration specifies “what” should happen, the individual components of an ML pipeline or the steps a Kubernetes cluster takes to return to homeostasis (NB: I’m noting how the <em>container orchestrator</em> view of K8s fits here for completeness sake, but very few ML teams I know actually use it in this way. Most simply use it as “place to run things,” so that’s how we’ll treat it from now on). For example, the "what" may be "run the <em>prod BERT fine-tuning</em> with the <em>prod pretrained checkpoint</em> on this hour's <em>preprocessed user comment data". </em>Execution, which happens <em>in the infra,</em> defines "how" something should happen - exact the compute, code (down to the commit), dependencies, environment, data artifacts, etc. to complete the task. This may be "the prod BERT fine-tuning is the <em>training.ft_bert_lora</em> method in the <em>nlp_team</em> git package, running on the <em>nlp_A100</em> Docker image on <em>4 A100s</em> in the <em>ml_infra Kubernetes</em> cluster." Note that the execution itself may be the higher-order system relative to something else, e.g. the <em>what</em> is using the nlp_A100 container image, but the <em>how</em> contains the exact name, version, and container store URI.</p><p>Separating orchestration from execution means unbundling <em>what</em> you want a system to do with <em>how</em> you want it done. Despite solving the packaging problem, it doesn’t mean doubling back on our Docker containers, pipelines, or MLOps tools. Rather, it means when a higher-order system, like a pipeline, calls into a lower-order system, like some training code in a Docker container on a Kubernetes cluster, that we should use a versioning system between them to decouple and independently control the implementations. In concrete terms, put as little code into your pipeline nodes as possible, and simply call out to wherever your actual ML code is executed. A versioning system, not unlike the dev/QA/prod staging systems, gives us a live, minimal, togglable, global source of truth for the implementations and infra underneath our artifacts and calls, and keeps record of the causal relationships and lineage between resources, down to exact versions. The benefits are fourfold:</p><ul><li>Iteration, Debugging, and R2P Speed - Being able to directly modify and version the executing code rather than constantly rebuilding, redeploying, and debugging containers.</li><li>Sharing and Reproducibility - Having your ML pipelines use the same underlying service or resource introduces a guarantee of reproducibility beyond each just running the same code (including glue code!) in their own containers.</li><li>Incident Response / Manual Execution - When you need to quickly unblock something, trying to coax containers in a DAG to perform the one-time execution you need is not fun.</li><li>Lineage, Governance, &amp; Management - When all you can record at the site of execution or after an artifact is created is that an opaque container ran, you know almost nothing about its provenance, and you know little about traffic patterns overall (e.g. how many times did people run the BERT fine-tuning? Which teams?).</li></ul><h2 id="orchestration-vs-execution-vs-whatever-containers-are">Orchestration vs. Execution (vs. whatever containers are)</h2><p>It’s important to be precise about what orchestration and execution are, where containers and versioning fit, and the recent developments in this story.</p><p>Your orchestrator is designed to decide <em>which</em> task to run, i.e. a semantic specification layer. These “<em>whats”</em> which are relatively stable day to day, even as the underlying methods or infra change, and can be browsed as a sort of “heartbeat” of an organization. Changing or A/B testing the implementation underneath some orchestrated task does not need to change the orchestration logic itself in any way, and this is a major asset. When I tweak my video preprocessing method, I don’t need to change any flows which include “do video preprocessing here,” and when I do change the flow logic itself, it’s a notable event and should be clearly visible. Orchestrators can look more like cron pipelines or event queues, but they still fundamentally specify “<em>whats</em>.” They are very good at surfacing and handling failures, enforcing dependencies between tasks, and striving to maintain certain rules of state in a broader system. Note that your orchestrator does not have a complete view of your infra, as many executions can happen and artifacts are created outside of orchestration, nor the global graph of relationships between artifacts and executions, as the activities within the tasks are generally opaque to the orchestrator itself. Sometimes an orchestrator asks its users to tag the artifacts which are created at each stage to help construct lineage, but this is a voluntary activity for its own sake.</p><p>Execution is the set of concrete services, jobs, and data artifacts which live on your compute and storage infrastructure. We’ll generally refer to the compute infra, i.e. places where code can be sent to execute, as “clusters” (despite it being a very overloaded term, I don’t know a better one), meaning a compute resource with some kind of submission entrypoint and a scheduler. A single box or serverless engine can be a cluster. Your world of compute consists of all these clusters, places where you can send jobs or code to execute, and perhaps have varying levels of formality and rigor to their scheduling system (even if just an OS). It’s important not to mix up the “dispatch” that can happen within a cluster (e.g. distributing work to workers) with the dispatch of code or jobs to the cluster entrypoint (e.g. from a higher-order system).</p><p>The most common cluster type discussed in this context is Kubernetes. When we think of K8s as a place to “send code for execution,” today that generally means packaging it into a container to run on the cluster. The execution Kubernetes supports is simultaneously quite heterogeneous, ranging from one-off jobs to long-lived services, but also very homogeneous, viewed in a different way as a barrage of opaque containers. This means visibility and management are simultaneously quite rich, being that k8s already has such tooling built-in, but also quite bare, as the parade of containers is mostly devoid of relationships and semantic meaning. For a long time, the packaging step has been painful to do manually and was handled by pipeline orchestrators or CD, and the act of turning something like distributed training code into a coordinated activity across containers remains an artisan craft.</p><p>Enter <a href="https://www.ray.io/" target="_blank" rel="noopener noreferrer">Ray</a>, a new kind of cluster scheduler which operates on native Python functions and objects rather than containers. It’s easy to see this as a “cluster” alongside K8s which can have work sent to it, but is usually used in a totally different way. Ray essentially gives us a DSL for specifying distributed execution <em>within a program</em>, making it possible to write distribution in the research stage which is portable to production, and eliminating much of the pain of distributed activities across containers. In this model, a researcher starts their work by creating a fresh Ray cluster, iterates on their code, and usually takes it down at the end of a work session. When they push the code to production in an ML pipeline, the node creates a Ray cluster (usually pulling it out of K8s), runs its work, and then releases the cluster. A number of big-name companies have adopted this model, and I consider <a href="https://shopify.engineering/merlin-shopify-machine-learning-platform" target="_blank" rel="noopener noreferrer">Shopify’s Merlin</a> to be a prototypical and well documented example. Ray can also be used to schedule work within a single instance or group of instances, but usually this is mediated behind a simple server on that cluster which essentially uses Ray internally. So you shouldn’t look at Ray and think “oh, here’s my system for dispatching jobs to compute from orchestration” because no one I know of maintains a big long-lived Ray cluster like a K8s cluster, but rather as a much better language in which to actually write the programs, which still need to be sent to compute for execution. The direction of Ray’s own tooling (notably Ray AIR, the ML tooling built on Ray Core), is consistent with this usage pattern.</p><p>A note on containers: Your docker containers are designed to cache the environment setup in which your code runs, including compilation if you’re working in a compiled language. If you use them, as many do in ML, as a parcel of <em>scripted</em> (e.g. Python)<em> </em>code to be executed, maybe even with a light yaml or CLI config interface - you’re probably going to have a bad time. For one, these containers are heavy, often a few GB in ML, and take time to build and ship around. Doing that hundreds of times per project seriously adds up, compared to say, having a base container and dropping your code into it with whatever changed. Taking the view of the container as a cache for environment setup, by building a new container for every commit you’re essentially “cache-missing” 100% of the time you change your code slightly. You end up, like many do, with a sea of containers which are, again, practically opaque from the outside. Not fun for reproducibility after all. Debugging code in these containers after throwing them at k8s is also a nightmare, especially when the issues arise from subtle misalignments between the code inside the container and the hardware it was dropped on in the cluster, e.g. the machine image that hardware was started with, and/or the GPU drivers, and/or the GPUs themselves, and/or the inter-GPU communication. You can tell yourself you’ll freeze your dependencies to avoid this debugging at your own peril (what OSS code and models could you use today if you froze your dependencies in mid-2022?). I think most of us could be changing our docker images far less in ML, and instead have a few shared images maintained well and updated over time.</p><h2 id="what-goes-wrong-when-we-couple-orchestration-and-execution">What goes wrong when we couple orchestration and execution</h2><p>Looking back at the state of the art, which couples orchestration and execution by packaging code into the orchestrator, often inside docker images, we see a slew of failures.</p><p>It’s important to note that this is not in any way a knock at orchestration. Orchestration is crucial for specifying complex jobs and dependencies, fault tolerance, observing failures, and more, and over time (some) have become highly ergonomic and loved by their users. Our friends at Prefect are aligned that they don’t want to be mediating execution because it’s not appropriate to bundle it into the pipelines proper.</p><h3>Iteration, debugging, and R2P speed</h3><p>With the code packaged into the orchestrator node, execution is gated on orchestration or packaging, which means iteration loops are in the order of hours rather than seconds. Debugging channels are much narrower, with SSH perhaps being inaccessible, and collecting logs and stdout is trickier. Translating notebooks into pipeline and container packaging is a well documented pain that we’ve discussed above. But more dramatically, any change within the <em>how</em> of the underlying pipeline’s execution means a change and new version of the pipeline. There’s no isolation in versioning between a change to the semantic specifics of the pipeline (i.e. what is being done) and the execution specifics (e.g. insert a log statement). It’s all bundled together into a massive list of pipeline versions. If you change your text preprocessing logic, which is imported and used in dozens of pipeline nodes, then you may have new versions of all of those pipelines, or worse, different implementations bundled into each. This is the kind of thing that doesn’t seem to matter until it does, when a downstream artifact starts behaving differently or you need to rollback a pipeline due to an incident. And good luck trying to A/B test a change to that text preprocessing function. Even if you’re using Ray as the distribution DSL, you’re still packaging the code into the orchestration node, with the same implications on iteration times and change versioning.</p><h3>Sharing and Reproducibility</h3><p>When the execution is bundled into the orchestration, very little is truly shared. Your nodes always contain glue code around the reusable parts, which means you’ll have dozens of pipelines with a “text preprocessing” node, but they all have slightly different behavior and/or may produce slightly different artifacts (which of course can’t then be shared). Those nodes might actually be on different hardware, and further, everyone running that code outside of an orchestrator is likely on different hardware too, trying their best to estimate the production environment. Reproducibility suffers, sharing suffers, it’s all lots of duplication and Wario reproductions across environments and teams. Compare that to having all of those pipelines and researchers just calling a shared prod text preprocessing service.</p><p>This is all not to mention the fact that any “caching” a pipeline does of artifacts is only cached within that pipeline. There is no global shared cache like in the DAG of artifacts in a system like dbt.</p><h3>Incidents / manual execution</h3><p>Often the best-conceived MLOps systems are the most rigid and annoying when you’re frantically trying to get a customer unblocked, handle an incident, or do something one-off. The “fault tolerance” of ML pipelines is nice until the thing which caused the failure requires a slight change to the pipeline to complete. Then you’re servicing a car through the tailpipe. If you could just run the blocking underlying step directly with your modifications, or quickly fork it and rerun the pipeline with an altered version, you’d never have this issue. If your execution is bundled into the pipeline itself, good luck.</p><h3>Lineage</h3><p>Many ML Engineers I speak to about lineage say “ya, we have lineage,” referring to “looking at the pipeline which generated a resource.” That’s not lineage at all. Some engineer wrote that pipeline, and the pipeline is no more “lineage” than if that engineer described the sequence of events into a Google Doc. Lineage is knowing the provenance (who, where, how) for an arbitrary resource (including previous versions), and being able to follow its dependency trail of upstream artifacts and executions (with exact code versions) across pipelines and even manual operations. Your orchestrator does not have comprehensive lineage because it can only see the things which happen in its workflows, and further, it probably can only see each step as a container, it has no real idea what’s happening inside. Your experiment manager probably doesn’t have it either, only a record of the executions you choose to record (I see people go as far as snapshotting their entire codebase over and over in blob storage with each execution to keep some semblance of breadcrumbs - good luck diffing those if you have an incident!). There are Python DSLs where you change your code into a pipeline in some way to record lineage, but again, those are volunteer efforts, and your graph of resources is only very good if you’re not missing many crucial links in the chain. Traditional data lineage tools track at the storage layer, and therefore have no capacity to answer basic questions like, “which model was used to generate this column of embeddings?”</p><p>Lineage needs to be traced through the versioning system and ideally at the points of execution themselves. You need to be able to say “the prod pretrained BERT service (version xxxx) uses the prod pretrained BERT checkpoint (version xxxx), which was trained with the prod (version xxxx) BERT pretraining service, yesterday’s preprocessed user comment data (version xxxx), and the preprocessed common crawl dataset (version xxxx)” etc. By being at the points of execution, you’ve got 100% coverage of the activities that generate new resources and versions, and by being inside the versioning system, you’ve got a semantic understanding of resources and relationships.</p><h3>Visibility &amp; Usage Management</h3><p>The “parade of containers” model of execution also makes it very difficult to answer questions like, “How many times this month was my team’s BERT embedding service used by other teams? Which teams?” You need to build that tracking yourself throughout your stack if you want it. And if you’re trying to optimize or load balance the executions on a cluster, good luck doing that by looking at the containers coming in. Sometimes people object to the notion that engineers and researchers should be able to call services or jobs on the compute infra directly (rather than through a notebook in a sandbox where their shenanigans belong!) because what if they disrupt another production job on the cluster with the resources they consume? Well, what if a second production job consumed some resources and did the same thing? Wouldn’t it be easier if these weren’t just “jobs” but rather “2 BERT fine-tunings, one from x team and one from y team, and a production ResNet50 embedding service” which could be load balanced directly? I see lots of unused compute because teams have no way to do real resource management beyond hoping to schedule things at different times of day, or hoard the cluster to keep other jobs out.</p><h2 id="ok-so-what-should-the-infrastructure-actually-look-like">Ok, so what should the infrastructure actually look like?</h2><p>Your execution should be in a place where you can iterate easily, interact with the cluster from elsewhere, and can have a single interaction point which can track all lineage (in ML, it’s more important to track lineage on the cluster where the artifacts are generated than at the storage destination!). Your orchestration nodes should be very lightweight, with most nodes simply calling out to shared microservices which execute the work itself. In principle, any code which is likely to change more often than the semantic specification of the orchestration itself probably shouldn’t be in the orchestration proper. Certainly anything shared by multiple people or pipelines should live outside the orchestrator. If you have a “BERT fine-tuning” node which is used by a number of researchers and pipelines, it would probably be reasonable to put it in a light cpu-only microservice with the glue code, which itself calls a shared training function service on a GPU box.</p><p>Which leads to the first reason most teams don’t already do this: Microservices are kind of annoying. You just wrap things over and over in FastAPI, Nginx, and/or containers, and they end up having their own debugging pains. Calling a microservice over HTTP is only slightly better for debugging and iteration than calling your code in orchestration, and maybe worse if you’re starting with a Python function and need to convert a bunch of your inputs and outputs to be JSON-able. Features like streaming (i.e. generators), auth, or propagating logs are annoying and need to be built for each one. There are systems to make building and deploying APIs easier, but in many cases they’re built around non-ML use cases and don’t support diverse hardware (e.g. AWS Lambdas), or are fully hosted and won’t work for existing compute infra (e.g. Modal, Banana, etc.).</p><p>The second reason most people don’t do this is that if you’re debugging or editing a pipeline, it’s much too easy to quickly sneak things into orchestration nodes rather than make them shared resources. I see engineers really struggle with this at times - they want their orchestration nodes to feel modular and reusable, but there’s some one-off code they need to add to one pipeline which just doesn’t fit. I can’t tell you how many times I’ve seen someone spend an extra week rethinking how they slice their code to run on each node.</p><h2 id="which-is-why-we-built-runhouse">Which is why we built Runhouse</h2><p>We feel that if building, sharing, and instrumenting a shared service required no more effort than writing the function in the first place, and features like streaming logs/stdout, generators, and async were supported out of the box, this decision would be obvious for most teams. Further, if we can make these functions-turned-services accessible, iterable, and debuggable in Python, without any need to learn about packaging or conform to infrastructure DSLs, most people would choose this interface into the infra for both their research and production work. This is the inspiration for <a href="https://github.com/run-house/runhouse" target="_blank" rel="noopener noreferrer">Runhouse OSS</a>, a unified interface into your infrastructure, designed to be aggressively DSL-free and work with your existing Python code. From anywhere - a local script, notebook, orchestration node - you can write experiments and pipelines which traverse any of your compute infrastructure, without ever having to wrap your code in a docker container or package it for particular infra.</p><p>Here’s a Hello World example of sending arbitrary code (in this case loading Stable Diffusion and running inference) to arbitrary compute (in this case, a fresh auto-scaling A10G in SageMaker). This function could be anything in my experiment or pipeline - training, preprocessing, hyper-parameter tuning, whatever - and I don’t need to package it up, refactor it, or “submit it for execution.” Once Runhouse sends it to my choice of compute infrastructure, I call it like a normal function. If I change it and rerun this script, the changed code is synced over via my `.to` call without even stopping the HTTP server on the cluster. It’s really a normal development loop, but I’m running on the real compute this code is meant for, not in a phony local environment.</p><div><p><span><code>import runhouse as rh
@@ -157,7 +965,7 @@ if __name__ == "__main__":
             </title>
             <description>
 <![CDATA[
-Score 8 | Comments 6 (<a href="https://news.ycombinator.com/item?id=37777533">thread link</a>) | @tkellogg
+Score 13 | Comments 9 (<a href="https://news.ycombinator.com/item?id=37777533">thread link</a>) | @tkellogg
 <br/>
 October 5, 2023 | https://timkellogg.me/blog/2023/10/01/interpretability | <a href="https://web.archive.org/web/*/https://timkellogg.me/blog/2023/10/01/interpretability">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="post">
@@ -491,7 +1299,7 @@ seeing what people come up with.</p>
             </title>
             <description>
 <![CDATA[
-Score 48 | Comments 46 (<a href="https://news.ycombinator.com/item?id=37776605">thread link</a>) | @adminu
+Score 49 | Comments 46 (<a href="https://news.ycombinator.com/item?id=37776605">thread link</a>) | @adminu
 <br/>
 October 5, 2023 | https://ph-uhl.com/can-you-customize-my-startup-s-login-page/ | <a href="https://web.archive.org/web/*/https://ph-uhl.com/can-you-customize-my-startup-s-login-page/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -547,7 +1355,7 @@ companies branding.</p>
             </title>
             <description>
 <![CDATA[
-Score 8 | Comments 1 (<a href="https://news.ycombinator.com/item?id=37775954">thread link</a>) | @ingve
+Score 41 | Comments 32 (<a href="https://news.ycombinator.com/item?id=37775954">thread link</a>) | @ingve
 <br/>
 October 5, 2023 | https://belkadan.com/blog/2023/10/Implicity-Atomic/ | <a href="https://web.archive.org/web/*/https://belkadan.com/blog/2023/10/Implicity-Atomic/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -603,7 +1411,7 @@ October 5, 2023 | https://belkadan.com/blog/2023/10/Implicity-Atomic/ | <a href=
             </title>
             <description>
 <![CDATA[
-Score 136 | Comments 36 (<a href="https://news.ycombinator.com/item?id=37775574">thread link</a>) | @GlowOnDub
+Score 182 | Comments 49 (<a href="https://news.ycombinator.com/item?id=37775574">thread link</a>) | @GlowOnDub
 <br/>
 October 4, 2023 | https://f3d.app// | <a href="https://web.archive.org/web/*/https://f3d.app//">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div> <div id="main-content"> <main> <p><a href="https://github.com/f3d-app/f3d/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/f3d-app/f3d/ci.yml?label=CI&amp;logo=github" alt="CI"></a> <a href="https://github.com/f3d-app/f3d-superbuild"><img src="https://img.shields.io/github/actions/workflow/status/f3d-app/f3d-superbuild/nightly.yml?label=Packaging&amp;logo=github" alt="Packaging"></a> <a href="https://codecov.io/gh/f3d-app/f3d"><img src="https://codecov.io/gh/f3d-app/f3d/branch/master/graph/badge.svg?token=siwG82IXK7" alt="codecov"></a> <a href="https://github.com/f3d-app/f3d/releases"><img src="https://img.shields.io/github/downloads/f3d-app/f3d/total.svg" alt="Downloads"></a> <a href="https://github.com/sponsors/f3d-app"><img src="https://img.shields.io/static/v1?label=Sponsor&amp;message=%E2%9D%A4&amp;logo=GitHub&amp;color=%23fe8e86" alt="Sponsors"></a> <a href="https://discord.f3d.app/"><img src="https://discordapp.com/api/guilds/1046005690809978911/widget.png?style=shield" alt="Discord"></a></p>  <p>By Michael Migliore and Mathieu Westphal.</p> <p><img src="https://raw.githubusercontent.com/f3d-app/f3d/master/resources/logo.svg" width="20px"> F3D (pronounced <code>/fɛd/</code>) is a fast and minimalist 3D viewer. It supports many file formats, from digital content to scientific datasets (including glTF, STL, STEP, PLY, OBJ, FBX, Alembic), can show animations and support thumbnails and many rendering and texturing options including real time physically based rendering and raytracing. <br clear="left"></p> <p>It is fully controllable from the command line and support configuration files. It can provide thumbnails, support interactive hotkeys, drag&amp;drop and integration into file managers.</p> <p>F3D also contains the libf3d, a simple library to render meshes, with C++ and Python Bindings, as well as experimental Java and Javascript bindings.</p> <p><img src="https://user-images.githubusercontent.com/3129530/194735416-3f386437-456c-4145-9b5e-6bb6451d7e9a.png" width="640"></p> <p><em>A typical render by F3D</em></p> <p><img src="https://user-images.githubusercontent.com/3129530/194735261-dd6f1c1c-fa57-47b0-9d27-f735d18ccd5e.gif" width="640"></p> <p><em>Animation of a glTF file within F3D</em></p> <p><img src="https://user-images.githubusercontent.com/3129530/194735272-5bcd3e7c-a333-41f5-8066-9b0bec9885e8.png" width="640"></p> <p><em>A direct scalars render by F3D</em></p> <p>See the <a href="https://f3d.app/doc/GALLERY.html">gallery</a> for more images, take a look at the <a href="https://f3d.app/doc/CHANGELOG.html">changelog</a> or go to the <a href="https://github.com/f3d-app/f3d/releases">releases page</a> to download F3D!</p> <p>If you need any help or want to discuss with other F3D users and developers, head over to our <a href="https://discord.f3d.app/">discord</a>.</p>  <p>Open a file and visualize it interactively:</p>  <p>Open a file and save the rendering into an image file:</p> <div><div><pre><code>f3d /path/to/file.ext --output=/path/to/img.png
@@ -621,7 +1429,7 @@ man f3d # Linux only
             </title>
             <description>
 <![CDATA[
-Score 210 | Comments 210 (<a href="https://news.ycombinator.com/item?id=37773918">thread link</a>) | @pella
+Score 223 | Comments 220 (<a href="https://news.ycombinator.com/item?id=37773918">thread link</a>) | @pella
 <br/>
 October 4, 2023 | https://www.beren.io/2023-03-19-LLMs-confabulate-not-hallucinate/ | <a href="https://web.archive.org/web/*/https://www.beren.io/2023-03-19-LLMs-confabulate-not-hallucinate/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -674,7 +1482,7 @@ October 4, 2023 | https://www.beren.io/2023-03-19-LLMs-confabulate-not-hallucina
             </title>
             <description>
 <![CDATA[
-Score 27 | Comments 2 (<a href="https://news.ycombinator.com/item?id=37773819">thread link</a>) | @freediver
+Score 34 | Comments 4 (<a href="https://news.ycombinator.com/item?id=37773819">thread link</a>) | @freediver
 <br/>
 October 4, 2023 | https://hamel.dev/notes/llm/inference/03_inference.html | <a href="https://web.archive.org/web/*/https://hamel.dev/notes/llm/inference/03_inference.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="quarto-content">
@@ -1143,7 +1951,7 @@ Based on your code (<a href="https://t.co/hSYaPTsEaK">https://t.co/hSYaPTsEaK</a
             </title>
             <description>
 <![CDATA[
-Score 108 | Comments 10 (<a href="https://news.ycombinator.com/item?id=37773599">thread link</a>) | @nvzqz
+Score 115 | Comments 10 (<a href="https://news.ycombinator.com/item?id=37773599">thread link</a>) | @nvzqz
 <br/>
 October 4, 2023 | https://nikolaivazquez.com/blog/divan/ | <a href="https://web.archive.org/web/*/https://nikolaivazquez.com/blog/divan/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><h2 id="announcing-divan">Announcing Divan!</h2>
@@ -1899,7 +2707,7 @@ October 4, 2023 | https://www.gresearch.com/blog/article/g-research-the-terminal
             </title>
             <description>
 <![CDATA[
-Score 53 | Comments 55 (<a href="https://news.ycombinator.com/item?id=37772070">thread link</a>) | @newsletterxyz
+Score 53 | Comments 67 (<a href="https://news.ycombinator.com/item?id=37772070">thread link</a>) | @newsletterxyz
 <br/>
 October 4, 2023 | https://www.thenewsletternewsletter.xyz/post/google-announces-plan-to-make-gmail-less-spammy-a-checklist-to-ensure-you-meet-the-new-sender-requirements | <a href="https://web.archive.org/web/*/https://www.thenewsletternewsletter.xyz/post/google-announces-plan-to-make-gmail-less-spammy-a-checklist-to-ensure-you-meet-the-new-sender-requirements">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div data-w-id="436c98f4-0b64-f554-b81e-93f36abbfded"><div><p>📣 Attention email senders!&nbsp;<a href="https://blog.google/products/gmail/gmail-security-authentication-spam-protection/?utm_source=thenewsletternewsletter&amp;utm_medium=website&amp;utm_campaign=100423">Google's got some updates</a>.</p><p>Starting February 1, 2024, new sender requirements for those sending to Gmail accounts will be in effect. And guess what? They're nudging you to start adapting now.</p><p>Some numbers:</p><p>👉 Gmail accounts for ~29% of email client market share, based on Litmus' August 2023 data.</p><p>👉&nbsp;With Gmail being such a dominant player (and ~1.8 billion users worldwide according to EarthWeb), this update likely impacts you or your business.</p><p>Below is a checklist to help ensure you meet the requirements.Google mentions, early adaptation might even improve your email delivery. Wait too long, and your emails might not be delivered as expected, or be marked as spam.</p><figure><p><img src="https://uploads-ssl.webflow.com/63757b6d3f051922fbdc1152/651dbeef0e471d05c666b8a9_TheNewsletterNewsletter_GmailSenderUpdates_February2024.png" loading="lazy" alt=""></p><figcaption>The Newsletter Newsletter</figcaption></figure><h2>🎉 Have a great week!</h2><p>If this was helpful or brought a little joy to you today, and you’d like to support The Newsletter Newsletter, feel free to:</p><ul role="list"><li>⏩ Send this to a colleague or someone you know that has a newsletter or works in email marketing.</li><li>👋 Say hi on <a href="https://twitter.com/newsletterxyz?utm_source=thenewsletternewsletter&amp;utm_medium=website&amp;utm_campaign=100423" target="_blank">Twitter</a>, <a href="https://www.linkedin.com/in/the-newsletter-newsletter/?utm_source=thenewsletternewsletter&amp;utm_medium=website&amp;utm_campaign=100423" target="_blank">LinkedIn</a>.</li><li>💭 <a href="https://flight.beehiiv.net/v2/clicks/eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1cmwiOiJtYWlsdG86aW5mb0B0aGVuZXdzbGV0dGVybmV3c2xldHRlci54eXoiLCJwb3N0X2lkIjoiNzBmYTEyZTUtZDVhZC00YTBmLTk3MzEtZTZiMTc5N2U3NTEyIiwicHVibGljYXRpb25faWQiOiJkMmRjOWE1OC0wZDc4LTQzODAtOGQwNi01YzA4OTMzNDFjZjIiLCJ2aXNpdF90b2tlbiI6IjY3MmFkNTg4LTRiN2ItNDVhNS1iNTU5LWI5YWFmNTI2MTE3ZCIsImlhdCI6MTY4OTYxMDE1MS4zODEsImlzcyI6Im9yY2hpZCJ9.-vX0A_ffz4cu7VFrVhUBgHoU18zN1ubirZNBOx2oI14">Send us an email</a> with what you thought about this article. Feedback is welcome!</li><li>⭐️ Big fans? Let us know by <a href="https://senja.io/p/the-newsletter-newsletter/r/1xFtcz?utm_source=thenewsletternewsletter&amp;utm_medium=website&amp;utm_campaign=092923" target="_blank">submitting a testimonial</a>!</li><li>🤝 Interested in working with us? Learn more <a href="https://www.thenewsletternewsletter.xyz/workwithus" target="_blank">here</a>.</li></ul><p>If you're not signed up for our newsletter, sign up below!</p></div></div></div></div>]]>
@@ -2279,7 +3087,7 @@ October 4, 2023 | https://www.ssp.sh/blog/why-using-neovim-data-engineer-and-wri
             </title>
             <description>
 <![CDATA[
-Score 120 | Comments 34 (<a href="https://news.ycombinator.com/item?id=37771041">thread link</a>) | @grzm
+Score 121 | Comments 35 (<a href="https://news.ycombinator.com/item?id=37771041">thread link</a>) | @grzm
 <br/>
 October 4, 2023 | https://dioragame.com/devlog/?log=3 | <a href="https://web.archive.org/web/*/https://dioragame.com/devlog/?log=3">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
@@ -2455,7 +3263,7 @@ const { wrapper, overlay, content, header, body, footer } = getClassNames(dialog
             </title>
             <description>
 <![CDATA[
-Score 35 | Comments 3 (<a href="https://news.ycombinator.com/item?id=37766244">thread link</a>) | @altilunium
+Score 38 | Comments 4 (<a href="https://news.ycombinator.com/item?id=37766244">thread link</a>) | @altilunium
 <br/>
 October 4, 2023 | https://maphappenings.com/2023/09/28/mappedin/ | <a href="https://web.archive.org/web/*/https://maphappenings.com/2023/09/28/mappedin/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2763,7 +3571,7 @@ the rulebook.</p>
             </title>
             <description>
 <![CDATA[
-Score 845 | Comments 122 (<a href="https://news.ycombinator.com/item?id=37764581">thread link</a>) | @jakelazaroff
+Score 856 | Comments 125 (<a href="https://news.ycombinator.com/item?id=37764581">thread link</a>) | @jakelazaroff
 <br/>
 October 4, 2023 | https://jakelazaroff.com/words/an-interactive-intro-to-crdts/ | <a href="https://web.archive.org/web/*/https://jakelazaroff.com/words/an-interactive-intro-to-crdts/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-content="" data-astro-cid-rnrqlda2="">
@@ -3098,7 +3906,7 @@ October 4, 2023 | https://collectivai.com/blog/hacktoberfest-2023-how-ai-can-cre
             </title>
             <description>
 <![CDATA[
-Score 178 | Comments 107 (<a href="https://news.ycombinator.com/item?id=37764489">thread link</a>) | @emilfroberg
+Score 181 | Comments 107 (<a href="https://news.ycombinator.com/item?id=37764489">thread link</a>) | @emilfroberg
 <br/>
 October 4, 2023 | https://benchmark.vectorview.ai/vectordbs.html | <a href="https://web.archive.org/web/*/https://benchmark.vectorview.ai/vectordbs.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p id="74a78110-44df-4fb2-99b0-d02b0d738b65">In an era where semantic search and retrieval-augmented generation (RAG) are redefining our online interactions, the backbone supporting these advancements is often overlooked: vector databases. If you're diving into applications like large language models, RAG, or any platform leveraging semantic search, you're in the right place. </p><p id="d8d8f0d8-54f6-4f62-963b-e99a2bfc6fc7">Picking a vector database can be hard. Scalability, latency, costs, and even compliance hinge on this choice. For those navigating this terrain, I've embarked on a journey to sieve through the noise and compare the leading vector databases of 2023. I’ve included the following vector databases in the comparision: Pinecone, Weviate, Milvus, Qdrant, Chroma, Elasticsearch and PGvector. The data behind the comparision comes from <a href="https://ann-benchmarks.com/">ANN Benchmarks</a>, the docs and internal benchmarks of each vector database and from digging in open source github repos.  </p><h3 id="20c9874e-9426-41e4-8b4f-6552e1e67108">A comparison of leading vector databases </h3><table id="3c84713c-6aaa-419a-994a-8394da97e0ec"><thead><tr id="169c9354-a8c2-40fe-9069-fc4b90f71590"><th id="nNGs"></th><th id="vFHg"><strong>Pinecone</strong></th><th id="BzQt"><strong>Weaviate</strong></th><th id="o:dW"><strong>Milvus</strong></th><th id="ou>Z"><strong>Qdrant</strong></th><th id="@XWd"><strong>Chroma</strong></th><th id="YN}c"><strong>Elasticsearch</strong></th><th id="Dj[_"><strong>PGvector</strong></th></tr></thead><tbody><tr id="b35c6d6a-c901-41b5-bf42-f36eaf005953"><th id="nNGs"><strong>Is open source</strong></th><td id="vFHg">❌</td><td id="BzQt">✅</td><td id="o:dW">✅</td><td id="ou>Z">✅</td><td id="@XWd">✅</td><td id="YN}c">❌</td><td id="Dj[_">✅</td></tr><tr id="60f4f8d2-e897-4a67-8fae-d438028efb6e"><th id="nNGs"><strong>Self-host</strong></th><td id="vFHg">❌</td><td id="BzQt">✅</td><td id="o:dW">✅</td><td id="ou>Z">✅</td><td id="@XWd">✅</td><td id="YN}c">✅</td><td id="Dj[_">✅</td></tr><tr id="cac3f7b1-0afb-4374-af6a-5a18196074b2"><th id="nNGs"><strong>Cloud management</strong></th><td id="vFHg">✅</td><td id="BzQt">✅</td><td id="o:dW">✅</td><td id="ou>Z">✅</td><td id="@XWd">❌</td><td id="YN}c">✅</td><td id="Dj[_">(✔️)</td></tr><tr id="0b0da29d-10bd-4391-ab7e-90090b7df310"><th id="nNGs"><strong>Purpose-built for Vectors</strong></th><td id="vFHg">✅</td><td id="BzQt">✅</td><td id="o:dW">✅</td><td id="ou>Z">✅</td><td id="@XWd">✅</td><td id="YN}c">❌</td><td id="Dj[_">❌</td></tr><tr id="f1474e0c-a949-4527-9b0a-aa3e3cb3feb6"><th id="nNGs"><strong>Developer experience</strong></th><td id="vFHg">👍👍👍</td><td id="BzQt">👍👍</td><td id="o:dW">👍👍</td><td id="ou>Z">👍👍</td><td id="@XWd">👍👍</td><td id="YN}c">👍</td><td id="Dj[_">👍</td></tr><tr id="9a7e338b-94fb-49d4-845c-e8d47ce750aa"><th id="nNGs"><strong>Community</strong></th><td id="vFHg">Community page &amp; events</td><td id="BzQt">8k☆ github,
@@ -3134,7 +3942,7 @@ October 4, 2023 | https://ambient.run/blog/platform | <a href="https://web.archi
             </title>
             <description>
 <![CDATA[
-Score 558 | Comments 214 (<a href="https://news.ycombinator.com/item?id=37763098">thread link</a>) | @appstorelottery
+Score 561 | Comments 214 (<a href="https://news.ycombinator.com/item?id=37763098">thread link</a>) | @appstorelottery
 <br/>
 October 4, 2023 | https://lfgslots.com/classicvideopoker/ | <a href="https://web.archive.org/web/*/https://lfgslots.com/classicvideopoker/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -3149,7 +3957,7 @@ October 4, 2023 | https://lfgslots.com/classicvideopoker/ | <a href="https://web
             </title>
             <description>
 <![CDATA[
-Score 401 | Comments 199 (<a href="https://news.ycombinator.com/item?id=37761273">thread link</a>) | @kristianp
+Score 409 | Comments 200 (<a href="https://news.ycombinator.com/item?id=37761273">thread link</a>) | @kristianp
 <br/>
 October 3, 2023 | https://blog.reyem.dev/post/extracting_hn_book_recommendations_with_chatgpt_api/ | <a href="https://web.archive.org/web/*/https://blog.reyem.dev/post/extracting_hn_book_recommendations_with_chatgpt_api/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -3591,7 +4399,7 @@ of the comment where the book was identified.  I also normalised the book titles
             </title>
             <description>
 <![CDATA[
-Score 460 | Comments 276 (<a href="https://news.ycombinator.com/item?id=37759871">thread link</a>) | @cmrdporcupine
+Score 466 | Comments 276 (<a href="https://news.ycombinator.com/item?id=37759871">thread link</a>) | @cmrdporcupine
 <br/>
 October 3, 2023 | https://darnell.day/bbc-gives-up-on-threads-by-instagram-sticks-with-mastodon | <a href="https://web.archive.org/web/*/https://darnell.day/bbc-gives-up-on-threads-by-instagram-sticks-with-mastodon">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p><img src="https://i.snap.as/LxUHCO5k.jpeg" alt="BBC News icon"></p>
@@ -3640,7 +4448,7 @@ October 3, 2023 | https://darnell.day/bbc-gives-up-on-threads-by-instagram-stick
             </title>
             <description>
 <![CDATA[
-Score 107 | Comments 28 (<a href="https://news.ycombinator.com/item?id=37759002">thread link</a>) | @zdw
+Score 107 | Comments 29 (<a href="https://news.ycombinator.com/item?id=37759002">thread link</a>) | @zdw
 <br/>
 October 3, 2023 | https://www.leadedsolder.com/2023/10/03/creativision-clone-v1.html | <a href="https://web.archive.org/web/*/https://www.leadedsolder.com/2023/10/03/creativision-clone-v1.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -3836,7 +4644,7 @@ October 3, 2023 | https://getunblocked.com/blog/get-unblocked | <a href="https:/
             </title>
             <description>
 <![CDATA[
-Score 259 | Comments 212 (<a href="https://news.ycombinator.com/item?id=37753292">thread link</a>) | @shsachdev
+Score 260 | Comments 212 (<a href="https://news.ycombinator.com/item?id=37753292">thread link</a>) | @shsachdev
 <br/>
 October 3, 2023 | https://www.careerfair.io/online-maze | <a href="https://web.archive.org/web/*/https://www.careerfair.io/online-maze">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4420,7 +5228,7 @@ October 3, 2023 | https://easylang.dev/show/#cod=hVPRbtswDHzXVxDtS5cujpN0wDosn7C
             </title>
             <description>
 <![CDATA[
-Score 134 | Comments 94 (<a href="https://news.ycombinator.com/item?id=37751270">thread link</a>) | @wikiwong
+Score 136 | Comments 95 (<a href="https://news.ycombinator.com/item?id=37751270">thread link</a>) | @wikiwong
 <br/>
 October 3, 2023 | https://dylibso.com/blog/why-extism/ | <a href="https://web.archive.org/web/*/https://dylibso.com/blog/why-extism/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -8149,7 +8957,7 @@ October 1, 2023 | https://floorp.app/en/ | <a href="https://web.archive.org/web/
             </title>
             <description>
 <![CDATA[
-Score 136 | Comments 51 (<a href="https://news.ycombinator.com/item?id=37734593">thread link</a>) | @tobr
+Score 137 | Comments 51 (<a href="https://news.ycombinator.com/item?id=37734593">thread link</a>) | @tobr
 <br/>
 October 1, 2023 | https://szymonkaliski.com/writing/2023-10-02-building-a-diy-pen-plotter/ | <a href="https://web.archive.org/web/*/https://szymonkaliski.com/writing/2023-10-02-building-a-diy-pen-plotter/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><p>This article documents my learnings from designing and building a <a href="https://szymonkaliski.com/projects/diy-pen-plotter">DIY Pen Plotter</a> during the summer of 2023.
