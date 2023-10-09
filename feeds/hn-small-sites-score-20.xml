@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Mon, 09 Oct 2023 12:24:33 GMT</lastBuildDate>
+        <lastBuildDate>Mon, 09 Oct 2023 16:22:27 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-20.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Mon, 09 Oct 2023 12:24:32 GMT</pubDate>
+        <pubDate>Mon, 09 Oct 2023 16:22:27 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,471 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Text Showdown: Gap Buffers vs. Ropes]]>
+            </title>
+            <description>
+<![CDATA[
+Score 33 | Comments 3 (<a href="https://news.ycombinator.com/item?id=37820532">thread link</a>) | @celeritascelery
+<br/>
+October 9, 2023 | https://coredumped.dev/2023/08/09/text-showdown-gap-buffers-vs-ropes/ | <a href="https://web.archive.org/web/*/https://coredumped.dev/2023/08/09/text-showdown-gap-buffers-vs-ropes/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+    <p>I have been working on a hobby project to reimagine the C core of <a href="https://coredumped.dev/tags/rust/">Emacs in Rust</a>. On this journey, I reached the point where I needed some way to represent the text of a buffer. The simplest approach is to just use a large string or array of lines. However these each suffer from poor performance as either the size or line length of text increases.</p>
+<p>GNU Emacs has famously used a gap buffer to represent editable text. It’s even mentioned by name on the <a href="https://en.wikipedia.org/wiki/Gap_buffer">wikipedia</a> entry for it. Gap buffers have the advantage of allowing fast local edits with a fairly simple design. Essentially you hold the text in a giant array with a gap of unused bytes in the middle. When you insert text, you replace some of the bytes with text, making the gap smaller. When you want to insert somewhere else in the text, you move the gap to that location and do the same operation. Delete performs the opposite operation, expanding the gap. With this simple mechanism, you can efficiently represent editable text.</p>
+<p>I see it as analogous to the more general data structure, the “array”. A gap buffer is just an array that is optimized for inserting at a “cursor” instead of at the end. Using a gap buffer has served Emacs well over many decades.</p>
+<p>Despite this, Emacs seems largely alone in its choice in the modern world. Most popular editors today use some variation of either a <a href="https://code.visualstudio.com/blogs/2018/03/23/text-buffer-reimplementation">piece table</a> or a <a href="https://blog.jetbrains.com/fleet/2022/02/fleet-below-deck-part-ii-breaking-down-the-editor/">rope</a>. Rather than storing data as a large contiguous array, these data structures chop the buffer into small chunks and operate on those. This enables them to avoid the O(n) penalty of moving the cursor when doing edits far away and the latency of resizing the buffer.</p>
+<p>Rust has <a href="https://crates.io/search?q=ropey">many rope crates</a> that have had a lot of optimization work put in. The obvious thing to do was to just pick one and move on. But I wanted to see for myself how the gap buffer holds up to these more “advanced” data structures. Modern computers can operate very quickly over linear memory. So I built a gap buffer and stacked it up against the competition.</p>
+<h2 id="design">
+    <a href="#design">
+      Design
+    </a>
+</h2>
+<p>My gap buffer (<a href="https://github.com/CeleritasCelery/rune/tree/master/crates/text-buffer">link</a>) is fairly true to the original design, with one big change; I store <a href="https://github.com/CeleritasCelery/rune/blob/master/crates/text-buffer/src/metric.rs">metrics</a> about the buffer in a separate tree. These metrics include things like char and line position, but could, in theory, include anything you want (like UTF-16 <a href="https://docs.rs/ropey/latest/ropey/struct.Rope.html#method.char_to_utf16_cu">code units</a>). This means that <em>finding</em> an arbitrary position in the buffer becomes at worse O(logn), but we still have to pay the cost of moving the gap.</p>
+<p>The ropes that I will be comparing against are <a href="https://docs.rs/ropey/latest/ropey/index.html">Ropey</a>, <a href="https://docs.rs/crop/0.3.0/crop/index.html">Crop</a>, and <a href="https://docs.rs/jumprope/latest/jumprope/index.html">Jumprope</a>. The last one is technically implemented via <a href="https://en.wikipedia.org/wiki/Skip_list">skip lists</a>, but that’s an implementation detail and the performance should be similar.</p>
+<h2 id="gap-buffer-costs">
+    <a href="#gap-buffer-costs">
+      Gap buffer costs
+    </a>
+</h2>
+<p>Before we jump into <a href="https://github.com/CeleritasCelery/rope-benches">benchmarks</a> comparing ropes and gap buffers. Let’s look at the time it takes to complete the two highest latency operations on gap buffers: resizing and moving the gap. This is a cost that ropes don’t share because their worst case for an editing operation is O(logn).</p>
+<h3 id="resize">
+    <a href="#resize">
+      Resize
+    </a>
+</h3>
+<p>Insertion in a gap buffer is O(1), just like an appending to a vector. But also like vectors, they only achieve this in the amortized case. Vectors need to resize once they get full, and this is a O(N) operation. But since the time between resizing is N appends, it averages out to O(1). Gap buffers are similar, except that we don’t usually continue to grow the gap as the text gets larger (that would lead to more overhead). In this sense, it isn’t truly O(1) insertion time, but even if it was, we generally care about the latency in interactive applications more than we care about the average case.</p>
+<figure><img src="https://coredumped.dev/images/buffer_resize.png">
+</figure>
+
+<p>Note that both axes are logarithmic. We can see that the cost to resize grows linearly with the size of the buffer, which is what we would expect. With a 1GB<sup id="fnref:1"><a href="#fn:1" role="doc-noteref">1</a></sup> file, it takes a little over 100ms to resize, which is starting to be perceptible.</p>
+<h3 id="moving-the-gap">
+    <a href="#moving-the-gap">
+      Moving the gap
+    </a>
+</h3>
+<p>How long does it take to slide the gap a given distance? This delay is added anytime we edit a different part of the buffer than we are currently in. The farther the move, the longer it takes. Unlike resizing which (from a user’s perspective) strikes randomly, this latency is easier to predict. You generally know when you are editing something farther than where you are currently at.</p>
+<figure><img src="https://coredumped.dev/images/buffer_move_gap.png">
+</figure>
+
+<p>Moving the gap 1GB is significantly faster than resizing 1GB, taking only 22ms. This isn’t nothing, but is small enough to be imperceptible. Of course, since this is a O(n) relationship, moving the gap even farther will have a proportionally higher cost.</p>
+<p>In practice, these latencies will be less of an issue, because giant files tend to be log files and auto-generated output, which are rarely edited. However, it is still an unavoidable cost of storing data in a contiguous fixed-sized structure.</p>
+<h2 id="memory-overhead">
+    <a href="#memory-overhead">
+      Memory overhead
+    </a>
+</h2>
+<p>For our comparisons, let’s start with memory overhead. The way to read this is if something has 50% overhead, that means you need 1.5GB of memory to open a 1GB file.</p>
+<figure><img src="https://coredumped.dev/images/buffer_overhead.png">
+</figure>
+
+<p>Woah! Jumprope is way outside the norm here, almost doubling the memory needed to open a file<sup id="fnref:2"><a href="#fn:2" role="doc-noteref">2</a></sup>. Crop and Ropey are much closer to what you would expect. However, this is the ideal case of opening a new file. Each rope node will be perfectly filled and the tree properly balanced.</p>
+<h3 id="edit-overhead">
+    <a href="#edit-overhead">
+      Edit overhead
+    </a>
+</h3>
+<p>Let’s look at the overhead when edits are applied to the text. These could be things like large search and replace or multiple cursors. This tends to leave the ropes in a less ideal state, and hence have higher overhead.</p>
+<figure><img src="https://coredumped.dev/images/buffer_edit_overhead.png">
+</figure>
+
+<p>Fairly significant change for all ropes. Jumprope has gone through the roof, jumping so high that I didn’t even bother expanding the plot to show it. Even crop, which had the lowest rope overhead in ideal conditions, has jumped almost 20x. The gap buffer on the other hand has barely moved. Unlike ropes, a gap buffer is always in ideal state with regards to layout. This unique property will show up later in the searching benchmarks.</p>
+<h2 id="real-world">
+    <a href="#real-world">
+      Real world
+    </a>
+</h2>
+<p>To compare editing performance we have a set of 5 <a href="https://github.com/josephg/editing-traces">real world</a> benchmarks from the author of Jumprope. These are recordings or “traces” of actual people editing some text in an editor. Each benchmark starts empty, then replays thousands of edits and arrives at the end text.</p>
+<p><img src="https://coredumped.dev/images/realworld1.png" alt="">
+<img src="https://coredumped.dev/images/realworld2.png" alt="">
+<img src="https://coredumped.dev/images/realworld3.png" alt=""></p>
+<p>Aside from Ropey, all the containers have comparable performance. In all benchmarks but one, the gap buffer is the fastest, but not by any meaningful amount. This demonstrates that in the average case, insert and delete performance is fairly comparable between the different data structures. Let’s zoom in on some specialized use cases.</p>
+<h2 id="creating">
+    <a href="#creating">
+      Creating
+    </a>
+</h2>
+<p>So we have a sense of the memory overhead and average performance for the different containers. Here we will compare the time to load and save the text from the data structures.</p>
+<h3 id="creating-from-a-string">
+    <a href="#creating-from-a-string">
+      Creating from a String
+    </a>
+</h3>
+<p>How long does it take to create a new data structure from a <code>String</code>? The string below is 1GB in size.</p>
+<figure><img src="https://coredumped.dev/images/from_string.png">
+</figure>
+
+<p>The gap buffer is significantly faster than the rest, but it’s not really a fair comparison. A <code>String</code> is essentially already a gap buffer. It has the string text, followed by some amount of unused capacity which can be used as a gap. So in this case we don’t need to copy or allocate at all, instead reusing the allocation from the string. That won’t always be the case, so how do things compare if we force them all to copy the source text? This would be the case when loading from a file.</p>
+<figure><img src="https://coredumped.dev/images/from_str.png">
+</figure>
+
+<p>Forcing a copy makes the gap buffer take about three times as long, but it is still faster than the rope implementations.</p>
+<h3 id="saving">
+    <a href="#saving">
+      Saving
+    </a>
+</h3>
+<p>What about saving a file? Here we are not going to benchmark the actual file system overhead, but instead use “writing the contents of 1GB to a string” as a proxy.</p>
+<figure><img src="https://coredumped.dev/images/save.png">
+</figure>
+
+<p>All containers are pretty comparable on this front.</p>
+<h2 id="multiple-cursors">
+    <a href="#multiple-cursors">
+      Multiple cursors
+    </a>
+</h2>
+<p>Back in 2017, Chris Wellons wrote a <a href="https://nullprogram.com/blog/2017/09/07/">blog post</a> titled “Gap Buffers Are Not Optimized for Multiple Cursors”. It makes the case that since gap buffers have to move the gap buffer back to the first cursor for each edit (a O(n) operation), they don’t scale well with multiple cursors. So instead of using multiple cursors, you should use some other editing operation like macros. <a href="https://github.com/hauleth/sad.vim#why-not-multiple-cursors">This</a> idea <a href="https://cdacamar.github.io/data%20structures/algorithms/benchmarking/text%20editors/c++/editor-data-structures/">has</a> now <a href="https://github.com/emacs-ng/emacs-ng/issues/378#issuecomment-907577662">become</a> part <a href="https://vms.wwwtech.de/notes/360">of</a> Internet <a href="https://vuink.com/post/ahyycebtenz-d-dpbz/blog/2017/09/07">lore</a>.</p>
+<p>I was not convinced by this argument. For one thing, there are no benchmarks, and many things that make sense intuitively don’t play out that way in the real world. Also, I realized you can avoid the overhead of moving the gap back to the first cursor with this one weird trick (computer scientists hate him!): Every time you do an edit, you reverse the direction you iterate through the cursors. If in one edit you go from the first cursor to the last, then in the next edit you go from the last cursor to the first. This saves the overhead of moving the gap back to the first cursor each time. Essentially you just sweep the gap back and forth as you make edits. Let’s benchmark this and see how well it works.</p>
+<figure><img src="https://coredumped.dev/images/smart_diff.png">
+</figure>
+
+<p>It looks like this trick works. Let’s zoom in on the percent overhead of the naive version.</p>
+<figure><img src="https://coredumped.dev/images/smart_diff_percent.png">
+</figure>
+
+<p>Once the distance gets large enough we have about 20-30% overhead. This shows that even in the naive case, most of the time is dominated by performing the actual edits, not moving the cursor back. Also, The overhead doesn’t grow linearly with the distance between the cursors.</p>
+<h3 id="compared-to-ropes">
+    <a href="#compared-to-ropes">
+      Compared to ropes
+    </a>
+</h3>
+<p>How does this compare to the rope implementations? We will start with cursors 100 bytes apart and increase the total cursor count.</p>
+<figure><img src="https://coredumped.dev/images/cursor_count.png">
+</figure>
+
+<p>The relationship is almost perfectly linear, with Crop and Jumprope about twice as fast as Ropey but 50% slower than the gap buffer. This relationship continues as we move beyond 10,000 cursors. So having high numbers of cursors doesn’t impact gap buffers.</p>
+<p>But one thing that might cause trouble is the distance <em>between</em> the cursors. Let’s benchmark 100 cursors while varying the average distance between them:</p>
+<figure><img src="https://coredumped.dev/images/cursor_distance.png">
+</figure>
+
+<p>Now the weakness of gap buffers starts to show. The distance between cursors does not matter to ropes, because every edit is O(logn), however, it matters a lot to gap buffers. You can see that the ropes are all roughly flat, but the gap buffer has a positive slope. After about 1K Jumprope and Crop start to beat it, and after about 4K it falls behind Ropey.</p>
+<p>However, there is nothing special about multiple cursors with this relationship. Gap buffers struggle with long-distance edits no matter what mechanism is used. It would be the same with macros, search and replace, etc. Given that, I would claim that gap buffers are optimized for multiple cursors just fine, it is non-local edits that are the source of the issue.</p>
+<h2 id="searching">
+    <a href="#searching">
+      Searching
+    </a>
+</h2>
+<p>People don’t only edit text, they also analyze it. One of the most common ways to do this is via searching. Rust has a highly optimized regex crate, but it only operates on slices. This is <a href="https://github.com/xi-editor/xi-editor/issues/1192">problematic</a> for <a href="https://github.com/helix-editor/helix/pull/211">ropes</a> since they store the buffer in many small allocations. Currently, the best way to do a regex search over a rope is to copy all the chunks out into a separate allocation and perform your search over that<sup id="fnref:3"><a href="#fn:3" role="doc-noteref">3</a></sup>. There is some work to create a <a href="https://github.com/rust-lang/regex/issues/425">streaming API version</a> of regex based on <code>regex-automata</code>, but it still has not been developed and may never prove to be as fast as slice searching.</p>
+<p>Given that, I wanted to test out how the different containers do when performing a full-text search. We would expect the gap buffer to have a significant advantage here because it is already in slice format.</p>
+<figure><img src="https://coredumped.dev/images/search.png">
+</figure>
+
+<p>We can see that the buffer is a near-perfect line because we are essentially only benchmarking the speed of the regex engine. The ropes on the other hand have significantly higher overhead and more variability. Searching 1 GB text, the gap buffer runs in 35ms, which is around 7x faster than the next fastest rope (~250ms).</p>
+<p>You might object that we are making things too easy for the gap buffer because the gap is at the start. If the gap was anywhere else we would need to move to before searching. Fair enough, but most of the time we wouldn’t need to move the gap all the way to the beginning or end. If the search is not multi-line, then you just need to move the gap to the nearest line boundary. But for the sake of analysis, let’s pretend we are doing a multi-line search. We will run the benchmark again with the gap in the middle of the text; the worst-case scenario. This will mean we need to move the gap 50% of the way across the text before we can begin searching.</p>
+<figure><img src="https://coredumped.dev/images/search_move.png">
+</figure>
+
+<p>It adds about 30% overhead to the gap search. This still doesn’t put it anywhere near the ropes. Ultimately, the speed of search was one of the reasons that I chose gap buffer over ropes for my project. Emacs does a lot of searching.</p>
+<p>That being said, many new parser libraries like Tree-sitter are already designed to operate on non-contiguous chunks, so the need for search becomes less important. We will see how this plays out in the future.</p>
+<h2 id="what-should-you-use">
+    <a href="#what-should-you-use">
+      What should you use?
+    </a>
+</h2>
+<p>So is this to say that everyone should switch over and start using gap buffers? Not quite. Ropes are really powerful data structures, and they never have the latency spikes associated with resizing or moving the gap. In real-world editing scenario’s it isn’t the best case or even the average case, it’s the worst-case tail latency that really matters. With ropes, you get worse case O(logn) behavior for all editing operations. As files get larger the extra latency associated with gap buffers starts to show itself. On the flip side, in my experience the larger a file is the less likely I am to be editing it, but the more likely I am to be searching it. These trade-offs work well in favor of gap buffers.</p>
+<p>Ropes have other benefits besides good performance. Both Crop and Ropey support concurrent access from multiple threads. This lets you take snapshots to do <a href="https://web.archive.org/web/20171220080405/https://blog.atom.io/2017/10/12/atoms-new-buffer-implementation.html">asynchronous saves</a>, backups, or multi-user edits. This isn’t something you could easily do with a gap buffer.</p>
+<p>Despite all that, gap buffers showed they can do quite well when placed against more “advanced” data structures. One of their key advantages is that gap buffers are always in an ideal state. They never need to worry about fragmentation or being unbalanced like trees do. The way I see it, gap buffers are better for searching and memory usage, but ropes are better at non-local editing patterns. Despite their simplicity, gap buffers can hold their own in the modern world. Maybe Emacs was on to something.</p>
+
+<p>Join the <a href="https://discu.eu/?q=https%3A%2F%2Fcoredumped.dev%2F2023%2F08%2F09%2Ftext-showdown-gap-buffers-vs-ropes%2F&amp;submit_title=Text%20showdown%3A%20Gap%20Buffers%20vs%20Ropes%20%E2%80%A2%20Core%20Dumped">discussion</a> or send me an <a href="mailto:troy.hinckley@dabrev.com">email</a>. Benchmarks can be found <a href="https://github.com/CeleritasCelery/rope-benches">here</a>.</p>
+<section role="doc-endnotes">
+<hr>
+<ol>
+<li id="fn:1" role="doc-endnote">
+<p>GB here means 2^30, as it should when <a href="https://www.merriam-webster.com/dictionary/kilobyte">talking about base-2 memory</a>. The only people who think it should be 10^9 are hard drive salesmen and the type of people who like to correct all their friends by saying “It’s centripetal, not centrifugal force!”. Also “gibibyte” sounds like Pokémon invented by a first grader.&nbsp;<a href="#fnref:1" role="doc-backlink">↩︎</a></p>
+</li>
+<li id="fn:2" role="doc-endnote">
+<p><a href="https://github.com/josephg/jumprope-rs/issues/5">github.com/josephg/jumprope-rs/issues/5</a>&nbsp;<a href="#fnref:2" role="doc-backlink">↩︎</a></p>
+</li>
+<li id="fn:3" role="doc-endnote">
+<p>You may think this unnecessary, and instead you only run the regex one line at a time. If the line is completely contained within a chunk you don’t need to allocate anything. And indeed both crop and ropey provide an iterator over the lines of text. But in my testing, this was about an order of magnitude slower than just copying the whole allocation and searching. I am not sure if that mostly comes from the iteration overhead, or if small regex runs are inefficient.&nbsp;<a href="#fnref:3" role="doc-backlink">↩︎</a></p>
+</li>
+</ol>
+</section>
+
+  </div></div>]]>
+            </description>
+            <link>https://coredumped.dev/2023/08/09/text-showdown-gap-buffers-vs-ropes/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-37820532</guid>
+            <pubDate>Mon, 09 Oct 2023 14:00:40 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Show HN: CheckAnyPlate – Free License Plate to VIN Decoder]]>
+            </title>
+            <description>
+<![CDATA[
+Score 35 | Comments 33 (<a href="https://news.ycombinator.com/item?id=37820165">thread link</a>) | @AutoAPI
+<br/>
+October 9, 2023 | https://checkanyvin.com/search/by-license-plate | <a href="https://web.archive.org/web/*/https://checkanyvin.com/search/by-license-plate">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+                    
+                    <p>
+                        Free License Plate to VIN decoding
+                    </p>
+                    
+                </div></div>]]>
+            </description>
+            <link>https://checkanyvin.com/search/by-license-plate</link>
+            <guid isPermaLink="false">hacker-news-small-sites-37820165</guid>
+            <pubDate>Mon, 09 Oct 2023 13:17:03 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Advice for Prospective PhD Students]]>
+            </title>
+            <description>
+<![CDATA[
+Score 31 | Comments 33 (<a href="https://news.ycombinator.com/item?id=37820067">thread link</a>) | @lairv
+<br/>
+October 9, 2023 | https://gonzales.science/resource-blog/for-prospective-phd-students | <a href="https://web.archive.org/web/*/https://gonzales.science/resource-blog/for-prospective-phd-students">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-block-type="2" id="block-a5c3b46d7b4a506f333f"><div>
+
+<div>
+  <p><em>Updated 10/09/2023 to include info on application fees/waivers, stipends and compensation.</em></p><p>What are labs looking for in prospective PhD students? How should you initiate conversations with the PI? What type of research experience are programs looking for? These are some of the main questions on the minds of aspiring PhD students. If you’re applying for programs this cycle, hopefully you’re thinking hard about these topics. This blog is an attempt to give some answers based on my overall approach to recruiting. It’s a window to some of the hidden curriculum behind the process (at least from my point of view). I take a significant amount of inspiration from this <a href="https://www.cell.com/cell/fulltext/S0092-8674(23)00806-1" target="_blank">perspective piece</a> by <a href="https://www.cientificolatino.com/" target="_blank"><strong><em>Científico Latino</em></strong></a>, which proposes that one small way that PI’s can increase equity and access to PhD-level education is to be more transparent about their expectations for PhD applicants. Another great resource is <a href="https://medium.com/@TaliaLerner/navigating-grad-school-admissions-in-science-c1972a9c0c0e" target="_blank">this piece</a> by Dr. Talia Lerner at Northwestern University. </p><p>In all honesty, I hesitate to write this. What do I know at this point? My lab hasn’t even officially opened and I have so little experience in hiring and recruiting. Yet, for some reason, I sort of just know what I’m looking for. Here are two random things I take comfort in when it comes to sharing my (potentially naïve) opinion on this topic:</p><ol data-rte-list="default"><li><p>Established professors run their mouths all the time with all kinds of bad opinions on twitter (ugh…X). Their public shouting weirdly empowers me to share in this blog what I think are some pretty good thoughts.</p></li><li><p>This exchange between the infamous music producer Rick Rubin and CNN broadcaster Anderson Cooper  (see the video <a href="https://www.tiktok.com/t/ZT8Y4ojFB/" target="_blank">here</a>):</p></li></ol><p>Cooper: <em>Do you play instruments?</em></p><p>Rubin: <em>Barely.</em></p><p>Cooper: <em>Do you know how to work a soundboard?</em></p><p>Rubin: <em>No….I have no technical ability…and I know nothing about music.</em></p><p>Cooper: <em>Well, you must know something.</em></p><p>Rubin: <em>Well, I know what I like and what I don’t like…and I’m decisive about what I like and what I don’t like.</em></p><p>For some reason, I’m decisive about what I like and what I don’t like. </p><p>As a disclaimer, many of these answers are <em>very specific </em>to my philosophy, my lab, and my opinions. Some points generalize broadly to other programs and PI’s, but not all of it. Every PI and PhD program is different. In fact, I’ve seen other professors take drastically different viewpoints than my own. I’ll try to point those out as we go along. Also, this perspective also doesn’t necessarily reflect the views of my own department. For the official admission requirements into Vanderbilt Biomedical Engineering (VU BME), see this <a href="https://engineering.vanderbilt.edu/bme/GraduateProgram/DegreeRequirements.php">link</a>. </p><p>Here is an overview of the topics I cover:</p><ul data-rte-list="default"><li><p>Know the application requirements</p></li><li><p>PhD stipends and compensation</p></li><li><p>Application fees and waivers</p></li><li><p>Should you reach out in advance of applying?</p></li><li><p>How to reach out</p></li><li><p>When to reach out</p></li><li><p>What to say when you reach out</p></li><li><p>Does GPA matter?</p></li><li><p>Should you have research experience?</p></li><li><p>Should you have <em>relevant</em> research experience?</p></li><li><p>What type of research experience should you have?</p></li><li><p>What results should have come out of your undergrad research?</p></li><li><p>Non-academic jobs and experience - should you include it?</p></li><li><p>What happens during our first zoom meeting</p></li><li><p>What happens during follow up meetings</p></li><li><p>Qualities I look for during our meetings</p></li><li><p>When do formal interviews happen?</p></li><li><p>Additional resources</p></li></ul><p>Along the way, we’ll review some encouraging tweets:</p>
+</div>
+
+
+
+</div></div><div data-block-type="2" id="block-yui_3_17_2_1_1696771644172_8996"><div>
+
+<div>
+  <h4>First things first: know the program requirements.</h4><p>Before doing anything, review the eligibility and application requirements for the PhD program you’re interested in. Don’t email professors or grad program directors with questions that are easily answerable. If you start off our very first interaction with an email asking “Is the GRE required to apply?” it’s immediately not a good look. This answer is easy to find. (VU BME does not require the GRE, btw). Some helpful links for VU BME: <a href="https://engineering.vanderbilt.edu/bme/GraduateProgram/">Application Deadlines</a>, <a href="https://engineering.vanderbilt.edu/bme/GraduateProgram/GraduateProgramFAQ.php">BME FAQ</a>, <a href="https://engineering.vanderbilt.edu/bme/GraduateProgram/DegreeRequirements.php">BME Admission Requirements</a>.</p><h4>PhD stipends and other compensation</h4><p>This is a RED ALERT for some of you!! Most PhD programs in science and engineering will come with free tuition, a stipend, and health insurance. I didn’t know this until the summer before my senior year as an undergraduate. I was completely shocked. Graduate school was always on my radar, but I didn’t give it much thought because of cost. I couldn’t even afford my undergraduate degree without my scholarships, and didn’t want to go into debt just to go to more school. Realizing that PhD programs not only came with tuition waivers, <em>but also stipends and health insurance options,</em> completely rocked my world. Pursuing a PhD was a no brainer for me from that moment on. </p><p>There are some caveats here and more details to be aware of:</p><ul data-rte-list="default"><li><p>Tuition is covered, but fees typically aren’t. This can still be a significant amount of money each semester. You can find more info for VU engineering fees and tuition costs <a href="https://www.vanderbilt.edu/stuaccts/fees/tuition_fees_2023-24_grad_prof.php" target="_blank">here</a>. </p></li><li><p>Next, there’s the stipend. I have such complex feelings about PhD stipends that I could fill up an entirely different blog. But essentially, you get paid to go to graduate school. <em>How much </em>you get paid can vary drastically between institutions. The VU BME stipend is currently $35,000/yr. Some institutions pay more, many places pay less. My starting stipend as a PhD student at Rice University was ~$28,000. You can also apply for prestigious graduate fellowships like the <a href="https://www.nsfgrfp.org/" target="_blank">NSF GRFP</a> and <a href="https://ndseg.sysplus.com/NDSEG/about/#:~:text=The%20NDSEG%20fellowship%20will%20pay,43%2C200%20annually)%20for%20fellowship%20tenure." target="_blank">NDSEG</a>, which pay $37,000 and $43,200, respectively. My complex feelings stem from the fact that these numbers can be tough to live on, particularly with the recent years of inflation and soaring housing costs. However, some of you are in the same boat I was went entering grad school. You don’t see these numbers and think “omg this is exploitation.” Instead, you see these numbers and think “omg this is more money than most of my family makes! I’m going to be set!” I was so pleased with my $28K/yr. Thrilled actually. Yet, we should all still advocate for better wages for PhD students. Anyway, take stipends and cost of living into account when searching for programs.</p></li><li><p>Final note on stipends: Again, program stipends will vary widely. Some may offer a stipend, but not guarantee it past 1-2 yrs. I received one of these offers, and it was from a place I had always dreamed of attending. (I’m not pointing fingers, but it was the UT Austin Nuclear Engineering program.) I walked away immediately. It just wasn’t worth it to me. You need to assess these offers based on your own situation and make an informed decision.</p></li><li><p>Lastly - health insurance. Most programs will offer graduate student health insurance. But, as with stipends, the monthly premiums and quality of insurance can vary widely. My graduate insurance was still really expensive and a constant stress. Inform yourself about these things.</p></li></ul><h4>Application fees and waivers</h4><p>Applying to multiple graduate schools can be expensive. Anywhere from $50-150 per application. Just be aware that waivers are available! Nearly every school should have a method to request an application waiver. Use these extensively and don’t feel bad about it. I’m not sure anyone knows where the application fees even go. </p><h4>Should I reach out to professors before the application deadline?</h4><p>For my lab, feel free to do this (I’m not sure about the preferences of other professors). I would generally say this is a good idea overall, especially for departments that are direct-admit like VU BME. Direct-admit means you are admitted directly into a lab. Other departments may instead admit you into the program, followed by a rotation period during your first 1-2 semesters to find a lab.</p><p>I have a very specific reason for why I prefer to interact with prospective students before and after applying: I take hiring very seriously! I admit - I’m quite picky about who I recruit into the lab. PhD students shape the lab culture. These first few students will lay the foundation of the Gonzales Lab for years to come. Therefore, I don’t just rely on your application and one formal interview. We will meet several times (I elaborate on this more below).</p><h4>How do I reach out?</h4><p>Send me an email. I’m also always open to a well written DM on twitter (X...ugh). (This is an example of something I’m cool with, but a lot of professors are not).</p><h4>When do I reach out?</h4><p>There are two different good times to reach out to me. One, you can reach out well in advance of the application deadline, anywhere from 1-6 months before. Honestly it could be a year in advance. I like people who think ahead. Note that late Fall near the application deadline can get really busy. So, one strategy may be to reach out over the summer.</p><p>After applying to the program and the department reviews applications, you may be invited for a formal visit to VU BME. These invites get sent out in December and January, and the visit usually happens in March. The ~3 month timeframe between the invite and visit is another great time to email. <em>I may also email you!</em> I try to get a head start on recruiting well in advance of the in-person visit.</p><h4>What should the email say?</h4><p>This is the tough part. You don’t want to be too brief, but you also don’t want to be too long. The most important rule is <span>don’t be generic</span>. If it looks like you sent this exact email to dozens of people, I’m much less enthusiastic to respond. Feel free to use a tool like ChatGPT, but also be sure to tailor and edit its output to your voice and your true curiosities. ChatGPT can also be overly formal. While I love being called an eminent scientist and renowned researcher, let’s be real. Most people know me for my bbq pics and silly tweets.</p><p>You should introduce yourself, your institution, your major, and quickly discuss the research area you are interested in pursuing. Also - it’s totally ok to not be sure what research area you want to pursue! I completely believe in exploring a lot of topics and labs to find one that excites you the most. Then, you can mention why my department and my lab is a good fit for your interests. It should be obvious that you are aware of some of our primary areas of expertise. Feel free to mention that you are planning to apply to the program (or have already applied and received an invitation to visit) and would like to meet to learn more about the opportunities in my lab. I try to meet with most people who reach out, but as the number of requests I receive continues to ramp up I may not be able to sustain that. Finally, attach a CV with more details like your GPA, research background, and other activities you are involved in. </p><p>Check out the cover letters I sent when applying for postdoc positions <a href="https://gonzales.science/resource-blog/blog-post-title-three-t7adn" target="_blank">here</a>. They are a pretty reasonable guide for how to structure an email about a PhD program and lab too.</p>
+</div>
+
+
+
+</div></div><div data-block-type="2" id="block-yui_3_17_2_1_1696771644172_14477"><div>
+
+<div>
+  <h4>Does GPA matter?</h4><p>Of course, GPA matters. However, individual PI’s weigh GPA differently. For me, I basically try to weigh all GPAs 3.5 and above equally. If you’re above this threshold, I quickly move on to recommendation letters and personal statements. For GPAs lower than this, I’ll take a close look at the transcript. Ideally, you have a higher GPA when considering only the core curriculum for your major (e.g., engineering or physics courses). It’s also encouraging to see if your grades ended strong after starting out on the low end in the first year or two. I’ll also strongly take into account if you are balancing big workloads. If you work part- or full-time to make a living while going to school, that goes a long way for me. If you have dependents or family to care for, that also goes a long way for me. <span>However, it is <strong>your job</strong> to bring this to my attention!</span> In your personal statement and CV, you have to somehow show that despite all of these obstacles, you still did pretty well in your courses. You can also have your letter writers point these things out. </p><p>Another note here is that many PI’s strongly prefer GPAs well above 3.5. I get it. A high GPA shows that when you give a topic your full attention, you can master it. This is an important skill during a PhD. However, in the same way that “book smart” and “street smart” are very different, I think there is a big gap between being “course smart” and “lab smart.” I’m looking for people who are going to be successful researchers, not people who can get a A in every course. </p><p>(FWIW, I had a 4.0. GPA. I haven’t gotten to brag about it in a while. So let me take this opportunity. It’s my blog. I get to do what I want.)</p><h4>Should I have research experience?</h4><p>Our official department stance is “strongly recommended,” and I echo this stance. I understand that research experience often means uncompensated time that many marginalized communities simply do not have. However, it’s a reality that the vast majority of applicants have some type of research experience. Research experience was strongly preferred more than a decade ago when I was applying, and the bar is significantly higher now. </p><p>From a very practical standpoint, also consider that research experience can be very eye-opening to a lot of people who thought they would really love it. Lab work can be lonely, tedious, and slow. It’s not for everyone and it would really suck for you to come to that realization after moving across the country to join a program. As an anecdote: the cohort of physics students I graduated with back in the day had maybe 10 students with the credentials to get into a quality PhD program, but only two or three of us even applied. The rest? An REU program or other undergraduate research experience showed them they didn’t actually enjoy working in a lab very much. </p><h4>Should I have <em>relevant</em> research experience?</h4><p>Of course, every PI prefers a research background with relevance to their own work. It blows my mind to see students with experience in device design, microfabrication, or any neuroscience work. However, I really do consider all candidates with all types of research background. What I care most about is that you dedicated yourself to time in a lab and sought out research experiences to expand your skillset. My job is to train you to do the work you want to do, not just recruit people who are already PhD-level scientists in my field.</p><p>Again - remember that this is my personal approach. There are definitely PI’s that simply do not consider candidates without direct experience in their field. This is wild to me, and I could rant in an entire second blog about it, but just accept that sometimes this is how it goes. </p><h4>What type of research experience should I have?</h4><p>There are two primary ways most undergraduates get research experience. One, a summer Research Experience for Undergraduates (REU). Two, working with a PI at your home institution for a few semesters. Neither is required for admission, but both are valuable for different reasons.</p><p>An REU shows that you actively applied and sought out external research experiences. It probably ended up being more boring than what you anticipated; regardless, these experiences give you a perspective on academic research you probably wouldn’t have gotten otherwise. In the best-case scenario, it exposed you to a field of research that you became passionate about pursuing for a PhD.</p><p>I also value consistent lab work at your home institution. It really stands out to me when someone has stuck with a lab for 2-4 semesters. Is this a requirement for my lab? Absolutely not. But I think most people would agree that the majority of undergraduates that join a lab typically observe a few experiments, tinker around a bit, then disappear in 1-2 semesters. So, it stands out to me when you stuck with one lab and juggled that extra workload with your classes. If you’ve bounced around between a few labs, that’s also ok. The most important thing is having one of your research advisors vouch for you in their letter, which brings us to the next point.</p><h4>Undergraduate research deliverables: letters of recommendation, papers, presentations</h4><p>I mentioned this above, but to me the primary deliverable of your undergraduate research experience should be a strong letter of recommendation from a research advisor. This person should be able to point to your work ethic, ability to solve problems, and specific things you worked on. Again, if you’ve spent multiple semesters in this lab, this letter writer will have a lot to talk about.</p><p>In addition to the letter, you should be able to communicate intelligently about your undergraduate work. This is very vague, I know. But basically in an interview it can be easy to tell if someone tinkered around a tiny bit and added those things to their CV versus someone who really dove into a project.</p><p>Research can also lead to presentations. Most institutions have annual undergraduate research symposia, and it’s a great idea to participate. A nice thing about REUs is they almost always end in a summer research symposium. Also, if you made a substantial amount of progress on a project, your advisor may have allowed you to attend and present at an external conference.</p><p>Lastly - the dreaded Undergraduate Publication. Are you a co-author on a publication? Fantastic. It means you made a considerable contribution to a project which can only be done through a significant amount of dedication. Are you first author on a publication? Wow! Truly impressive and a rare feat for an undergraduate researcher. Do you not have any publications? Don’t sweat it. I’m looking for people with a history of a strong work ethic, an innate curiosity, and an ability to think and dream big. </p><h4>Non-academic jobs and experience - should I include it?</h4><p>I am a huge supporter of two things not related to research and education: having a job while an undergraduate or showing a substantial dedication to an organization. </p><p>I’m going to go full force here: I think having a 20+ hr/week job and balancing a full course load (plus even some research) is <em>the best</em> preparation for graduate school. Grad school is quite literally balancing full-time coursework with an entire second job of working in a lab. Some undergraduates have the luxury of dedicating their entire time and energy to doing well in their courses while being financially supported by family. You’re lucky and I fully expect your transcript and CV to reflect this advantage. For those of you who balanced jobs throughout your undergraduate education: I am such a fan. Please please please include these jobs on your CV and weave them into your personal statement. </p><p>In addition to a job, I really appreciate people who show significant dedication to <em>something/anything </em>outside of classes and lab. This can be a campus organization, athletics, local church, 4H, DEI initiative, or activism. I really don’t care what it is, but I think that displaying dedication and passion for something that took up a substantial part of your time just indicates a solid personal quality.</p><h4>First zoom meeting</h4><p>Ok so you emailed me (maybe after sending me a reminder email probably), and we setup a meeting to chat. I try to keep this informal! I know you’re probably nervous, but just know that on my end I’m always excited. I’ve met so many incredible students who will go on to do great things. These conversations can be one of the best parts of the job. </p><p>Generally, I’ll try to keep this first meeting focused on you, your interests, your long-term goals, and whether my lab fits those interests and goals. Somewhat counterintuitively, I’ll actually avoid going into depth about science. Of course, we will talk about my research program and open projects in my lab, but I really try and keep this first conversation focused on getting to know you (and letting you get to know me). I want to know how you got to be where you are today, how you made the decision to pursue a PhD, and where you see yourself going in the future. </p><p>I’m taking this approach for a few reasons. For one, science is about people. I want to demonstrate even in our very first chat that I care about more than just the science. Two, communication is key to our long-term success together. If things ever go bad, communication will be the first thing to break down between us. So, I want to see our communication start off strong—even in the absence of an in-depth conversation about science. </p><h4>Follow-up meetings</h4><p>If our first meeting goes well, I will almost certainly schedule follow-up meetings. It’s in these meetings that we can dig into some project ideas and brainstorm together. I’ll also likely send some papers for you to look over and I’ll ask for your thoughts on them.</p><h4>What I have my eye out for in our meetings</h4><p>Here are some things that really stand out to me during these meetings:</p><ol data-rte-list="default"><li><p>Questions. Ask a TON of questions. Ask fun questions. Ask hard questions. Try to trip me up with questions. Ask science questions. Ask questions about papers. Ask questions about my projects. Ask questions about mentorship. I love it. It shows you are curious, inquisitive, and want to make a very informed decision. It shows you’re <em>thinking</em> and it’s hard to train someone to think. See the end of this blog for links to some solid interview questions.</p></li><li><p>Show me you’re interested. I may think you’re a great candidate, but I also need to know you are genuinely interested in my lab and Vanderbilt! Be responsive to emails. Show up prepared for our chats. Have lots of questions. Read the papers I send you. Read up on my field. Read up on my lab - I have a ton of documents on this website that give you insight into how the lab operates. It goes a long way for me to know you took the initiative and read these in advance (like you’re doing right now - great job!).</p></li><li><p>Dream big and be creative. When we’re talking about science, I hope you have wild ideas. Some might be great ideas, others bad. Some may have been done already and others might be infeasible. Toss them into the conversation anyway. Show me you’re thinking. Even if neuroscience and neuroengineering are completely new realms for you, I think a lot of great ideas spring from naïvety. I think the best scientists around take their cumulative experiences, interests, and backgrounds and shape them into completely unique research directions.</p></li><li><p>Be up for anything. I like someone who is broadly curious and willing to take on any challenge. Don’t be too rigid in the type of project you’re looking for. Too often people narrow themselves into a corner way too early in their careers. Don’t show up with the attitude of “I have experience in X, so I’d like to continue working on X.” It’s a PhD. The whole point is to learn a ton of new things.</p></li><li><p>Don’t worry about being wrong. If I ask a question, it’s ok to not have the answer. A solid quality of a good scientist is knowing that you don’t know all the things. Case in point:</p></li></ol>
+</div>
+
+
+
+</div></div><div data-block-type="2" id="block-yui_3_17_2_1_1696771644172_12649"><div>
+
+<div>
+  <h4>What about formal interviews?</h4><p>As I mentioned earlier, after your application is reviewed for VU BME, a subset of applicants are invited for an in-person recruitment event at VU. This is where the bulk of recruiting typically happens. You get to meet faculty, hang out with graduate students, eat good food, and have a ton of fun. You will also have formal interviews with the faculty you’re interested in working with. </p><p>I personally find it really difficult to make a hiring decision based only off of the interview time. This is why it’s a good idea to reach out in advance of the application deadline or recruitment weekend. We can meet virtually in advance and get to know each other! If the formal interview is our first meeting, I’ll schedule follow up virtual meetings with applicants I want to know more about. </p><h4>Final resources</h4><p><a href="https://www.cientificolatino.com/" target="_self"><strong><em>Científico Latino</em></strong></a><strong><em> </em></strong>has excellent resources for everyone on step-by-step guides for applying to graduate school. They offer guides, webinars, and also an entire <a href="https://www.cientificolatino.com/gsmi" target="_blank">mentorship program</a> for underrepresented students. I highly recommend checking out their website and getting involved.</p><p>Need good questions? Paola Figueroa-Delgado, a PhD candidate in the Yale Department of Cell Biology, has some excellent resources. See her awesome twitter  (ugh…X) thread <a href="https://x.com/PaolaVFigueroa/status/1312157953550479361?s=20" target="_blank">here</a>, where she provides infographics with lists of excellent questions to ask when looking for the right PhD advisor and during interviews. With permission, here are those infographics: </p>
+</div>
+
+
+
+</div></div><div data-block-type="2" id="block-yui_3_17_2_1_1696771644172_20836"><div>
+
+<p>That’s all for now. Best of luck on your journey through academia.</p>
+
+
+
+</div></div></div>]]>
+            </description>
+            <link>https://gonzales.science/resource-blog/for-prospective-phd-students</link>
+            <guid isPermaLink="false">hacker-news-small-sites-37820067</guid>
+            <pubDate>Mon, 09 Oct 2023 13:06:08 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Modeling CRDTs in Alloy – the importance of idempotence]]>
+            </title>
+            <description>
+<![CDATA[
+Score 48 | Comments 3 (<a href="https://news.ycombinator.com/item?id=37819683">thread link</a>) | @brianhicks
+<br/>
+October 9, 2023 | https://bytes.zone/posts/modeling-crdts-in-alloy-introduction-and-the-importance-of-idempotence/ | <a href="https://web.archive.org/web/*/https://bytes.zone/posts/modeling-crdts-in-alloy-introduction-and-the-importance-of-idempotence/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article><p><em>Brian Hicks, October 9, 2023</em></p><p>I've been interested in <a href="https://www.inkandswitch.com/local-first/">local-first software</a> for a long time, and recently attended an event about it with a bunch of luminaries from various research groups. I learned a lot, and it rekindled my interest in syncable data structures.</p><p>I've tried to sync data over the years with varying degrees of success. For example, I've known about <a href="https://en.wikipedia.org/wiki/Operational_transformation">operational transformations (OT)</a> for a while (via <a href="https://quilljs.com/">Quill</a>, but I have never been able to get the syncing operations working to my satisfaction. Message ordering is crucially important in OT, and it's hard to get right. I get the impression that the engineers who worked on Google Wave (which also used OT) also struggled with this…&nbsp;I remember reading a quote a while back that said something along the lines of "I wish I could have those years of my life back, and I wouldn't recommend anyone else try syncing this way." Ouch!</p><p>In contrast to OT, conflict-free replicated data types (CRDTs) seem really promising! <a href="https://en.wikipedia.org/wiki/Conflict-free_replicated_data_type">Wikipedia has a good summary</a>, which I'll quote:</p><blockquote><p>In distributed computing, a conflict-free replicated data type (CRDT) is a data structure that is replicated across multiple computers in a network, with the following features:</p><ol><li>The application can update any replica independently, concurrently and without coordinating with other replicas.</li><li>An algorithm (itself part of the data type) automatically resolves any inconsistencies that might occur.</li><li>Although replicas may have different state at any particular point in time, they are guaranteed to eventually converge.</li></ol></blockquote><p>These properties appeal to me! If CRDTs can automatically and independently converge, no matter how far apart they drift, then you could store them wherever and however you like. Offline support should be simple, and adding live collaboration features should not mean spending years figuring out edge cases. Sign me up!</p><p>What are CRDTs made from, though? It looks like typically it's some internal stuff, a function to resolve the internal stuff to a <code>value</code>, and a function to <code>merge</code> two of the data structure together. The merge function is the number-one-most-important thing about this whole arrangement, and has to satisfy<sup><a href="#1">1</a></sup> these three laws:</p><ul><li>commutative (so <code>merge(a, b)</code> must be the same as <code>merge(b, a)</code>)</li><li>associative (so <code>merge(merge(a, b), c)</code> must be the same as <code>merge(a, merge(b, c))</code>)</li><li>idempotent (so <code>merge(a, b)</code> must be the same as <code>merge(merge(a, b), b)</code>.<sup><a href="#2">2</a></sup>)</li></ul><p>If all these are true, we can always merge two states, regardless of how many changes have been made since we last merged, and get the same result on both sides of the sync. Cool!</p><p>These seem like the kinds of things that <a href="https://bytes.zone/projects/learning-alloy/">Alloy</a> would be good at modeling, so let's try it! Over the next couple of posts, I'm going to build a handful of data structures that follow these three rules and compose them into data structures we could build an application on top of.</p><p>Let's get a taste for this with <code>OR(bool, bool)</code>. First off, does it satisfy our three properties?</p><ul><li>commutative: <code>OR(True, False)</code> is the same as <code>OR(False, True)</code></li><li>associative: <code>OR(OR(True, False), True)</code> is the same as <code>OR(True, OR(False, True))</code></li><li>idempotent: calling <code>OR(x, True)</code> gives the same result as <code>OR(OR(x, True), True)</code>.</li></ul><p>So it looks like <code>OR</code> might be fine, but let's be sure. We can check this in Alloy by first defining<sup><a href="#3">3</a></sup> a boolean:</p><pre data-lang="alloy"><code data-lang="alloy"><span>enum</span><span> Bool { True, False }
+</span></code></pre><p>Then a merge function, which we check is correct:</p><pre data-lang="alloy"><code data-lang="alloy"><span>fun </span><span>merge[</span><span>a, b: Bool</span><span>]</span><span>:</span><span> Bool {
+</span><span>  </span><span>// OR
+</span><span>  a </span><span>=</span><span> True </span><span>implies</span><span> a </span><span>else</span><span> b
+</span><span>}
+</span><span>
+</span><span>check</span><span> MergeIsCorrect {
+</span><span>  </span><span>// read as: given `a` and `b`, which are `Bool`, the
+</span><span>  </span><span>// following condition must hold.
+</span><span>  </span><span>all</span><span> a, b</span><span>:</span><span> Bool </span><span>|
+</span><span>    (a </span><span>=</span><span> True </span><span>or</span><span> b </span><span>=</span><span> True) </span><span>implies </span><span>merge[</span><span>a, b</span><span>] </span><span>=</span><span> True
+</span><span>}
+</span></code></pre><p>And finally, our three properties:</p><pre data-lang="alloy"><code data-lang="alloy"><span>check</span><span> MergeIsCommutative {
+</span><span>  </span><span>all</span><span> a, b</span><span>:</span><span> Bool </span><span>| </span><span>merge[</span><span>a, b</span><span>] </span><span>= </span><span>merge[</span><span>b, a</span><span>]
+</span><span>}
+</span><span>
+</span><span>check</span><span> MergeIsAssociative {
+</span><span>  </span><span>all</span><span> a, b, c</span><span>:</span><span> Bool </span><span>| </span><span>merge[</span><span>merge[a, b</span><span>]</span><span>, c] </span><span>= </span><span>merge[</span><span>a, merge[b, c</span><span>]</span><span>]
+</span><span>}
+</span><span>
+</span><span>check</span><span> MergeIsIdempotent {
+</span><span>  </span><span>all</span><span> a, b</span><span>:</span><span> Bool </span><span>| </span><span>merge[</span><span>a, b</span><span>] </span><span>= </span><span>merge[</span><span>merge[a, b</span><span>]</span><span>, b]
+</span><span>}
+</span></code></pre><p>Great! Alloy can't find any errors with <code>OR</code>.<sup><a href="#4">4</a></sup> We expected that, so let's break it in interesting ways. What if the merge function was <code>XOR(bool, bool)</code><sup><a href="#5">5</a></sup> instead?</p><pre data-lang="alloy"><code data-lang="alloy"><span>fun </span><span>merge[</span><span>a, b: Bool</span><span>]</span><span>:</span><span> Bool {
+</span><span>  a </span><span>=</span><span> b </span><span>implies</span><span> False </span><span>else</span><span> True
+</span><span>}
+</span></code></pre><p>Now Alloy finds that we've broken idempotency: <code>merge[False, True]</code> is <code>True</code>, but <code>merge[merge[False, True], True]</code> is <code>False</code>. This would cause big problems if we used <code>XOR</code> as a merge function: the act of syncing could change our values! We can imagine this sequence of events:</p><ol><li>Node A sets the value to <code>True</code></li><li>Node B sets the value to <code>False</code></li><li>The nodes sync, both resolving to <code>True</code> (since <code>XOR(True, False)</code> is <code>True</code>)</li><li>The nodes sync again, both resolving to <code>False</code> (since <code>XOR(True, True)</code> is <code>False</code>)</li><li>Further syncs would stay at <code>False</code> until someone changed the value to <code>True</code>, at which point we'd repeat from step 3.</li></ol><p>But in a fun twist of fate, we don't <em>have</em> to imagine this; we can ask Alloy to generate these traces for us. First we'll make a document that contains a changeable value:</p><pre data-lang="alloy"><code data-lang="alloy"><span>sig</span><span> Document {
+</span><span>  var value</span><span>: one</span><span> Bool,
+</span><span>}
+</span></code></pre><p>Then we'll define a <code>not</code> for our boolean and a couple of operations (flipping an arbitrary value and syncing two documents):</p><pre data-lang="alloy"><code data-lang="alloy"><span>fun </span><span>bool_not[</span><span>b: Bool</span><span>]</span><span>:</span><span> Bool {
+</span><span>  b </span><span>=</span><span> True </span><span>implies</span><span> False </span><span>else</span><span> True
+</span><span>}
+</span><span>
+</span><span>// intent: when `flip` is true, the provided document will go
+</span><span>// from True to False or False to True in the next time step. 
+</span><span>// This serves as our proxy for someone clicking a button in
+</span><span>// a UI or whatever.
+</span><span>pred </span><span>flip[</span><span>d: Document</span><span>]</span><span> {
+</span><span>  </span><span>// implementation: `value` is actually a set of tuples from
+</span><span>  </span><span>// documents to booleans, and `value'` is the same but in the
+</span><span>  </span><span>// next time step. We set the entire value explicitly
+</span><span>  </span><span>// (instead of just saying like `d'.value = False`) because
+</span><span>  </span><span>// otherwise Alloy could say "and what if something changes
+</span><span>  </span><span>// that you weren't expecting?"
+</span><span>  </span><span>//
+</span><span>  </span><span>// Syntax: `-&gt;` creates a tuple, and `++` replaces all
+</span><span>  </span><span>// existing tuples referencing `d` in the set.
+</span><span>  value' </span><span>=</span><span> value </span><span>++</span><span> d</span><span>-&gt;</span><span>bool_not[</span><span>d.value</span><span>]
+</span><span>}
+</span><span>
+</span><span>// intent: merge two documents together in a way that all the
+</span><span>// `merge` rules hold. Maybe imagine we have `d1` locally and
+</span><span>// are getting `d2` over the network (but remember that order
+</span><span>// should not matter!)
+</span><span>pred </span><span>sync[</span><span>d1, d2: Document</span><span>]</span><span> {
+</span><span>  </span><span>let</span><span> merged </span><span>= </span><span>merge[</span><span>d1.value, d2.value</span><span>]</span><span> {
+</span><span>    value' </span><span>=</span><span> value </span><span>++</span><span> (d1</span><span>-&gt;</span><span>merged </span><span>+</span><span> d2</span><span>-&gt;</span><span>merged)
+</span><span>  }
+</span><span>}
+</span></code></pre><p>Now wire them up so these events can happen over time:<sup><a href="#6">6</a></sup></p><pre data-lang="alloy"><code data-lang="alloy"><span>pred</span><span> init {
+</span><span>  </span><span>// `Document` is a set of documents, and `-&gt;` will apply pairwise
+</span><span>  </span><span>// for the sets in its arguments, so this means this says "all
+</span><span>  </span><span>// documents start at `False`"
+</span><span>  value </span><span>=</span><span> Document </span><span>-&gt;</span><span> False
+</span><span>}
+</span><span>
+</span><span>fact</span><span> traces {
+</span><span>  </span><span>// this says "start with `init`, then pick one of these things to
+</span><span>  </span><span>// happen at each time step." Putting it in a `fact` means that
+</span><span>  </span><span>// any assertions we make from now on assume that we want these
+</span><span>  </span><span>// instructions.
+</span><span>  init
+</span><span>  always {
+</span><span>    (</span><span>one</span><span> d</span><span>:</span><span> Document </span><span>| </span><span>flip[</span><span>d</span><span>]</span><span>)
+</span><span>    </span><span>or</span><span> (</span><span>some</span><span> d1, d2</span><span>:</span><span> Document </span><span>| </span><span>sync[</span><span>d1, d2</span><span>]</span><span>)
+</span><span>  }
+</span><span>}
+</span></code></pre><p>We can now check that our sync is idempotent:<sup><a href="#7">7</a></sup></p><pre data-lang="alloy"><code data-lang="alloy"><span>check</span><span> SyncIsIdempotent {
+</span><span>  </span><span>// at all times, if sync happens twice in a row (the `;` syntax) then
+</span><span>  </span><span>// the next value (`value'`) and the one after that (`value''`) should
+</span><span>  </span><span>// be the same.
+</span><span>  always </span><span>all</span><span> d1, d2</span><span>:</span><span> Document </span><span>|
+</span><span>    (</span><span>sync[</span><span>d1, d2</span><span>]</span><span>; </span><span>sync[</span><span>d1, d2</span><span>]</span><span>) </span><span>implies</span><span> value' </span><span>=</span><span> value''
+</span><span>}
+</span></code></pre><p>If we make <code>OR</code> our <code>merge</code> function, this works fine and Alloy can't find any counterexamples. If we use <code>XOR</code> for <code>merge</code>, though, Alloy finds the trace I mentioned could show up earlier. Here's what it shows us.</p><table><thead><tr><th>Step</th><th>Description</th><th>Image</th></tr></thead><tbody><tr><td>1.</td><td>We start off with all documents at <code>False</code>.</td><td><img src="https://bytes.zone/images/xor-trace-step-1-and-4.png" alt="an Alloy instance showing two documents both set to False"></td></tr><tr><td>2.</td><td>One of the documents flips to <code>True</code>.</td><td><img src="https://bytes.zone/images/xor-trace-step-2.png" alt="the previous instance, but with one document now set to True"></td></tr><tr><td>3.</td><td>The documents sync, converging to <code>True</code>.</td><td><img src="https://bytes.zone/images/xor-trace-step-3.png" alt="the previous instance, but with both documents now set to True"></td></tr><tr><td>4.</td><td>The documents sync again, converging to <code>False</code> because <code>XOR(True, True)</code> (the previously synced state) is <code>False</code>.</td><td><img src="https://bytes.zone/images/xor-trace-step-1-and-4.png" alt="the previous instance, but with both documents now set to False"></td></tr><tr><td>5.</td><td>Stay here forever or return to 2.</td><td></td></tr></tbody></table><p>In case you're encountering them for the first time, these diagrams are generated by Alloy—they're pretty fantastic for showing other people exactly what can happen in a system. (That's also why <code>Document 0</code> is <code>d1</code> and so on. The documents are defined separately, and the <code>d1</code> and <code>d2</code> labels come from our <code>check</code> so we can see what's doing what.)</p><p>Alloy can do more than this, too. If we modify our condition to have 3 distinct documents like this:</p><pre data-lang="alloy"><code data-lang="alloy"><span>check</span><span> SyncIsIdempotent {
+</span><span>  always </span><span>all disj</span><span> d1, d2, d3</span><span>:</span><span> Document </span><span>|
+</span><span>    (</span><span>sync[</span><span>d1, d2</span><span>]</span><span>; </span><span>sync[</span><span>d2, d3</span><span>]</span><span>) </span><span>implies</span><span> value' </span><span>=</span><span> value''
+</span><span>}
+</span></code></pre><p>Then Alloy shows the situation getting even sillier. You only need one of the nodes to be <code>False</code>, at which point it's possible that the documents as a whole could never converge again and just flap back and forth randomly forever. It all depends on which documents sync with which other documents. Turns out idempotency is pretty important!</p><p>That's it for today. Next time we'll go from booleans-of-dubious-usefulness to counters!</p><hr><p>Big thanks to <a href="https://jakelazaroff.com/">Jake Lazaroff</a> for his help reviewing this post. If you're interested in this stuff, he also recently published <a href="https://jakelazaroff.com/words/an-interactive-intro-to-crdts/">an interactive intro to CRDTs</a> that you may enjoy!</p></article></div>]]>
+            </description>
+            <link>https://bytes.zone/posts/modeling-crdts-in-alloy-introduction-and-the-importance-of-idempotence/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-37819683</guid>
+            <pubDate>Mon, 09 Oct 2023 12:23:38 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[The Prosecutor's Fallacy (2018)]]>
+            </title>
+            <description>
+<![CDATA[
+Score 44 | Comments 27 (<a href="https://news.ycombinator.com/item?id=37819637">thread link</a>) | @YeGoblynQueenne
+<br/>
+October 9, 2023 | https://www.cebm.ox.ac.uk/news/views/the-prosecutors-fallacy | <a href="https://web.archive.org/web/*/https://www.cebm.ox.ac.uk/news/views/the-prosecutors-fallacy">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+        
+                    <div id="site-content">
+
+                        
+
+                            
+                                
+                            
+
+                            
+                                
+                                    
+                                        
+                                    
+                                
+                            
+
+                            
+                                
+                                    
+                                
+                            
+            
+                            <div>
+                                <div id="site-content-body">
+            
+                                    
+                <div><p><strong>Getting the wrong end of the stick: The Prosecutor’s Fallacy</strong></p>
+<p>We may all be guilty of it at some time or other</p>
+<p><em>The probability that this nurse’s shifts would coincide with so many deaths and resuscitations by chance is 1 in 342 million, so she must be guilty.<br></em><em>Given your positive test result, the chance of your dying within 10 years is 99.9%.<br></em><em>He mustn’t love me anymore, as it’s been 3 days and he hasn’t returned my call</em>.</p>
+<p>Kathy Taylor, medical statistician</p>
+<p>The three statements above have one thing in common – they are all examples of&nbsp;<a href="http://psycnet.apa.org/record/1987-34415-001" target="_blank" title="">The Prosecutor’s Fallacy</a>&nbsp;(1). This is a logical error involving&nbsp;<a href="https://en.wikipedia.org/wiki/Conditional_probability" target="_blank" title="">conditional probabilities&nbsp;</a>– a measure of the<span>&nbsp;</span>chance, likelihood, or probability of X when Y has happened, Y being something that modifies the chance. The Prosecutor’s Fallacy can be avoided by making sure the probability answers the right question, by focusing on how the evidence applies to the ‘defendant’ and not on the ‘evidence’ alone in the absence of other relevant factors.</p>
+<p>The Prosecutor’s Fallacy is most often associated with miscarriages of justice. It’s when the probability of innocence given the evidence is wrongly assumed to equal an infinitesimally small probability that that evidence would occur if the defendant was innocent. Consequently, highly improbable innocent explanations have led to the assumption of guilt, as with the murder convictions of&nbsp;<a href="https://www.theguardian.com/society/2007/mar/17/childrensservices.uknews" target="_blank" title="">Sally Clark&nbsp;</a>in 1999 and&nbsp;<a href="https://en.wikipedia.org/wiki/Lucia_de_Berk" target="_blank" title="">Lucia de Berk</a>&nbsp;in 2003 (2).</p>
+<p><a href="https://www.nytimes.com/2008/06/08/books/review/Johnson-G-t.html" target="_blank" title="">Leonard Mlodinow’s&nbsp;</a>doctor made the same logical error when he gave an alarming prognosis back in 1989 (3). His doctor had misinterpreted the 1 in 1000 probability that the HIV test will produce a positive result when the blood is not infected (the false positive rate), interpreting it as the probability that his blood was not infected if it gave a positive test result. Only 1 in 10,000 people from a low-risk population who are tested is eventually confirmed as being infected, but because the false positive rate is 1 in 1000, 10 people in 10,000 will test positive who aren’t infected, compared with 1 who is. Thus, the odds that Mlodinow was infected was 10 to 1 against. The fact that he was from a low-risk population suggested that he was unlikely to be infected.</p>
+<p>The third example &nbsp;above (“He mustn’t love me any more…”) reflects someone wrongly assuming that, given a delayed response to their message, the probability that they have lost favour is equal to the high probability of a delayed response that would occur if they had lost favour, whereas there is higher probability that there is some other reason for the delay. Variants of this example, which lead to misunderstandings between friends, families or colleagues make it the most common example of the Prosecutor’s Fallacy.</p>
+<p>In these examples, the conditional probabilities are inverted, but doing this ignores both the alternative explanations and the associated probability of “guilt” (disease or lost favour) before the new evidence (the result of a test or delayed response) occurs. In the courtroom, this assumed (or prior) probability is the probability of guilt or innocence based on all the other evidence, and in the medical context, it’s the prevalence of the disease. Ignoring the&nbsp;<a href="https://en.wikipedia.org/wiki/Base_rate_fallacy" target="_blank" title="">base rate</a>&nbsp;is a common error (4).&nbsp;<a href="https://en.wikipedia.org/wiki/Bayes%27_theorem" target="_blank" title="">Bayes’ theorem</a>&nbsp;(5) shows how the two conditional probabilities are related in updating the prior probability following the addition of new information:</p>
+<p><span><img data-copyright-style="inverted" src="https://www.cebm.ox.ac.uk/images/news/kt1.png" title="KT1.png" data-src="https://www.cebm.ox.ac.uk/images/news/kt1.png" alt="KT1.png"></span></p>
+<p>Therefore, the Prosecutors Fallacy is a subtle error that requires careful thought to understand, which makes teaching it all the more challenging. Visual explanations may be helpful.</p>
+<p>The difference between the two conditional probabilities can be illustrated by considering the results of a diagnostic test in one million people, at two levels of prevalence, and using blocks with areas scaled to represent the number of people (shown in black). The test has 98% sensitivity and a false positive rate of 1% (shown in red).</p>
+
+
+<p><span><img data-copyright-style="inverted" src="https://www.cebm.ox.ac.uk/images/news/kt2-1.png" title="KT2.png" data-src="https://www.cebm.ox.ac.uk/images/news/kt2-1.png" alt="KT2.png"></span></p>
+<p><span>The first conditional probability is&nbsp;</span><em>P(Positive test result</em><span>|</span><em>No disease),&nbsp;</em><span>which is the false positive rate. It is the same for (a) and (b):</span></p>
+<p><span><span><img data-copyright-style="inverted" src="https://www.cebm.ox.ac.uk/images/news/kt3.png" title="KT3.png" data-src="https://www.cebm.ox.ac.uk/images/news/kt3.png" alt="KT3.png"></span></span></p>
+
+<p>The numerator is the number of people who have no disease and have tested positive (9998 and 8000 for (a) and (b) respectively). The denominator is the total number with no disease irrespective of their test result (labelled No Disease). This probability does not vary according to the prevalence.</p>
+<p>The second conditional probability is&nbsp;<em>P(No disease</em>|<em>Positive test result)</em>, i.e. the chance that you don’t have the disease, even though the test is positive:</p>
+<p><span><img data-copyright-style="inverted" src="https://www.cebm.ox.ac.uk/images/news/kt4.png" title="KT4.png" data-src="https://www.cebm.ox.ac.uk/images/news/kt4.png" alt="KT4.png"></span></p>
+<p>The numerator is the same, as before, but the denominator is the number of people in the whole sample with a positive test result (shaded area). &nbsp;This probability depends on the prevalence and also on the relative number of those with positive tests, with and without the disease.</p>
+<p>Notice that at 0.02% prevalence the two conditional probabilities differ by 97% but at 20% prevalence the difference is only 3%. Therefore, the Prosecutor’s Fallacy is not an issue when the prevalence (or prior likelihood of guilt) is high, because the conditional probabilities are similar.</p>
+<p>A simpler version of the Prosecutor’s Fallacy arises when a defendant shares the physical characteristics of the perpetrator of the crime, and the probability of innocence given this match –&nbsp;<em>P(Innocent</em>|<em>Match) –&nbsp;</em>is wrongly assumed to equal the infinitesimally small chance of a random person in the population sharing those characteristics –&nbsp;<em>P(Match)</em>. These probabilities are not equal, as shown above by Bayes’ theorem. Unlike the previous examples, conditional probabilities are not inverted, but like the previous examples, this logical error arises from answering the wrong question, by focusing purely on the evidence and not on the evidence as it relates to the defendant, including other factors that may modify the likelihoods.</p>
+<p>References</p>
+<ol>
+<li>Thompson WC, Schumann EL. Interpretation of statistical evidence in criminal trials: The prosecutor’s fallacy and defense attorney’s fallacy. Law and Human Behaviour 1987; 11:167-187</li>
+<li>Hubert L, Wainer H. A statistical guide for the ethically perplexed. CRP Press, Taylor &amp; Francis Group. 2013.</li>
+<li>Mlodinow L. The drunkard’s walk: how randomness rules our lives. Allen Lane. 2008</li>
+<li>Tversky, A.; Kahneman, D. (1974). “Judgment under Uncertainty: Heuristics and Biases”.&nbsp;<em>Science</em>.&nbsp;<strong>185</strong>(4157): 1124–1131.</li>
+<li>Altman D. Practical statistics for medical research. Chapman &amp; Hall. 1993</li>
+</ol>
+<p>Kathy receives funding from the NHS National Institute for Health Research (NIHR) Programme for Applied Research. The views expressed are those of the author and not necessary of the NHS or the NIHR.</p>
+<p><em>Want to learn how we teach statistics and other key topics in Evidence-Based HealthCare? Then join us at our annual teaching course 14 - S</em><em>eptember 2020. More details&nbsp;<a title="" href="https://www.cebm.ox.ac.uk/news/views/the-prosecutors-fallacy/resolveuid/5b4bdeab63f94e1eaafadd0bc5a93f20" target="_self">here</a>.</em></p></div>
+                
+            
+                                    
+                                </div>
+            
+                                
+            
+                            </div>
+            
+                            
+                                
+                            
+                        
+        
+                    </div>
+        
+                    
+        
+                </div></div>]]>
+            </description>
+            <link>https://www.cebm.ox.ac.uk/news/views/the-prosecutors-fallacy</link>
+            <guid isPermaLink="false">hacker-news-small-sites-37819637</guid>
+            <pubDate>Mon, 09 Oct 2023 12:16:28 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[UK Postal Address Oddities (2018)]]>
             </title>
             <description>
 <![CDATA[
-Score 26 | Comments 24 (<a href="https://news.ycombinator.com/item?id=37818991">thread link</a>) | @rwmj
+Score 50 | Comments 62 (<a href="https://news.ycombinator.com/item?id=37818991">thread link</a>) | @rwmj
 <br/>
 October 9, 2023 | https://paulplowman.com/stuff/uk-address-oddities/ | <a href="https://web.archive.org/web/*/https://paulplowman.com/stuff/uk-address-oddities/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="post-763">
@@ -227,11 +687,66 @@ PS. If you’ve not read my previous posts, The HM Land Registry property sales 
         </item>
         <item>
             <title>
+<![CDATA[Stream Compression in NATS]]>
+            </title>
+            <description>
+<![CDATA[
+Score 31 | Comments 7 (<a href="https://news.ycombinator.com/item?id=37818685">thread link</a>) | @SebastianM
+<br/>
+October 9, 2023 | https://qaze.app/blog/nats-stream-compression/ | <a href="https://web.archive.org/web/*/https://qaze.app/blog/nats-stream-compression/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="article-content"><p>NATS 2.10 is <a href="https://nats.io/blog/nats-server-2.10-release/">finally available</a> and it comes with a lot of exciting new features. In this blog post, we’re looking at the new compression feature for NATS Streams.</p>
+<p>Starting with NATS 2.10, you can configure the compression for every stream individually if you use the <code>file</code> storage type. Currently, there’s support for the <a href="https://pkg.go.dev/github.com/klauspost/compress/s2#section-readme">S2 compression format</a> but there may be other supported formats in the future. The S2 compression is an extension of Google’s <a href="https://github.com/google/snappy">Snappy</a> compression with the goal of high throughput.</p>
+<p>Let’s take a look at the storage savings when using the S2 compression.</p>
+<h2 id="creating-the-streams">Creating the streams</h2>
+<p>To test the compression efficiency, we create two streams with <a href="https://github.com/nats-io/natscli">NATS CLI</a> with the exact same configuration besides compression turned on/off.</p>
+<pre is:raw="" tabindex="0"><code><span><span>nats</span><span> </span><span>stream</span><span> </span><span>add</span><span> </span><span>NO_COMPRESSION</span><span> </span><span>\</span></span>
+<span><span>--subjects </span><span>NO_COMPRESSION</span><span> </span><span>\</span></span>
+<span><span>--replicas </span><span>1</span><span> </span><span>\</span></span>
+<span><span>--storage=file </span><span>\</span></span>
+<span><span>--defaults</span></span>
+<span></span>
+<span><span>nats</span><span> </span><span>stream</span><span> </span><span>add</span><span> </span><span>WITH_COMPRESSION</span><span> </span><span>\</span></span>
+<span><span>--subjects </span><span>WITH_COMPRESSION</span><span> </span><span>\</span></span>
+<span><span>--replicas </span><span>1</span><span> </span><span>\</span></span>
+<span><span>--storage=file </span><span>\</span></span>
+<span><span>--compression </span><span>s2</span><span> </span><span>\</span></span>
+<span><span>--defaults</span></span></code></pre>
+<p><strong>Please note that you need at least version 0.1.0 of the NATS CLI, which is the first version that has the compression option.</strong></p>
+<h2 id="generating-test-data">Generating Test Data</h2>
+<p>To be able to compare the size of the two streams, we publish the same messages (32 bytes payload) to both of the streams with the help of the CLI. Then we take a look at the used storage with the help of <code>du</code> for both of the streams a few times after inserting a fixed amount of messages.</p>
+<pre is:raw="" tabindex="0"><code><span><span>nats</span><span> </span><span>pub</span><span> </span><span>NO_COMPRESSION</span><span> </span><span>--count</span><span> </span><span>10000</span><span> </span><span>"4KJZE2Nx6IbTsEo8lvGJIg1XDz2njdLF"</span></span>
+<span><span>nats</span><span> </span><span>pub</span><span> </span><span>WITH_COMPRESSION</span><span> </span><span>--count</span><span> </span><span>10000</span><span> </span><span>"4KJZE2Nx6IbTsEo8lvGJIg1XDz2njdLF"</span></span></code></pre>
+<p>You can see my full script for generating the test data/results <a href="https://gist.github.com/sebholstein/975399c22129e39c4b124a23db063043">here</a>.</p>
+<h2 id="test-results">Test Results</h2>
+<p><img alt="Stream Size Comparison" src="https://qaze.app/_astro/stream-size-32-bytes-messages.4f242feb_eyB2y.svg" width="819" height="461" loading="lazy" decoding="async"></p>
+<p><img alt="Saved Storage" src="https://qaze.app/_astro/saved-storage-32-bytes.5d9c492c_1VtHd5.svg" width="819" height="505" loading="lazy" decoding="async"></p>
+<p>We can see that in this test setup, we have no storage savings until ~100,000 messages. In fact, we have a slight storage overhead (which I don’t understand so far). After that amount of messages, the compression kicks in and brings us up to 86 % of storage savings. This behavior initially puzzled me as I looked at the results. After examining the inner workings of `nats-server“, it all became much clearer to me. If you want to understand the compression logic better, read the <a href="#compression-logic-in-nats-server">compression logic section</a> in this blog post.</p>
+<h4 id="nats-cli-stream-size">NATS CLI Stream Size</h4>
+<p>With <code>nats stream info […]</code> we are able to check the stream size via the CLI. When looking at the graph below, it’s interesting that the reported size of the compressed stream is slightly higher than the uncompressed stream. So the real disk space used is currently not available via the nats-server API when having compression turned on.</p>
+<p><img alt="NATS CLI reported stream sizes" src="https://qaze.app/_astro/cli-reported-stream-size-32-bytes.69feac12_1zAN9r.svg" width="819" height="461" loading="lazy" decoding="async"></p>
+<h2 id="is-it-possible-to-turn-on-compression-for-existing-streams">Is it possible to turn on compression for existing streams?</h2>
+<p>Yes, it’s possible (which is really great) but it doesn’t give you storage savings for the existing messages just by turning it on. Let’s take a look at our <code>NO_COMPRESSION</code> stream and turn on S2 compression via the CLI:</p>
+<pre is:raw="" tabindex="0"><code><span><span>nats</span><span> </span><span>stream</span><span> </span><span>edit</span><span> </span><span>NO_COMPRESSION</span><span> </span><span>--compression</span><span> </span><span>s2</span></span></code></pre>
+<p>After enabling it, the used disk space (checked with <code>du -c [nats-folder]/jetstream/$G/NO_COMPRESSION</code>) is exactly the same as before. Even when adding a few messages to the stream, the compression doesn’t effect for the existing messages. So let’s take a deeper look how compression logic looks like in <code>nats-server</code>.</p>
+<h2 id="compression-logic-in-nats-server">Compression Logic in nats-server</h2>
+<p>NATS stores Stream messages in <em>blocks</em> on disk. Each block is stored in a separate file in the Jetstream storage directory, specifically in the [nats-folder]/jetstream/$G/[stream-name]/msgs folder. These blocks are represented by <code>[index].blk</code> files.
+The size of a block depends on various factors, such as encryption, retention policy, and the maximum bytes configured for the stream. For a limits-based stream without a <code>MaxBytes</code> limit or encryption enabled, the block size is 8 MB.</p>
+<p>Before writing each message, the server checks if it has reached the end of the current block based on the current block size. If it has, the full block gets compressed. <strong>This means that not every new incoming message is compressed immediately, which helps maintain a good write throughput.</strong></p>
+<p>The compression process for a full block begins by reading the entire contents of the current block into memory before compressing it. The compression is performed solely in memory. Once compression is complete, the block is encrypted (if encryption is enabled). To ensure safety, the compressed/(encrypted) block is initially written to a new temporary file. After a successful write operation, the temporary file is then renamed to the original block name. Following this, a new (uncompressed) block gets created, and the new incoming message is written to that new block.</p>
+<h2 id="wrap-up">Wrap Up</h2>
+<p>I hope you enjoyed reading about the new compression feature of NATS Streams. The compression can save a significant amount of storage/money, especially in cloud environments. When appending messages to a stream, there is no immediate performance overhead for each individual message write, as compression is only executed when a block reaches full capacity.</p></article></div>]]>
+            </description>
+            <link>https://qaze.app/blog/nats-stream-compression/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-37818685</guid>
+            <pubDate>Mon, 09 Oct 2023 09:47:36 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Show HN: I made a all-in-one web app to help me with my freelance admin tasks]]>
             </title>
             <description>
 <![CDATA[
-Score 89 | Comments 15 (<a href="https://news.ycombinator.com/item?id=37818374">thread link</a>) | @42loops
+Score 200 | Comments 41 (<a href="https://news.ycombinator.com/item?id=37818374">thread link</a>) | @42loops
 <br/>
 October 9, 2023 | https://momo.coach/index.html | <a href="https://web.archive.org/web/*/https://momo.coach/index.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><p><h2>Master your freelance admin, one habit at a time</h2></p><div><div><div><p>Overcomplicated time tracking across multiple clients and countless spreadsheets</p><p>Lost revenue from unaccounted hours</p><p>Difficulty keeping up with earnings and costs</p><p>struggles with crafting invoices and quotes</p><p>Misplaced receipts, leading to missed reimbursements</p><p>Feeling anxious as the quarter-end approaches, and the time for VAT return looms</p></div></div></div><div><div><div><div><p>Effortlessly track your time</p></div><div><p>Create professional and compliant invoices</p></div><div><p>Upload CSV transactions file from your bank to keep track of incomes and expenses</p></div><div><p>Compile reports to prepare your tax returns smoothly</p></div></div></div></div><div><div><h3>Try us to save time and stress less in your freelance journey!</h3><div><h3>Plan</h3><h4>With 10GB storage<br>$10/month</h4><p><a href="https://app.momo.coach/signup">Start Free Trial</a></p><p>no long-term contract, you can cancel at any time</p></div></div></div></div></div></div>]]>
@@ -246,7 +761,7 @@ October 9, 2023 | https://momo.coach/index.html | <a href="https://web.archive.o
             </title>
             <description>
 <![CDATA[
-Score 90 | Comments 20 (<a href="https://news.ycombinator.com/item?id=37816721">thread link</a>) | @surprisetalk
+Score 153 | Comments 32 (<a href="https://news.ycombinator.com/item?id=37816721">thread link</a>) | @surprisetalk
 <br/>
 October 8, 2023 | https://stephango.com/flexoki | <a href="https://web.archive.org/web/*/https://stephango.com/flexoki">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -268,6 +783,13 @@ October 8, 2023 | https://stephango.com/flexoki | <a href="https://web.archive.o
 
 
 
+
+<h2 id="syntax-highlighting">Syntax highlighting</h2>
+
+<p>You can find examples of code on the pages for <a href="https://stephango.com/tidy">Tidy Reader</a> and <a href="https://stephango.com/tidyurl">Tidy URL</a> highlighted using PrismJS.</p>
+
+<p><a href="https://stephango.com/assets/flexoki-code.png"><img src="https://stephango.com/assets/flexoki-code.png" title="Flexoki code sample"></a>
+</p>
 
 <h2 id="base-tones">Base tones</h2>
 
@@ -593,15 +1115,22 @@ October 8, 2023 | https://stephango.com/flexoki | <a href="https://web.archive.o
 
 <p>Solving for all these problems is how I arrived at Flexoki. I wish it could have been more science than art, but it wasn’t. Some day I hope to arrive at a more reliable way to generate digital color palettes that respect the constraints I laid out. In the meantime, I hope you find this iteration of Flexoki useful.</p>
 
-<h2 id="themes">Themes</h2>
+<h2 id="supported-apps">Supported apps</h2>
 
-<p>Flexoki is currently available for the following apps:</p>
+<p>Flexoki is currently available for the following apps and tools:</p>
 
 <ul>
   <li>
 <a href="https://github.com/kepano/flexoki-obsidian" target="_blank" rel="noopener noreferrer">Obsidian standalone theme</a> and included with <a href="https://stephango.com/minimal">Minimal</a>
 </li>
-  <li><a href="https://github.com/kepano/flexoki/tree/main/iterm2" target="_blank" rel="noopener noreferrer">iTerm2 theme</a></li>
+  <li><a href="https://github.com/kepano/flexoki/tree/main/gimp" target="_blank" rel="noopener noreferrer">GIMP palette</a></li>
+  <li><a href="https://github.com/kepano/flexoki/tree/main/iterm2" target="_blank" rel="noopener noreferrer">iTerm2</a></li>
+  <li><a href="https://github.com/kepano/flexoki/tree/main/kitty" target="_blank" rel="noopener noreferrer">Kitty</a></li>
+  <li><a href="https://github.com/kepano/flexoki/tree/main/terminal" target="_blank" rel="noopener noreferrer">macOS Terminal</a></li>
+  <li><a href="https://github.com/kepano/flexoki/tree/main/neovim" target="_blank" rel="noopener noreferrer">Neovim</a></li>
+  <li><a href="https://gist.github.com/phenomen/affd8c346538378548febd20dccdbfcc" target="_blank" rel="noopener noreferrer">Shadcn</a></li>
+  <li><a href="https://gist.github.com/martin-mael/4b50fa8e55da846f3f73399d84fa1848" target="_blank" rel="noopener noreferrer">Tailwind</a></li>
+  <li><a href="https://github.com/kepano/flexoki/tree/main/windows-terminal" target="_blank" rel="noopener noreferrer">Windows Terminal</a></li>
 </ul>
 
 <h2 id="contributing">Contributing</h2>
@@ -646,7 +1175,7 @@ October 8, 2023 | https://stephango.com/flexoki | <a href="https://web.archive.o
             </title>
             <description>
 <![CDATA[
-Score 99 | Comments 46 (<a href="https://news.ycombinator.com/item?id=37815488">thread link</a>) | @crtasm
+Score 117 | Comments 56 (<a href="https://news.ycombinator.com/item?id=37815488">thread link</a>) | @crtasm
 <br/>
 October 8, 2023 | https://www.sharoma.com/minidisc/hacking.htm | <a href="https://web.archive.org/web/*/https://www.sharoma.com/minidisc/hacking.htm">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content">
@@ -816,7 +1345,7 @@ October 8, 2023 | https://www.sharoma.com/minidisc/hacking.htm | <a href="https:
             </title>
             <description>
 <![CDATA[
-Score 129 | Comments 37 (<a href="https://news.ycombinator.com/item?id=37814701">thread link</a>) | @cdme
+Score 138 | Comments 44 (<a href="https://news.ycombinator.com/item?id=37814701">thread link</a>) | @cdme
 <br/>
 October 8, 2023 | https://marvinh.dev/blog/speeding-up-javascript-ecosystem-part-7/ | <a href="https://web.archive.org/web/*/https://marvinh.dev/blog/speeding-up-javascript-ecosystem-part-7/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><p>📖 tl;dr: Many projects are littered with files that just re-export other files. These so called "barrel files" are one of the key reasons why JavaScript tooling is slow in bigger projects.</p><div>
@@ -875,7 +1404,7 @@ October 8, 2023 | https://marvinh.dev/blog/speeding-up-javascript-ecosystem-part
             </title>
             <description>
 <![CDATA[
-Score 161 | Comments 58 (<a href="https://news.ycombinator.com/item?id=37814667">thread link</a>) | @redbell
+Score 174 | Comments 64 (<a href="https://news.ycombinator.com/item?id=37814667">thread link</a>) | @redbell
 <br/>
 October 8, 2023 | https://www.spacecentre.nz/resources/facts/physics/metals-fuse.html | <a href="https://web.archive.org/web/*/https://www.spacecentre.nz/resources/facts/physics/metals-fuse.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content">
@@ -912,7 +1441,7 @@ October 8, 2023 | https://www.spacecentre.nz/resources/facts/physics/metals-fuse
             </title>
             <description>
 <![CDATA[
-Score 84 | Comments 55 (<a href="https://news.ycombinator.com/item?id=37814355">thread link</a>) | @cpeterso
+Score 91 | Comments 60 (<a href="https://news.ycombinator.com/item?id=37814355">thread link</a>) | @cpeterso
 <br/>
 October 8, 2023 | https://www.rubick.com/demo-driven-development/ | <a href="https://web.archive.org/web/*/https://www.rubick.com/demo-driven-development/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div>
@@ -1096,7 +1625,7 @@ October 8, 2023 | https://www.rubick.com/demo-driven-development/ | <a href="htt
             </title>
             <description>
 <![CDATA[
-Score 31 | Comments 25 (<a href="https://news.ycombinator.com/item?id=37814153">thread link</a>) | @todsacerdoti
+Score 37 | Comments 32 (<a href="https://news.ycombinator.com/item?id=37814153">thread link</a>) | @todsacerdoti
 <br/>
 October 8, 2023 | https://www.softwareatscale.dev/p/the-hidden-performance-cost-of-nodejs | <a href="https://web.archive.org/web/*/https://www.softwareatscale.dev/p/the-hidden-performance-cost-of-nodejs">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><h4>Discover more from Software at Scale</h4><p>Discussions on running software systems, teams, and products.</p><p>Over 1,000 subscribers</p> </div><div><div><div dir="auto"><p><a href="https://nodejs.org/en" rel="">NodeJS</a><span> and </span><a href="https://graphql.org/" rel="">GraphQL</a><span> are popular technologies for building web applications, but in my experience, they come with certain scaling and performance tradeoffs to be aware of.</span></p><p><strong>tl;dr</strong><span>: GraphQL's modular structure generally leads to code that instantiates excessive promises, which degrades request performance. Benchmarks show a 2-3x latency increase.</span></p><p><span>NodeJS is known for its non-blocking I/O operations, thanks to its design of the event loop. The event loop is a single </span><a href="https://nodejs.org/en/docs/guides/event-loop-timers-and-nexttick" rel="">dispatcher thread</a><span> that enables concurrent I/O operations without forcing developers to reason about managing parallelism.</span></p><p><span>All synchronous work in NodeJS happens on the event loop thread (other than a few isolated multithreaded features like </span><a href="https://nodejs.org/api/worker_threads.html" rel="">worker_threads</a><span>). When the event loop is managed well, and </span><a href="http://highscalability.com/blog/2013/12/11/using-nodejs-paypal-doubles-rps-lowers-latency-with-fewer-de.html" rel="">I/O is a true bottleneck</a><span>, NodeJS can be a very efficient/scalable technology.</span></p><p>On the other hand, if a request does a lot of processing on the event loop, it will block other requests on that container. NodeJS applications are particularly susceptible to sporadic performance issues due to noisy neighbors - other heavy request handlers - that overly consume the event loop. Additionally, GraphQL's resolver structure can result in more promise overhead compared to REST endpoints, which may cause suboptimal user-perceived latency if not managed carefully.</p><p>GraphQL enables a modular design for APIs. For example, we can define a type in our schema, and define one resolver for that type, regardless of where that type appears in the graph.</p><pre><code>// schema.
@@ -1189,7 +1718,7 @@ setInterval(() =&gt; {
             </title>
             <description>
 <![CDATA[
-Score 35 | Comments 6 (<a href="https://news.ycombinator.com/item?id=37810508">thread link</a>) | @vincelt
+Score 36 | Comments 7 (<a href="https://news.ycombinator.com/item?id=37810508">thread link</a>) | @vincelt
 <br/>
 October 8, 2023 | https://benchmarks.llmonitor.com/leaderboard | <a href="https://web.archive.org/web/*/https://benchmarks.llmonitor.com/leaderboard">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p><a href="https://benchmarks.llmonitor.com/">leaderboard</a> | <a href="https://benchmarks.llmonitor.com/prompts">dataset</a> | <a href="https://benchmarks.llmonitor.com/compare">compare</a> | <a href="https://benchmarks.llmonitor.com/about">about</a></p><br><!--$--><!--$--><p>Traditional LLMs benchmarks have drawbacks: they quickly become part of training datasets and are hard to relate to in terms of real-world use-cases.</p><p>I made this as an experiment to address these issues. Here, the dataset is dynamic (changes every week) and composed of crowdsourced real-world prompts.</p><p>We then use GPT-4 to grade each model's response against a set of rubrics (more details on the about page). The prompt dataset is easily explorable.</p><p>Everything is then stored in a Postgres database and this page shows the raw results.</p><br><table><thead><tr><th>Rank</th><th>Model</th><th>Score</th><th>Results</th></tr></thead><tbody><tr><td>1</td><td>GPT 4 03/14 (Legacy)</td><td>93</td><td><a href="https://benchmarks.llmonitor.com/gpt-4-0314">view</a></td></tr><tr><td>2</td><td>GPT 4</td><td>89</td><td><a href="https://benchmarks.llmonitor.com/gpt-4">view</a></td></tr><tr><td>3</td><td>GPT 3.5 Turbo Instruct</td><td>84</td><td><a href="https://benchmarks.llmonitor.com/gpt-3.5-turbo-instruct">view</a></td></tr><tr><td>4</td><td>GPT 3.5 Turbo</td><td>81</td><td><a href="https://benchmarks.llmonitor.com/gpt-3.5-turbo">view</a></td></tr><tr><td>5</td><td>GPT 3.5 Turbo 03/01 (Legacy)</td><td>79</td><td><a href="https://benchmarks.llmonitor.com/gpt-3.5-turbo-0301">view</a></td></tr><tr><td>6</td><td>Claude v2</td><td>68</td><td><a href="https://benchmarks.llmonitor.com/claude-2">view</a></td></tr><tr><td>7</td><td>Falcon Chat (180B)</td><td>67</td><td><a href="https://benchmarks.llmonitor.com/falcon-180b-chat">view</a></td></tr><tr><td>8</td><td>Hermes Llama2 13B</td><td>66</td><td><a href="https://benchmarks.llmonitor.com/nous-hermes-llama2-13b">view</a></td></tr><tr><td>8</td><td>Claude v1</td><td>66</td><td><a href="https://benchmarks.llmonitor.com/claude-1">view</a></td></tr><tr><td>9</td><td>Jurassic 2 Ultra</td><td>61</td><td><a href="https://benchmarks.llmonitor.com/j2-ultra">view</a></td></tr><tr><td>9</td><td>ReMM SLERP L2 13B</td><td>61</td><td><a href="https://benchmarks.llmonitor.com/remm-slerp-l2-13b">view</a></td></tr><tr><td>9</td><td>Synthia 70B</td><td>61</td><td><a href="https://benchmarks.llmonitor.com/synthia-70b">view</a></td></tr><tr><td>10</td><td>PaLM 2 Bison (Code Chat)</td><td>60</td><td><a href="https://benchmarks.llmonitor.com/palm-2-codechat-bison">view</a></td></tr><tr><td>10</td><td>Jurassic 2 Mid</td><td>60</td><td><a href="https://benchmarks.llmonitor.com/j2-mid">view</a></td></tr><tr><td>10</td><td>Claude Instant v1</td><td>60</td><td><a href="https://benchmarks.llmonitor.com/claude-instant-1">view</a></td></tr><tr><td>10</td><td>LLaMA-2-Chat (70B)</td><td>60</td><td><a href="https://benchmarks.llmonitor.com/llama-2-70b-chat">view</a></td></tr><tr><td>11</td><td>Mythalion 13B</td><td>59</td><td><a href="https://benchmarks.llmonitor.com/mythalion-13b">view</a></td></tr><tr><td>12</td><td>Phind CodeLlama 34B v2 </td><td>57</td><td><a href="https://benchmarks.llmonitor.com/phind-codellama-34b-v2">view</a></td></tr><tr><td>12</td><td>PaLM 2 Bison</td><td>57</td><td><a href="https://benchmarks.llmonitor.com/palm-2-chat-bison">view</a></td></tr><tr><td>12</td><td>Mistral 7B Instruct v0.1</td><td>57</td><td><a href="https://benchmarks.llmonitor.com/mistral-7b-instruct-v0.1">view</a></td></tr><tr><td>13</td><td>MythoMax-L2 (13B)</td><td>56</td><td><a href="https://benchmarks.llmonitor.com/mythomax-l2-13b">view</a></td></tr><tr><td>14</td><td>command</td><td>55</td><td><a href="https://benchmarks.llmonitor.com/command">view</a></td></tr><tr><td>15</td><td>Guanaco (65B)</td><td>51</td><td><a href="https://benchmarks.llmonitor.com/guanaco-65b">view</a></td></tr><tr><td>15</td><td>Airoboros L2 70B</td><td>51</td><td><a href="https://benchmarks.llmonitor.com/airoboros-l2-70b-2.1">view</a></td></tr><tr><td>16</td><td>Vicuna v1.3 (13B)</td><td>50</td><td><a href="https://benchmarks.llmonitor.com/vicuna-13b-v1.3">view</a></td></tr><tr><td>16</td><td>LLaMA-2-Chat (13B)</td><td>50</td><td><a href="https://benchmarks.llmonitor.com/llama-2-13b-chat">view</a></td></tr><tr><td>16</td><td>LLaMA-2-Chat (7B)</td><td>50</td><td><a href="https://benchmarks.llmonitor.com/llama-2-7b-chat">view</a></td></tr><tr><td>17</td><td>command-nightly</td><td>47</td><td><a href="https://benchmarks.llmonitor.com/command-nightly">view</a></td></tr><tr><td>18</td><td>Chronos Hermes (13B)</td><td>45</td><td><a href="https://benchmarks.llmonitor.com/chronos-hermes-13b">view</a></td></tr><tr><td>19</td><td>MPT-Chat (7B)</td><td>43</td><td><a href="https://benchmarks.llmonitor.com/mpt-7b-chat">view</a></td></tr><tr><td>19</td><td>Guanaco (33B)</td><td>43</td><td><a href="https://benchmarks.llmonitor.com/guanaco-33b">view</a></td></tr><tr><td>20</td><td>Vicuna v1.3 (7B)</td><td>41</td><td><a href="https://benchmarks.llmonitor.com/vicuna-7b-v1.3">view</a></td></tr><tr><td>21</td><td>MPT-Chat (30B)</td><td>40</td><td><a href="https://benchmarks.llmonitor.com/mpt-30b-chat">view</a></td></tr><tr><td>21</td><td>Falcon Instruct (40B)</td><td>40</td><td><a href="https://benchmarks.llmonitor.com/falcon-40b-instruct">view</a></td></tr><tr><td>22</td><td>Alpaca (7B)</td><td>39</td><td><a href="https://benchmarks.llmonitor.com/alpaca-7b">view</a></td></tr><tr><td>23</td><td>Pythia-Chat-Base (7B)</td><td>38</td><td><a href="https://benchmarks.llmonitor.com/pythia-chat-base-7b-v0.16">view</a></td></tr><tr><td>23</td><td>Code Llama Instruct (13B)</td><td>38</td><td><a href="https://benchmarks.llmonitor.com/codellama-13b-instruct">view</a></td></tr><tr><td>23</td><td>RedPajama-INCITE Chat (7B)</td><td>38</td><td><a href="https://benchmarks.llmonitor.com/redpajama-incite-7b-chat">view</a></td></tr><tr><td>24</td><td>GPT-NeoXT-Chat-Base (20B)</td><td>34</td><td><a href="https://benchmarks.llmonitor.com/gpt-neoxt-chat-base-20b">view</a></td></tr><tr><td>24</td><td>Code Llama Instruct (34B)</td><td>34</td><td><a href="https://benchmarks.llmonitor.com/codellama-34b-instruct">view</a></td></tr><tr><td>25</td><td>StarCoderChat Alpha (16B)</td><td>33</td><td><a href="https://benchmarks.llmonitor.com/starchat-alpha">view</a></td></tr><tr><td>25</td><td>command-light</td><td>33</td><td><a href="https://benchmarks.llmonitor.com/command-light">view</a></td></tr><tr><td>26</td><td>Weaver 12k</td><td>32</td><td><a href="https://benchmarks.llmonitor.com/weaver">view</a></td></tr><tr><td>26</td><td>Falcon Instruct (7B)</td><td>32</td><td><a href="https://benchmarks.llmonitor.com/falcon-7b-instruct">view</a></td></tr><tr><td>27</td><td>Koala (13B)</td><td>31</td><td><a href="https://benchmarks.llmonitor.com/koala-13b">view</a></td></tr><tr><td>28</td><td>Jurassic 2 Light</td><td>30</td><td><a href="https://benchmarks.llmonitor.com/j2-light">view</a></td></tr><tr><td>28</td><td>Guanaco (13B)</td><td>30</td><td><a href="https://benchmarks.llmonitor.com/guanaco-13b">view</a></td></tr><tr><td>29</td><td>Code Llama Instruct (7B)</td><td>24</td><td><a href="https://benchmarks.llmonitor.com/codellama-7b-instruct">view</a></td></tr><tr><td>29</td><td>RedPajama-INCITE Chat (3B)</td><td>24</td><td><a href="https://benchmarks.llmonitor.com/redpajama-incite-chat-3b-v1">view</a></td></tr><tr><td>30</td><td>Dolly v2 (12B)</td><td>23</td><td><a href="https://benchmarks.llmonitor.com/dolly-v2-12b">view</a></td></tr><tr><td>31</td><td>Dolly v2 (7B)</td><td>21</td><td><a href="https://benchmarks.llmonitor.com/dolly-v2-7b">view</a></td></tr><tr><td>32</td><td>Dolly v2 (3B)</td><td>17</td><td><a href="https://benchmarks.llmonitor.com/dolly-v2-3b">view</a></td></tr><tr><td>33</td><td>Open-Assistant StableLM SFT-7 (7B)</td><td>10</td><td><a href="https://benchmarks.llmonitor.com/stablelm-7b-sft-v7-epoch-3">view</a></td></tr><tr><td>34</td><td>Open-Assistant Pythia SFT-4 (12B)</td><td>7</td><td><a href="https://benchmarks.llmonitor.com/oasst-sft-4-pythia-12b-epoch-3.5">view</a></td></tr></tbody></table><!--/$--><!--/$--></div></div>]]>
@@ -1204,7 +1733,7 @@ October 8, 2023 | https://benchmarks.llmonitor.com/leaderboard | <a href="https:
             </title>
             <description>
 <![CDATA[
-Score 514 | Comments 54 (<a href="https://news.ycombinator.com/item?id=37810144">thread link</a>) | @eieio
+Score 559 | Comments 55 (<a href="https://news.ycombinator.com/item?id=37810144">thread link</a>) | @eieio
 <br/>
 October 8, 2023 | https://eieio.games/nonsense/game-11-flappy-bird-finder/ | <a href="https://web.archive.org/web/*/https://eieio.games/nonsense/game-11-flappy-bird-finder/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div itemprop="articleBody">
@@ -1396,7 +1925,7 @@ October 8, 2023 | https://eieio.games/nonsense/game-11-flappy-bird-finder/ | <a 
             </title>
             <description>
 <![CDATA[
-Score 62 | Comments 62 (<a href="https://news.ycombinator.com/item?id=37809869">thread link</a>) | @amadeuspagel
+Score 62 | Comments 64 (<a href="https://news.ycombinator.com/item?id=37809869">thread link</a>) | @amadeuspagel
 <br/>
 October 8, 2023 | https://markxu.com/strong-evidence | <a href="https://web.archive.org/web/*/https://markxu.com/strong-evidence">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1557,7 +2086,7 @@ October 8, 2023 | https://interestingauthors.com/blog/experience/quora/ | <a hre
             </title>
             <description>
 <![CDATA[
-Score 192 | Comments 63 (<a href="https://news.ycombinator.com/item?id=37809126">thread link</a>) | @billwashere
+Score 195 | Comments 64 (<a href="https://news.ycombinator.com/item?id=37809126">thread link</a>) | @billwashere
 <br/>
 October 8, 2023 | https://docs.paradedb.com/blog/introducing_bm25 | <a href="https://web.archive.org/web/*/https://docs.paradedb.com/blog/introducing_bm25">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p><img src="https://mintlify.s3-us-west-1.amazonaws.com/paradedb/blog/images/bm25.png"></p><p>We’re unveiling <code>pg_bm25</code>: a Rust-based Postgres extension that significantly improves Postgres’ full text
@@ -1643,7 +2172,7 @@ or <a href="https://github.com/paradedb/paradedb#from-self-hosted-postgres" targ
             </title>
             <description>
 <![CDATA[
-Score 77 | Comments 82 (<a href="https://news.ycombinator.com/item?id=37809111">thread link</a>) | @rthnbgrredf
+Score 77 | Comments 83 (<a href="https://news.ycombinator.com/item?id=37809111">thread link</a>) | @rthnbgrredf
 <br/>
 October 8, 2023 | https://www.bejarano.io/terraform-stateless-critique/ | <a href="https://web.archive.org/web/*/https://www.bejarano.io/terraform-stateless-critique/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content">
@@ -2246,7 +2775,7 @@ Recently I got put in change of wrangling 25+ TB of raw genotyping data for my l
             </title>
             <description>
 <![CDATA[
-Score 600 | Comments 179 (<a href="https://news.ycombinator.com/item?id=37800951">thread link</a>) | @thunderbong
+Score 606 | Comments 179 (<a href="https://news.ycombinator.com/item?id=37800951">thread link</a>) | @thunderbong
 <br/>
 October 7, 2023 | https://nerdyarticles.com/a-clutter-free-life-with-paperless-ngx/ | <a href="https://web.archive.org/web/*/https://nerdyarticles.com/a-clutter-free-life-with-paperless-ngx/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section>
@@ -2427,7 +2956,7 @@ services:
             </title>
             <description>
 <![CDATA[
-Score 243 | Comments 71 (<a href="https://news.ycombinator.com/item?id=37800062">thread link</a>) | @orlp
+Score 244 | Comments 71 (<a href="https://news.ycombinator.com/item?id=37800062">thread link</a>) | @orlp
 <br/>
 October 7, 2023 | https://orlp.net/blog/subtraction-is-functionally-complete/ | <a href="https://web.archive.org/web/*/https://orlp.net/blog/subtraction-is-functionally-complete/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -2796,7 +3325,7 @@ October 6, 2023 | https://simone.org/honeypot-diaries/ | <a href="https://web.ar
             </title>
             <description>
 <![CDATA[
-Score 142 | Comments 77 (<a href="https://news.ycombinator.com/item?id=37797696">thread link</a>) | @inmygarage
+Score 143 | Comments 77 (<a href="https://news.ycombinator.com/item?id=37797696">thread link</a>) | @inmygarage
 <br/>
 October 6, 2023 | https://amandapeyton.com/blog/2023/10/braid-is-dead-long-live-braid/ | <a href="https://web.archive.org/web/*/https://amandapeyton.com/blog/2023/10/braid-is-dead-long-live-braid/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2959,7 +3488,7 @@ Through the narrow aisles of pain.</p>
             </title>
             <description>
 <![CDATA[
-Score 97 | Comments 14 (<a href="https://news.ycombinator.com/item?id=37797659">thread link</a>) | @zachdaniel
+Score 98 | Comments 14 (<a href="https://news.ycombinator.com/item?id=37797659">thread link</a>) | @zachdaniel
 <br/>
 October 6, 2023 | https://jon.hk/elixir/ash/a-gentle-primer-to-ash/ | <a href="https://web.archive.org/web/*/https://jon.hk/elixir/ash/a-gentle-primer-to-ash/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4678,7 +5207,7 @@ Potions.Student.assign_house!(rachel, %{house_id: 3})</code></pre>
             </title>
             <description>
 <![CDATA[
-Score 261 | Comments 115 (<a href="https://news.ycombinator.com/item?id=37797606">thread link</a>) | @bobbydigitales
+Score 262 | Comments 115 (<a href="https://news.ycombinator.com/item?id=37797606">thread link</a>) | @bobbydigitales
 <br/>
 October 6, 2023 | https://dotbigbang.com/game/1af877e9bfdb47088611f55982b7570f/prestons-diamond-wars?mp=playdw | <a href="https://web.archive.org/web/*/https://dotbigbang.com/game/1af877e9bfdb47088611f55982b7570f/prestons-diamond-wars?mp=playdw">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -6139,7 +6668,7 @@ October 6, 2023 | https://whattoreadafter.xyz/ai-librarian | <a href="https://we
             </title>
             <description>
 <![CDATA[
-Score 59 | Comments 11 (<a href="https://news.ycombinator.com/item?id=37796980">thread link</a>) | @heyjonboy
+Score 60 | Comments 11 (<a href="https://news.ycombinator.com/item?id=37796980">thread link</a>) | @heyjonboy
 <br/>
 October 6, 2023 | https://kellanem.com/notes/push-and-pull | <a href="https://web.archive.org/web/*/https://kellanem.com/notes/push-and-pull">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div aria-label="Content">
@@ -6583,7 +7112,7 @@ data and where it might be flaky.
             </title>
             <description>
 <![CDATA[
-Score 263 | Comments 40 (<a href="https://news.ycombinator.com/item?id=37792097">thread link</a>) | @Ivoah
+Score 265 | Comments 41 (<a href="https://news.ycombinator.com/item?id=37792097">thread link</a>) | @Ivoah
 <br/>
 October 6, 2023 | https://blog.meain.io/2023/what-is-in-dot-git/ | <a href="https://web.archive.org/web/*/https://blog.meain.io/2023/what-is-in-dot-git/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -6751,7 +7280,7 @@ October 6, 2023 | https://blog.meain.io/2023/what-is-in-dot-git/ | <a href="http
             </title>
             <description>
 <![CDATA[
-Score 21 | Comments 24 (<a href="https://news.ycombinator.com/item?id=37790782">thread link</a>) | @jithinraj
+Score 22 | Comments 24 (<a href="https://news.ycombinator.com/item?id=37790782">thread link</a>) | @jithinraj
 <br/>
 October 6, 2023 | https://olilo.ai/llms | <a href="https://web.archive.org/web/*/https://olilo.ai/llms">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -7142,148 +7671,10 @@ October 5, 2023 | https://transformer-circuits.pub/2023/monosemantic-features/in
             </title>
             <description>
 <![CDATA[
-Score 64 | Comments 9 (<a href="https://news.ycombinator.com/item?id=37787238">thread link</a>) | @taubek
+Score 98 | Comments 19 (<a href="https://news.ycombinator.com/item?id=37787238">thread link</a>) | @taubek
 <br/>
 October 5, 2023 | https://thisisimportant.net/posts/process-models-for-documentation/ | <a href="https://web.archive.org/web/*/https://thisisimportant.net/posts/process-models-for-documentation/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content">
-<article>
-    <p>As a tech writer, I’ve encountered a number of different processes that teams and companies have used to
-add documentation to their product development processes. Some of these are intentional and others are
-incidental—but all are used to create documentation across the software development industry.</p>
-<p>At its most basic, the product development life cycle involves the following steps:</p>
-<p><img src="https://thisisimportant.net/images/2023/09/pdlc.png" alt="Rough sequential timeline of plan, design, develop, test, and release steps."></p>
-<p>When you add documentation, that might look something like this:</p>
-<p><a href="https://thisisimportant.net/images/2023/09/process-basic.png"><img src="https://thisisimportant.net/images/2023/09/process-basic.png" alt="Sequential timeline of two simultaneous processes, one for development with steps of plan, design, develop, test, and release, and another for documentation with a shorter step to coordinate timelines and resources, a shorter step to consult on UI text at the same time as design, a step to write documentation midway through development, a review and test step overlapping with the test step in development, and a publishing step coinciding with the release step."></a></p>
-<p>The typical models I’ve encountered working as a tech writer can be categorized as follows:</p>
-
-<h2 id="the-throw-it-over-the-wall-model">The “throw it over the wall” model</h2>
-<p>The “throw it over the wall” model happens when engineering and documentation teams don’t have much
-interaction. Instead, in a waterfall-like approach, the development team creates something and tells the
-documentation writer about it after it’s built.</p>
-<p>This can happen intentionally or incidentally. Maybe an entire feature gets developed, is ready to launch, and someone lets the documentation writer know—before or after the release.</p>
-<p><a href="https://thisisimportant.net/images/2023/09/process-throw-over-wall.png"><img src="https://thisisimportant.net/images/2023/09/process-throw-over-wall.png" alt="A timeline showing four different job duties, PM, UX, engineering, and documentation. The first three start planning, then design happens, then development happens, then after development finishes, PM requests documentation and documentation plans, drafts, and reviews the documentation while development finishes testing, then there is a coordinated release."></a></p>
-<h3 id="advantages">Advantages</h3>
-<p>The advantages to this model are largely to the organization:</p>
-<ul>
-<li><strong>Can work well across time zones</strong> where the engineering team is in one location and the writer is in
-another, because you don’t have to try to do synchronous work like attend the same meetings.</li>
-<li><strong>Faster to write documentation</strong> because the product or feature is fully functional when the writer starts
-drafting. Encountering bugs during the drafting process can create a feedback loop where the writer can help
-improve the product and maintain (or build) empathy for the reader, but it definitely slows down
-drafting when key functionality is broken or not developed yet.</li>
-</ul>
-<h3 id="disadvantages">Disadvantages</h3>
-<p>The disadvantages of this model are both to the customer experience:</p>
-<ul>
-<li><strong>Little to no ability to improve or change the product</strong> in response to documentation feedback, because
-development is already complete. At best, the writer can file bugs or stories to get picked up later if they
-are validated by customer feedback. // for the product</li>
-<li><strong>Inconsistent feature coverage in the documentation</strong> because only the items that get thrown over the wall
-as part of a request for documentation get documented. This can lead to content drift, where the docs no
-longer match the product in some cases, or are missing some features that could use documentation.</li>
-<li><strong>Delays between feature launch and published documentation</strong>. Depending on when the feature is thrown over
-the wall, you can get delays between launching the feature and publishing documentation. If that happens,
-customers might not find out about the new feature, or if they do, don’t have any documentation to help them
-if they’re confused or something is broken, forcing them to file a support case if they can.
-Ultimately, this delay can make customers dissatisfied with your product.</li>
-</ul>
-<p>And to the organization and its writers:</p>
-<ul>
-<li><strong>Unpredictable workload for the writer.</strong> By not being involved in the planning process and finding out
-about a project when it lands on the other side of the wall, there’s a constant juggling of priorities with
-little flexibility on timelines. If every project appears as a surprise, it’s pretty difficult to
-plan resources or estimates.</li>
-<li><strong>Pressure to write documentation quickly</strong> because documentation was left as the last step in the process,
-they’re seen as a bottleneck to the release process.</li>
-<li><strong>Low context about the product and low rapport with the team.</strong> You might produce documentation that misses
-key functionality that wasn’t apparent to you when you encountered the functionality, or not have a full
-understanding of what was built or why, depending on what the handoff process looks like.</li>
-</ul>
-<h2 id="the-put-out-the-latest-fire-model">The “put out the latest fire” model</h2>
-<p>This is a fairly common model, especially for overburdened documentation writers or those working as
-contractors or consultants on a project. You could be an external freelancer brought in to work on a specific
-project or be part of a documentation or content team that works with others on a project-by-project basis.</p>
-<p><a href="https://thisisimportant.net/images/2023/09/process-put-out-fire.png"><img src="https://thisisimportant.net/images/2023/09/process-put-out-fire.png" alt="A timeline showing four different job duties, PM, UX, engineering, and documentation. The first three start planning, then as design starts happening and engineering starts planning, documentation starts planning too. As design finishes, development has started, and PM (optionally) reviews and approves a doc plan. The doc writer drafts documentation while development finishes and goes into test, then there’s a short review cycle and a coordinated release process across all teams."></a></p>
-<h3 id="advantages-1">Advantages</h3>
-<p>The advantages to this model are largely to the organization:</p>
-<ul>
-<li><strong>Lets fewer tech writers work across more projects.</strong> Whether it’s successful is debatable, due to the
-volume of context switching required by the writers.</li>
-<li><strong>Faster onboarding onto new projects or teams</strong>, since the onus is on the project team to build the context
-for the writer, often to the degree of writing drafts or sending screenshots to the writer.</li>
-<li><strong>Can permit flexibility in commitments</strong>, where projects without allocations go intentionally undocumented
-(or get delayed) because the documentation team doesn’t have the resources to support a requested project,
-or you can move a writer from one area to another</li>
-</ul>
-<h3 id="disadvantages-1">Disadvantages</h3>
-<p>The disadvantages are borne by both customers and the organization:</p>
-<ul>
-<li><strong>Results in feature-driven documentation rather than user-centric documentation.</strong>
-Because the writer has less context on the what, why, and for whom of the project, you can end up with
-feature-driven documentation that describes what was built rather than what the reader can accomplish
-with the new functionality.</li>
-<li><strong>Estimating documentation workload is challenging</strong> due to the overlapping and intersecting projects,
-combined with the difficult-to-anticipate effects of context switching. More time can be spent juggling priorities than writing, and writers can quickly end up overburdened compared with their colleagues.</li>
-<li><strong>Needs org-wide process consistency to be successful.</strong> If project teams don’t work using the same (or at
-least clearly documented) processes and rituals, the onboarding process onto a new project or team can be
-jarring and slow, somewhat erasing the benefits of moving writers to other projects as they’re needed.</li>
-</ul>
-<h2 id="the-im-with-the-team-model">The “I’m with the team” model</h2>
-<p>In this model, the documentation writer is treated as a full-fledged member of the engineering team, involved
-in all the same meetings, Slack channels, and most discussions.</p>
-<p><a href="https://thisisimportant.net/images/2023/09/process-with-the-team.png"><img src="https://thisisimportant.net/images/2023/09/process-with-the-team.png" alt="A timeline showing four different job duties, PM, UX, engineering, and documentation. PM starts planning, then design, docs, and engineering are brought in to plan at the same time. Designing starts and documentation collaborates on UI text, and development starts. When development is mostly complete, documentation drafting starts and is reviewed while the product is being tested. Then there’s a coordinated release across all teams."></a></p>
-<h3 id="advantages-2">Advantages</h3>
-<p>The advantages of this approach are mostly for the customer:</p>
-<ul>
-<li><strong>User-centric documentation rather than feature-driven documentation.</strong> If you know what is being built,
-why, and who for, it’s a lot easier to craft documentation that is guided by the user goals guiding product
-development rather than writing down what was built and how it works.</li>
-<li><strong>Increased consistency in product text (and improved product quality).</strong> Because the writer is involved
-throughout the development and design processes, they can contribute to text in the product—whether UI text
-(content design) or API specifications and descriptions.</li>
-<li><strong>Accelerated content development.</strong> With ultimate context and involvement on what is going on, and little
-if any context switching, the writer can produce documentation fairly quickly and without too much delay
-before and after development and testing ends.</li>
-</ul>
-<h3 id="disadvantages-2">Disadvantages</h3>
-<p>The disadvantages of this approach are borne largely by the organization:</p>
-<ul>
-<li><strong>It can be resource intensive.</strong> It’s often not economical to have a 1:1 writer to team ratio because not
-every project that engineering works on requires documentation. Of course, if engineers are working on
-technical debt, writers can also spend time on documentation debt or professional development, but this sort
-of luxurious level of staffing isn’t one that I’ve ever seen. Depending on the pace of development, the
-optimal writer ratio might be closer to 1:3 writer to teams, but that’s still higher than the other models.</li>
-<li><strong>Writers can waste effort and get confused</strong> if they start drafting before the product is finished
-“enough” to start drafting. If you document every iteration of a feature flow before it is finalized,
-you might write the same procedure multiple times. Sometimes these drafts let you get to the most efficient
-and concise way of explaining something, but there’s also a risk that a writer gets attached to an
-incorrect mental model and the procedure ends up less clear than it might have otherwise.</li>
-<li><strong>Can introduce single points of failure.</strong> If every writer is embedded in a specific team, there is a risk
-that if that writer goes on vacation or quits, no one else will have enough context to cover for them
-effectively.</li>
-<li><strong>The writers can be siloed and lack visibility into other projects at the company</strong>. Because the writers
-spend more time with their engineering team(s) than the documentation team, this approach takes extra effort
-to build documentation team cohesion and consistency across the writing styles on the team.</li>
-</ul>
-<h2 id="which-model-is-the-best">Which model is the best?</h2>
-<p>It depends on your priorities and circumstances!</p>
-<p><img src="https://thisisimportant.net/images/2023/09/process-trifecta.png" alt="A decorative image showing the three models, a wall to symbolize throwing it over the wall, an orange and yellow flame to symbolize putting out fires, and three orblike people icons to symbolize being part of the team."></p>
-<p>In an ideal world, I think that the “I’m with the team” model is the one most likely to produce the
-best documentation — but it’s also the most resource-intensive, and therefore might not be the most
-feasible option for every organization.</p>
-<p>The “put out the latest fire” model can work well at a company with low-complexity projects and consistent
-organization-wide procedures, making it possible to plug-and-play writers on demand to different projects.
-Unfortunately, many projects that require documentation also benefit from strong domain expertise and local
-project context, so this approach is best suited for short term transition phases at a company. After you
-know what projects are going to stick around and need writing commitment, you can invest in a more proactive
-and embedded approach like the “I’m with the team” model.</p>
-<p>For small companies like a seed-stage startup, or one that is great at asynchronous communication, the
-“throw it over the wall” approach lets you add documentation without changing your core engineering
-processes. If you’re at the early stage where you’re prioritizing moving as fast as possible most of the
-time, this approach probably makes sense.</p>
-</article>
-
-        </div></div>]]>
+<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
             </description>
             <link>https://thisisimportant.net/posts/process-models-for-documentation/</link>
             <guid isPermaLink="false">hacker-news-small-sites-37787238</guid>
@@ -7310,7 +7701,7 @@ October 5, 2023 | https://here.news/post/93c46bbd-ea0d-48e2-bba6-135e58887f81/ch
             </title>
             <description>
 <![CDATA[
-Score 81 | Comments 11 (<a href="https://news.ycombinator.com/item?id=37787161">thread link</a>) | @EntICOnc
+Score 86 | Comments 11 (<a href="https://news.ycombinator.com/item?id=37787161">thread link</a>) | @EntICOnc
 <br/>
 October 5, 2023 | https://seri.tools/blog/compiling-rust-for-legacy-windows/# | <a href="https://web.archive.org/web/*/https://seri.tools/blog/compiling-rust-for-legacy-windows/#">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><main><div><p>Posted: 2020-05-26</p><p>Discussion on <a href="https://www.reddit.com/r/rust/comments/gr0xqa/compiling_rust_binaries_for_windows_98_se_and/">/r/rust</a>, <a href="https://news.ycombinator.com/item?id=23313577">HN</a>, <a href="https://users.rust-lang.org/t/compiling-rust-binaries-for-windows-98-se-and-more-a-journey/43283">Rust user forum</a></p><p><em>tl;dr:</em> It actually works, mostly! See the <a href="https://seri.tools/blog/compiling-rust-for-legacy-windows/#conclusion">conclusion</a> down below.</p><p>Did you know that <a href="https://www.rust-lang.org/">Rust</a> has a <a href="https://forge.rust-lang.org/release/platform-support.html">Tier 2 target</a> called <code>i586-pc-windows-msvc</code>? I didn't either, until a few days ago. This target disables SSE2 support and only emits instructions available on the original <a href="https://en.wikipedia.org/wiki/P5_(microarchitecture)">Intel Pentium</a> from 1993.</p><p>So, for fun, I wanted to try compiling a binary that works on similarly old systems. My retro Windows of choice is Windows 98 Second Edition, so that is what I have settled for as the initial target for this project.</p><p>Some inspiration also came from <a href="https://www.hanselman.com/blog/NETEverywhereApparentlyAlsoMeansWindows311AndDOS.aspx">C# running on Windows 3.11</a>.</p><h2 id="prerequisites">Prerequisites<a href="#prerequisites">&nbsp;(link)</a></h2><h3 id="visual-c-toolset">Visual C++ Toolset<a href="#visual-c-toolset">&nbsp;(link)</a></h3><p>After a quick search online it seems that the Visual C++ 2005 toolset is the last one that officially supports building for Windows 98. A quick Windows 10 VM and Visual Studio installation later, I've copied the whole <code>Microsoft Visual Studio 8</code> folder over to my host machine, knowing from previous endeavours that the CLI tools in Microsoft's C/C++ toolset are pretty much portable, as long as the environment variables are set correctly. The toolset includes a handful of batch files like <code>vsvars32.bat</code>, setting the proper paths and variables automatically. I've copied it and altered all the paths to point to the correct locations on my host machine.</p><h3 id="rust">Rust<a href="#rust">&nbsp;(link)</a></h3><p>Since I was sure that some tinkering with <code>rustc</code> and/or the standard library will be necessary, I've checked out the Rust repo. Some <code>scoop install python</code>, setting the correct host and target in the <code>config.toml</code>, and <code>python x.py build -i --stage 1 src/libstd</code> later, Rust and all the dependencies began compiling! After 26 Minutes and 18 Gigabytes the stage 1 compiler and standard library for <code>x86_64-pc-windows-msvc</code> and <code>i586-pc-windows-msvc</code> have been built!</p><p>Props to the people that wrote the extensive documentation inside of <code>config.toml.example</code> and <a href="https://rustc-dev-guide.rust-lang.org/building/suggested.html">online</a>, making the build not much harder than your regular ol' Rust crate!</p><p>In order to use the fresh new toolchain, we have to tell <code>rustup</code> about it:</p><pre><code><span>rustup toolchain link win98 D:\RustProjs\rust\build\x86_64-pc-windows-msvc\stage1
@@ -7896,7 +8287,7 @@ October 5, 2023 | https://ollama.ai/blog/ollama-is-now-available-as-an-official-
             </title>
             <description>
 <![CDATA[
-Score 201 | Comments 34 (<a href="https://news.ycombinator.com/item?id=37785920">thread link</a>) | @xnx
+Score 202 | Comments 34 (<a href="https://news.ycombinator.com/item?id=37785920">thread link</a>) | @xnx
 <br/>
 October 5, 2023 | https://landing.google.co.jp/caps/ | <a href="https://web.archive.org/web/*/https://landing.google.co.jp/caps/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
