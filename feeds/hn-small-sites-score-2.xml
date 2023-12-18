@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Mon, 18 Dec 2023 12:23:58 GMT</lastBuildDate>
+        <lastBuildDate>Mon, 18 Dec 2023 16:23:20 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-2.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Mon, 18 Dec 2023 12:23:58 GMT</pubDate>
+        <pubDate>Mon, 18 Dec 2023 16:23:20 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -18,6 +18,1263 @@
 <![CDATA[me@alexwendland.com (Alex Wendland)]]>
         </managingEditor>
         <ttl>240</ttl>
+        <item>
+            <title>
+<![CDATA[Python, C, Assembly – Faster Cosine Similarity]]>
+            </title>
+            <description>
+<![CDATA[
+Score 3 | Comments 0 (<a href="https://news.ycombinator.com/item?id=38684461">thread link</a>) | @ashvardanian
+<br/>
+December 18, 2023 | https://ashvardanian.com/posts/python-c-assembly-comparison/ | <a href="https://web.archive.org/web/*/https://ashvardanian.com/posts/python-c-assembly-comparison/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p><a href="https://ashvardanian.com/tags/less-slow/">In this fourth article of the “Less Slow” series</a>, I’m accelerating <a href="https://github.com/unum-cloud">Unum’s open-source Vector Search primitives</a> used by some great database and cloud providers to replace Meta’s <a href="https://github.com/facebookresearch/faiss">FAISS</a> and scale-up search in their products. This time, our focus is on the most frequent operation for these tasks - computing the the Cosine Similarity/Distance between two vectors. It’s so common, even doubling it’s performance can have a noticeable impact on applications economics. But compared to a pure Python baseline our <strong>single-threaded performance grew by a factor of 2'500x</strong>. Let’s go through optimizations one by one:</p><ul><li><a href="#python">Kicking off with basic Python</a>.</li><li><a href="#numpy-between-python-and-c">Noticed a 35x slowdown when not using NumPy right</a>.</li><li><a href="#scipy">Managed a 2-5x speed boost with SciPy</a>.</li><li><a href="#c">Jumped to a 200x speedup using C</a>.</li><li><a href="#assembly">A big leap to 400x faster with SIMD intrinsics</a>.</li><li><a href="#bmi2-and-goto">Touched 747x combining AVX-512 and BMI2</a>.</li><li><a href="#fp16">Climbed to 1,260x adding AVX-512FP16</a>.</li><li><a href="#vnni">The final high: 2,521x faster with AVX-512VNNI</a>.</li></ul><p><img loading="lazy" src="https://ashvardanian.com/python-c-assembly-comparison/python-vs-c-vs-assembly.png" alt="Cover"></p><p>Some highlights:</p><ul><li>Again, <code>goto</code> doesn’t get the love it deserves in C.</li><li>BMI2 instructions on x86 are consistently overlooked… thanks to AMD Zen2, I guess.</li><li>AVX-512FP16 is probably the most important extension in the current AI race.</li></ul><blockquote><p>I’m still scratching my head on the <strong>4VNNI</strong> extensions of AVX-512, and couldn’t find a good way to benefit from them here or even in the polynomial approximations of the <a href="https://ashvardanian.com/posts/gcc-12-vs-avx512fp16/">Jensen Shannon divergence computations in the last post</a>, so please let me know where I should try them 🤗</p></blockquote><h2 id="cosine-similarity">Cosine Similarity</h2><p>Cosine Similarity is a way to check if two “vectors” are looking in the same direction, regardless of their magnitude. It is a widespread metric used in Machine Learning and Information Retrieval, and it is defined as:</p><p>$$
+\cos(\theta) = \frac{A \cdot B}{|A| |B|} = \frac{\sum_{i=1}^{n} A_i B_i}{\sqrt{\sum_{i=1}^{n} A_i^2} \sqrt{\sum_{i=1}^{n} B_i^2}}
+$$</p><p>Where $A$ and $B$ are two vectors with $n$ dimensions. The cosine similarity is a value between $-1$ and $1$, where $1$ means that the two vectors are pointing in the same direction, $-1$ implies that they are pointing in opposite directions and $0$ means that they are orthogonal. Cosine Distance, in turn, is a distance function, which is defined as $1 - \cos(\theta)$. It is a value between $0$ and $2$, where $0$ means that the two vectors are identical, and $2$ means that they are pointing in opposite directions. <em>I may use the terms interchangeably, but they are not exactly the same.</em></p><h2 id="python">Python</h2><p>The first implementation is the most naive one, written in pure Python… by ChatGPT. It is a direct translation of the mathematical formula and is very easy to read and understand.</p><div><div><table><tbody><tr><td><pre tabindex="0"><code><span id="hl-0-1"><a href="#hl-0-1">1</a>
+</span><span id="hl-0-2"><a href="#hl-0-2">2</a>
+</span><span id="hl-0-3"><a href="#hl-0-3">3</a>
+</span><span id="hl-0-4"><a href="#hl-0-4">4</a>
+</span><span id="hl-0-5"><a href="#hl-0-5">5</a>
+</span><span id="hl-0-6"><a href="#hl-0-6">6</a>
+</span></code></pre></td><td><pre tabindex="0"><code data-lang="python"><span><span><span>def</span> <span>cosine_distance</span><span>(</span><span>a</span><span>,</span> <span>b</span><span>):</span>
+</span></span><span><span>    <span>dot_product</span> <span>=</span> <span>sum</span><span>(</span><span>ai</span> <span>*</span> <span>bi</span> <span>for</span> <span>ai</span><span>,</span> <span>bi</span> <span>in</span> <span>zip</span><span>(</span><span>a</span><span>,</span> <span>b</span><span>))</span>
+</span></span><span><span>    <span>magnitude_a</span> <span>=</span> <span>math</span><span>.</span><span>sqrt</span><span>(</span><span>sum</span><span>(</span><span>ai</span> <span>*</span> <span>ai</span> <span>for</span> <span>ai</span> <span>in</span> <span>a</span><span>))</span>
+</span></span><span><span>    <span>magnitude_b</span> <span>=</span> <span>math</span><span>.</span><span>sqrt</span><span>(</span><span>sum</span><span>(</span><span>bi</span> <span>*</span> <span>bi</span> <span>for</span> <span>bi</span> <span>in</span> <span>b</span><span>))</span>
+</span></span><span><span>    <span>cosine_similarity</span> <span>=</span> <span>dot_product</span> <span>/</span> <span>(</span><span>magnitude_a</span> <span>*</span> <span>magnitude_b</span><span>)</span>
+</span></span><span><span>    <span>return</span> <span>1</span> <span>-</span> <span>cosine_similarity</span>
+</span></span></code></pre></td></tr></tbody></table></div></div><p>I’ll run on 4th Gen Intel Xeon CPUs, codenamed Sapphire Rapids, and available on AWS as the <code>r7iz</code> instances. Before running a benchmark, let’s generate random numbers and put them into a list, simulating the 1536-dimensional “embeddings” from the OpenAI Ada service.</p><div><div><table><tbody><tr><td><pre tabindex="0"><code><span id="hl-1-1"><a href="#hl-1-1">1</a>
+</span><span id="hl-1-2"><a href="#hl-1-2">2</a>
+</span><span id="hl-1-3"><a href="#hl-1-3">3</a>
+</span></code></pre></td><td><pre tabindex="0"><code data-lang="py"><span><span><span>np</span><span>.</span><span>random</span><span>.</span><span>seed</span><span>(</span><span>0</span><span>)</span>
+</span></span><span><span><span>a_list</span> <span>=</span> <span>np</span><span>.</span><span>random</span><span>.</span><span>rand</span><span>(</span><span>1536</span><span>)</span><span>.</span><span>tolist</span><span>()</span>
+</span></span><span><span><span>b_list</span> <span>=</span> <span>np</span><span>.</span><span>random</span><span>.</span><span>rand</span><span>(</span><span>1536</span><span>)</span><span>.</span><span>tolist</span><span>()</span>
+</span></span></code></pre></td></tr></tbody></table></div></div><p>Running the benchmark with the <code>%timeit</code> utility, we get <strong>93.2 µs</strong> ± 1.75 µs per loop.. Or roughly 100 microseconds per call. Is that good or bad?</p><p>Our solution is Pythonic but inefficient, as it traverses each <code>list</code> twice. So let’s use the common Pythonic <code>zip</code> idiom:</p><div><div><table><tbody><tr><td><pre tabindex="0"><code><span id="hl-2-1"><a href="#hl-2-1"> 1</a>
+</span><span id="hl-2-2"><a href="#hl-2-2"> 2</a>
+</span><span id="hl-2-3"><a href="#hl-2-3"> 3</a>
+</span><span id="hl-2-4"><a href="#hl-2-4"> 4</a>
+</span><span id="hl-2-5"><a href="#hl-2-5"> 5</a>
+</span><span id="hl-2-6"><a href="#hl-2-6"> 6</a>
+</span><span id="hl-2-7"><a href="#hl-2-7"> 7</a>
+</span><span id="hl-2-8"><a href="#hl-2-8"> 8</a>
+</span><span id="hl-2-9"><a href="#hl-2-9"> 9</a>
+</span><span id="hl-2-10"><a href="#hl-2-10">10</a>
+</span></code></pre></td><td><pre tabindex="0"><code data-lang="py"><span><span><span>def</span> <span>cosine_distance</span><span>(</span><span>a</span><span>,</span> <span>b</span><span>):</span>
+</span></span><span><span>    <span>dot_product</span> <span>=</span> <span>0</span>
+</span></span><span><span>    <span>magnitude_a</span> <span>=</span> <span>0</span>
+</span></span><span><span>    <span>magnitude_b</span> <span>=</span> <span>0</span>
+</span></span><span><span>    <span>for</span> <span>ai</span><span>,</span> <span>bi</span> <span>in</span> <span>zip</span><span>(</span><span>a</span><span>,</span> <span>b</span><span>):</span>
+</span></span><span><span>        <span>dot_product</span> <span>+=</span> <span>ai</span> <span>*</span> <span>bi</span>
+</span></span><span><span>        <span>magnitude_a</span> <span>+=</span> <span>ai</span> <span>*</span> <span>ai</span>
+</span></span><span><span>        <span>magnitude_b</span> <span>+=</span> <span>bi</span> <span>*</span> <span>bi</span>
+</span></span><span><span>    <span>cosine_similarity</span> <span>=</span> <span>dot_product</span> <span>/</span> <span>(</span><span>magnitude_a</span> <span>*</span> <span>magnitude_b</span><span>)</span>
+</span></span><span><span>    <span>return</span> <span>1</span> <span>-</span> <span>cosine_similarity</span>
+</span></span></code></pre></td></tr></tbody></table></div></div><p>Running the benchmark, we get <strong>65.3 µs</strong> ± 716 ns per loop., resulting <strong>30% savings!</strong> I believe it’s a fair baseline.</p><h2 id="numpy-between-python-and-c">NumPy: Between Python and C</h2><p>NumPy is a powerful tool in Python’s toolbox, helping folks work fast with arrays. Many people see it as the go-to for doing science stuff in Python. A lot of machine learning tools lean on it. Since it’s built with C, you’d think it’d be speedy. Let’s take our basic Python lists and make them sharper with NumPy. We’re looking at single-precision, half-precision numbers, and 8-bit integers.</p><div><div><table><tbody><tr><td><pre tabindex="0"><code><span id="hl-3-1"><a href="#hl-3-1">1</a>
+</span><span id="hl-3-2"><a href="#hl-3-2">2</a>
+</span><span id="hl-3-3"><a href="#hl-3-3">3</a>
+</span></code></pre></td><td><pre tabindex="0"><code data-lang="py"><span><span><span>floats</span> <span>=</span> <span>np</span><span>.</span><span>random</span><span>.</span><span>rand</span><span>(</span><span>1536</span><span>)</span><span>.</span><span>astype</span><span>(</span><span>np</span><span>.</span><span>float32</span><span>)</span>
+</span></span><span><span><span>halfs</span> <span>=</span> <span>np</span><span>.</span><span>random</span><span>.</span><span>rand</span><span>(</span><span>1536</span><span>)</span><span>.</span><span>astype</span><span>(</span><span>np</span><span>.</span><span>float16</span><span>)</span>
+</span></span><span><span><span>ints</span> <span>=</span> <span>(</span><span>np</span><span>.</span><span>random</span><span>.</span><span>rand</span><span>(</span><span>1536</span><span>)</span> <span>*</span> <span>100</span><span>)</span><span>.</span><span>astype</span><span>(</span><span>np</span><span>.</span><span>int8</span><span>)</span>
+</span></span></code></pre></td></tr></tbody></table></div></div><p>These are popular choices for quantization (making data smaller) in tools like <a href="https://github.com/facebookresearch/faiss">Meta’s FAISS</a> and <a href="https://github.com/unum-cloud/usearch">Unum’s USearch</a>. Half-precision is pretty handy, working well most of the time. But using integers? That depends on the AI model you’re using. Thanks to <a href="https://www.tensorflow.org/model_optimization/guide/quantization/training">Quantization Aware Training</a>, two of my faves — <a href="https://huggingface.co/intfloat/e5-base-v2">Microsoft’s E5</a> for just text and <a href="https://github.com/unum-cloud/uform">Unum’s UForm</a> for multi-modal data — work well even compressed to 8-bit numbers.</p><hr><p>After getting our vectors set up, I used our <code>cosine_distance</code> function to see how similar the three arrays are:</p><ul><li><code>floats</code>: <strong>349 µs</strong> ± 5.71 µs per loop.</li><li><code>halfs</code>: <strong>525 µs</strong> ± 9.69 µs per loop.</li><li><code>ints</code>: <strong>2.31 ms</strong> ± 26 µs per loop.</li></ul><p>But here’s the problem. Instead of getting faster, things went <strong>35x slower</strong> than our <strong>65.3 µs</strong> starting point. Why?</p><ol><li><p><strong>Memory Management</strong>: Sure, NumPy uses C arrays, which are cool. But every time we loop through them, we turn small byte stuff into bigger Python stuff. And with memory being unpredictable, it’s surprising things didn’t go even slower.</p></li><li><p><strong>Half-Precision Support</strong>: Most new devices support half-precision. But the software side? Not so much. Only a few AI tools use it, and they often focus on GPU stuff, leaving out the CPU. So, converting half-precision things on the go can be slow.</p></li><li><p><strong>Integer Overflows</strong>: Doing math with our tiny integers isn’t smooth. We keep getting these annoying overflow warnings. The CPU spends more time checking things than actually doing the math. We often see things like: <em>“RuntimeWarning: overflow encountered in scalar multiply”</em>.</p></li></ol><p>Here’s a tip: If you’re using NumPy, go all in. Mixing it with regular Python can really slow you down!</p><h2 id="scipy">SciPy</h2><p>NumPy is also the foundation of the SciPy library, which provides many valuable functions for scientific computing, including the <code>scipy.distance.spatial.cosine</code>. It will use the native NumPy operations for as much as possible.</p><ul><li><code>floats</code>: <strong>15.8 µs</strong> ± 416 ns per loop.</li><li><code>halfs</code>: <strong>46.6 µs</strong> ± 291 ns per loop.</li><li><code>ints</code>: <strong>12.2 µs</strong> ± 37.5 ns per loop.</li></ul><p>Now, we see the true potential of NumPy, and the underlying Basic Linear Algebra Subroutines (BLAS) libraries implemented in C, Fortran, and Assembly. Our pure Python baseline was <strong>65.3 µs</strong>, and we now got 2-5 times faster, depending on the data type. Notably, <code>halfs</code> are still slow. Checking the specs of a similar CPU, we can clearly see support for <code>f16c</code> instructions, which means that the CPU can at least decode half-precision values without software emulation, and we shouldn’t be experiencing this much throttling.</p><p><a href="https://www.techpowerup.com/cpu-specs/xeon-platinum-8470q.c3091"><img loading="lazy" src="https://ashvardanian.com/python-c-assembly-comparison/sapphire-rapids-specs.png" alt="Sapphire Rapids Features"></a></p><h2 id="c">C</h2><p>C is the lowest-level hardware-agnostic programming language - hence the best way to optimize small numerical functions, like the Cosine Similarity and Distance.
+It is also trivial to wrap C functions into pure CPython bindings for the default Python runtime, and if you use the FastCall convention, like we do, you can make your custom code as fast as the built-in Python functions, like what I’ve described recently with StringZilla, replacing Python’s default <code>str</code> string class with a faster alternative.
+Unlike C++, however, C doesn’t support “generics” or “template functions”.
+So we have to separately implement the <code>cosine_distance</code> function for each data type we want to support, or use the ugly “macros”:</p><div><div><table><tbody><tr><td><pre tabindex="0"><code><span id="hl-4-1"><a href="#hl-4-1"> 1</a>
+</span><span id="hl-4-2"><a href="#hl-4-2"> 2</a>
+</span><span id="hl-4-3"><a href="#hl-4-3"> 3</a>
+</span><span id="hl-4-4"><a href="#hl-4-4"> 4</a>
+</span><span id="hl-4-5"><a href="#hl-4-5"> 5</a>
+</span><span id="hl-4-6"><a href="#hl-4-6"> 6</a>
+</span><span id="hl-4-7"><a href="#hl-4-7"> 7</a>
+</span><span id="hl-4-8"><a href="#hl-4-8"> 8</a>
+</span><span id="hl-4-9"><a href="#hl-4-9"> 9</a>
+</span><span id="hl-4-10"><a href="#hl-4-10">10</a>
+</span><span id="hl-4-11"><a href="#hl-4-11">11</a>
+</span><span id="hl-4-12"><a href="#hl-4-12">12</a>
+</span><span id="hl-4-13"><a href="#hl-4-13">13</a>
+</span></code></pre></td><td><pre tabindex="0"><code data-lang="c"><span><span><span>#define SIMSIMD_MAKE_COS(name, input_type, accumulator_type, converter)                                                \
+</span></span></span><span><span><span>    inline static simsimd_f32_t simsimd_##name##_##input_type##_cos(                                                   \
+</span></span></span><span><span><span>        simsimd_##input_type##_t const* a, simsimd_##input_type##_t const* b, simsimd_size_t n) {                      \
+</span></span></span><span><span><span>        simsimd_##accumulator_type##_t ab = 0, a2 = 0, b2 = 0;                                                         \
+</span></span></span><span><span><span>        for (simsimd_size_t i = 0; i != n; ++i) {                                                                      \
+</span></span></span><span><span><span>            simsimd_##accumulator_type##_t ai = converter(a[i]);                                                       \
+</span></span></span><span><span><span>            simsimd_##accumulator_type##_t bi = converter(b[i]);                                                       \
+</span></span></span><span><span><span>            ab += ai * bi;                                                                                             \
+</span></span></span><span><span><span>            a2 += ai * ai;                                                                                             \
+</span></span></span><span><span><span>            b2 += bi * bi;                                                                                             \
+</span></span></span><span><span><span>        }                                                                                                              \
+</span></span></span><span><span><span>        return ab != 0 ? 1 - ab * SIMSIMD_RSQRT(a2) * SIMSIMD_RSQRT(b2) : 1;                                           \
+</span></span></span><span><span><span>    }
+</span></span></span></code></pre></td></tr></tbody></table></div></div><p>This is a real snippet from the library and depends on yet another macro - <code>SIMSIMD_RSQRT(x)</code>, defined as the <code>1 / sqrtf(x)</code> by default.
+We later instantiate it for all the data types we need:</p><div><div><table><tbody><tr><td><pre tabindex="0"><code><span id="hl-5-1"><a href="#hl-5-1">1</a>
+</span><span id="hl-5-2"><a href="#hl-5-2">2</a>
+</span><span id="hl-5-3"><a href="#hl-5-3">3</a>
+</span></code></pre></td><td><pre tabindex="0"><code data-lang="c"><span><span><span>SIMSIMD_MAKE_COS</span><span>(</span><span>serial</span><span>,</span> <span>f32</span><span>,</span> <span>f32</span><span>,</span> <span>SIMSIMD_IDENTIFY</span><span>)</span> <span>// `simsimd_serial_f32_cos`
+</span></span></span><span><span><span></span><span>SIMSIMD_MAKE_COS</span><span>(</span><span>serial</span><span>,</span> <span>f16</span><span>,</span> <span>f32</span><span>,</span> <span>SIMSIMD_UNCOMPRESS_F16</span><span>)</span> <span>// `simsimd_serial_f16_cos`
+</span></span></span><span><span><span></span><span>SIMSIMD_MAKE_COS</span><span>(</span><span>serial</span><span>,</span> <span>i8</span><span>,</span> <span>i32</span><span>,</span> <span>SIMSIMD_IDENTIFY</span><span>)</span> <span>// `simsimd_serial_i8_cos`
+</span></span></span></code></pre></td></tr></tbody></table></div></div><p>Those macros will generate the following functions:</p><ul><li><code>simsimd_serial_f32_cos</code>: for 32-bit <code>floats</code>.</li><li><code>simsimd_serial_f16_cos</code>: for 16-bit <code>halfs</code>, accumulating 32-bit values.</li><li><code>simsimd_serial_i8_cos</code>: for 8-bit <code>ints</code>, accumulating 32-bit values.</li></ul><p>We benchmark those using the Google Benchmark library:</p><ul><li><code>floats</code>: 1956 ns ~ <strong>33x</strong> faster than Python.</li><li><code>halfs</code>: 1118 ns ~ <strong>58x</strong> faster than Python.</li><li><code>ints</code>: 299 ns ~ <strong>218x</strong> faster than Python.</li></ul><p>That’s a great result, but this code relies on the compiler to perform heavy lifting and produce efficient Assembly. As we know, sometimes even the most recent compilers, like <a href="https://ashvardanian.com/posts/gcc-12-vs-avx512fp16/">GCC 12, can be 119x slower than hand-written Assembly</a>. Even on the simplest data-parallel tasks, like computing the Jensen Shannon divergence of two discrete probability distributions.</p><blockquote><p lang="en" dir="ltr">I’ve found a fairly simple data-parallel workload, where AVX-512FP16 <a href="https://twitter.com/hashtag/SIMD?src=hash&amp;ref_src=twsrc%5Etfw">#SIMD</a> code beats O3/fast-math assembly produced by GCC 12 by a factor of 118x 🤯🤯🤯<a href="https://t.co/cFftGbMBQe">https://t.co/cFftGbMBQe</a></p>— Ash Vardanian (@ashvardanian) <a href="https://twitter.com/ashvardanian/status/1716581551717433572?ref_src=twsrc%5Etfw">October 23, 2023</a></blockquote><h2 id="assembly">Assembly</h2><p>Assembly is the lowest-level programming language, and it is the closest to the hardware. It is also the most difficult to write and maintain, as it is not portable, and it is very easy to make mistakes. But it is also the most rewarding, as it allows us to write the most efficient code and to use the most advanced hardware features, like AVX-512. AVX-512, in turn, is not a monolith. It’s a very complex instruction set with the following subsets:</p><ul><li>AVX-512F: 512-bit SIMD instructions.</li><li>AVX-512DQ: double-precision floating-point instructions.</li><li>AVX-512BW: byte and word instructions.</li><li>AVX-512VL: vector length extensions.</li><li>AVX-512CD: conflict detection instructions.</li><li>AVX-512ER: exponential and reciprocal instructions.</li><li>AVX-512PF: prefetch instructions.</li><li>AVX-512VBMI: vector byte manipulation instructions.</li><li>AVX-512IFMA: integer fused multiply-add instructions.</li><li>AVX-512VBMI2: vector byte manipulation instructions 2.</li><li><strong>AVX-512VNNI</strong>: vector neural network instructions.</li><li>AVX-512BITALG: bit algorithms instructions.</li><li>AVX-512VPOPCNTDQ: vector population count instructions.</li><li>AVX-5124VNNIW: vector neural network instructions word variable precision.</li><li>AVX-5124FMAPS: fused multiply-add instructions single precision.</li><li>AVX-512VP2INTERSECT: vector pairwise intersect instructions.</li><li>AVX-512BF16: <code>bfloat16</code> instructions.</li><li><strong>AVX-512FP16</strong>: half-precision floating-point instructions.</li></ul><p>Luckily, we won’t need all of them today. If you are curious, you can read more about them in the <a href="https://software.intel.com/content/www/us/en/develop/articles/intel-sdm.html">Intel 64 and IA-32 Architectures Software Developer’s Manual</a>… but be ready, it’s a very long read.</p><p>Moreover, we don’t have to write the Assembly per se, as we can use the <a href="https://software.intel.com/sites/landingpage/IntrinsicsGuide/">SIMD Intrinsics</a> to essentially write the Assembly instructions without leaving C.</p><div><div><table><tbody><tr><td><pre tabindex="0"><code><span id="hl-6-1"><a href="#hl-6-1"> 1</a>
+</span><span id="hl-6-2"><a href="#hl-6-2"> 2</a>
+</span><span id="hl-6-3"><a href="#hl-6-3"> 3</a>
+</span><span id="hl-6-4"><a href="#hl-6-4"> 4</a>
+</span><span id="hl-6-5"><a href="#hl-6-5"> 5</a>
+</span><span id="hl-6-6"><a href="#hl-6-6"> 6</a>
+</span><span id="hl-6-7"><a href="#hl-6-7"> 7</a>
+</span><span id="hl-6-8"><a href="#hl-6-8"> 8</a>
+</span><span id="hl-6-9"><a href="#hl-6-9"> 9</a>
+</span><span id="hl-6-10"><a href="#hl-6-10">10</a>
+</span><span id="hl-6-11"><a href="#hl-6-11">11</a>
+</span><span id="hl-6-12"><a href="#hl-6-12">12</a>
+</span><span id="hl-6-13"><a href="#hl-6-13">13</a>
+</span><span id="hl-6-14"><a href="#hl-6-14">14</a>
+</span><span id="hl-6-15"><a href="#hl-6-15">15</a>
+</span><span id="hl-6-16"><a href="#hl-6-16">16</a>
+</span><span id="hl-6-17"><a href="#hl-6-17">17</a>
+</span><span id="hl-6-18"><a href="#hl-6-18">18</a>
+</span><span id="hl-6-19"><a href="#hl-6-19">19</a>
+</span><span id="hl-6-20"><a href="#hl-6-20">20</a>
+</span><span id="hl-6-21"><a href="#hl-6-21">21</a>
+</span><span id="hl-6-22"><a href="#hl-6-22">22</a>
+</span><span id="hl-6-23"><a href="#hl-6-23">23</a>
+</span><span id="hl-6-24"><a href="#hl-6-24">24</a>
+</span><span id="hl-6-25"><a href="#hl-6-25">25</a>
+</span><span id="hl-6-26"><a href="#hl-6-26">26</a>
+</span></code></pre></td><td><pre tabindex="0"><code data-lang="c"><span><span><span>__attribute__</span><span>((</span><span>target</span><span>(</span><span>"avx512f,avx512vl"</span><span>)))</span> <span>//
+</span></span></span><span><span><span></span><span>inline</span> <span>static</span> <span>simsimd_f32_t</span>
+</span></span><span><span><span>simsimd_avx512_f32_cos</span><span>(</span><span>simsimd_f32_t</span> <span>const</span><span>*</span> <span>a</span><span>,</span> <span>simsimd_f32_t</span> <span>const</span><span>*</span> <span>b</span><span>,</span> <span>simsimd_size_t</span> <span>n</span><span>)</span> <span>{</span>
+</span></span><span><span>    <span>__m512</span> <span>ab_vec</span> <span>=</span> <span>_mm512_set1_ps</span><span>(</span><span>0</span><span>);</span>
+</span></span><span><span>    <span>__m512</span> <span>a2_vec</span> <span>=</span> <span>_mm512_set1_ps</span><span>(</span><span>0</span><span>);</span>
+</span></span><span><span>    <span>__m512</span> <span>b2_vec</span> <span>=</span> <span>_mm512_set1_ps</span><span>(</span><span>0</span><span>);</span>
+</span></span><span><span>
+</span></span><span><span>    <span>for</span> <span>(</span><span>simsimd_size_t</span> <span>i</span> <span>=</span> <span>0</span><span>;</span> <span>i</span> <span>&lt;</span> <span>n</span><span>;</span> <span>i</span> <span>+=</span> <span>16</span><span>)</span> <span>{</span>
+</span></span><span><span>        <span>__mmask16</span> <span>mask</span> <span>=</span> <span>n</span> <span>-</span> <span>i</span> <span>&gt;=</span> <span>16</span> <span>?</span> <span>0xFFFF</span> <span>:</span> <span>((</span><span>1u</span> <span>&lt;&lt;</span> <span>(</span><span>n</span> <span>-</span> <span>i</span><span>))</span> <span>-</span> <span>1u</span><span>);</span>
+</span></span><span><span>        <span>__m512</span> <span>a_vec</span> <span>=</span> <span>_mm512_maskz_loadu_ps</span><span>(</span><span>mask</span><span>,</span> <span>a</span> <span>+</span> <span>i</span><span>);</span>
+</span></span><span><span>        <span>__m512</span> <span>b_vec</span> <span>=</span> <span>_mm512_maskz_loadu_ps</span><span>(</span><span>mask</span><span>,</span> <span>b</span> <span>+</span> <span>i</span><span>);</span>
+</span></span><span><span>        <span>ab_vec</span> <span>=</span> <span>_mm512_fmadd_ps</span><span>(</span><span>a_vec</span><span>,</span> <span>b_vec</span><span>,</span> <span>ab_vec</span><span>);</span>
+</span></span><span><span>        <span>a2_vec</span> <span>=</span> <span>_mm512_fmadd_ps</span><span>(</span><span>a_vec</span><span>,</span> <span>a_vec</span><span>,</span> <span>a2_vec</span><span>);</span>
+</span></span><span><span>        <span>b2_vec</span> <span>=</span> <span>_mm512_fmadd_ps</span><span>(</span><span>b_vec</span><span>,</span> <span>b_vec</span><span>,</span> <span>b2_vec</span><span>);</span>
+</span></span><span><span>    <span>}</span>
+</span></span><span><span>
+</span></span><span><span>    <span>simsimd_f32_t</span> <span>ab</span> <span>=</span> <span>_mm512_reduce_add_ps</span><span>(</span><span>ab_vec</span><span>);</span>
+</span></span><span><span>    <span>simsimd_f32_t</span> <span>a2</span> <span>=</span> <span>_mm512_reduce_add_ps</span><span>(</span><span>a2_vec</span><span>);</span>
+</span></span><span><span>    <span>simsimd_f32_t</span> <span>b2</span> <span>=</span> <span>_mm512_reduce_add_ps</span><span>(</span><span>b2_vec</span><span>);</span>
+</span></span><span><span>
+</span></span><span><span>    <span>__m128d</span> <span>a2_b2</span> <span>=</span> <span>_mm_set_pd</span><span>((</span><span>double</span><span>)</span><span>a2</span><span>,</span> <span>(</span><span>double</span><span>)</span><span>b2</span><span>);</span>
+</span></span><span><span>    <span>__m128d</span> <span>rsqrts</span> <span>=</span> <span>_mm_mask_rsqrt14_pd</span><span>(</span><span>_mm_setzero_pd</span><span>(),</span> <span>0xFF</span><span>,</span> <span>a2_b2</span><span>);</span>
+</span></span><span><span>    <span>double</span> <span>rsqrts_array</span><span>[</span><span>2</span><span>];</span>
+</span></span><span><span>    <span>_mm_storeu_pd</span><span>(</span><span>rsqrts_array</span><span>,</span> <span>rsqrts</span><span>);</span>
+</span></span><span><span>    <span>return</span> <span>1</span> <span>-</span> <span>ab</span> <span>*</span> <span>rsqrts_array</span><span>[</span><span>0</span><span>]</span> <span>*</span> <span>rsqrts_array</span><span>[</span><span>1</span><span>];</span>
+</span></span><span><span><span>}</span>
+</span></span></code></pre></td></tr></tbody></table></div></div><p>Let’s start with a relatively simple implementation:</p><ul><li>A single <code>for</code>-loop iterates through 2 vectors, scanning up to 16 entries simultaneously.</li><li>When it reaches the end of the vectors, it uses a mask to load the remaining entries with the <code>((1u &lt;&lt; (n - i)) - 1u)</code> mask.</li><li>It doesn’t expect the vectors to be aligned, so it uses the <code>loadu</code> instructions.</li><li>It avoids separate additions using the <code>fmadd</code> instruction, which computes <code>a * b + c</code>.</li><li>It uses the <code>reduce_add</code> intrinsic to sum all the elements in the vector, which is not a SIMD code, but the compiler can optimize that part for us.</li><li>It uses the <code>rsqrt14</code> instruction to compute the reciprocal square root of the sum of <code>a2</code> and <code>b2</code>, very accurately approximating <code>1/sqrt(a2)</code> and <code>1/sqrt(b2)</code>, and avoiding LibC calls.</li></ul><p>Benchmarking this code and its symmetric counterparts for other data types, we get the following:</p><ul><li><code>floats</code>: 118 ns ~ <strong>553x</strong> faster than Python.</li><li><code>halfs</code>: 79 ns ~ <strong>827x</strong> faster than Python.</li><li><code>ints</code>: 158 ns ~ <strong>413x</strong> faster than Python.</li></ul><p>We are now in the higher three digits.</p><h3 id="bmi2-and-goto">BMI2 and <code>goto</code></h3><p>The world is full of prejudice and unfairness, and some of the biggest ones in programming are:</p><ul><li>considering a <code>goto</code> to be an anti-pattern.</li><li>not using the BMI2 family of assembly instructions.</li></ul><p>The first one is handy when optimizing low-level code and avoiding unnecessary branching. The second is a tiny set of <code>bzhi</code>, <code>pdep</code>, <code>pext</code>, and a few other, convenient for bit manipulation! We will restore fairness and introduce them to our code, replacing double-precision computations with single-precision.</p><div><div><table><tbody><tr><td><pre tabindex="0"><code><span id="hl-7-1"><a href="#hl-7-1"> 1</a>
+</span><span id="hl-7-2"><a href="#hl-7-2"> 2</a>
+</span><span id="hl-7-3"><a href="#hl-7-3"> 3</a>
+</span><span id="hl-7-4"><a href="#hl-7-4"> 4</a>
+</span><span id="hl-7-5"><a href="#hl-7-5"> 5</a>
+</span><span id="hl-7-6"><a href="#hl-7-6"> 6</a>
+</span><span id="hl-7-7"><a href="#hl-7-7"> 7</a>
+</span><span id="hl-7-8"><a href="#hl-7-8"> 8</a>
+</span><span id="hl-7-9"><a href="#hl-7-9"> 9</a>
+</span><span id="hl-7-10"><a href="#hl-7-10">10</a>
+</span><span id="hl-7-11"><a href="#hl-7-11">11</a>
+</span><span id="hl-7-12"><a href="#hl-7-12">12</a>
+</span><span id="hl-7-13"><a href="#hl-7-13">13</a>
+</span><span id="hl-7-14"><a href="#hl-7-14">14</a>
+</span><span id="hl-7-15"><a href="#hl-7-15">15</a>
+</span><span id="hl-7-16"><a href="#hl-7-16">16</a>
+</span><span id="hl-7-17"><a href="#hl-7-17">17</a>
+</span><span id="hl-7-18"><a href="#hl-7-18">18</a>
+</span><span id="hl-7-19"><a href="#hl-7-19">19</a>
+</span><span id="hl-7-20"><a href="#hl-7-20">20</a>
+</span><span id="hl-7-21"><a href="#hl-7-21">21</a>
+</span><span id="hl-7-22"><a href="#hl-7-22">22</a>
+</span><span id="hl-7-23"><a href="#hl-7-23">23</a>
+</span><span id="hl-7-24"><a href="#hl-7-24">24</a>
+</span><span id="hl-7-25"><a href="#hl-7-25">25</a>
+</span><span id="hl-7-26"><a href="#hl-7-26">26</a>
+</span><span id="hl-7-27"><a href="#hl-7-27">27</a>
+</span><span id="hl-7-28"><a href="#hl-7-28">28</a>
+</span><span id="hl-7-29"><a href="#hl-7-29">29</a>
+</span><span id="hl-7-30"><a href="#hl-7-30">30</a>
+</span><span id="hl-7-31"><a href="#hl-7-31">31</a>
+</span><span id="hl-7-32"><a href="#hl-7-32">32</a>
+</span><span id="hl-7-33"><a href="#hl-7-33">33</a>
+</span><span id="hl-7-34"><a href="#hl-7-34">34</a>
+</span><span id="hl-7-35"><a href="#hl-7-35">35</a>
+</span></code></pre></td><td><pre tabindex="0"><code data-lang="c"><span><span><span>__attribute__</span><span>((</span><span>target</span><span>(</span><span>"avx512f,avx512vl,bmi2"</span><span>)))</span> <span>//
+</span></span></span><span><span><span></span><span>inline</span> <span>static</span> <span>simsimd_f32_t</span>
+</span></span><span><span><span>simsimd_avx512_f32_cos</span><span>(</span><span>simsimd_f32_t</span> <span>const</span><span>*</span> <span>a</span><span>,</span> <span>simsimd_f32_t</span> <span>const</span><span>*</span> <span>b</span><span>,</span> <span>simsimd_size_t</span> <span>n</span><span>)</span> <span>{</span>
+</span></span><span><span>    <span>__m512</span> <span>ab_vec</span> <span>=</span> <span>_mm512_set1_ps</span><span>(</span><span>0</span><span>);</span>
+</span></span><span><span>    <span>__m512</span> <span>a2_vec</span> <span>=</span> <span>_mm512_set1_ps</span><span>(</span><span>0</span><span>);</span>
+</span></span><span><span>    <span>__m512</span> <span>b2_vec</span> <span>=</span> <span>_mm512_set1_ps</span><span>(</span><span>0</span><span>);</span>
+</span></span><span><span>    <span>__m512</span> <span>a_vec</span><span>,</span> <span>b_vec</span><span>;</span>
+</span></span><span><span>
+</span></span><span><span><span>simsimd_avx512_f32_cos_cycle</span><span>:</span>
+</span></span><span><span>    <span>if</span> <span>(</span><span>n</span> <span>&lt;</span> <span>16</span><span>)</span> <span>{</span>
+</span></span><span><span>        <span>__mmask16</span> <span>mask</span> <span>=</span> <span>_bzhi_u32</span><span>(</span><span>0xFFFFFFFF</span><span>,</span> <span>n</span><span>);</span>
+</span></span><span><span>        <span>a_vec</span> <span>=</span> <span>_mm512_maskz_loadu_ps</span><span>(</span><span>mask</span><span>,</span> <span>a</span><span>);</span>
+</span></span><span><span>        <span>b_vec</span> <span>=</span> <span>_mm512_maskz_loadu_ps</span><span>(</span><span>mask</span><span>,</span> <span>b</span><span>);</span>
+</span></span><span><span>        <span>n</span> <span>=</span> <span>0</span><span>;</span>
+</span></span><span><span>    <span>}</span> <span>else</span> <span>{</span>
+</span></span><span><span>        <span>a_vec</span> <span>=</span> <span>_mm512_loadu_ps</span><span>(</span><span>a</span><span>);</span>
+</span></span><span><span>        <span>b_vec</span> <span>=</span> <span>_mm512_loadu_ps</span><span>(</span><span>b</span><span>);</span>
+</span></span><span><span>        <span>a</span> <span>+=</span> <span>16</span><span>,</span> <span>b</span> <span>+=</span> <span>16</span><span>,</span> <span>n</span> <span>-=</span> <span>16</span><span>;</span>
+</span></span><span><span>    <span>}</span>
+</span></span><span><span>    <span>ab_vec</span> <span>=</span> <span>_mm512_fmadd_ps</span><span>(</span><span>a_vec</span><span>,</span> <span>b_vec</span><span>,</span> <span>ab_vec</span><span>);</span>
+</span></span><span><span>    <span>a2_vec</span> <span>=</span> <span>_mm512_fmadd_ps</span><span>(</span><span>a_vec</span><span>,</span> <span>a_vec</span><span>,</span> <span>a2_vec</span><span>);</span>
+</span></span><span><span>    <span>b2_vec</span> <span>=</span> <span>_mm512_fmadd_ps</span><span>(</span><span>b_vec</span><span>,</span> <span>b_vec</span><span>,</span> <span>b2_vec</span><span>);</span>
+</span></span><span><span>    <span>if</span> <span>(</span><span>n</span><span>)</span>
+</span></span><span><span>        <span>goto</span> <span>simsimd_avx512_f32_cos_cycle</span><span>;</span>
+</span></span><span><span>
+</span></span><span><span>    <span>simsimd_f32_t</span> <span>ab</span> <span>=</span> <span>_mm512_reduce_add_ps</span><span>(</span><span>ab_vec</span><span>);</span>
+</span></span><span><span>    <span>simsimd_f32_t</span> <span>a2</span> <span>=</span> <span>_mm512_reduce_add_ps</span><span>(</span><span>a2_vec</span><span>);</span>
+</span></span><span><span>    <span>simsimd_f32_t</span> <span>b2</span> <span>=</span> <span>_mm512_reduce_add_ps</span><span>(</span><span>b2_vec</span><span>);</span>
+</span></span><span><span>
+</span></span><span><span>    <span>// Compute the reciprocal square roots of a2 and b2
+</span></span></span><span><span><span></span>    <span>__m128</span> <span>rsqrts</span> <span>=</span> <span>_mm_rsqrt14_ps</span><span>(</span><span>_mm_set_ps</span><span>(</span><span>0.f</span><span>,</span> <span>0.f</span><span>,</span> <span>a2</span> <span>+</span> <span>1.e-9</span><span>f</span><span>,</span> <span>b2</span> <span>+</span> <span>1.e-9</span><span>f</span><span>));</span>
+</span></span><span><span>    <span>simsimd_f32_t</span> <span>rsqrt_a2</span> <span>=</span> <span>_mm_cvtss_f32</span><span>(</span><span>rsqrts</span><span>);</span>
+</span></span><span><span>    <span>simsimd_f32_t</span> <span>rsqrt_b2</span> <span>=</span> <span>_mm_cvtss_f32</span><span>(</span><span>_mm_shuffle_ps</span><span>(</span><span>rsqrts</span><span>,</span> <span>rsqrts</span><span>,</span> <span>_MM_SHUFFLE</span><span>(</span><span>0</span><span>,</span> <span>0</span><span>,</span> <span>0</span><span>,</span> <span>1</span><span>)));</span>
+</span></span><span><span>    <span>return</span> <span>1</span> <span>-</span> <span>ab</span> <span>*</span> <span>rsqrt_a2</span> <span>*</span> <span>rsqrt_b2</span><span>;</span>
+</span></span><span><span><span>}</span>
+</span></span></code></pre></td></tr></tbody></table></div></div><p>Result for <code>floats</code>: 87.4 ns ~ <strong>747x</strong> faster than Python.</p><blockquote><p>One of the reasons the BMI2 extensions didn’t take off originally is that, AMD processors before Zen 3 implemented <code>pdep</code> and <code>pext</code> with a latency of 18 cycles. Newer CPUs do it with the latency of 3 cycles.</p></blockquote><h3 id="fp16">FP16</h3><p>Ice Lake CPUs supported all the instructions we’ve used so far. In contrast, the newer Sapphire Rapids instructions add native support for half-precision math.</p><div><div><table><tbody><tr><td><pre tabindex="0"><code><span id="hl-8-1"><a href="#hl-8-1"> 1</a>
+</span><span id="hl-8-2"><a href="#hl-8-2"> 2</a>
+</span><span id="hl-8-3"><a href="#hl-8-3"> 3</a>
+</span><span id="hl-8-4"><a href="#hl-8-4"> 4</a>
+</span><span id="hl-8-5"><a href="#hl-8-5"> 5</a>
+</span><span id="hl-8-6"><a href="#hl-8-6"> 6</a>
+</span><span id="hl-8-7"><a href="#hl-8-7"> 7</a>
+</span><span id="hl-8-8"><a href="#hl-8-8"> 8</a>
+</span><span id="hl-8-9"><a href="#hl-8-9"> 9</a>
+</span><span id="hl-8-10"><a href="#hl-8-10">10</a>
+</span><span id="hl-8-11"><a href="#hl-8-11">11</a>
+</span><span id="hl-8-12"><a href="#hl-8-12">12</a>
+</span><span id="hl-8-13"><a href="#hl-8-13">13</a>
+</span><span id="hl-8-14"><a href="#hl-8-14">14</a>
+</span><span id="hl-8-15"><a href="#hl-8-15">15</a>
+</span><span id="hl-8-16"><a href="#hl-8-16">16</a>
+</span></code></pre></td><td><pre tabindex="0"><code data-lang="c"><span><span><span>simsimd_avx512_f16_cos_cycle</span><span>:</span>
+</span></span><span><span>    <span>if</span> <span>(</span><span>n</span> <span>&lt;</span> <span>32</span><span>)</span> <span>{</span>
+</span></span><span><span>        <span>__mmask32</span> <span>mask</span> <span>=</span> <span>_bzhi_u32</span><span>(</span><span>0xFFFFFFFF</span><span>,</span> <span>n</span><span>);</span>
+</span></span><span><span>        <span>a_i16_vec</span> <span>=</span> <span>_mm512_maskz_loadu_epi16</span><span>(</span><span>mask</span><span>,</span> <span>a</span><span>);</span>
+</span></span><span><span>        <span>b_i16_vec</span> <span>=</span> <span>_mm512_maskz_loadu_epi16</span><span>(</span><span>mask</span><span>,</span> <span>b</span><span>);</span>
+</span></span><span><span>        <span>n</span> <span>=</span> <span>0</span><span>;</span>
+</span></span><span><span>    <span>}</span> <span>else</span> <span>{</span>
+</span></span><span><span>        <span>a_i16_vec</span> <span>=</span> <span>_mm512_loadu_epi16</span><span>(</span><span>a</span><span>);</span>
+</span></span><span><span>        <span>b_i16_vec</span> <span>=</span> <span>_mm512_loadu_epi16</span><span>(</span><span>b</span><span>);</span>
+</span></span><span><span>        <span>a</span> <span>+=</span> <span>32</span><span>,</span> <span>b</span> <span>+=</span> <span>32</span><span>,</span> <span>n</span> <span>-=</span> <span>32</span><span>;</span>
+</span></span><span><span>    <span>}</span>
+</span></span><span><span>    <span>ab_vec</span> <span>=</span> <span>_mm512_fmadd_ph</span><span>(</span><span>_mm512_castsi512_ph</span><span>(</span><span>a_i16_vec</span><span>),</span> <span>_mm512_castsi512_ph</span><span>(</span><span>b_i16_vec</span><span>),</span> <span>ab_vec</span><span>);</span>
+</span></span><span><span>    <span>a2_vec</span> <span>=</span> <span>_mm512_fmadd_ph</span><span>(</span><span>_mm512_castsi512_ph</span><span>(</span><span>a_i16_vec</span><span>),</span> <span>_mm512_castsi512_ph</span><span>(</span><span>a_i16_vec</span><span>),</span> <span>a2_vec</span><span>);</span>
+</span></span><span><span>    <span>b2_vec</span> <span>=</span> <span>_mm512_fmadd_ph</span><span>(</span><span>_mm512_castsi512_ph</span><span>(</span><span>b_i16_vec</span><span>),</span> <span>_mm512_castsi512_ph</span><span>(</span><span>b_i16_vec</span><span>),</span> <span>b2_vec</span><span>);</span>
+</span></span><span><span>    <span>if</span> <span>(</span><span>n</span><span>)</span>
+</span></span><span><span>        <span>goto</span> <span>simsimd_avx512_f16_cos_cycle</span><span>;</span>
+</span></span></code></pre></td></tr></tbody></table></div></div><p>The body of our function has changed:</p><ul><li>we are now scanning 32 entries per cycle, as the scalars are 2x smaller.</li><li>we are using the <code>_ph</code> intrinsics, the half-precision counterparts of the <code>_ps</code> intrinsics.</li></ul><p>Result for <code>halfs</code>: 51.8 ns ~ <strong>1'260x</strong> faster than Python.</p><p><strong>VNNI</strong>
+Today’s final instruction we’ll explore is the <code>vpdpbusd</code> from the AVX-512VNNI subset. It multiplies 8-bit integers, generating 16-bit intermediate results, which are then added to a 32-bit accumulator. With smaller scalars, we can house 64 of them in a single ZMM register.</p><div><div><table><tbody><tr><td><pre tabindex="0"><code><span id="hl-9-1"><a href="#hl-9-1"> 1</a>
+</span><span id="hl-9-2"><a href="#hl-9-2"> 2</a>
+</span><span id="hl-9-3"><a href="#hl-9-3"> 3</a>
+</span><span id="hl-9-4"><a href="#hl-9-4"> 4</a>
+</span><span id="hl-9-5"><a href="#hl-9-5"> 5</a>
+</span><span id="hl-9-6"><a href="#hl-9-6"> 6</a>
+</span><span id="hl-9-7"><a href="#hl-9-7"> 7</a>
+</span><span id="hl-9-8"><a href="#hl-9-8"> 8</a>
+</span><span id="hl-9-9"><a href="#hl-9-9"> 9</a>
+</span><span id="hl-9-10"><a href="#hl-9-10">10</a>
+</span><span id="hl-9-11"><a href="#hl-9-11">11</a>
+</span><span id="hl-9-12"><a href="#hl-9-12">12</a>
+</span><span id="hl-9-13"><a href="#hl-9-13">13</a>
+</span><span id="hl-9-14"><a href="#hl-9-14">14</a>
+</span><span id="hl-9-15"><a href="#hl-9-15">15</a>
+</span><span id="hl-9-16"><a href="#hl-9-16">16</a>
+</span></code></pre></td><td><pre tabindex="0"><code data-lang="c"><span><span><span>simsimd_avx512_i8_cos_cycle</span><span>:</span>
+</span></span><span><span>    <span>if</span> <span>(</span><span>n</span> <span>&lt;</span> <span>64</span><span>)</span> <span>{</span>
+</span></span><span><span>        <span>__mmask64</span> <span>mask</span> <span>=</span> <span>_bzhi_u64</span><span>(</span><span>0xFFFFFFFFFFFFFFFF</span><span>,</span> <span>n</span><span>);</span>
+</span></span><span><span>        <span>a_vec</span> <span>=</span> <span>_mm512_maskz_loadu_epi8</span><span>(</span><span>mask</span><span>,</span> <span>a</span><span>);</span>
+</span></span><span><span>        <span>b_vec</span> <span>=</span> <span>_mm512_maskz_loadu_epi8</span><span>(</span><span>mask</span><span>,</span> <span>b</span><span>);</span>
+</span></span><span><span>        <span>n</span> <span>=</span> <span>0</span><span>;</span>
+</span></span><span><span>    <span>}</span> <span>else</span> <span>{</span>
+</span></span><span><span>        <span>a_vec</span> <span>=</span> <span>_mm512_loadu_epi8</span><span>(</span><span>a</span><span>);</span>
+</span></span><span><span>        <span>b_vec</span> <span>=</span> <span>_mm512_loadu_epi8</span><span>(</span><span>b</span><span>);</span>
+</span></span><span><span>        <span>a</span> <span>+=</span> <span>64</span><span>,</span> <span>b</span> <span>+=</span> <span>64</span><span>,</span> <span>n</span> <span>-=</span> <span>64</span><span>;</span>
+</span></span><span><span>    <span>}</span>
+</span></span><span><span>    <span>ab_i32s_vec</span> <span>=</span> <span>_mm512_dpbusd_epi32</span><span>(</span><span>ab_i32s_vec</span><span>,</span> <span>a_vec</span><span>,</span> <span>b_vec</span><span>);</span>
+</span></span><span><span>    <span>a2_i32s_vec</span> <span>=</span> <span>_mm512_dpbusd_epi32</span><span>(</span><span>a2_i32s_vec</span><span>,</span> <span>a_vec</span><span>,</span> <span>a_vec</span><span>);</span>
+</span></span><span><span>    <span>b2_i32s_vec</span> <span>=</span> <span>_mm512_dpbusd_epi32</span><span>(</span><span>b2_i32s_vec</span><span>,</span> <span>b_vec</span><span>,</span> <span>b_vec</span><span>);</span>
+</span></span><span><span>    <span>if</span> <span>(</span><span>n</span><span>)</span>
+</span></span><span><span>        <span>goto</span> <span>simsimd_avx512_i8_cos_cycle</span><span>;</span>
+</span></span></code></pre></td></tr></tbody></table></div></div><p>After compiling, you might expect to see three <code>vpdpbusd</code> invocations. However, the compiler had other ideas. Instead of sticking to our expected flow, it duplicated <code>vpdpbusd</code> calls in both branches of the <code>if</code> condition to minimize code sections and jumps. Here’s a glimpse of our main operational section:</p><pre tabindex="0"><code data-lang="assembly">.L2:
+        ; Check `if (n &lt; 64)` and jump to the L7 if it's true.
+        cmp     rax, rdx                            
+        je      .L7
+        ; Load 64 bytes from `a` and `b` into `zmm1` and `zmm0`.
+        vmovdqu8        zmm1, ZMMWORD PTR [rdi]
+        vmovdqu8        zmm0, ZMMWORD PTR [rsi]
+        ; Increment `a` and `b` pointers by 64.
+        add     rdi, 64
+        add     rsi, 64
+        ; Perform mixed-precision dot-products.
+        vpdpbusd        zmm4, zmm1, zmm0 ; ab = b * a
+        vpdpbusd        zmm3, zmm1, zmm1 ; b2 = b * b
+        vpdpbusd        zmm2, zmm0, zmm0 ; a2 = a * a
+        ; Subtract the number of remaining entries and jump back.
+        sub     rdx, 64
+        jne     .L2
+.L7:
+        ; Process the tail, by building the `k1` mask first.
+        ; We avoid `k0`, which is a hardcoded constant used to indicate unmasked operations.
+        mov     rdx, -1
+        bzhi    rax, rdx, rax
+        kmovq   k1, rax
+        ; Load under 64 bytes from `a` and `b` into `zmm1` and `zmm0`,
+        ; using the mask from the `k1`, which can be applied to any AVX-512 argument.
+        vmovdqu8        zmm1{k1}{z}, ZMMWORD PTR [rdi]
+        vmovdqu8        zmm0{k1}{z}, ZMMWORD PTR [rsi]
+        ; Perform mixed-precision dot-products.
+        vpdpbusd        zmm3, zmm1, zmm1 ; b2 = b * b
+        vpdpbusd        zmm4, zmm1, zmm0 ; ab = b * a
+        vpdpbusd        zmm2, zmm0, zmm0 ; a2 = a * a
+        ; Exit the loop.
+        jmp     .L4
+</code></pre><p>It’s often intriguing to see how compilers shuffle around my instructions, especially when it seems somewhat arbitrary in brief code segments. Our heavy SIMD will anyways be decoded into micro-ops, and then the CPU rearranges them all over again, disregarding compiler’s sequence. Still, upon testing this with the Google Benchmark library, we observed the following for <code>ints</code>: <strong>25.9 ns</strong>, which is roughly <strong>2'521 times faster</strong> than our original Python baseline. Delivered as promised 🤗</p><h2 id="conclusion">Conclusion</h2><p>There’s a common belief that you need a massive infrastructure, akin to what giants like OpenAI or Google possess, to create impactful technology. However, I’m a proponent of the idea that many amazing innovations can spring from humble beginnings – even on a shoestring budget. If you share this sentiment and are keen on optimizing and innovating, you might be interested in some other libraries I’ve had a hand in. 😉</p><table><thead><tr><th></th><th></th><th></th><th></th><th></th></tr></thead><tbody><tr><td><a href="https://github.com/unum-cloud/usearch"><img loading="lazy" src="https://img.shields.io/github/stars/unum-cloud/usearch?style=social&amp;label=USearch%20repository" alt="USearch"></a></td><td><a href="https://github.com/ashvardanian/stringzilla"><img loading="lazy" src="https://img.shields.io/github/stars/ashvardanian/stringzilla?style=social&amp;label=StringZilla%20repository" alt="StringZilla"></a></td><td><a href="https://github.com/unum-cloud/uform"><img loading="lazy" src="https://img.shields.io/github/stars/unum-cloud/uform?style=social&amp;label=UForm%20repository" alt="UForm"></a></td><td><a href="https://github.com/ashvardanian/simsimd"><img loading="lazy" src="https://img.shields.io/github/stars/ashvardanian/simsimd?style=social&amp;label=SimSIMD%20repository" alt="SimSIMD"></a></td><td><a href="https://github.com/unum-cloud/ucall"><img loading="lazy" src="https://img.shields.io/github/stars/unum-cloud/ucall?style=social&amp;label=UCall%20repository" alt="UCall"></a></td></tr></tbody></table><h2 id="appendix-comparing-compilers">Appendix: Comparing Compilers</h2><p>For those eager to delve deeper, examining the Assembly generated by different compilers can be insightful. A popular comparison is between GCC and Intel’s new ICX compiler, with the latter now being based on LLVM. Before diving into the Assembly details, let’s first benchmark their performance.</p><div><div><table><tbody><tr><td><pre tabindex="0"><code><span id="hl-11-1"><a href="#hl-11-1">1</a>
+</span><span id="hl-11-2"><a href="#hl-11-2">2</a>
+</span><span id="hl-11-3"><a href="#hl-11-3">3</a>
+</span><span id="hl-11-4"><a href="#hl-11-4">4</a>
+</span><span id="hl-11-5"><a href="#hl-11-5">5</a>
+</span><span id="hl-11-6"><a href="#hl-11-6">6</a>
+</span></code></pre></td><td><pre tabindex="0"><code data-lang="sh"><span><span>$ cmake -DCMAKE_C_COMPILER<span>=</span><span>"gcc-12"</span> -DCMAKE_CXX_COMPILER<span>=</span><span>"g++-12"</span> -DCMAKE_BUILD_TYPE<span>=</span>Release -DSIMSIMD_BUILD_BENCHMARKS<span>=</span><span>1</span> -B ./build_release
+</span></span><span><span>$ cmake --build build_release --config Release <span>&amp;&amp;</span> ./build_release/simsimd_bench --benchmark_out<span>=</span><span>"gcc-12.json"</span> --benchmark_filter<span>=</span>1536d
+</span></span><span><span>
+</span></span><span><span>$ <span>source</span> /opt/intel/oneapi/setvars.sh
+</span></span><span><span>$ cmake -DCMAKE_C_COMPILER<span>=</span><span>"icx"</span> -DCMAKE_CXX_COMPILER<span>=</span><span>"icpx"</span> -DCMAKE_BUILD_TYPE<span>=</span>Release -DSIMSIMD_BUILD_BENCHMARKS<span>=</span><span>1</span> -B ./build_release
+</span></span><span><span>$ cmake --build build_release --config Release <span>&amp;&amp;</span> ./build_release/simsimd_bench --benchmark_out<span>=</span><span>"intel-2023.json"</span> --benchmark_filter<span>=</span>1536d
+</span></span></code></pre></td></tr></tbody></table></div></div><p>The above script compiles the code using both compilers and then runs each binary, exporting the results into distinct JSON files. Afterwards, you can use Google Benchmark’s lesser-known tool, <code>compare.py</code>, to determine if there are significant performance differences and whether a deeper dive into the Assembly is warranted:</p><div><div><table><tbody><tr><td><pre tabindex="0"><code><span id="hl-12-1"><a href="#hl-12-1"> 1</a>
+</span><span id="hl-12-2"><a href="#hl-12-2"> 2</a>
+</span><span id="hl-12-3"><a href="#hl-12-3"> 3</a>
+</span><span id="hl-12-4"><a href="#hl-12-4"> 4</a>
+</span><span id="hl-12-5"><a href="#hl-12-5"> 5</a>
+</span><span id="hl-12-6"><a href="#hl-12-6"> 6</a>
+</span><span id="hl-12-7"><a href="#hl-12-7"> 7</a>
+</span><span id="hl-12-8"><a href="#hl-12-8"> 8</a>
+</span><span id="hl-12-9"><a href="#hl-12-9"> 9</a>
+</span><span id="hl-12-10"><a href="#hl-12-10">10</a>
+</span><span id="hl-12-11"><a href="#hl-12-11">11</a>
+</span><span id="hl-12-12"><a href="#hl-12-12">12</a>
+</span><span id="hl-12-13"><a href="#hl-12-13">13</a>
+</span><span id="hl-12-14"><a href="#hl-12-14">14</a>
+</span><span id="hl-12-15"><a href="#hl-12-15">15</a>
+</span><span id="hl-12-16"><a href="#hl-12-16">16</a>
+</span><span id="hl-12-17"><a href="#hl-12-17">17</a>
+</span></code></pre></td><td><pre tabindex="0"><code data-lang="sh"><span><span>$ mkdir -p gbench
+</span></span><span><span>$ wget https://github.com/google/benchmark/blob/main/tools/compare.py?raw<span>=</span><span>true</span> -O compare.py
+</span></span><span><span>$ wget https://github.com/google/benchmark/blob/main/tools/gbench/report.py?raw<span>=</span><span>true</span> -O gbench/report.py
+</span></span><span><span>$ wget https://github.com/google/benchmark/blob/main/tools/gbench/util.py?raw<span>=</span><span>true</span> -O gbench/util.py
+</span></span><span><span>$ python compare.py benchmarks gcc-12.json intel-2023.json
+</span></span><span><span>
+</span></span><span><span>Comparing gcc-12.json to intel-2023.json
+</span></span><span><span>Benchmark                                                         Time             CPU      Time Old      Time New       CPU Old       CPU New
+</span></span><span><span>----------------------------------------------------------------------------------------------------------------------------------------------
+</span></span><span><span>avx2_f16_cos_1536d/min_time:10.000/threads:1                   +0.0002         +0.0002           <span>235</span>           <span>235</span>           <span>235</span>           <span>235</span>
+</span></span><span><span>avx2_i8_cos_1536d/min_time:10.000/threads:1                    -0.0034         -0.0034            <span>91</span>            <span>91</span>            <span>91</span>            <span>91</span>
+</span></span><span><span>avx512_f16_cos_1536d/min_time:10.000/threads:1                 +0.0024         +0.0024            <span>52</span>            <span>52</span>            <span>52</span>            <span>52</span>
+</span></span><span><span>avx512_i8_cos_1536d/min_time:10.000/threads:1                  +0.0110         +0.0110            <span>26</span>            <span>26</span>            <span>26</span>            <span>26</span>
+</span></span><span><span>avx512_f32_cos_1536d/min_time:10.000/threads:1                 +0.0206         +0.0206            <span>87</span>            <span>89</span>            <span>87</span>            <span>89</span>
+</span></span><span><span>serial_f16_cos_1536d/min_time:10.000/threads:1                 -0.0013         -0.0013          <span>1988</span>          <span>1985</span>          <span>1988</span>          <span>1985</span>
+</span></span><span><span>serial_f32_cos_1536d/min_time:10.000/threads:1                 -0.0000         -0.0000          <span>1118</span>          <span>1118</span>          <span>1118</span>          <span>1118</span>
+</span></span><span><span>serial_i8_cos_1536d/min_time:10.000/threads:1                  -0.0001         -0.0001           <span>299</span>           <span>299</span>           <span>299</span>           <span>299</span>
+</span></span></code></pre></td></tr></tbody></table></div></div><p>From the results, we observe minimal runtime differences between the two compilers. The generated Assembly is remarkably similar, particularly in the critical sections. Intel’s output is often 10% shorter which is typically advantageous. The most pronounced differences emerge outside of the <code>for</code> loop. Notably, the <code>_mm512_reduce_add_epi32</code> intrinsic doesn’t correspond directly to a specific SIMD instruction, granting the compilers a bit more leeway:</p><ul><li>GCC opts for a lengthier reduction using <code>vextracti64x4</code> and <code>vextracti64x2</code>.</li><li>Intel prefers the succinct <code>vextracti128</code>.</li></ul><p>Both compilers employ the <code>vpshufd</code> for shuffling but use varied masks. For a detailed exploration, visit the <a href="https://godbolt.org/#z:OYLghAFBqd5QCxAYwPYBMCmBRdBLAF1QCcAaPECAMzwBtMA7AQwFtMQByARg9KtQYEAysib0QXACx8BBAKoBnTAAUAHpwAMvAFYTStJg1DIApACYAQuYukl9ZATwDKjdAGFUtAK4sGIAMwA7KSuADJ4DJgAcj4ARpjEIGYAnKQADqgKhE4MHt6%2BAcEZWY4C4ZExLPGJKbaY9qUMQgRMxAR5Pn5BdQ05za0E5dFxCUmpCi1tHQXdEwNDldVjAJS2qF7EyOwc5v4RyN5YANQm/m54LCwRBMQRAHQIp9gmGgCCL68EAJ5pmFhURyotFQTAIRyyLAh6AA%2BlR/GZoQRTlY3t9fv8jsgEK1wRcodC8AAORHIj5ov6YAFeBhZYCRdBHYFGXGQi4wrIAL0wJP8KPeb2h0NBNzwsS8BG50Kggq8Shh0OWyw%2BguFtzFEsFUEmwEwBAg5jMTAAbqoAKxcMxG2ikY1mi1UG0m81mWIAd0ddstDAYeFIsSuZgNiuWRwA9KGPhFaBFMOCWo5kCz8XCEUi3hD8bbnQTiWgFBAM2yc4jMQIJgAqI5MUhJ">Compiler Explorer</a>.</p></div></div>]]>
+            </description>
+            <link>https://ashvardanian.com/posts/python-c-assembly-comparison/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-38684461</guid>
+            <pubDate>Mon, 18 Dec 2023 16:14:22 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[The Private Definition of Accessible]]>
+            </title>
+            <description>
+<![CDATA[
+Score 5 | Comments 0 (<a href="https://news.ycombinator.com/item?id=38683774">thread link</a>) | @graypegg
+<br/>
+December 18, 2023 | https://graypegg.com/2023/11/25/the-private-definition-of-accessible.html | <a href="https://web.archive.org/web/*/https://graypegg.com/2023/11/25/the-private-definition-of-accessible.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+    <p>For the following post, I need to make the distinction between two definitions of the word “accessibility”. I’ll be doing this with a little parenthetical after the word. Accessibility (Universal) will refer to the first definition I will give. Accessibility (Developer) will refer to the second definition. If it’s placed in quotes, I’m referring to the string “accessibility” itself.</p>
+
+<h2 id="accessibility-the-word">Accessibility: The Word</h2>
+
+<p>“Accessible” is an adjective that I think most software engineers would be confident in describing. There would be variation in wording if you ran a poll, but I’m sure you’d see most definitions derive from something like the following:</p>
+
+<blockquote>
+  <p><em>Accessible (Universal): a thing, that anyone is capable of using, regardless of physical or mental disability.</em></p>
+</blockquote>
+
+<p>I think this captures the goals of interface design quite well even if it’s rather lofty, and would actually be a good jumping-off point as one of a few guiding principles of accessible (Universal) software development in the same vein as the agile manifesto principles function for building software projects. However, I don’t believe this is the most common understanding of “accessibility” when put into practice. When software developers are placed under constraints that require them to prove work, their definition can shift subtly. My experience has shown it normally morphs into something resembling the following:</p>
+
+<blockquote>
+  <p><em>Accessible (Developer): a thing, that conforms to visual restrictions necessary for the visually impaired, and features machine readable information and keyboard interactions for use by the blind.</em></p>
+</blockquote>
+
+<p>This is a narrow and, as far as I know, a private developers-only definition of “accessibility.” We first name two groups of users which I think is an important mutation. The visually impaired and legally blind are fully distinct from the “normal” cohort of users in this definition, as compared to the universal definition which talked of “anyone”. This may initially seem prudent! Developers work with requirements, stories, and personas. These are our personas to our definition which acts as a user story.</p>
+
+<p>The two personas conceptualized by the accessibility (Developer) definition are extremely specific. Someone who is visually impaired uses an increased font size and requires contrast ratios to exceed a certain minimum in order to perceive them. Someone who is blind is using assistive software to read-aloud or otherwise parse the HTML and expects there to be as much information present in that space as possible. These sorts of mental images are pretty common in discussions about accessibility (Developer). While people who align with these personas exist, I don’t believe this concrete image of disability is constructive for creating interfaces.</p>
+
+<h2 id="concrete-examples-of-disability-are-inadequate-personas">Concrete examples of disability are inadequate personas.</h2>
+
+<p>You may hear people contextualize why accessibility (Developer) is important by invoking a disability name. An example I’ve heard before is “What if one of our customers is blind! They won’t know what this image without an alt tag is.” This is not an untrue statement. If machine readable information isn’t provided to a user that uses a machine to read-aloud the content of the screen, they will not be presented with any information about the image. A blind person is likely to use this sort of tool.</p>
+
+<p>The only place where this well-intentioned thinking falls short for the blind user in question, is the solution. The implication my imaginary strawperson developer is making here, is that machine readable information solves this issue; in this case by adding an HTML <code>alt</code> attribute on an image tag. This is true in simple cases, however the web applications I have worked on have yet to be simple. Does this blind user hear the text you’re including in the alt tag in multiple other places? Are you making the interface itself more confusing? Do we imagine this alt tag as part of a wider interface to support this medium, or just simply as a way to “increase” accessibility (Developer)?</p>
+
+<p>At many points in your life, for a temporary, indeterminate, or permanent amount of time, you will find yourself disabled. This can be due to injury or age, but situation is a much more common cause of disability. Someone wearing gloves in the cold could be thought of as temporarily disabled, as they have extremely low dexterity and sensation. Comparing this to our example of a blind user, you are both lacking a sense that we designed around the assumption you had. I use the word disability not to dilute that word of it’s emotional meaning, but to use it for it’s overly-literal meaning: unable to preform some specific action. You may not conceptualize disability at this level, but I think it’s worth conceptualizing “ability” without it’s associated lack-of-ailment for a moment.</p>
+
+<p>
+How might we talk about what needs to be done to make an accessible (Universal) product then? Imagine instead the range of options your users have to interact with your product. This to me, is a better way to visualize our personas. **Rather than assigning these bundles of disabilities a name, we can instead target ways that people may interact with our product.** I like to think of these as layers on top of what you're building. The range of interaction options I was mentioning before can be conceptualized as the depth of these layers.
+
+<img alt="A small diagram showing three layers. One at the top showing a standard website layout with a cusor over top of it. The next layer below it showing the same layout, but connected by keyboard shortcuts for navigation anf interaction. And the final layer showing a flowchart with quote marks, representing interconnected descriptions provided by something like VoiceOver." src="https://graypegg.com/assets/layers.png" data-lines="9">
+</p>
+
+<p>All of these interfaces exist on top of one another. Someone will be exposed to the top layer by default that we’re familiar with as “the interface”. This is normally designed by someone, who considered the medium in which it’s being displayed. A website is expected to respond to touch for example, as many devices that can use websites, support touch. A designer will carefully consider the size of touch targets to make things easy to tap with a finger, and prefer swipe gestures over requiring accurate finger-pecking.</p>
+
+<p>If an interaction is impossible or difficult on someone’s device however, they instinctively look for the next layer. I call this a layer, because it’s another designed interface co-located with another, using a different set of expectations about the interaction medium. A website is expected to be navigable by keyboard for example. This shouldn’t require the use of another human interface device. The layer is dedicated to the keyboard. Our example user with cold hands in gloves will be able to use the Next/Tab key in their phone’s keyboard to jump to the next field they’re filling in. They aren’t staying in the second layer, but nothing is lost by switching to it. We have provided an alternative interaction medium which allowed them to use our product.</p>
+
+<p>Another layer, oft-misunderstood or mixed into the keyboard layer, is a machine announced interface. Devtools in your browser of choice give you a peek into this layer under an “Accessibility” tab normally. This is a separate interface of UI with descriptions, commonly announced by a text-to-speech program but not always. Mixing this into the keyboard layer, straddles the user with the responsibility to use quite complex software just to use a keyboard. We should aim to keep the definition of these interface layers as small as possible so users can pick the one they can use most efficiently. A machine announced interface layer should not be unusable without a touch screen or keyboard for example. Should the user want to use any of these interface layers, they can without losing function. A VoiceOver user will regularly make use of tab order in the keyboard interface layer for example.</p>
+
+<p>You might have other layers depending on your business. An example might be restaurants who have a kitchen display system. These normally must work with bumpbars, a kind of hotkey macro pad. <strong>The important thing to conceptualize here is that you’re designing multiple co-located interfaces, not one interface with accessible (Developer) sprinkles added to it that free you of any responsibility.</strong></p>
+
+<h2 id="there-is-a-human">There is a Human</h2>
+
+<p>If our top layer interface (the one your designer considered every pixel, swipe, and click for) used a different visual style of text box for every single input in the app, I think most people would agree that it’s difficult to use. You might have gotten into this situation because each input was subtly different: one is for an email, the other is for a password, another is for a name which must be at least 1 character long, and the final one is used to feign some simulacra of signing your name for an antiquated legal process. Just because they are different, doesn’t mean their interaction is different, they all require me to type something. This is a distinction you already innately understand, and probably find this paragraph tedious to read though.</p>
+
+<p>You might not feel the same about this same obvious issue in other interface layers you don’t use. How many forms have you seen online with an asterisk to mark a required field? This is a simple example, but it creates a bizarre world to navigate at the machine announced layer. Imagine hearing an input described as <strong>“First name star, edit text”</strong> as it would be by VoiceOver, Apple’s very popular screen reader. Even if you include a <code>required</code> attribute (surely accruing accessibility (Developer) cred in your PR) this will still be <strong>“First name star required, edit text”</strong> to your users making use of this layer. I can’t easily recreate this experience for a user who does not use assistive software, but let me give you an example of what this sloppiness looks like in our top layer.</p>
+
+<blockquote>
+  <div title="A simulated example of the serial delivery of information from something like VoiceOver or JAWS. Three elements are shown but only 1 at a time.">
+<p>star required</p>
+<p><label>
+    <span>First name star</span>
+    
+</label>
+</p></div>
+</blockquote>
+
+<p>The medium we’re emulating can only communicate one thing at a time, so it’s on the user to hold onto context as it goes past. What is star? Is it required? Is star an entity I have to provide in this form? This would be considered sloppy design in the visual realm, a unique splatter of colour on some input for some cryptic reason would be a better example that doesn’t rely on me trying to recreate an experience here, but when discussing a machine announced interface we assume “they will get it.” You may have even had that thought while reading this example. People that use these tools have come across this common quirk before, so surely they must have picked up on it by now. And that’s probably true! But I think we should aim to craft interfaces to the same level of quality, no matter which interaction layer a user is on.</p>
+
+<p>These configurations, and the resulting information communicated to your users, is an interface. Many people experience their online world either partially or fully in this layer. There is a high chance that you will have to as well at least 1 time in your life. <strong>Consider the fact that a human is always present no matter the medium.</strong> Clear communication and sensible labels will go a long way towards removing barriers because the human being can make inferences. <strong>Adding more noise for the machine to read is not always the correct choice.</strong></p>
+
+<p>The unexplained “star” is an example of a fix you could make by removing something from the machine announced layer. <code>role=presentation</code> on the asterisk and the <code>required</code> attribute on the input is worth a try in VoiceOver to see the difference it can make. Consider designing this interface layer so it makes sense, not simply assuming maximum machine information will tend towards sense.</p>
+
+<h2 id="curb-cut-effect">Curb Cut Effect</h2>
+
+<p>A colour contrast minimum rule is a favourite of the automated accessibility (Developer) test crowd. It’s not without it’s merit either! <a href="https://webaim.org/resources/contrastchecker/">The famous WebAIM contrast checker</a> very easily visualizes how slight changes in colour can render UI basically incomprehensible. The issue is not with the rule here at all. It’s actually to do with the narrow scope in which it’s applied.</p>
+
+<p>As with the other interface layers I gave examples of, the mouse or touchscreen interface layer needs consideration for it’s own medium. Information is delivered to users two dimensionally, out of a screen with some limited range of brightness, colour, and size. Ensuring contrast is perceivable is important. <strong>It actually benefits anyone using a screen.</strong> You’ve probably come across some interfaces with transparent unreadable text boxes, or featureless square buttons that blend into the background that frustrated you. If you haven’t, congratulations! But I can show you a multitude of Hacker News posts with examples of valid complaints from many other people. Strict application of a contrast minimum would’ve at least forced someone to consider why they chose the frustrating option.</p>
+
+<p>And yet, I still see readability and contrast being relegated to this accessibility (Developer) “best effort” group of tasks. Bemoaned by some minority of designers as an attack on creative freedom at the behest of the visually impaired. But if we strip away this weird private definition of the word “accessibility”, and try to find a new explanation why this matters, I think we would come to the conclusion that it’s simply good user experience design. The end result is a better, easier to use product.</p>
+
+<p>The prime example of this effect is the curb cut: an angled slice made into the curb on the side of a road, to make access onto and off of the road possible by rolling instead of stepping. In your mind, you’re imagining wheelchairs. Someone that cannot walk onto the curb must be physically disabled, and therefore uses a wheelchair. This is so cemented in our collective consciousness that we use a symbol of a person in a wheelchair to represent the concept of “disability”. A parking spot with that symbol displayed, won’t be far from a curb cut.</p>
+
+<p>However, this 1:1 reasoning is clearly not the full story. If you’ve ever had to use a mover’s dolley before, you’ll know how useful these curb cuts are. Same with someone on a bike, who generally values their pelvis <strong>not</strong> being blasted into shards going over a curb on thin road bike tires. The built environment was improved for everyone by adding an interface option (rolling) that we understood as being for only 1 specific kind of person.</p>
+
+<h2 id="considering-my-interfaces-while-avoiding-the-allure-of-minmaxing-my-accessibility-developer-score">Considering My Interfaces While Avoiding the Allure of Min/Maxing My Accessibility (Developer) Score</h2>
+
+<p>We developers are an interesting bunch. We take large problems, and break them down into small describable mini-problems that we can then automate, and provide an abstraction to make using our solution easy to use. While this process does work well for many problems, it’s not universal. Sometimes large “birds eye” solutions are necessary. Designers and artists are very familiar with this concept; holding steadfast to strict rules won’t always create a cohesive work, or even a work that’s fit for purpose. Instead, stepping back and considering the way someone uses the thing you’re making gives you a direction towards the impact/outcome you want to have, rather than trying to take the shortcut of following tips and tricks to save yourself the effort of exploration.</p>
+
+<p>This doesn’t mean standards for interface design are bad, far from it actually, but I don’t think we can assume that following an accessibility (Developer) “best practice” standard means the result is accessible (Universal). That requires we promise respect for your users, not out of pity for some list of disabilities that someone else predetermined as the “important ones”, but rather respect for your users to use tools how they see fit. Boiling this goal down to “it passes the automated a11y test” doesn’t hold up our side of this promise often enough.</p>
+
+  </div></div>]]>
+            </description>
+            <link>https://graypegg.com/2023/11/25/the-private-definition-of-accessible.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-38683774</guid>
+            <pubDate>Mon, 18 Dec 2023 15:31:13 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Dissecting the Go-Ethereum keystore files using Raku tools]]>
+            </title>
+            <description>
+<![CDATA[
+Score 3 | Comments 1 (<a href="https://news.ycombinator.com/item?id=38683363">thread link</a>) | @pheix
+<br/>
+December 18, 2023 | https://raku-advent.blog/2023/12/18/dissecting-the-go-ethereum-keystore-files-using-raku-tools/ | <a href="https://web.archive.org/web/*/https://raku-advent.blog/2023/12/18/dissecting-the-go-ethereum-keystore-files-using-raku-tools/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="post-3178">
+
+	
+
+	
+	<div>
+		
+<p>Generally the <a href="https://en.wikipedia.org/wiki/Ethereum">Ethereum</a> (Web3) keystore file is a kind of container for the private key, it has the specific structure mostly related to encryption details. Actually you will not find the private key there as a plain text, but the keystore file has everything to decrypt the private key… with some tricks surely.</p>
+
+
+
+<p>When you work with <a href="https://geth.ethereum.org/docs/getting-started" target="_blank" rel="noreferrer noopener">Geth</a> as a backend to access the blockchain, you have to work with accounts and therefore the «address/password» pairs or relevant private keys. Honestly, use of credential pairs is good enough for the most of the tasks, but since you want to boost the performance of your application and use it with authentication-less endpoints — you have to get some Geth-specific features directly in your app. <a href="https://raku-advent.blog/2021/12/12/a-long-journey-to-ethereum-signatures/" target="_blank" rel="noreferrer noopener">Transaction signing</a>, for example.</p>
+
+
+
+<p>Transactions must be signed by a private key obviously, so you can somehow get private key and store it somewhere you want, but more flexible approach — manage existed keystore files.</p>
+
+
+
+<p>Also you might be interested in Geth accounts management via keystore file direct access — fortunately Geth reloads keystores on the fly. Of course, I have to warn you about these hacking practices: you can corrupt or delete your account and eventually lose the access to your data on blockchain, but as a research or experiment — it’s ok 😜.</p>
+
+
+
+<h2>What is the Ethereum (Web3) keystore file</h2>
+
+
+
+<h3>Overview</h3>
+
+
+
+<p>Roughly speaking, a keystore file is an encrypted representation of the private key. By structure — it is a JSON file with the following content:</p>
+
+
+
+<pre id="advent-code-c8b045b1-0d20-47f1-8afe-d558c47fb2e6"><p>{
+    "<span>address</span>": "<span>92745e7e310d18e23384511b50fad184cb7cf826</span>",
+    "<span>crypto</span>": {
+        "<span>cipher</span>": "<span>aes-128-ctr</span>",
+        "<span>ciphertext</span>": "<span>6eaf8f9485a714ed30cf38c8ebbb78dc52c0fe4120adb998c0d0b70fe64d6aee</span>",
+        "<span>cipherparams</span>": {
+            "<span>iv</span>": "<span>fda483b2d6595dde7f2157a6e3611a03</span>"
+        },
+        "<span>kdf</span>": "<span>scrypt</span>",
+        "<span>kdfparams</span>": {
+            "<span>dklen</span>": <span>32</span>,
+            "<span>n</span>": <span>262144</span>,
+            "<span>p</span>": <span>1</span>,
+            "<span>r</span>": <span>8</span>,
+            "<span>salt</span>": "<span>5a1dba123aed0b365371b84b83af0be5691b06d4411d750144eabbb59be0efac</span>"
+        },
+        "<span>mac</span>": "<span>9e5bab612ac8c325c29ead18f619163edf41d831a1ef731a51ce4649c0e7d49e</span>"
+    },
+    "<span>id</span>": "<span>845c31f0-ac2c-4216-b8eb-76886eaa0cc1</span>",
+    "<span>version</span>": <span>3</span>
+}
+</p></pre>
+
+
+
+<p>The main member is the <code>version</code>. It defines the version of the keystore file and hence the encryption approach. I focus on the latest (3rd) generation of Ethereum keystores.</p>
+
+
+
+<p>The other JSON members in keystore file are:</p>
+
+
+
+<ul>
+<li><code>id</code> is the random universally unique identifier generated on keystore file creation. Importing an account with Geth from a keystore file (and exporting it if needed) will by default lead to keystore with different <code>id</code>. If this is not desired, you have to use <a href="https://ethereum-accounts.readthedocs.io/en/latest/account_export.html" target="_blank" rel="noreferrer noopener">3rd-party</a> tools allow to reuse or explicitly define <code>id</code>;</li>
+
+
+
+<li><code>address</code> relies on private key and might be fetched with <code>Bitcoin::Core::Secp256k1</code> <a href="https://gitlab.com/pheix/raku-bitcoin-core-secp256k1">module</a>;</li>
+
+
+
+<li><code>crypto</code> has <a href="https://ethereum.org/en/developers/docs/data-structures-and-encoding/web3-secret-storage/" target="_blank" rel="noreferrer noopener">all enctyption details</a> to get private key from the keystore file, encrypted private key is stored in <code>ciphertext</code>.</li>
+</ul>
+
+
+
+<h3>Actual scope (real world tasks)</h3>
+
+
+
+<p>I mentioned a few real world tasks we can solve via direct keystore management, but let me show a hot one at least. I maintain a few full nodes for <a href="https://www.alchemy.com/overviews/sepolia-testnet" target="_blank" rel="noreferrer noopener">Sepolia test network</a>. On node deployment there are two options for address management: use automatically generated address or import an existing one.</p>
+
+
+
+<p>Both cases have their own specifics. The common thing: both need a positive account balance (some available funds) to start interacting with test network.</p>
+
+
+
+<h4>Tools (aka hacks) to get private key from keystore file</h4>
+
+
+
+<p>The first case (automatically generated address) is the trivial one if you do not want to manage (track) your balance with the 3rd party wallet: you just need to get some funds from the faucet (I use the faucet by <a rel="noreferrer noopener" href="https://sepoliafaucet.com/" target="_blank">Alchemy</a>) and track funds transfer with <a rel="noreferrer noopener" href="https://sepolia.etherscan.io/" target="_blank">Etherscan</a>.</p>
+
+
+
+<p>The magic happens when you want to add your automatically generated address to 3rd-party wallets. You have to fetch somehow private key from the keystore file initially generated in Geth and import it, for example, into MetaMask. I wrote a simple <a href="https://gitlab.com/pheix-research/talks/-/blob/main/advent/assets/2023/sources/node.js/fromkeystorefile/file2privkey.js">Node.js script</a> as a hacker tool for that task. It’s a bit excessive and obviously not flexible approach — you should have Node.js installed, also script needs <a href="https://github.com/ethereumjs/keythereum" target="_blank" rel="noreferrer noopener">Keythereum</a> package as a primary dependency. So eventually I had to install all that stuff to my Sepolia node server, added a few symlinks (script looks for keystore file in <code>keystore</code> folder explicitly) and run script from privileged user:</p>
+
+
+
+<pre id="advent-code-c8b045b1-0d20-47f1-8afe-d558c47fb2e6"><p>node file2privkey.js
+<span># 632735b66ad875108deef039be855aae7f702653fcc2b2efb1e5666c1306f2fd</span>
+</p></pre>
+
+
+
+<p>Another hacking approach — use Python. It’s a bit more scalable than Node.js: Python is pre-installed in the most of the popular Linux distributions and the <a href="https://gitlab.com/pheix-research/talks/-/blob/main/advent/assets/2023/sources/python/fromkeystorefile/file2privkey.py">script</a> has just a single <a href="https://pypi.org/project/pycrypto/" target="_blank" rel="noreferrer noopener">external dependency</a>:</p>
+
+
+
+<pre id="advent-code-c8b045b1-0d20-47f1-8afe-d558c47fb2e6"><p>python3 file2privkey.py
+<span># 632735b66ad875108deef039be855aae7f702653fcc2b2efb1e5666c1306f2fd</span>
+</p></pre>
+
+
+
+<p>Since you got the raw private key, you can <a href="https://support.metamask.io/hc/en-us/articles/360015489331-How-to-import-an-account#h_01G01W07NV7Q94M7P1EBD5BYM4" target="_blank" rel="noreferrer noopener">easily import</a> it into Metamask and manage/track your account (balance at least) via a friendly UI.</p>
+
+
+
+<h4>Importing new accounts (private keys) into Geth client</h4>
+
+
+
+<p>The second case (import existing private key) into Geth client has two options under the hood as well. We can use Node.js <a href="https://gitlab.com/pheix-research/talks/-/blob/main/advent/assets/2023/sources/node.js/tokeystorefile/privkey2file.js">again</a> for raw private key to keystore file conversion (dependence to <a href="https://github.com/ethereumjs/ethereumjs-wallet" target="_blank" rel="noreferrer noopener">ethereumjs-wallet</a> package). Another approach: built-in <a href="https://geth.ethereum.org/docs/tools/clef/introduction" target="_blank" rel="noreferrer noopener">Clef</a> account manager — new accounts might be added via the command line:</p>
+
+
+
+<pre id="advent-code-c8b045b1-0d20-47f1-8afe-d558c47fb2e6"><p>clef <span>--advanced --stdio-ui --loglevel</span>=6 <span>--keystore</span>=/ethereum-local-network/geth.local/geth-node2/keystore/ importraw /pk</p></pre>
+
+
+
+<p>Input argument <code>--keystore</code> points to folder, where Geth stores its keystore files; <code>importraw</code> option triggers raw private key import; <code>/pk</code> is just the path to the sample text file with raw private key. Import via <code>clef</code> is used in <a href="https://gitlab.com/pheix-pool/core-perl6/-/blob/develop/.gitlab-ci.yml?ref_type=heads#L39">Pheix CI/CD</a> at GitLab.</p>
+
+
+
+<h2>Implementation in Raku</h2>
+
+
+
+<p>I started with the quick research — how it’s <a href="https://github.com/ethereum/go-ethereum/blob/v1.13.5/accounts/keystore/passphrase.go#L200" target="_blank" rel="noreferrer noopener">implemented</a> in Geth client <a href="https://github.com/ethereum/go-ethereum/tree/v1.13.5" target="_blank" rel="noreferrer noopener">written</a> in Go.</p>
+
+
+
+<h3>Initial state (it looks promising)</h3>
+
+
+
+<p>Not a lot of work and it looks like Raku has everything in its ecosystem for straight-forward implementation:</p>
+
+
+
+<ul>
+<li><a href="https://github.com/ethereum/go-ethereum/blob/916d6a441a866cb618ae826c220866de118899f7/accounts/keystore/passphrase.go#L203" target="_blank" rel="noreferrer noopener">Parse</a> JSON with <code>JSON::Fast</code> <a href="https://github.com/timo/json_fast" target="_blank" rel="noreferrer noopener">module</a>;</li>
+
+
+
+<li><a href="https://github.com/ethereum/go-ethereum/blob/916d6a441a866cb618ae826c220866de118899f7/accounts/keystore/passphrase.go#L243" target="_blank" rel="noreferrer noopener">Decrypt</a> V3 key:
+<ul>
+<li><a href="https://github.com/ethereum/go-ethereum/blob/916d6a441a866cb618ae826c220866de118899f7/accounts/keystore/passphrase.go#L345" target="_blank" rel="noreferrer noopener">get</a> derived key with <code>Crypt::LibScrypt</code> <a href="https://github.com/jonathanstowe/Crypt-LibScrypt" target="_blank" rel="noreferrer noopener">module</a>;</li>
+
+
+
+<li><a href="https://github.com/ethereum/go-ethereum/blob/916d6a441a866cb618ae826c220866de118899f7/accounts/keystore/passphrase.go#L267" target="_blank" rel="noreferrer noopener">get</a> keccak hash from derived key and keystore’s ciphertext with <code>Node::Ethereum::Keccak256::Native</code> <a href="https://gitlab.com/pheix/raku-node-ethereum-keccak256-native">module</a>;</li>
+
+
+
+<li><a href="https://github.com/ethereum/go-ethereum/blob/916d6a441a866cb618ae826c220866de118899f7/accounts/keystore/passphrase.go#L272" target="_blank" rel="noreferrer noopener">decrypt</a> ciphertext by derived key and keystore’s input vector with AES128: with <code>OpenSSL</code> or <code>Gcrypt</code> modules [<a href="https://github.com/sergot/openssl" target="_blank" rel="noreferrer noopener">ref1</a>, <a href="https://github.com/CurtTilmes/raku-libgcrypt" target="_blank" rel="noreferrer noopener">ref2</a>];</li>
+</ul>
+</li>
+
+
+
+<li><a href="https://github.com/ethereum/go-ethereum/blob/916d6a441a866cb618ae826c220866de118899f7/accounts/keystore/passphrase.go#L228" target="_blank" rel="noreferrer noopener">verify</a> decrypted V3 key (raw private key) and <a href="https://github.com/ethereum/go-ethereum/blob/916d6a441a866cb618ae826c220866de118899f7/accounts/keystore/passphrase.go#L238" target="_blank" rel="noreferrer noopener">get</a> Ethereum address with <code>Bitcoin::Core::Secp256k1</code> <a href="https://gitlab.com/pheix/raku-bitcoin-core-secp256k1">module</a>;</li>
+
+
+
+<li>generate UUID v4 with <code>Crypt::Random</code> <a href="https://github.com/skinkade/crypt-random" target="_blank" rel="noreferrer noopener">module</a> — in case we want to create keystore file from raw private key.</li>
+</ul>
+
+
+
+<h3><a href="#problems-are-on-the-most-important-steps"></a>Problems (are on the most important steps)</h3>
+
+
+
+<p>The main issues are at decryption, unfortunately the most important step. First issue is at <code>Crypt::LibScrypt</code>: custom KDF parameters could not be used because of module limitations. By default only <code>scrypt-hash</code> is implemented, it uses KDF constants hardcoded in <code>Crypt::LibScrypt</code>. Obviously those constants impact hash generation, so to get it working with Geth keystores we have to add binding to <code>libscrypt_scrypt</code> function from Native <a href="https://github.com/technion/libscrypt" target="_blank" rel="noreferrer noopener">libscrypt</a> library.</p>
+
+
+
+<p>Next issue is at <code>OpenSSL</code> and <code>Gcrypt</code>, both do not include AES128-CTR implementation. I will consider details below. Finally I found the problem at <code>Bitcoin::Core::Secp256k1</code> — compression was not configurable there, but we need to <a href="https://github.com/bitcoin-core/secp256k1/blob/77af1da9f631fa622fb5b5895fd27be431432368/include/secp256k1.h#L216" target="_blank" rel="noreferrer noopener">support</a> <code>SECP256K1_EC_UNCOMPRESSED</code> alongside <code>SECP256K1_EC_COMPRESSED</code>.</p>
+
+
+
+<h3><a href="#lets-raise-a-few-pull-requests"></a>Let’s raise a few Pull Requests</h3>
+
+
+
+<h4><a href="#cryptlibscrypt"></a><code>Crypt::LibScrypt</code></h4>
+
+
+
+<p>On initial step I added a few principal updates to <code>Crypt::LibScrypt</code> module, as it was mentioned above we need a binding to internal hashing function <code>libscrypt_scrypt</code>. Finally the next bindings (and exported wrappers) were added:</p>
+
+
+
+<ul>
+<li><code>libscrypt_salt_gen</code> — method for salt generation, «must-have» feature for keystore file generation;</li>
+
+
+
+<li><code>libscrypt_scrypt</code> — main <code>libscrypt</code>‘s hashing method, totally configurable via user-defined KDF (Key Derivation Function) parameters;</li>
+
+
+
+<li><code>libscrypt_mcf</code> — method to transpose raw hash buffer to modular crypt format (MCF), stringified hash in MCF might be verified by <code>scrypt-verify</code>;</li>
+</ul>
+
+
+
+<p>Pull request: <a href="https://github.com/jonathanstowe/Crypt-LibScrypt/pull/1/files" target="_blank" rel="noreferrer noopener">https://github.com/jonathanstowe/Crypt-LibScrypt/pull/1/files</a>.</p>
+
+
+
+<h4><a href="#openssl"></a><code>OpenSSL</code></h4>
+
+
+
+<p>Updates to <code>OpenSSL</code> are quite straight-forward: I added AES128-CTR binding <code>EVP_aes_128_ctr</code> and implemented new <code>encrypt</code> and <code>decrypt</code> multi methods with mandatory <code>:$aes128ctr</code> argument (to call <code>EVP_aes_128_ctr</code> from).</p>
+
+
+
+<p>Pull request: <a href="https://github.com/sergot/openssl/pull/103/files" target="_blank" rel="noreferrer noopener">https://github.com/sergot/openssl/pull/103/files</a>.</p>
+
+
+
+<h3><a href="#yet-another-binding-for-gnu-libgcrypt"></a>Yet another binding for GNU Libgcrypt</h3>
+
+
+
+<p>Initially I tried <code>Gcrypt</code> as the module with AES128-CTR in place. <code>Gcrypt</code> is the great set of bindings for GNU <a href="https://gnupg.org/software/libgcrypt/index.html" target="_blank" rel="noreferrer noopener">libgcrypt</a>. My expectation was: <code>Gcrypt</code> has a bindings for AES family with all available modes. Quote from module README:</p>
+
+
+
+<blockquote>
+<p><em>It provides functions for all cryptograhic building blocks: symmetric cipher algorithms (AES, Arcfour, Blowfish, Camellia, CAST5, ChaCha20 DES, GOST28147, Salsa20, SEED, Serpent, Twofish) and modes (ECB, CFB, CBC, OFB, CTR, CCM, GCM, OCB, POLY1305, AESWRAP).</em></p>
+</blockquote>
+
+
+
+<p>The first finding was: the mode switch is broken in <code>Gcrypt</code> since it was released. Just a typo in <code>Gcrypt/Constants.rakumod</code>: <a href="https://github.com/CurtTilmes/raku-libgcrypt/blob/c7f7c77e0d8fe67a0c504b9df0ad19e264e1f72f/lib/Gcrypt/Constants.rakumod#L103" target="_blank" rel="noreferrer noopener">enum</a> with modes is defined as <code>Gcrypt::CipherMode</code>, but in generic <code>Gcrypt::Cipher</code> class, mode <a href="https://github.com/CurtTilmes/raku-libgcrypt/blob/c7f7c77e0d8fe67a0c504b9df0ad19e264e1f72f/lib/Gcrypt/Cipher.rakumod#L64" target="_blank" rel="noreferrer noopener">is set up</a> from <code>Gcrypt::CipherModes</code> 🤷. So looks like none tested it before, a bit of a dangerous beginning.</p>
+
+
+
+<p>I did a quick fix and started tests, but decryption bellow gives wrong <code>$secret</code> buffer:</p>
+
+
+
+<pre id="advent-code-c8b045b1-0d20-47f1-8afe-d558c47fb2e6"><p>my <span>buf8 $secret</span> = <span>Crypt::LibGcrypt::Cipher</span>.<span>new</span>(:<span>algorithm</span>(<span>GCRY_CIPHER_AES</span>), :<span>key</span>(<span>$derivedkey</span>.<span>subbuf</span>(<span>0</span>, <span>16</span>)), :<span>mode</span>(<span>'CTR'</span>), :<span>iv</span>(<span>$iv</span>)).<span>decrypt</span>(<span>$ciphertext</span>, :<span>bin</span>(<span>True</span>));
+</p></pre>
+
+
+
+<p>To debug that, I wrote simple <a href="https://gitlab.com/pheix/raku-node-ethereum-keystore/-/blob/3e3558263e72dd8833ad89712fd85ff5ac21d5ba/c/main.c">C-application</a>, where I compared <code>libgcrypt</code> and <code>libssl</code> decryption — it worked 100% similar to Raku implementation, <code>libssl</code> gave correct secret and <code>libgcrypt</code> gave incorrect one (but the same as I got from Raku script). That finding showed that I missed something in <code>libgcrypt</code> implementation, so I started investigation (googling actually). Next finding was: in <code>libgcrypt</code> embedded <a rel="noreferrer noopener" href="https://github.com/Chronic-Dev/libgcrypt/blob/e5a923dee8ad0539a53f5d16076ff326e4b49fa5/tests/basic.c#L412" target="_blank">tests</a> for AES in CTR mode counter vector <code>ctr</code> was used instead of initial vector <code>iv</code>. So I <a href="https://gitlab.com/pheix/raku-node-ethereum-keystore/-/commit/e8e05caa31304ac1fcc6017fb13e342df727bc4b">modified</a> my C-application and 🎉 I finally got correct secret via <code>libgcrypt</code>.</p>
+
+
+
+<p>So what updates should be added to Raku <code>Gcrypt</code> module eventually? Actually a few ones:</p>
+
+
+
+<ul>
+<li><a href="https://gitlab.com/pheix/raku-crypt-libgcrypt/-/blob/main/lib/Crypt/LibGcrypt/Cipher.rakumod?ref_type=heads#L65">fix</a> <code>Gcrypt::CipherModes</code> typo;</li>
+
+
+
+<li>add <a href="https://gitlab.com/pheix/raku-crypt-libgcrypt/-/blob/main/lib/Crypt/LibGcrypt/CipherHandle.rakumod#L14">binding</a> to <code>gcry_cipher_setctr</code>;</li>
+
+
+
+<li>set counter vector with <code>setctr</code> <a href="https://gitlab.com/pheix/raku-crypt-libgcrypt/-/blob/main/lib/Crypt/LibGcrypt/Cipher.rakumod?ref_type=heads#L123">multi method</a>;</li>
+
+
+
+<li>constructor <a href="https://gitlab.com/pheix/raku-crypt-libgcrypt/-/blob/main/lib/Crypt/LibGcrypt/Cipher.rakumod?ref_type=heads#L80">upgrade</a> — set up counter vector if needed.</li>
+</ul>
+
+
+
+<p>While working on <code>Gcrypt</code>, my pull requests for <code>Crypt::LibScrypt</code> and <code>OpenSSL</code> were still pending (now are pending as well), so I decided to <a href="https://gitlab.com/pheix/raku-crypt-libgcrypt">fork</a> <code>Gcrypt</code> to <code>Crypt::LibGcrypt</code>, because another one stuck PR will frustrate me finally.</p>
+
+
+
+<h3>Upgrade secp256k1 Raku binding </h3>
+
+
+
+<p>The quickest step! I’m the maintainer of <code>Bitcoin::Core::Secp256k1</code>, so I just pushed the <a>updates</a> to the source base 😍. The idea behind: add an option to get uncompressed key with <code>serialize_public_key_to_compressed</code> method. Looks a bit controversial (from naming perspective), but it’s just the feature for key serialization without compression.</p>
+
+
+
+<h2>Manage keystore files with 🤫</h2>
+
+
+
+<p>So looks like we got all «puzzles» working and finally after an evening spent on <code>Node::Ethereum::KeyStore::V3</code> module coding, we are ready for 👇</p>
+
+
+
+<h3>Quick start</h3>
+
+
+
+<p>This module has everything under the hood to manage your keystore files and raw public keys. You can easily decrypt existed keystore:</p>
+
+
+
+<pre id="advent-code-c8b045b1-0d20-47f1-8afe-d558c47fb2e6"><p><b>use</b> <span>Node::Ethereum::KeyStore::V3</span>;
+
+my <span>$password</span>  = <span>'node1'</span>;
+my <span>$decrypted</span> = <span>Node::Ethereum::KeyStore::V3</span>.<span>new</span>(:<span>keystorepath</span>(<span>'./data/92745E7e310d18e23384511b50FAd184cB7CF826.keystore'</span>)).<span>decrypt_key</span>(:<span>$password</span>);
+
+<span>$decrypted</span>&lt;<span>buf8</span>&gt;.<span>say</span>;
+<span>$decrypted</span>&lt;<span>str</span>&gt;.<span>say</span>;
+
+<span># Buf[uint8]:0x
+# 632735b66ad875108deef039be855aae7f702653fcc2b2efb1e5666c1306f2fd</span>
+</p></pre>
+
+
+
+<p>New keystore file could be generated from raw public key via a few calls:</p>
+
+
+
+<pre id="advent-code-c8b045b1-0d20-47f1-8afe-d558c47fb2e6"><p><b>use</b> <span>Node::Ethereum::KeyStore::V3</span>;
+
+my <span>$secret</span>    = <span>'632735b66ad875108deef039be855aae7f702653fcc2b2efb1e5666c1306f2fd'</span>;
+my <span>$password</span>  = <span>'node1'</span>;
+my <span>$ksobject</span>  = <span>Node::Ethereum::KeyStore::V3</span>.<span>new</span>(:<span>keystorepath</span>(<span>'./sample-keystore.json'</span>));
+my <span>$keycrypto</span> = <span>$ksobject</span>.<span>keystore</span>((:<span>$password</span>, :<span>$secret</span>);
+
+<span>$ksobject</span>.<span>save</span>(:<span>$keystore</span>);
+</p></pre>
+
+
+
+<h3>Command line utility</h3>
+
+
+
+<p><code>Node::Ethereum::KeyStore::V3</code> module distribution has <code>ethkeystorev3-cli</code> utility onboard. After the module installation it’s available via command line:</p>
+
+
+
+<pre id="advent-code-c8b045b1-0d20-47f1-8afe-d558c47fb2e6"><p>ethkeystorev3-cli
+<span># Usage:
+#   ethkeystorev3-cli --keystorepath= --password= [--privatekey=]</span></p></pre>
+
+
+
+<p>Keystore file decryption:</p>
+
+
+
+<pre id="advent-code-c8b045b1-0d20-47f1-8afe-d558c47fb2e6"><p>ethkeystorev3-cli <span>--keystorepath</span>=<span>$HOME</span>/sample-keystore.json <span>--password</span>=111
+<span># 632735b66ad875108deef039be855aae7f702653fcc2b2efb1e5666c1306f2fd</span></p></pre>
+
+
+
+<p>Keystore file generation:</p>
+
+
+
+<pre id="advent-code-c8b045b1-0d20-47f1-8afe-d558c47fb2e6"><p>ethkeystorev3-cli <span>--keystorepath</span>=<span>$HOME</span>/sample-keystore-gen.json <span>--password</span>=111 <span>--privatekey</span>=632735b66ad875108deef039be855aae7f702653fcc2b2efb1e5666c1306f2fd
+<span># keystore /home/user/sample-keystore-gen.json is successfully saved</span></p></pre>
+
+
+
+<h3><a href="#dependencies"></a>Dependencies</h3>
+
+
+
+<p>Since my pull request to <code>Crypt::LibScrypt</code> is still pending, I decided to maintain my fork of <code>Crypt::LibScrypt</code> with personal <code>auth</code>. For now <code>Node::Ethereum::KeyStore::V3</code> module depends on <code>Crypt::LibScrypt:ver&lt;0.0.7+&gt;:auth&lt;zef:knarkhov&gt;</code> (available in <code>fez</code> ecosystem).</p>
+
+
+
+<h2>Afterword</h2>
+
+
+
+<h3>Ethelia service</h3>
+
+
+
+<p><a href="https://ethelia.pheix.org/">Ethelia</a> is a secure, authoritative and reliable Ethereum blockchain storage provider for different kinds of lightweight data. </p>
+
+
+
+<p>Blockchain technology gives decentralization, security and resistance against data corruption or falsifying out of the box, and Ethelia delivers to end user the ability to store tamper-proof and sensitive data there.</p>
+
+
+
+<p>Сonsider a network with functionally different nodes: IoT, programmable logic controllers, smart home systems, micro-services, standalone multi-threading or mobile applications. Every node runs own duty cycle with state changes and events emission.</p>
+
+
+
+<p>In general non-critical state changes or usual events should not be logged, but once the node detects some anomaly or exceptional behavior, importance of logging increases exponentially. Such events might be stored on blockchain by Ethelia and the fact of storing will guarantee the data integrity and consistency.</p>
+
+
+
+<p>Ethelia is live and runs Raku-driven <a href="https://gitlab.com/groups/ethelia/-/shared?sort=name_asc">backend</a>.</p>
+
+
+
+<h3>Registering via Telegram Bot</h3>
+
+
+
+<p>I like sign up/in approach from <a href="https://midjourney.com/home/?callbackUrl=%2Fapp%2F">Midjourney</a> — do it via Discord. For Ethelia it’s done the same way, but Telegram is used instead. Registration model is described <a href="https://docs.ethelia.pheix.org/rawhide/registration-model/">here</a>.</p>
+
+
+
+<p>Basic idea is — customer has to pass the registration interview with the bot and if interview is passed, bot registers new customer on Ethelia’s node. Telegram bot is written in Raku, the module for interviewing is at early beta and still under developing, currently I’m trying to combine static questions with the dynamic GPT4 ones (generated on the fly according the interview flow).</p>
+
+
+
+<p><code>Node::Ethereum::KeyStore::V3</code> module is <a href="https://gitlab.com/pheix-research/raku-dossier-prototype/-/blob/main/bin/trivial-bot.raku?ref_type=heads#L451">used</a> there at the final step for actual account creation (keystore file generation to Geth <code>keystore</code> folder).</p>
+
+
+
+<p>Since you are registered, you can post your lightweight data to a different Ethereum networks (our private <a href="https://github.com/ethereum/guide/blob/master/poa.md">PoA</a>, Sepolia and mainnet) via Ethelia’s endpoint. The only limitation for this moment — API access token is available only during the auth session in <a href="https://pheix.org/admin">web control panel</a>.</p>
+
+
+
+<h3>Demo pitch</h3>
+
+
+
+<figure><a href="https://gitlab.com/pheix-research/talks/-/raw/main/advent/assets/2023/tg-reg-v2-1.7x.gif"><img src="https://gitlab.com/pheix-research/talks/-/raw/main/advent/assets/2023/tg-reg-v2-1.7x.gif" alt=""></a></figure>
+
+
+
+<p>You are welcome to <a href="https://t.me/+0YOeSWFoceAyYjBi" target="_blank" rel="noreferrer noopener">try it</a> out! Thank you for reading. Happy Christmas 🎄🎅☃️🎁⛄🦌🎄</p>
+	</div><!-- .entry-content -->
+
+	<!-- .entry-footer -->
+
+				
+</article></div>]]>
+            </description>
+            <link>https://raku-advent.blog/2023/12/18/dissecting-the-go-ethereum-keystore-files-using-raku-tools/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-38683363</guid>
+            <pubDate>Mon, 18 Dec 2023 15:01:02 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Mastering AWS Adoption Strategies: From Basics to Advanced]]>
+            </title>
+            <description>
+<![CDATA[
+Score 3 | Comments 0 (<a href="https://news.ycombinator.com/item?id=38682970">thread link</a>) | @mooreds
+<br/>
+December 18, 2023 | https://cloudkitect.com/mastering-aws-adoption-strategies-from-basics-to-advanced/ | <a href="https://web.archive.org/web/*/https://cloudkitect.com/mastering-aws-adoption-strategies-from-basics-to-advanced/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+                                                    
+<p>Welcome to this comprehensive tutorial on AWS adoption strategies! In this guide, we will explore a spectrum of AWS infrastructure configuration approaches, ranging from the fundamental basics to more advanced and sophisticated setups. AWS, or Amazon Web Services, offers a robust cloud computing platform, and understanding how to structure your infrastructure is crucial for optimizing security, efficiency, and scalability.</p>
+
+
+
+<p><strong>The Basic AWS Setup</strong></p>
+
+
+
+<figure><img fetchpriority="high" decoding="async" width="720" height="405" src="https://cloudkitect.com/wp-content/uploads/2023/10/Slide1.jpeg" alt="" srcset="https://cloudkitect.com/wp-content/uploads/2023/10/Slide1.jpeg 720w, https://cloudkitect.com/wp-content/uploads/2023/10/Slide1-200x113.jpeg 200w" sizes="(max-width: 720px) 100vw, 720px"></figure>
+
+
+
+<p>Many organizations kickstart their AWS journey by deploying all their application resources within a single AWS account. It’s a straightforward and convenient approach, but it’s not necessarily aligned with best practices, especially regarding security. This common practice exposes systems to a high risk of misconfiguration, potentially leading to security breaches and data loss. To establish a more robust and secure AWS environment, it’s essential to explore advanced account structures and resource partitioning strategies that align better with security and operational best practices.</p>
+
+
+
+<p><strong>A Simple Two-Account Strategy</strong></p>
+
+
+
+<figure><img decoding="async" width="720" height="405" src="https://cloudkitect.com/wp-content/uploads/2023/10/Slide2.jpeg" alt="" srcset="https://cloudkitect.com/wp-content/uploads/2023/10/Slide2.jpeg 720w, https://cloudkitect.com/wp-content/uploads/2023/10/Slide2-200x113.jpeg 200w" sizes="(max-width: 720px) 100vw, 720px"></figure>
+
+
+
+<p>A significant step up from the basic setup is adopting a two-account strategy. In this approach, every organization should maintain at least two separate AWS accounts:</p>
+
+
+
+<ul>
+<li><strong>Development Account:</strong> Dedicated to the development and testing of applications.</li>
+
+
+
+<li><strong>Production Account:</strong> Solely for hosting production workloads, with provisions for automation in deployment processes.</li>
+</ul>
+
+
+
+<p>This dual-account structure offers several advantages, primarily bolstering security. By segregating development and production environments, access to sensitive production data is limited, reducing the risk of accidental deletions and enhancing data protection. This separation aligns with security best practices and contributes to the overall stability and reliability of your AWS infrastructure.</p>
+
+
+
+<p><strong>AWS Account Management with Control Tower</strong></p>
+
+
+
+<figure><img decoding="async" width="720" height="405" src="https://cloudkitect.com/wp-content/uploads/2023/10/Slide3.jpeg" alt="" srcset="https://cloudkitect.com/wp-content/uploads/2023/10/Slide3.jpeg 720w, https://cloudkitect.com/wp-content/uploads/2023/10/Slide3-200x113.jpeg 200w" sizes="(max-width: 720px) 100vw, 720px"></figure>
+
+
+
+<p>Taking AWS account management to the next level involves the use of a dedicated AWS account for management purposes and integrating the AWS Control Tower service to create a basic landing zone. This approach results in the establishment of two distinct organizational units:</p>
+
+
+
+<ul>
+<li><strong>Security Organization Unit:</strong> Comprising an ‘audit’ account for security checks and a ‘centralized logging’ account for log consolidation and enhanced monitoring.</li>
+
+
+
+<li><strong>Workloads Organization Unit:</strong> Further refining the architecture, this organizational unit divides into a ‘Dev OU’ tailored for development workloads and a ‘Prod OU’ exclusively for hosting production workloads.</li>
+</ul>
+
+
+
+<p>This meticulously structured setup serves as a robust foundation, allowing scalability and future maturity without the need for extensive overhauls. It not only enhances security but also optimizes resource management, setting the stage for an efficient and adaptable AWS infrastructure.</p>
+
+
+
+<p><strong>The Enhanced Landing Zone – Strategies for SMBs and Enterprises</strong></p>
+
+
+
+<figure><img loading="lazy" decoding="async" width="720" height="405" src="https://cloudkitect.com/wp-content/uploads/2023/10/Slide6.jpeg" alt="" srcset="https://cloudkitect.com/wp-content/uploads/2023/10/Slide6.jpeg 720w, https://cloudkitect.com/wp-content/uploads/2023/10/Slide6-200x113.jpeg 200w" sizes="(max-width: 720px) 100vw, 720px"></figure>
+
+
+
+<p>For those seeking an even more advanced AWS setup, CloudKitect recommends the Enhanced Landing Zone approach. This configuration introduces additional organizational units, including a ‘Sandbox OU’ for developer experimentation and an ‘Infrastructure OU’ dedicated to shared services like Route53. Within the ‘workloads OU,’ further refinement is achieved by establishing distinct organizational units for development, staging, and production environments. Each unit is equipped with specific security control policies, ensuring a fine-tuned approach to security management.</p>
+
+
+
+<p>To enhance security further, this strategy deploys config rules in each account for compliance checks against industry standards such as PCI, NIST, and CIS. The results of these checks are directed to an audit account configured with Security Hub, Amazon Macie, and GuardDuty to conduct in-depth analysis and report on compliance and security violations. Additionally, a central logging account is designated to receive logs from every account, facilitating comprehensive log analysis and improving overall security posture.</p>
+
+
+
+<p><strong>Conclusion</strong></p>
+
+
+
+<p>The success of your AWS journey lies in its foundation. While the complexity of AWS infrastructure may seem daunting, establishing the right organizational structure, implementing security policies, and optimizing resource management are essential. Fortunately, CloudKitect offers proprietary tools that streamline this entire infrastructure setup, reducing it from a potentially daunting task to a process that can be completed in just a few hours.</p>
+
+
+
+<p>Remember, a well-structured AWS environment not only enhances security but also sets the stage for efficient operations, scalability, and future growth. So, whether you’re just starting your AWS journey or looking to refine your existing setup, mastering these AWS adoption strategies is a step in the right direction.</p>
+                                                </div></div>]]>
+            </description>
+            <link>https://cloudkitect.com/mastering-aws-adoption-strategies-from-basics-to-advanced/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-38682970</guid>
+            <pubDate>Mon, 18 Dec 2023 14:29:06 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[What's New in Ruby 3.3]]>
+            </title>
+            <description>
+<![CDATA[
+Score 3 | Comments 0 (<a href="https://news.ycombinator.com/item?id=38681564">thread link</a>) | @unripe_syntax
+<br/>
+December 18, 2023 | https://nithinbekal.com/posts/ruby-3-3/ | <a href="https://web.archive.org/web/*/https://nithinbekal.com/posts/ruby-3-3/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+  <p>Every year on Christmas day,
+the Ruby core team releases
+a new version of Ruby.
+This year will likely be no different,
+and we can expect Ruby 3.3 next week.</p>
+
+<p>This year,
+the primary focus of the release
+is performance and developer experience.
+There aren’t as many
+major changes to the language features
+as in previous versions,
+so this post is going to be shorter than usual.
+Here are some of
+the highlights of the release:</p>
+
+<h3 id="yjit">YJIT</h3>
+
+<p>YJIT, Ruby’s JIT compiler,
+has seen some incredible advances
+in the past couple of years.
+Companies like
+<a href="https://dev.37signals.com/yjit-is-fast/">Basecamp</a>
+and
+<a href="https://railsatscale.com/2023-09-18-ruby-3-3-s-yjit-runs-shopify-s-production-code-15-faster/">Shopify</a>
+are already running
+with preview releases of 3.3 in production
+and have seen over 15% speedups.
+In fact,
+YJIT has been so effective
+at speeding up Rails apps
+that it will be
+<a href="https://github.com/rails/rails/pull/49947">enabled by default</a>
+on newly generated Rails apps
+if you are on Ruby 3.3.</p>
+
+<p>A new method,
+<code>RubyVM::YJIT.enable</code>
+has been introduced,
+which allows you to enable YJIT at runtime.
+This can be useful
+if you want to load the app quickly
+and then enable YJIT
+after it has booted.
+This is what Rails uses to enable JIT
+in an initializer.</p>
+
+<h3 id="rjit">RJIT</h3>
+
+<p>An experimental JIT compiler called RJIT
+has been introduced.
+This is written in pure Ruby,
+and replaces MJIT,
+which was an alternative JIT
+that was available in Ruby 3.2.
+RJIT uses a lot more memory than YJIT,
+and exists only for experimentation.
+In production,
+you should always use YJIT.</p>
+
+<h3 id="irb">IRB</h3>
+
+<p>After using <code>pry</code> and <code>byebug</code>
+as my preferred debugging tools for years,
+I switched to using <a href="https://github.com/ruby/irb#usage">IRB</a>
+for all my debugging
+in the past few months.
+With this release,
+IRB, and its integration
+with the builtin <a href="https://github.com/ruby/debug#how-to-use"><code>debug</code> gem</a>
+has improved so much
+that <code>pry</code> and <code>byebug</code>
+are no longer necessary
+for debugging your code.</p>
+
+<h3 id="range">Range</h3>
+
+<p>There are a couple of changes to the <code>Range</code> class.
+An <code>overlap?</code> method has been added:</p>
+
+<div><div><pre><code><span>(</span><span>1</span><span>..</span><span>3</span><span>).</span><span>overlap?</span><span>(</span><span>3</span><span>..</span><span>5</span><span>)</span> <span># true</span>
+<span>(</span><span>1</span><span>..</span><span>3</span><span>).</span><span>overlap?</span><span>(</span><span>4</span><span>..</span><span>6</span><span>)</span> <span># false</span>
+</code></pre></div></div>
+
+<p>You can also call <code>reverse_each</code>
+on begin-less ranges now:</p>
+
+<div><div><pre><code><span>(</span><span>..</span><span>10</span><span>).</span><span>reverse_each</span><span>.</span><span>take</span><span>(</span><span>3</span><span>)</span> <span>#=&gt; [10, 9, 8]</span>
+</code></pre></div></div>
+
+<h3 id="prism-parser">Prism parser</h3>
+
+<p>A new parser called <a href="https://github.com/ruby/prism">Prism</a>
+has been introduced as a default gem.
+It is more error tolerant
+and can be used as a replacement for ripper.
+This is portable across Ruby implementations,
+and is currently being integrated into
+MRI, JRuby, TruffleRuby and Sorbet.</p>
+
+<p>With prism,
+you can parse code using
+<code>Prism.parse</code>
+and get a result that looks like this:</p>
+
+<div><div><pre><code>&gt; Prism.parse("1 + 2")
+
+#&lt;Prism::ParseResult:0x000000010f5518c8
+ @comments=[],
+ @data_loc=nil,
+ @errors=[],
+ @magic_comments=[],
+ @source=#&lt;Prism::Source:0x000000012aa77530 @offsets=[0], @source="1 + 2", @start_line=1&gt;,
+ @value=
+  @ ProgramNode (location: (1,0)-(1,5))
+  ├── locals: []
+  └── statements:
+      @ StatementsNode (location: (1,0)-(1,5))
+      └── body: (length: 1)
+          └── @ CallNode (location: (1,0)-(1,5))
+              ├── flags: ∅
+              ├── receiver:
+              │   @ IntegerNode (location: (1,0)-(1,1))
+              │   └── flags: decimal
+              ├── call_operator_loc: ∅
+              ├── name: :+
+              ├── message_loc: (1,2)-(1,3) = "+"
+              ├── opening_loc: ∅
+              ├── arguments:
+              │   @ ArgumentsNode (location: (1,4)-(1,5))
+              │   ├── flags: ∅
+              │   └── arguments: (length: 1)
+              │       └── @ IntegerNode (location: (1,4)-(1,5))
+              │           └── flags: decimal
+              ├── closing_loc: ∅
+              └── block: ∅,
+ @warnings=[]&gt;
+</code></pre></div></div>
+
+<h3 id="mn-thread-scheduler">M:N thread scheduler</h3>
+
+<p>A new M:N thread scheduler has been introduced
+to improve thread and ractor performance.
+Here, M is the number of ractors
+and N is the number of native threads
+(equal to number of CPU cores, for instance).
+This allows us to create a large number of ractors
+without having to pay the overhead
+of creating a native thread for each one of them.</p>
+
+<h3 id="other-changes">Other changes</h3>
+
+<ul>
+  <li>In Ruby 3.4,
+there is a <a href="https://bugs.ruby-lang.org/issues/18980">proposal</a>
+to use <code>it</code> as a reference
+to the first argument to a block.
+Calling a method called <code>it</code> without args
+has been deprecated
+and will show a warning.</li>
+  <li>Bison has been replaced with
+<a href="https://github.com/yui-knk/lrama">Lrama parser generator</a>
+to improve maintainability.</li>
+  <li>There have been more optimizations
+to the garbage collector
+to further improve performance.</li>
+</ul>
+
+<h3 id="more-reading">More reading</h3>
+
+<p>With these posts,
+I try to highlight some of the changes
+that I found most interesting,
+and often skip over features I might not use.
+If you’re looking for a more comprehensive look at the release,
+I highly recommend looking at the
+<a href="https://www.ruby-lang.org/en/news/2023/12/11/ruby-3-3-0-rc1-released/">release announcement</a>
+and the <a href="https://github.com/ruby/ruby/blob/v3_3_0_rc1/NEWS.md">changelog</a>.</p>
+
+<div>
+  <p>
+    This article is part of the <em>What's New in Ruby</em> series.
+    To read about a different version of Ruby,
+    pick the version here:
+  </p>
+
+  <p>
+    <a href="https://nithinbekal.com/posts/ruby-2-3-features/">2.3</a> &nbsp;&nbsp;
+    <a href="https://nithinbekal.com/posts/ruby-2-4-features/">2.4</a> &nbsp;&nbsp;
+    <a href="https://nithinbekal.com/posts/ruby-2-5-features/">2.5</a> &nbsp;&nbsp;
+    <a href="https://nithinbekal.com/posts/ruby-2-6/">2.6</a> &nbsp;&nbsp;
+    <a href="https://nithinbekal.com/posts/ruby-2-7/">2.7</a> &nbsp;&nbsp;
+    <a href="https://nithinbekal.com/posts/ruby-3-0/">3.0</a> &nbsp;&nbsp;
+    <a href="https://nithinbekal.com/posts/ruby-3-1/">3.1</a> &nbsp;&nbsp;
+    <a href="https://nithinbekal.com/posts/ruby-3-2/">3.2</a> &nbsp;&nbsp;
+    <a href="https://nithinbekal.com/posts/ruby-3-3/">3.3</a>
+  </p>
+</div>
+
+
+  </div></div>]]>
+            </description>
+            <link>https://nithinbekal.com/posts/ruby-3-3/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-38681564</guid>
+            <pubDate>Mon, 18 Dec 2023 12:26:38 GMT</pubDate>
+        </item>
         <item>
             <title>
 <![CDATA[How to get your first ten customers]]>
@@ -605,7 +1862,7 @@ December 17, 2023 | https://www.pankajtanwar.in/blog/i-built-a-gnome-shell-exten
             </title>
             <description>
 <![CDATA[
-Score 3 | Comments 1 (<a href="https://news.ycombinator.com/item?id=38679357">thread link</a>) | @_bramses
+Score 3 | Comments 2 (<a href="https://news.ycombinator.com/item?id=38679357">thread link</a>) | @_bramses
 <br/>
 December 17, 2023 | https://www.bramadams.dev/issue-39/ | <a href="https://web.archive.org/web/*/https://www.bramadams.dev/issue-39/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -729,7 +1986,7 @@ December 17, 2023 | https://www.bramadams.dev/issue-39/ | <a href="https://web.a
             </title>
             <description>
 <![CDATA[
-Score 43 | Comments 8 (<a href="https://news.ycombinator.com/item?id=38679078">thread link</a>) | @Kortaggio
+Score 79 | Comments 20 (<a href="https://news.ycombinator.com/item?id=38679078">thread link</a>) | @Kortaggio
 <br/>
 December 17, 2023 | https://figgie.com/how-to-play | <a href="https://web.archive.org/web/*/https://figgie.com/how-to-play">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -969,7 +2226,7 @@ December 17, 2023 | https://ringwatchers.com/article/booster-prop-distribution |
             </title>
             <description>
 <![CDATA[
-Score 51 | Comments 43 (<a href="https://news.ycombinator.com/item?id=38678853">thread link</a>) | @danielfoster
+Score 52 | Comments 46 (<a href="https://news.ycombinator.com/item?id=38678853">thread link</a>) | @danielfoster
 <br/>
 December 17, 2023 | https://afronomist.com/volkswagen-admits-touchscreen-experiment-failed-will-bring-back-physical-buttons/ | <a href="https://web.archive.org/web/*/https://afronomist.com/volkswagen-admits-touchscreen-experiment-failed-will-bring-back-physical-buttons/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1269,7 +2526,7 @@ December 17, 2023 | https://writersontherange.org/live-rough-and-know-the-real-w
             </title>
             <description>
 <![CDATA[
-Score 46 | Comments 56 (<a href="https://news.ycombinator.com/item?id=38676612">thread link</a>) | @bottega_boy
+Score 46 | Comments 59 (<a href="https://news.ycombinator.com/item?id=38676612">thread link</a>) | @bottega_boy
 <br/>
 December 17, 2023 | https://www.centurylife.org/how-to-choose-cookware/ | <a href="https://web.archive.org/web/*/https://www.centurylife.org/how-to-choose-cookware/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><main><article class="page" aria-label="How to Choose Cookware" itemscope="" itemtype="https://schema.org/CreativeWork"><div itemprop="text"><p>Good cookware more than pays for itself. Here’s why:</p>
@@ -1764,7 +3021,7 @@ Either way, you will hear from me again.</p></div></div>]]>
             </title>
             <description>
 <![CDATA[
-Score 113 | Comments 103 (<a href="https://news.ycombinator.com/item?id=38674158">thread link</a>) | @ksec
+Score 113 | Comments 110 (<a href="https://news.ycombinator.com/item?id=38674158">thread link</a>) | @ksec
 <br/>
 December 17, 2023 | https://forum.misra.org.uk/thread-1668.html | <a href="https://web.archive.org/web/*/https://forum.misra.org.uk/thread-1668.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="post_3679">
@@ -1945,21 +3202,10 @@ provider without missing anything.</p>
             </title>
             <description>
 <![CDATA[
-Score 69 | Comments 38 (<a href="https://news.ycombinator.com/item?id=38673392">thread link</a>) | @pchm
+Score 69 | Comments 39 (<a href="https://news.ycombinator.com/item?id=38673392">thread link</a>) | @pchm
 <br/>
 December 17, 2023 | https://ptrchm.com/posts/base32-explained/ | <a href="https://web.archive.org/web/*/https://ptrchm.com/posts/base32-explained/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="root">
-    
-
-
-    <main>
-      
-  <article itemscope="" itemtype="http://schema.org/BlogPosting">
-    
-
-    
-
-    <div itemprop="articleBody">
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div itemprop="articleBody">
       <p>Base64 is one of those things I’ve used countless times, without ever fully understanding what it does. For my <a href="https://ptrchm.com/posts/based-uuid">UUID shortener</a>, I chose to implement Base32 — a more readable and URL-friendly alternative to Base64. I didn’t want to rely on any third-party libraries for the encoding part. This meant going back to basics and learning what actually happens when you encode data to a Base2ⁿ format.</p>
 <p>This post is my attempt to explain and visualize how Base32 encoding works at the bit level and how it relates to other Base2ⁿ formats, like Base64.</p>
 <p>We’ll implement a Base32 encoder from scratch. I’ll be using Ruby for the example code, but the principles should be easily translated to any programming language.</p>
@@ -2513,20 +3759,7 @@ BASE32("foobar") = "MZXW6YTBOI======"
 </ol>
 </section>
 
-    </div>
-
-    
-  </article>
-
-  
-  
-  
-
-    </main>
-
-    
-
-  </div></div>]]>
+    </div></div>]]>
             </description>
             <link>https://ptrchm.com/posts/base32-explained/</link>
             <guid isPermaLink="false">hacker-news-small-sites-38673392</guid>
@@ -3124,7 +4357,7 @@ accordance with <code>pgvector</code>’s license. If you’d like to contribute
             </title>
             <description>
 <![CDATA[
-Score 50 | Comments 16 (<a href="https://news.ycombinator.com/item?id=38672999">thread link</a>) | @Ygg2
+Score 53 | Comments 18 (<a href="https://news.ycombinator.com/item?id=38672999">thread link</a>) | @Ygg2
 <br/>
 December 17, 2023 | https://notgull.net/cautionary-unsafe-tale/ | <a href="https://web.archive.org/web/*/https://notgull.net/cautionary-unsafe-tale/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -3956,7 +5189,7 @@ programming in Chapter 2.</p>
             </title>
             <description>
 <![CDATA[
-Score 143 | Comments 131 (<a href="https://news.ycombinator.com/item?id=38672386">thread link</a>) | @riidom
+Score 144 | Comments 131 (<a href="https://news.ycombinator.com/item?id=38672386">thread link</a>) | @riidom
 <br/>
 December 17, 2023 | https://notgull.net/finding-a-forge/ | <a href="https://web.archive.org/web/*/https://notgull.net/finding-a-forge/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4645,7 +5878,7 @@ December 16, 2023 | https://stoney.monster/@stoneymonster/111592567052438463 | <
 Score 9 | Comments 2 (<a href="https://news.ycombinator.com/item?id=38669775">thread link</a>) | @MollyRealized
 <br/>
 December 16, 2023 | https://www.badspacecomics.com/post/empires | <a href="https://web.archive.org/web/*/https://www.badspacecomics.com/post/empires">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="site-root"><div id="masterPage"><header tabindex="-1" id="SITE_HEADER_WRAPPER"><div id="SITE_HEADER" tabindex="-1"><div></div><div><div></div><div><div data-mesh-id="SITE_HEADERinlineContent" data-testid="inline-content"><div data-mesh-id="SITE_HEADERinlineContent-gridContainer" data-testid="mesh-container-content"><wix-dropdown-menu id="DrpDwnMn0" tabindex="-1" dir="ltr" data-stretch-buttons-to-menu-width="false" data-same-width-buttons="false" data-num-items="2" data-menuborder-y="0" data-menubtn-border="0" data-ribbon-els="0" data-label-pad="0" data-ribbon-extra="0" data-dropalign="right"><nav id="DrpDwnMn0navContainer" aria-label="Site"><ul id="DrpDwnMn0itemsContainer" data-marginallchildren="true"><li id="DrpDwnMn00" data-direction="ltr" data-listposition="center" data-data-id="dataItem-jbescxa3" data-state="menu false  link" data-index="0"><a data-testid="linkElement" href="https://www.badspacecomics.com/" aria-haspopup="false"><div><p id="DrpDwnMn00label">HOME</p></div></a></li><li id="DrpDwnMn01" data-direction="ltr" data-listposition="right" data-data-id="bmi2" data-state="menu false  link" data-index="1"><a data-testid="linkElement" href="https://www.badspacecomics.com/about" aria-haspopup="false"><div><p id="DrpDwnMn01label">ABOUT</p></div></a></li><li id="DrpDwnMn0__more__" data-direction="ltr" data-listposition="right" data-state="menu false  header" data-index="__more__" data-dropdown="false"><div data-testid="linkElement" tabindex="0" aria-haspopup="false"><div><p id="DrpDwnMn0__more__label">More</p></div></div></li></ul><div id="DrpDwnMn0dropWrapper" data-dropalign="right" data-dropdown-shown="false"><ul id="DrpDwnMn0moreContainer"></ul></div></nav></wix-dropdown-menu><div id="comp-kvolp30t" title="Main Title background_edited.jpg"><a data-testid="linkElement" href="https://www.badspacecomics.com/" target="_self"><wow-image id="img_comp-kvolp30t" data-image-info="{&quot;containerId&quot;:&quot;comp-kvolp30t&quot;,&quot;displayMode&quot;:&quot;fill&quot;,&quot;targetWidth&quot;:378,&quot;targetHeight&quot;:239,&quot;isLQIP&quot;:false,&quot;imageData&quot;:{&quot;width&quot;:710,&quot;height&quot;:450,&quot;uri&quot;:&quot;e7e88a_2408f34d632d40598266b0b90ac1c02d~mv2.jpg&quot;,&quot;name&quot;:&quot;Main Title background_edited.jpg&quot;,&quot;displayMode&quot;:&quot;fill&quot;}}" data-bg-effect-name="" data-has-ssr-src=""><img src="https://static.wixstatic.com/media/e7e88a_2408f34d632d40598266b0b90ac1c02d~mv2.jpg/v1/fill/w_378,h_239,al_c,q_80,usm_0.66_1.00_0.01,enc_auto/Main%20Title%20background_edited.jpg" alt="Main Title background_edited.jpg" width="378" height="239" srcset="https://static.wixstatic.com/media/e7e88a_2408f34d632d40598266b0b90ac1c02d~mv2.jpg/v1/fill/w_378,h_239,al_c,q_80,usm_0.66_1.00_0.01,enc_auto/Main%20Title%20background_edited.jpg 1x, https://static.wixstatic.com/media/e7e88a_2408f34d632d40598266b0b90ac1c02d~mv2.jpg/v1/fill/w_756,h_478,al_c,lg_1,q_85,enc_auto/Main%20Title%20background_edited.jpg 2x" fetchpriority="high"></wow-image></a></div><p id="comp-kvohstik" data-testid="richTextElement"><h2><span><span><span><span>Bad Space</span></span></span></span></h2></p></div></div></div></div></div></header><main id="PAGES_CONTAINER" tabindex="-1" data-main-content="true"><div id="SITE_PAGES" data-page-transition="OutIn"><div id="SITE_PAGES_TRANSITION_GROUP"><div id="h0m95"><div><div id="Containerh0m95"><div data-mesh-id="Containerh0m95inlineContent" data-testid="inline-content"><div data-mesh-id="Containerh0m95inlineContent-gridContainer" data-testid="mesh-container-content"><section id="comp-lj5hc8nj" tabindex="-1"><div id="bgLayers_comp-lj5hc8nj" data-hook="bgLayers"></div><div data-mesh-id="comp-lj5hc8njinlineContent" data-testid="inline-content"><div data-mesh-id="comp-lj5hc8njinlineContent-gridContainer" data-testid="mesh-container-content"><div id="TPAMultiSection_jrt1w8ne"><div><div><div data-hook="post-page-root"><div><div></div><div id="content-wrapper"><div data-hook="post-page"><div><div><div><div><div><article data-hook="post"><div><div><div><div></div></div></div></div><div data-hook="post-description"><article><div><div><div><div data-rce-version="9.16.1"><div dir="ltr" data-id="rich-content-viewer"><div><div id="viewer-e0qa2"><div></div></div></div></div></div></div></div></div></article></div><div><div><div id="post-footer"><div data-hook="post-main-actions-desktop"><div></div><div data-hook="post-main-actions__stats"><p><span tabindex="0">33,342 views</span><span tabindex="0">27 comments</span></p></div></div></div></div></div></article></div></div><div><div><div><div><div data-hook="recent-posts"><div><h2>Recent Posts</h2><p><a href="https://www.badspacecomics.com/" data-hook="recent-posts-desktop__link">See All</a></p></div><div><div><div><article tabindex="0" data-hook="recent-post-list-item"><div><div><a href="https://www.badspacecomics.com/post/behind-your-eyes" data-hook="link" tabindex="-1"></a><div><div data-hook="recent-post__title"><p><a href="https://www.badspacecomics.com/post/behind-your-eyes" data-hook="link">Behind Your Eyes</a></p></div><div><div><div data-hook="post-footer"><div><div data-hook="post-stats"></div></div></div></div></div></div></div></div></article></div><div><article tabindex="0" data-hook="recent-post-list-item"><div><div><a href="https://www.badspacecomics.com/post/medusa-gaze" data-hook="link" tabindex="-1"></a><div><div data-hook="recent-post__title"><p><a href="https://www.badspacecomics.com/post/medusa-gaze" data-hook="link">Medusa Gaze</a></p></div><div><div><div data-hook="post-footer"><div><div data-hook="post-stats"></div></div></div></div></div></div></div></div></article></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></section></div></div></div></div></div></div></div></main></div></div></div>]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="site-root"><div id="masterPage"><header tabindex="-1" id="SITE_HEADER_WRAPPER"><div id="SITE_HEADER" tabindex="-1"><div></div><div><div></div><div><div data-mesh-id="SITE_HEADERinlineContent" data-testid="inline-content"><div data-mesh-id="SITE_HEADERinlineContent-gridContainer" data-testid="mesh-container-content"><wix-dropdown-menu id="DrpDwnMn0" tabindex="-1" dir="ltr" data-stretch-buttons-to-menu-width="false" data-same-width-buttons="false" data-num-items="2" data-menuborder-y="0" data-menubtn-border="0" data-ribbon-els="0" data-label-pad="0" data-ribbon-extra="0" data-dropalign="right"><nav id="DrpDwnMn0navContainer" aria-label="Site"><ul id="DrpDwnMn0itemsContainer" data-marginallchildren="true"><li id="DrpDwnMn00" data-direction="ltr" data-listposition="center" data-data-id="dataItem-jbescxa3" data-state="menu false  link" data-index="0"><a data-testid="linkElement" href="https://www.badspacecomics.com/" aria-haspopup="false"><div><p id="DrpDwnMn00label">HOME</p></div></a></li><li id="DrpDwnMn01" data-direction="ltr" data-listposition="right" data-data-id="bmi2" data-state="menu false  link" data-index="1"><a data-testid="linkElement" href="https://www.badspacecomics.com/about" aria-haspopup="false"><div><p id="DrpDwnMn01label">ABOUT</p></div></a></li><li id="DrpDwnMn0__more__" data-direction="ltr" data-listposition="right" data-state="menu false  header" data-index="__more__" data-dropdown="false"><div data-testid="linkElement" tabindex="0" aria-haspopup="false"><div><p id="DrpDwnMn0__more__label">More</p></div></div></li></ul><div id="DrpDwnMn0dropWrapper" data-dropalign="right" data-dropdown-shown="false"><ul id="DrpDwnMn0moreContainer"></ul></div></nav></wix-dropdown-menu><div id="comp-kvolp30t" title="Main Title background_edited.jpg"><a data-testid="linkElement" href="https://www.badspacecomics.com/" target="_self"><wow-image id="img_comp-kvolp30t" data-image-info="{&quot;containerId&quot;:&quot;comp-kvolp30t&quot;,&quot;displayMode&quot;:&quot;fill&quot;,&quot;targetWidth&quot;:378,&quot;targetHeight&quot;:239,&quot;isLQIP&quot;:false,&quot;imageData&quot;:{&quot;width&quot;:710,&quot;height&quot;:450,&quot;uri&quot;:&quot;e7e88a_2408f34d632d40598266b0b90ac1c02d~mv2.jpg&quot;,&quot;name&quot;:&quot;Main Title background_edited.jpg&quot;,&quot;displayMode&quot;:&quot;fill&quot;}}" data-bg-effect-name="" data-has-ssr-src=""><img src="https://static.wixstatic.com/media/e7e88a_2408f34d632d40598266b0b90ac1c02d~mv2.jpg/v1/fill/w_378,h_239,al_c,q_80,usm_0.66_1.00_0.01,enc_auto/Main%20Title%20background_edited.jpg" alt="Main Title background_edited.jpg" width="378" height="239" srcset="https://static.wixstatic.com/media/e7e88a_2408f34d632d40598266b0b90ac1c02d~mv2.jpg/v1/fill/w_378,h_239,al_c,q_80,usm_0.66_1.00_0.01,enc_auto/Main%20Title%20background_edited.jpg 1x, https://static.wixstatic.com/media/e7e88a_2408f34d632d40598266b0b90ac1c02d~mv2.jpg/v1/fill/w_756,h_478,al_c,lg_1,q_85,enc_auto/Main%20Title%20background_edited.jpg 2x" fetchpriority="high"></wow-image></a></div><p id="comp-kvohstik" data-testid="richTextElement"><h2><span><span><span><span>Bad Space</span></span></span></span></h2></p></div></div></div></div></div></header><main id="PAGES_CONTAINER" tabindex="-1" data-main-content="true"><div id="SITE_PAGES" data-page-transition="OutIn"><div id="SITE_PAGES_TRANSITION_GROUP"><div id="h0m95"><div><div id="Containerh0m95"><div data-mesh-id="Containerh0m95inlineContent" data-testid="inline-content"><div data-mesh-id="Containerh0m95inlineContent-gridContainer" data-testid="mesh-container-content"><section id="comp-lj5hc8nj" tabindex="-1"><div id="bgLayers_comp-lj5hc8nj" data-hook="bgLayers"></div><div data-mesh-id="comp-lj5hc8njinlineContent" data-testid="inline-content"><div data-mesh-id="comp-lj5hc8njinlineContent-gridContainer" data-testid="mesh-container-content"><div id="TPAMultiSection_jrt1w8ne"><div><div><div data-hook="post-page-root"><div><div></div><div id="content-wrapper"><div data-hook="post-page"><div><div><div><div><div><article data-hook="post"><div><div><div><div></div></div></div></div><div data-hook="post-description"><article><div><div><div><div data-rce-version="9.16.1"><div dir="ltr" data-id="rich-content-viewer"><div><div id="viewer-e0qa2"><div></div></div></div></div></div></div></div></div></article></div><div><div><div id="post-footer"><div data-hook="post-main-actions-desktop"><div></div><div data-hook="post-main-actions__stats"><p><span tabindex="0">32,300 views</span><span tabindex="0">27 comments</span></p></div></div></div></div></div></article></div></div><div><div><div><div><div data-hook="recent-posts"><div><h2>Recent Posts</h2><p><a href="https://www.badspacecomics.com/" data-hook="recent-posts-desktop__link">See All</a></p></div><div><div><div><article tabindex="0" data-hook="recent-post-list-item"><div><div><a href="https://www.badspacecomics.com/post/behind-your-eyes" data-hook="link" tabindex="-1"></a><div><div data-hook="recent-post__title"><p><a href="https://www.badspacecomics.com/post/behind-your-eyes" data-hook="link">Behind Your Eyes</a></p></div><div><div><div data-hook="post-footer"><div><div data-hook="post-stats"></div></div></div></div></div></div></div></div></article></div><div><article tabindex="0" data-hook="recent-post-list-item"><div><div><a href="https://www.badspacecomics.com/post/medusa-gaze" data-hook="link" tabindex="-1"></a><div><div data-hook="recent-post__title"><p><a href="https://www.badspacecomics.com/post/medusa-gaze" data-hook="link">Medusa Gaze</a></p></div><div><div><div data-hook="post-footer"><div><div data-hook="post-stats"></div></div></div></div></div></div></div></div></article></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></section></div></div></div></div></div></div></div></main></div></div></div>]]>
             </description>
             <link>https://www.badspacecomics.com/post/empires</link>
             <guid isPermaLink="false">hacker-news-small-sites-38669775</guid>
@@ -4657,7 +5890,7 @@ December 16, 2023 | https://www.badspacecomics.com/post/empires | <a href="https
             </title>
             <description>
 <![CDATA[
-Score 49 | Comments 4 (<a href="https://news.ycombinator.com/item?id=38669636">thread link</a>) | @charles_f
+Score 51 | Comments 5 (<a href="https://news.ycombinator.com/item?id=38669636">thread link</a>) | @charles_f
 <br/>
 December 16, 2023 | https://fev.al/posts/opposed-to-s210/ | <a href="https://web.archive.org/web/*/https://fev.al/posts/opposed-to-s210/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div itemprop="articleBody">
@@ -5279,7 +6512,7 @@ December 16, 2023 | https://www.cs.huji.ac.il/w~ai/projects/2012/Rummikub/ | <a 
 
 <a href="http://huji.ac.il/"><img width="278" height="69" src="https://new.huji.ac.il/profiles/openscholar/themes/os_bootstrap/images/logo.png"></a>
 <h4>Something went wrong...
-<p> Support ID: B_ 7090944500435385177 </p></h4>
+<p> Support ID: B_ 7090944500441535049 </p></h4>
 Please copy and paste the Support ID when contacting us<br>
 
 Information security Email: <a href="mailto:infosec@huji.ac.il"> infosec@huji.ac.il</a> 
@@ -5409,7 +6642,7 @@ December 16, 2023 | https://trufflesecurity.com/blog/google-oauth-is-broken-sort
             </title>
             <description>
 <![CDATA[
-Score 37 | Comments 63 (<a href="https://news.ycombinator.com/item?id=38667064">thread link</a>) | @fahhem
+Score 38 | Comments 65 (<a href="https://news.ycombinator.com/item?id=38667064">thread link</a>) | @fahhem
 <br/>
 December 16, 2023 | https://blog.fahhem.com/2023/12/dev-onboarding-then-now/ | <a href="https://web.archive.org/web/*/https://blog.fahhem.com/2023/12/dev-onboarding-then-now/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div> <p>Onboarding to a new project can be a wild ride. Sometimes, you just have a codebase that "worked on the dev's machine" and no instructions beyond that. Other times there's a documented series of commands to run on your machine that you're generally expected to just trust to not mess things up. And lately, there's a few tools that are available to make that process more consistent across many projects, and therefore less of a burden on both the maintainers and those being onboarded.</p> <h3>How it used to be</h3> <p>You might be expecting "back in my day" here, but I have to admit that while I'm not as young as I was when I started this blog, I'm not that old either. Instead, I'll say that, traditionally, onboarding onto an active project involved finding and running some set of commands and hoping they worked on your system.</p> <p>If you ran exactly the same system as the original authors, and worked on similar projects to them in the past, then the commands would likely work... and that's the problem. Very rarely did people start new projects on blank slate machines, instead they would start them on systems that had tools, libraries, and other projects already installed on them. As a result, when someone new came on with a different system environment, they would run into issues like incorrect versions, missing libraries, etc very commonly.</p> <p>Projects that commonly had newer developers join, whether through popularity, due to commercial success, or seasonality (college courses), would typically solve this problem by building and maintaining robust setup scripts. These scripts would "know" to check for things previous onboardings revealed, such as which Linux distro is running, which versions of software was installed or not installed, and sometimes even the underlying hardware was 32- or 64-bit, and more.</p> <p>However, all projects no matter their popularity, would constantly get emails (or issues opened) with various error logs from developers trying to use the project on older or newer machines. The popular projects would deal with them and reduce the frequency, while less popular projects would see these issues languish due to the difficulty in asynchronously debugging these sorts of problems. The maintainers don't have access to a machine with these problems, only the reporter does, and if the maintainer asks a question a day later, the likelihood that the reporter ever comes back is very low.</p> <h3>Why it was a problem</h3> <p>Not only is debugging those sorts of problems difficult for open-source projects, but it's still annoying for companies. Every time a new engineer is hired, or comes to you from another team, they have to spend time figuring out how to setup their machine for your project. A monorepo potentially solves that for transfers, but not for wholly new engineers. This can be solved for in well-resourced teams by creating disk images ready to go, but creating and maintaining those is its own skill entirely. I'll have a post coming up next year about sysadmin skills being rare despite being so valuable, and this is one of those skills.</p> <p>You might be wondering why these problems come up so often, and it's because environments vary so wildly that it's easy to run into issues. Here's an abbreviated list of the sorts of issues that I've personally seen and had to solve:</p> <ul> <li>Project was written/built for Linux, engineer uses Mac OS X (or, more rarely in my circles, Windows)</li> <li>Project scripts assume bash is the default shell, engineer setup zsh or fish</li> <li>Project scripts assume certain files are in /etc/, like /etc/lsb-release, but only some Linux distros have that file</li> <li>Project binaries can run, but not be compiled, due to missing "dev" libraries, such as <code>libboost-atomic1.74-dev</code> even though <code>libboost-atomic1.74.0</code> is installed and linkable.</li> <li>Project A uses gcc-5 and won't compile with gcc-7 or later, while Project B wants to upgrade to gcc-8. Some Linux distros make it easy to install multiple versions of gcc, but you still have to take care to set the right environment variables. Others only allow one version so engineers switching between project constantly have to install/reinstall GCC.</li> <li>Same as above, but for npm, node, Python, etc etc and often these tools are only allowed to have one version installed by the OS, so more tools are needed to manage them all.</li> </ul> <h3>What changed in the software world</h3> <p>The software ecosystem is constantly evolving, and for proof one can simply look at the number of Javascript HTML manipulation frameworks with benchmarks:</p> <p><img alt="Javascript HTML frameworks" src="https://blog.fahhem.com/images/2023-12-js-frameworks.png"></p> <p>Unrelated to Javascript frameworks, we also got containers. They can be referred to as Docker, LXC, rkt, OCI, podman containers and more, but generally I'll be referring to the concept of network, disk, and process namespacing that allows you to run what looks like a Linux VM inside a Linux host, but without the overhead of a VM.</p> <p>Containers were initially meant for creating production environments, so that a server deployed to today or two months from now can get to the exact same state as what's running on a developer's machine. Since so much of the work was around the idea of creating lightweight container images with only one service in it, it took a while for the idea of creating a container for developer tooling to become popular.</p> <h3>Containers save the day</h3> <p>Back in 2017, containers were so popular that a whole new cluster orchestration framework based entirely around containers was gaining steam (Kubernetes). However, they weren't yet popular for developer tooling, so as I setup a new project for work I had to decide how we were going to setup developer environments. Luckily, we were basing a lot of what we were doing in the early days based on an open-source project that was an early adopter of developer containers.</p> <p>I then created, based on that project's scripts, a <code>docker/dev/start.sh</code>, <code>docker/dev/remove.sh</code>, and <code>docker/dev/into.sh</code>. which would create, remove, and launch a shell in a dev container, respectively. There was also a <code>docker/dev/Dockerfile</code> that described how to build the container image, and since we were onboarding engineers relatively often (once a month initially, but eventually multiple a week) I setup a <code>docker/dev/build.sh</code> that would build and upload the container image that the <code>start.sh</code> script would pull and use locally.</p> <p>We then went for years, updating the Dockerfile as needed to install more tools, newer versions of them, and we even updated the version of the container's OS (Ubuntu 16.04 LTS to 20.04 LTS). All the while, the host machines only needed a few tools installed, namely <code>docker-ce</code>. During my time there, I never updated my desktop OS (Ubuntu 16.04) even though the container was based on a newer OS, and we never had to worry about what was installed or not on the host of any laptop or desktop of any of the engineers.</p> <h3>Today, it's (actually) better</h3> <p>Back in 2017, or even as recent as 2021, there weren't many options beyond creating and maintaining these scripts entirely yourself. This year, as I was looking to setup multiple new projects, I looked into the space again and I found <code>devcontainers</code>, or their domain name <code>containers.dev</code>, which is a spec and a tool that came out of the VS Code team to define everything in those 3 scripts in a more modular way.</p> <p>Unfortunately, as a result of its birth, it's pretty tied to VS Code and there is a "reference CLI" but it doesn't (yet) implement the stop functionality. It seems the way to benefit the most from the spec is to use it with VS Code or GitHub codespaces, or other cloud providers like gitpod.</p> <p>However, while researching one last time for this post, I found one tool that actually does what I want. I found them previously, but their docs were confusing and seemed to imply they didn't support what I wanted, but I tried them out anyway and it turns out they always did!</p> <h3>How to replace all those scripts, but not really</h3> <p>Honestly, <a href="https://devpod.sh/">devpod.sh</a> is pretty good, except their docs seem to be mainly around IDE's, remote hosts, and cloning new projects. Firstly, we need to define a devcontainer.json somewhere/somehow, and then we can use devpod for everything else.</p> <p>For devcontainer.json, without using a local VS Code (the web version doesn't support the extension), you just have to wade through https://containers.dev/ and figure things out. To help you, I'll paste what I consider a file that you can start "from scratch" with and add relevant features and changes to from there:</p> <div><pre><span></span><code><span>{</span>
@@ -5910,7 +7143,7 @@ This benefits from testing on a very recent Android version.</li>
             </title>
             <description>
 <![CDATA[
-Score 72 | Comments 32 (<a href="https://news.ycombinator.com/item?id=38666148">thread link</a>) | @irsagent
+Score 74 | Comments 33 (<a href="https://news.ycombinator.com/item?id=38666148">thread link</a>) | @irsagent
 <br/>
 December 16, 2023 | https://blog.dureuill.net/articles/recurring-lifetime/ | <a href="https://web.archive.org/web/*/https://blog.dureuill.net/articles/recurring-lifetime/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div itemprop="articleBody">
@@ -6136,7 +7369,7 @@ You would think that users know better and that documentation suffices, but list
             </title>
             <description>
 <![CDATA[
-Score 232 | Comments 134 (<a href="https://news.ycombinator.com/item?id=38664412">thread link</a>) | @alexzeitler
+Score 233 | Comments 134 (<a href="https://news.ycombinator.com/item?id=38664412">thread link</a>) | @alexzeitler
 <br/>
 December 16, 2023 | https://event-driven.io/en/the_end_is_near_for_crud_data/ | <a href="https://web.archive.org/web/*/https://event-driven.io/en/the_end_is_near_for_crud_data/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p><span>
@@ -6285,10 +7518,10 @@ https://event-driven.io/static/bf71643d590f7b7062d48499f63153cd/36e56/2023-12-15
             </title>
             <description>
 <![CDATA[
-Score 4 | Comments 1 (<a href="https://news.ycombinator.com/item?id=38664330">thread link</a>) | @steve-chavez
+Score 4 | Comments 2 (<a href="https://news.ycombinator.com/item?id=38664330">thread link</a>) | @steve-chavez
 <br/>
 December 16, 2023 | https://revistas.um.edu.uy/index.php/ingenieria/article/view/1147/1496 | <a href="https://web.archive.org/web/*/https://revistas.um.edu.uy/index.php/ingenieria/article/view/1147/1496">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
+<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
             </description>
             <link>https://revistas.um.edu.uy/index.php/ingenieria/article/view/1147/1496</link>
             <guid isPermaLink="false">hacker-news-small-sites-38664330</guid>
@@ -6785,7 +8018,7 @@ December 16, 2023 | https://cinemasojourns.com/2023/12/15/the-ballad-of-hank-mcc
             </title>
             <description>
 <![CDATA[
-Score 111 | Comments 75 (<a href="https://news.ycombinator.com/item?id=38663881">thread link</a>) | @vnglst
+Score 112 | Comments 75 (<a href="https://news.ycombinator.com/item?id=38663881">thread link</a>) | @vnglst
 <br/>
 December 16, 2023 | https://koenvangilst.nl/blog/rising-temperatures | <a href="https://web.archive.org/web/*/https://koenvangilst.nl/blog/rising-temperatures">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content"><div><div><div><p><img alt="Koen van Gilst" fetchpriority="high" width="24" height="24" decoding="async" data-nimg="1" srcset="https://koenvangilst.nl/_next/image?url=%2Favatar.jpg&amp;w=32&amp;q=75 1x, https://koenvangilst.nl/_next/image?url=%2Favatar.jpg&amp;w=48&amp;q=75 2x" src="https://koenvangilst.nl/_next/image?url=%2Favatar.jpg&amp;w=48&amp;q=75"></p><p>Koen van Gilst / <!-- -->December 16, 2023</p></div><p>2 min read<!-- --> • <span><span>––– </span>views</span></p></div><ul><li><a href="https://koenvangilst.nl/blog/tag/climate-change">climate change</a></li><li><a href="https://koenvangilst.nl/blog/tag/data-visualization">data visualization</a></li></ul><section><p>Rarely does a day pass without some news of our changing climate. Here in the Netherlands, we're also experiencing this firsthand – our summers are hotter and our winters milder. In this blog post, I've tried to visually capture these changes. By using temperature data from the Dutch Meteorological Institute (KNMI), I've created two visualizations that show how the average temperature in The Netherlands has changed since the 1900s.</p>
@@ -7111,7 +8344,7 @@ December 15, 2023 | https://www.abc.net.au/news/2023-12-16/biggest-solar-flare-y
             </title>
             <description>
 <![CDATA[
-Score 227 | Comments 29 (<a href="https://news.ycombinator.com/item?id=38661580">thread link</a>) | @sno6
+Score 228 | Comments 29 (<a href="https://news.ycombinator.com/item?id=38661580">thread link</a>) | @sno6
 <br/>
 December 15, 2023 | https://www.farley.ai/posts/causal | <a href="https://web.archive.org/web/*/https://www.farley.ai/posts/causal">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><p>I recently came across an elegant CRDT design that is useful for text collaboration applications that I just had to write about. What follows is an exploration of Causal Trees and an introduction (or refresher) to several important distributed systems concepts.</p><p>CRDTs are a family of algorithms and datastructures that provide eventual consistency guarantees by following some simple mathematical properties. As their popularity has increased over the last decade, so too has their usage. CRDTS are commonly found in collaborative applications, where concurrent updates can be frequent, but they’re also used quite extensively in local network and peer-to-peer environments, due to the algorithms not requiring a central authority to reconcile inconsistencies. That last sentence is quite important, because it means that we can get distributed eventual consistency (things eventually converge to a consistent value among nodes) without complicated processes such as consensus. Don’t fret if you’re a fan of central authority though, <a href="https://www.figma.com/">Figma</a> successfully uses CRDTs server-side to handle the collaborative aspects of their product, as well as <a href="https://github.com/soundcloud/roshi">Soundcloud</a> and many others.</p><p>The CRDT I will be describing today is the Causal Tree (roughly as <a href="https://web.archive.org/web/20190505005829/http://www.st.ewi.tudelft.nl/victor/articles/ctre.pdf">described</a> by Victor Grishchenko). Which we will look at in the context of a simple text collaboration application. But before we get too far ahead of ourselves, have a play with the example below and see if you can get an intuitive sense of how the algorithm operates. Some things to keep an eye out for are the ids associated with each node (on hover), and also what happens when individual characters are deleted.</p><h3>Example 1</h3><p>Each client in the above example has their own local causal tree, the compiled value of which you can see written to their respective text inputs. The implementation we will be discussing is known as a state-based CRDT, or CvRDT, which means that we send the whole tree over the wire to clients instead of just the individual operations as they occur. As a client types, new nodes are added to their tree and sent over to peers who are interested in seeing their updates, when a client receives another client’s tree (which may or may not have new nodes) they merge with their own tree in a way that guarantees a consistent result. One way to think of merge is like a set join, if client 1 has the values {a, b, c} and client 2 has {d}, merging the clients in either order will always result in the same value. But before we go deeper on the merge operation let’s take a step back and see how the tree is structured.</p><h2>Tree structure</h2><p>In our toy example above, each node represents an individual character. You may have noticed that each node’s parent is the letter that directly precedes that node (this isn’t always the case). This ordering is one half of the equation that allows us to position nodes consistently. Take for example an alternative structure where each character has an array index position instead.</p><p>h<span>⁰ </span>e<span>¹ </span>l<span>²	</span>l<span>³	</span>o<span>⁴	</span></p><p>Now imagine that you went on to add an exclamation mark at the end of the string, but concurrently with that operation you merged changes from another client that added the string “Welcome and “ before “hello”. You’re now left with “Welco!me and hello”, which was not your original intention. Now, you _could_ bake in some logic to your application that adjusts your old index to account for the new changes, shifting the index of each character in “hello” by the amount of characters that were inserted, but that’s not the elegant algorithm that I promised. That’s something else known as <a href="https://en.wikipedia.org/wiki/Operational_transformation">Operational Transformation (OT)</a> that folks that like to complicate simple things use (Google Docs uses OT heavily).</p><p>The much simpler approach taken in causal trees is to simply associate a node with the node preceding it. If we do that, it doesn’t matter if the underlying tree changes, it still preserves our original intention. In essence we’re trading an absolute positioning approach for a relative one.</p><p>But how can individual nodes reference each other? If you hover over any of the nodes below you will notice that they have two identifiers, one timestamp and one entity id. A timestamp is a monotonically increasing integer value that gets incremented each time a node is added to a tree. Because wall clocks in distributed systems are unreliable to be used to order operations, we use this method combined with the entity id when necessary to create what’s called a total order of the nodes in our tree. Those familiar with <a href="https://en.wikipedia.org/wiki/Lamport_timestamp">Lamport timestamps</a> will recognise this approach. If a tree is isolated from any other trees and you type a sequence of characters, you will produce a tree similar to a linked list, with each node’s timestamp being 1 higher than its parent. If we get sent another client’s tree that we notice has nodes with higher timestamps we merge those nodes into ours by attaching them to their parents, that will either exist in our tree or be introduced by theirs. We then simply update our local tree’s timestamp to be the max of our current timestamp and the tree’s timestamp that we are merging with. Intuitively, this means that when we start adding nodes after the merge, the id represents how much context, or amount of nodes we have seen before making the decision to add that node, in other words, what ‘caused’ the new node.</p><p>Hover over the nodes in the example below and see if you can figure out what the final value will be, based on the ids alone. Click “Reveal” if you get stuck.</p><h3>Example 2</h3><p>What's illustrated here is that higher timestamps represent operations that happened with more context, or at a later point in the document's history, and as such they are traversed first when building the final value.</p><p>So what did the user type and in what order to create the tree above?</p><ul><li>They first typed “Causatrees”</li><li>Realising they misspelled the word they added an "l " after "Causa"</li></ul><p>Notice how there are two branches after the 6th node? it makes sense we first traverse the branch with the higher timestamp because it was added after the misspelling had occurred. But there's a few more cases we need to be aware of.</p><h2>Traversal</h2><p>Which brings us to an important topic, tree traversal and sibling trees. To produce the correct final value we need to traverse the tree in depth-first pre-order, but with special cases for sibling branches. Those special cases are:</p><ul><li>If a node has multiple children (sibling branches) traverse the branches ordered by timestamp descending order. We saw this in the previous example.</li><li>If branches have the same timestamp, traverse the branch that has the higher entity id first. What you order by here isn’t important but it is critical that we order in a way that is consistent. Ordering by entity id is just an example of that.</li></ul><p>I said at the start of the article that causal trees can be used in collaborative, networked environments, which means that it needs to handle concurrent updates, duplicate writes, partitioning between clients and all of the stuff we love to think about when it comes to distributed system design. So how does it do that?</p><p>When some tree (a) merges with another tree (b), the merge operation is essentially a diff and patch. What that means is we find all of the nodes from tree ‘a’ that aren’t in ‘b’ and add them to ‘a’. This operation is idempotent, which means we can perform it any number of times and the result will be the same, like inserting a new value to a set. Two other properties that are required for a CvRDT are commutativity and associativity. Commutativity ensures that the order of merging does not affect the final result, for instance, merging tree 'a' with 'b' yields the same result as merging 'b' with 'a'. Associativity allows for grouping merge operations in any order, so combining 'a' with 'b', and then with 'c', gives the same result as merging 'a' with the result of merging 'b' with 'c'. When each tree (or node) in a distributed system observes the same set of changes, even if in different orders, they will eventually converge to the same consistent state due to these properties. Let’s look at an example.</p><p>In the example below we have three clients, the first of which has written “I &lt;3” and then gone offline. Concurrently, after receiving the first client’s changes, client 2 and 3 type “ Pears” and “ Apples” respectively. We can see these concurrent changes represented by the sibling trees after the heart. Instead of having both changes interleaved to produce a jumbled concoction of applepear letter-soup, client 1 (and all clients after merging) is left with text that represents both changes. The ids at the sibling branch/fork are the same, which, again, shows what context each client had available to them when they made their change.</p><h3>Example 3</h3><p>This demonstration showcases how causal trees can resolve concurrent updates in a consistent manner. Whether you would want to do that instead of showing conflicts to the user for them to resolve themselves is up to the application.</p><h2>Deletion</h2><p>You may have noticed by now that if you delete a node, the value of that node changes to a 🪦. When a node is deleted we need to keep it around for consistency reasons, but the value is ignored when we create the final value from traversing the tree. This is a common technique found in distributed database design and CRDT designs known as tombstoning. I’ll leave it as an exercise to the reader to try to understand how consistency would be impacted if we removed the node completely from the tree on deletion.</p><h2>Conclusion</h2><p>And that’s a wrap! hopefully you’ve learnt something new about CRDTs! If you’re wondering about real-world implementations you will be happy to know that the ideas we talked about today are integral to the design of such popular general purpose CRDT libraries as <a href="https://github.com/automerge/automerge">Automerge</a> and <a href="https://github.com/yjs/yjs">Yjs</a>.</p><p>If you’re curious about tree size implications, optimizations, and things like node garbage collection, then please check the further reading list below, there’s some gems in there I think you will enjoy.</p><h2>Further reading</h2><ul><li><a href="https://josephg.com/blog/crdts-go-brrr/">CRDTs go brr (optimization exploration).</a></li><li><a href="https://web.archive.org/web/20190505005829/http://www.st.ewi.tudelft.nl/victor/articles/ctre.pdf">The original Causal Tree paper.</a></li><li><a href="http://archagon.net/blog/2018/03/24/data-laced-with-history/">Data laced with history (exploration of causal trees and optimizations).</a></li><li><a href="https://github.com/sno6/causal/blob/main/simpletree/simpletree.go">Educational Go implementation that I wrote.</a></li></ul><h2>Thanks</h2><p>Thanks to the folks at <a href="https://reactflow.dev/">React Flow</a> for letting me use a free Pro account to build the interactive demos.</p></div></div></div>]]>
@@ -7172,7 +8405,7 @@ December 15, 2023 | https://www.onlycfo.io/p/new-tax-rule-is-terrible-for-softwa
             </title>
             <description>
 <![CDATA[
-Score 170 | Comments 28 (<a href="https://news.ycombinator.com/item?id=38660007">thread link</a>) | @wb14123
+Score 177 | Comments 29 (<a href="https://news.ycombinator.com/item?id=38660007">thread link</a>) | @wb14123
 <br/>
 December 15, 2023 | https://www.binwang.me/2023-12-14-ZFS-Profiling-on-Arch-Linux.html | <a href="https://web.archive.org/web/*/https://www.binwang.me/2023-12-14-ZFS-Profiling-on-Arch-Linux.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="article_content">
@@ -8284,7 +9517,7 @@ December 15, 2023 | https://anderegg.ca/2023/12/15/the-threads-invasion | <a hre
             </title>
             <description>
 <![CDATA[
-Score 662 | Comments 79 (<a href="https://news.ycombinator.com/item?id=38657126">thread link</a>) | @willcooke
+Score 667 | Comments 79 (<a href="https://news.ycombinator.com/item?id=38657126">thread link</a>) | @willcooke
 <br/>
 December 15, 2023 | https://www.whizzy.org/2023-12-14-bricked-xmas/ | <a href="https://web.archive.org/web/*/https://www.whizzy.org/2023-12-14-bricked-xmas/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -8973,7 +10206,7 @@ Fastest: NaiveMemoryCoalescingMatmul&lt;f32, 3&gt;</code></pre></div><!--/--><p>
             </title>
             <description>
 <![CDATA[
-Score 138 | Comments 73 (<a href="https://news.ycombinator.com/item?id=38656007">thread link</a>) | @el0hel
+Score 139 | Comments 75 (<a href="https://news.ycombinator.com/item?id=38656007">thread link</a>) | @el0hel
 <br/>
 December 15, 2023 | https://mattrucker.com/risk-management-is-not-project-management/ | <a href="https://web.archive.org/web/*/https://mattrucker.com/risk-management-is-not-project-management/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -9137,7 +10370,7 @@ December 15, 2023 | https://www.thenews.com.pk/print/1138030-spain-population-hi
             </title>
             <description>
 <![CDATA[
-Score 735 | Comments 127 (<a href="https://news.ycombinator.com/item?id=38655066">thread link</a>) | @tontinton
+Score 737 | Comments 127 (<a href="https://news.ycombinator.com/item?id=38655066">thread link</a>) | @tontinton
 <br/>
 December 15, 2023 | https://tontinton.com/posts/database-fundementals/ | <a href="https://web.archive.org/web/*/https://tontinton.com/posts/database-fundementals/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section><p>About a year ago, I tried thinking which database I should choose for my next project, and came to the realization that I don't really know the differences of databases enough. I went to different database websites and saw mostly marketing and words I don't understand.</p><p>This is when I decided to read the excellent books <code>Database Internals</code> by Alex Petrov and <code>Designing Data-Intensive Applications</code> by Martin Kleppmann.</p><p>The books piqued my curiosity enough to write my own little database I called <a href="https://github.com/tontinton/dbeel">dbeel</a>.</p><p>This post is basically a short summary of these books, with a focus on the fundamental problems a database engineer thinks about in the shower.</p><p>Let's start with the simplest database program ever written, just 2 bash functions (we'll call it <code>bashdb</code>):</p><pre data-lang="bash"><code data-lang="bash"><span>#!/bin/bash
@@ -9977,7 +11210,7 @@ December 15, 2023 | https://willem.com/blog/2023-12-15_backup-rotation-scheme/ |
             </title>
             <description>
 <![CDATA[
-Score 277 | Comments 387 (<a href="https://news.ycombinator.com/item?id=38653110">thread link</a>) | @enz
+Score 278 | Comments 387 (<a href="https://news.ycombinator.com/item?id=38653110">thread link</a>) | @enz
 <br/>
 December 15, 2023 | https://eng.aurelienpierre.com/2021/10/webp-is-so-great-except-its-not/ | <a href="https://web.archive.org/web/*/https://eng.aurelienpierre.com/2021/10/webp-is-so-great-except-its-not/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
@@ -10888,7 +12121,7 @@ Iw°ÉCÏš„8U6R’úÓ,ÅÖ6ÎéÎô¦_QíÁW9JSÿ=\¾·Üáuæ™
             </title>
             <description>
 <![CDATA[
-Score 402 | Comments 279 (<a href="https://news.ycombinator.com/item?id=38652619">thread link</a>) | @SigKill9
+Score 410 | Comments 289 (<a href="https://news.ycombinator.com/item?id=38652619">thread link</a>) | @SigKill9
 <br/>
 December 15, 2023 | https://kitemaker.co/blog/more_product_fewer_pms | <a href="https://web.archive.org/web/*/https://kitemaker.co/blog/more_product_fewer_pms">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p><img src="https://kitemaker.co/images/blog/more_product_fewer_pms.jpeg"></p><p>There has been a lot of discussion about how many Product Managers (PMs) are required in a product team. This conversation gained momentum after <a href="https://www.lennyspodcast.com/brian-cheskys-new-playbook/">Airbnb</a> restructured their product management organization, followed by articles about how startups are <a href="https://www.commandbar.com/blog/everyone-is-hating-on-product-managers-these-yc-companies-never-hired-one">thriving without any PMs</a>.</p>
@@ -11007,7 +12240,7 @@ For high-impact GPAI models with systemic risk, Parliament negotiators managed t
             </title>
             <description>
 <![CDATA[
-Score 9 | Comments 1 (<a href="https://news.ycombinator.com/item?id=38651731">thread link</a>) | @mikae1
+Score 10 | Comments 1 (<a href="https://news.ycombinator.com/item?id=38651731">thread link</a>) | @mikae1
 <br/>
 December 14, 2023 | https://activitypods.org/blog/the-road-to-activitypods-2-0/ | <a href="https://web.archive.org/web/*/https://activitypods.org/blog/the-road-to-activitypods-2-0/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
