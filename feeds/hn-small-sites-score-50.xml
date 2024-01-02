@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Tue, 02 Jan 2024 16:23:37 GMT</lastBuildDate>
+        <lastBuildDate>Tue, 02 Jan 2024 20:20:50 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-50.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Tue, 02 Jan 2024 16:23:37 GMT</pubDate>
+        <pubDate>Tue, 02 Jan 2024 20:20:50 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,211 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Self-hosting a high-availability Postgres cluster on Kubernetes]]>
+            </title>
+            <description>
+<![CDATA[
+Score 72 | Comments 52 (<a href="https://news.ycombinator.com/item?id=38843589">thread link</a>) | @siamese_puff
+<br/>
+January 2, 2024 | https://ryan-schachte.com/blog/ha_postgres_zolando/ | <a href="https://web.archive.org/web/*/https://ryan-schachte.com/blog/ha_postgres_zolando/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div> <div> <p><span>Self-hosting a high-availability Postgres cluster on Kubernetes</span> <span>Deploying an HA Postgres cluster using Zalando w/ K8s.</span></p> </div> <blockquote>
+<p><em>View the <a href="https://news.ycombinator.com/item?id=38843589">Hacker News discussion</a></em></p>
+</blockquote>
+<p>Large cloud providers <em>do</em> indeed go down and without carefully architecting your systems to handle the scenario of <em>when</em> they go down, not <em>if</em> they go down, you need to have automated <a href="https://www.cloudflare.com/learning/performance/what-is-server-failover/">service failover</a> integrated into your system design process to ensure maximal uptime of your most critical applications. 2023 was a fun year for incidents, let’s have a look at just a few I cherry-picked below.</p>
+<ul>
+<li><a href="https://status.cloud.google.com/incidents/dS9ps52MUnxQfyDGPfkY">Google Cloud Paris Data Center Fire (April 25, 2023)</a></li>
+<li><a href="https://aws.amazon.com/message/061323/">AWS us-east-1 Outage (June 13, 2023)</a></li>
+<li><a href="https://www.datacenterdynamics.com/en/news/data-center-power-surge-and-cooling-failure-brings-down-microsoft-azure-services/">Microsoft Azure South East Asia Outage (February 9, 2023)</a></li>
+<li><a href="https://newsletter.pragmaticengineer.com/p/three-cloud-providers-three-outages">Microsoft Azure West Europe Outage (July 5, 2023)</a></li>
+<li><a href="https://www.networkworld.com/article/957256/microsoft-blames-aussie-data-center-outage-on-staff-strength-failed-automation.html">Microsoft Azure Australia Outage (August 30, 2023)</a></li>
+</ul>
+<blockquote>
+<p>If you’re not convinced or feel like you want to study the topic of high-availability more, you should check out <a href="https://www.cockroachlabs.com/blog/brief-history-high-availability/">this fantastic article</a> from Cockroach Labs (creators of CockroachDB).</p>
+</blockquote>
+<p>As I’ve invested more in standardizing hosting my applications on Kubernetes, I started to think about shifting my database into Kubernetes as well to centralize <em>how</em> I manage all my services in one place. While this topic doesn’t come without heavy debate, I think we’ve evolved to a point where supporting this hosting paradigm is pretty streamlined.</p>
+<p>By the end of this article we will have:</p>
+<ul>
+<li>Setup a highly-available and fault tolerant Postgres cluster from scratch</li>
+<li>Host a UI to manage the clusters</li>
+<li>Create a database and test disaster recovery by killing nodes</li>
+</ul>
+<blockquote>
+<p>If you see me issue the command <code>k</code>, it’s a custom alias mapped in my <code>~/.zshrc</code> that maps to <code>kubectl</code>. I’ll often just type <code>k</code> for brevity.</p>
+</blockquote>
+<h2 id="zalando-postgres-operator">Zalando Postgres operator</h2>
+<p><a href="https://github.com/zalando/postgres-operator">Zalando</a> is a Postgres <a href="https://www.redhat.com/en/blog/introducing-operators-putting-operational-knowledge-into-software">operator</a> that facilitates the deployment of a highly available (HA) Postgres cluster. Zalando uses <a href="https://patroni.readthedocs.io/en/latest/">Patroni</a> under the hood, which is essentially a template for scaling HA Postgres clusters.</p>
+<p>Key features of the Zalando Postgres Operator include:</p>
+<ul>
+<li>Rolling updates on Postgres cluster changes, including quick minor version updates.</li>
+<li>Live volume resize without pod restarts (for certain storage types like AWS EBS and PVC).</li>
+<li>Database connection pooling with PGBouncer</li>
+</ul>
+<p>Let’s start by deploying the Zalando operator to our cluster followed by the Postgres cluster itself. We will be heavily referencing the <a href="https://postgres-operator.readthedocs.io/en/latest/">documentation</a> moving forward.</p>
+<p>To keep things raw, we will use the manifests directly with <code>kubectl</code>.</p>
+<figure data-rehype-pretty-code-figure=""><figcaption id="root-fig-g3818hif"> PostgresOperatorDeploy.sh <!-- <span class="custom-figcaption__controls__lang">{lang}</span> -->  </figcaption> <pre tabindex="0" data-language="bash" data-theme=""><code data-line-numbers="" data-language="bash" data-theme="" data-line-numbers-max-digits="1"><span data-line=""><span># First, clone the repository and change to the directory</span></span>
+<span data-line=""><span>git</span><span> clone</span><span> https://github.com/zalando/postgres-operator.git</span></span>
+<span data-line=""><span>cd</span><span> postgres-operator</span></span>
+<span data-line=""> </span>
+<span data-line=""><span># apply the manifests in the following order</span></span>
+<span data-line=""><span>kubectl</span><span> create</span><span> -f</span><span> manifests/configmap.yaml</span><span>  # configuration</span></span>
+<span data-line=""><span>kubectl</span><span> create</span><span> -f</span><span> manifests/operator-service-account-rbac.yaml</span><span>  # identity and permissions</span></span>
+<span data-line=""><span>kubectl</span><span> create</span><span> -f</span><span> manifests/postgres-operator.yaml</span><span>  # deployment</span></span>
+<span data-line=""><span>kubectl</span><span> create</span><span> -f</span><span> manifests/api-service.yaml</span><span>  # operator API to be used by UI</span></span></code></pre></figure>
+<p>I recommend reading each one of these manifests thoroughly to ensure compatibility with your cluster.</p>
+<p>You can validate everything is running with <code>kubectl get pod -l name=postgres-operator</code>.</p>
+<figure data-rehype-pretty-code-figure=""><pre tabindex="0" data-language="bash" data-theme=""><code data-language="bash" data-theme=""><span data-line=""><span>NAME</span><span>                                READY</span><span>   STATUS</span><span>    RESTARTS</span><span>   AGE</span></span>
+<span data-line=""><span>postgres-operator-77f6d658c-mnlj6</span><span>   1</span><span>/1</span><span>     Running</span><span>   0</span><span>          37</span><span>s</span></span></code></pre></figure>
+<h3 id="zalando-management-ui-optional">Zalando management UI (optional)</h3>
+<p>Zalando provides a UI out of the box which is incredibly easy to deploy.</p>
+<figure data-rehype-pretty-code-figure=""><pre tabindex="0" data-language="bash" data-theme=""><code data-language="bash" data-theme=""><span data-line=""><span># using kubectl</span></span>
+<span data-line=""><span>kubectl</span><span> apply</span><span> -f</span><span> ui/manifests/</span></span>
+<span data-line=""> </span>
+<span data-line=""><span># or using Helmcharts</span></span>
+<span data-line=""><span># helm install postgres-operator-ui ./charts/postgres-operator-ui</span></span></code></pre></figure>
+<p>You can validate the deployment is running by grepping for the pods.</p>
+<figure data-rehype-pretty-code-figure=""><pre tabindex="0" data-language="bash" data-theme=""><code data-language="bash" data-theme=""><span data-line=""><span>❯</span><span> kubectl</span><span> get</span><span> pods</span><span> |</span><span> grep</span><span> -i</span><span> postgres-operator-ui</span></span>
+<span data-line=""><span>postgres-operator-ui-7bf9676b84-824j6</span><span>   1</span><span>/1</span><span>     Running</span><span>   0</span><span>          28</span><span>m</span></span></code></pre></figure>
+<p>Since I don’t plan on exposing this, we can quickly crack it open with using <code>kubectl port-forward</code>.</p>
+<figure data-rehype-pretty-code-figure=""><pre tabindex="0" data-language="bash" data-theme=""><code data-language="bash" data-theme=""><span data-line=""><span>kubectl</span><span> port-forward</span><span> deploy/postgres-operator-ui</span><span> 9090</span><span>:8081</span></span></code></pre></figure>
+<p>From here, we should be able to access the UI via <code>http://localhost:9090</code>.</p>
+
+<p>Moving forward, I will <em>not</em> be using the UI, but it’s available if you prefer it.</p>
+<h2 id="postgres-cluster-deployment">Postgres cluster deployment</h2>
+<p>We will still be leveraging <a href="https://github.com/zalando/postgres-operator">Zalando</a> for deploying the Postgres cluster as well. You can view more options in the <a href="https://github.com/zalando/postgres-operator/blob/master/manifests/complete-postgres-manifest.yaml">complete manifest example YML</a>or the <a href="https://opensource.zalando.com/postgres-operator/docs/reference/cluster_manifest.html">parameter overview here</a>.</p>
+<p>I have 3 nodes in my cluster and I want 2/3 to actually run the operator (node2 and node3). Before configuring the affinity to do this, we need to label our data plane nodes. The label here is arbitrary.</p>
+<figure data-rehype-pretty-code-figure=""><pre tabindex="0" data-language="bash" data-theme=""><code data-language="bash" data-theme=""><span data-line=""><span>kubectl</span><span> label</span><span> nodes</span><span> node2</span><span> pg-replication=</span><span>true</span></span>
+<span data-line=""><span>kubectl</span><span> label</span><span> nodes</span><span> node3</span><span> pg-replication=</span><span>true</span></span></code></pre></figure>
+<p>In my case, I’m just going to schedule on my <code>worker</code> nodes. using <code>node-role.kubernetes.io/worker=worker</code>.</p>
+<p>Now we should be able to apply the <code>postgres</code> resource to our cluster.</p>
+<figure data-rehype-pretty-code-figure=""><figcaption id="root-fig-h44hcadj"> zalando/Deployment.yml <!-- <span class="custom-figcaption__controls__lang">{lang}</span> -->  </figcaption> <pre tabindex="0" data-language="yaml" data-theme=""><code data-line-numbers="" data-language="yaml" data-theme="" data-line-numbers-max-digits="2"><span data-line=""><span>apiVersion</span><span>:</span><span> "acid.zalan.do/v1"</span></span>
+<span data-line=""><span>kind</span><span>:</span><span> postgresql</span></span>
+<span data-line=""><span>metadata</span><span>:</span></span>
+<span data-line=""><span>  name</span><span>:</span><span> pg-cluster</span></span>
+<span data-line=""><span>spec</span><span>:</span></span>
+<span data-line=""><span>  teamId</span><span>:</span><span> "homelab"</span></span>
+<span data-line=""><span>  volume</span><span>:</span></span>
+<span data-line=""><span>    size</span><span>:</span><span> 20Gi</span></span>
+<span data-line=""><span>    storageClass</span><span>:</span><span> local-path</span></span>
+<span data-line=""><span>  enableMasterLoadBalancer</span><span>:</span><span> true</span></span>
+<span data-line=""><span>  numberOfInstances</span><span>:</span><span> 2</span></span>
+<span data-line=""><span>  users</span><span>:</span></span>
+<span data-line=""><span>    schachte</span><span>:</span></span>
+<span data-line=""><span>    -</span><span> superuser</span></span>
+<span data-line=""><span>    -</span><span> createdb</span></span>
+<span data-line=""><span>  postgresql</span><span>:</span></span>
+<span data-line=""><span>    version</span><span>:</span><span> "15"</span></span>
+<span data-line=""><span>  nodeAffinity</span><span>:</span></span>
+<span data-line=""><span>    requiredDuringSchedulingIgnoredDuringExecution</span><span>:</span></span>
+<span data-line=""><span>      nodeSelectorTerms</span><span>:</span></span>
+<span data-line=""><span>        -</span><span> matchExpressions</span><span>:</span></span>
+<span data-line=""><span>            -</span><span> key</span><span>:</span><span> node-role.kubernetes.io/worker</span></span>
+<span data-line=""><span>              operator</span><span>:</span><span> In</span></span>
+<span data-line=""><span>              values</span><span>:</span></span>
+<span data-line=""><span>                -</span><span> worker</span></span></code></pre></figure>
+<blockquote>
+<p>Note: I have <a href="https://longhorn.io/"><code>Longhorn</code></a> installed on my cluster, so my <code>storageClass</code> may be different than yours. Feel free to omit the <code>storageClass</code> key or validate what class to use via <code>kubectl get storageClass</code>.</p>
+</blockquote>
+<p>There are a couple important things to point out that are subtle.</p>
+<ul>
+<li><code>numberOfInstances</code> total number of instances for a given cluster. The operator parameters&nbsp;<code>max_instances</code>&nbsp;and&nbsp;<code>min_instances</code>&nbsp;may also adjust this number. Required field.</li>
+<li><code>enableMasterLoadBalancer</code> boolean flag to override the operator defaults (set by the&nbsp;<code>enable_master_load_balancer</code>&nbsp;parameter) to define whether to enable the load balancer pointing to the Postgres primary. Optional.</li>
+<li><code>size</code> will be the amount allocated <em>for each</em> instance. In this case, we will allocate a total of 40Gi of storage.</li>
+</ul>
+<p>In this case we have 2 running clusters that will sync with one another. The clusters will be running on 2 separate nodes due to the <code>nodeAffinity</code> selector.</p>
+<figure data-rehype-pretty-code-figure=""><pre tabindex="0" data-language="bash" data-theme=""><code data-language="bash" data-theme=""><span data-line=""><span># view allocated storage</span></span>
+<span data-line=""><span>❯</span><span> k</span><span> get</span><span> pv</span></span>
+<span data-line=""> </span>
+<span data-line=""><span>NAME</span><span>                                       CAPACITY</span><span>   ACCESS</span><span> MODES</span><span>   RECLAIM</span><span> POLICY</span><span>   STATUS</span><span>   CLAIM</span><span>                         STORAGECLASS</span><span>   REASON</span><span>   AGE</span></span>
+<span data-line=""><span>pvc-913d0700-ae39-4be5-96e6-afddf86ae64a</span><span>   20</span><span>Gi</span><span>       RWO</span><span>            Delete</span><span>           Bound</span><span>    default/pgdata-pg-cluster-0</span><span>   local-path</span><span>              8</span><span>m3s</span></span>
+<span data-line=""><span>pvc-efec9b6a-24d1-46ff-9039-749d6e72841c</span><span>   20</span><span>Gi</span><span>       RWO</span><span>            Delete</span><span>           Bound</span><span>    default/pgdata-pg-cluster-1</span><span>   local-path</span><span>              7</span><span>m56s</span></span></code></pre></figure>
+<p>Great, each node has a 20Gi replica of the DB in case one of the nodes dies, the data consumers shouldn’t notice any degradation.</p>
+<figure data-rehype-pretty-code-figure=""><pre tabindex="0" data-language="bash" data-theme=""><code data-language="bash" data-theme=""><span data-line=""><span># view running K8s services</span></span>
+<span data-line=""><span>&gt;</span><span> k get svc</span></span>
+<span data-line=""> </span>
+<span data-line=""><span># omitting other services for brevity</span></span>
+<span data-line=""><span>...</span></span>
+<span data-line=""><span>pg-cluster</span><span>             LoadBalancer</span><span>   10.43</span><span>.112.7</span><span>     192.168</span><span>.70.10,192.168.70.20,192.168.70.30</span><span>   5432</span><span>:32461/TCP</span><span>   10</span><span>m</span></span></code></pre></figure>
+<p>Alas the benefit of the <code>enableMasterLoadBalancer</code> parameter. Since I’m running on a bare-metal server, this param allocates me the node private IPs as the externally accessible addresses instead of just the internal clusterIP.</p>
+<figure data-rehype-pretty-code-figure=""><pre tabindex="0" data-language="bash" data-theme=""><code data-language="bash" data-theme=""><span data-line=""><span>&gt;</span><span> k get pods</span></span>
+<span data-line=""> </span>
+<span data-line=""><span># omitting other pods for brevity</span></span>
+<span data-line=""><span>postgres-operator-77f6d658c-mnlj6</span><span>       1</span><span>/1</span><span>     Running</span><span>   0</span><span>          78</span><span>m</span></span>
+<span data-line=""><span>postgres-operator-ui-7bf9676b84-824j6</span><span>   1</span><span>/1</span><span>     Running</span><span>   0</span><span>          76</span><span>m</span></span>
+<span data-line=""><span>pg-cluster-1</span><span>                            1</span><span>/1</span><span>     Running</span><span>   0</span><span>          6</span><span>m38s</span></span>
+<span data-line=""><span>pg-cluster-0</span><span>                            1</span><span>/1</span><span>     Running</span><span>   0</span><span>          6</span><span>m19s</span></span></code></pre></figure>
+<p>In total we have:</p>
+<ul>
+<li>Postgres operator for managing the cluster</li>
+<li>Postgres operator UI</li>
+<li>Cluster 0 running on node 2</li>
+<li>Cluster 1 running on node 3</li>
+</ul>
+<h2 id="connecting-to-the-database">Connecting to the database</h2>
+<p>Let’s connect to the DB. You can use whatever client you like, in my case I’ll use <code>PGAdmin</code>, but <code>psql</code> or something similar would suffice.</p>
+
+<p>Typically you would have a load balancer IP that balances across your nodes running Postgres, but we’ll validate with just a couple nodes independently and validate the data is replicated.</p>
+<p>The <code>password</code> is auto generated and placed in a K8s secret. View it with:</p>
+<figure data-rehype-pretty-code-figure=""><pre tabindex="0" data-language="bash" data-theme=""><code data-language="bash" data-theme=""><span data-line=""><span># find the secret for the user you specified</span></span>
+<span data-line=""><span>k</span><span> get</span><span> secrets</span></span>
+<span data-line=""> </span>
+<span data-line=""><span># export the secret to stdout and base64 decode it so we can use within our DB client</span></span>
+<span data-line=""><span>kubectl</span><span> get</span><span> secret</span><span> schachte.pg-cluster.credentials.postgresql.acid.zalan.do</span><span> -o</span><span> jsonpath=</span><span>"{.data.password}"</span><span> |</span><span> base64</span><span> --decode</span></span></code></pre></figure>
+<p>I’m going to create a <code>blog</code> database and add a <code>comments</code> table with dummy data as our starting point.</p>
+<figure data-rehype-pretty-code-figure=""><figcaption id="root-fig-0i9hghe8"> dummyCommentsFixtures.sql <!-- <span class="custom-figcaption__controls__lang">{lang}</span> -->  </figcaption> <pre tabindex="0" data-language="sql" data-theme=""><code data-line-numbers="" data-language="sql" data-theme="" data-line-numbers-max-digits="2"><span data-line=""><span>CREATE</span><span> TABLE</span><span> comments</span><span> (</span></span>
+<span data-line=""><span>  id </span><span>SERIAL</span><span> PRIMARY KEY</span><span>, </span></span>
+<span data-line=""><span>  email </span><span>VARCHAR</span><span>(</span><span>255</span><span>) </span><span>NOT NULL</span><span>, </span></span>
+<span data-line=""><span>  date</span><span> TIMESTAMP</span><span> NOT NULL</span><span>, </span></span>
+<span data-line=""><span>  name</span><span> VARCHAR</span><span>(</span><span>255</span><span>) </span><span>NOT NULL</span><span>, </span></span>
+<span data-line=""><span>  comment </span><span>TEXT</span><span> NOT NULL</span></span>
+<span data-line=""><span>);</span></span>
+<span data-line=""> </span>
+<span data-line=""><span>-- Insert 20 dummy records</span></span>
+<span data-line=""><span>INSERT INTO</span><span> comments (email, </span><span>date</span><span>, </span><span>name</span><span>, comment) </span></span>
+<span data-line=""><span>SELECT</span><span> </span></span>
+<span data-line=""><span>  md5(</span></span>
+<span data-line=""><span>    random</span><span>()</span><span>:: </span><span>text</span></span>
+<span data-line=""><span>  ):: </span><span>varchar</span><span>(</span><span>255</span><span>) </span><span>AS</span><span> email, </span></span>
+<span data-line=""><span>  TIMESTAMP</span><span> '2024-01-01'</span><span> +</span><span> (</span></span>
+<span data-line=""><span>    random</span><span>()</span><span> *</span><span> (</span></span>
+<span data-line=""><span>      TIMESTAMP</span><span> '2024-12-31'</span><span> -</span><span> TIMESTAMP</span><span> '2024-01-01'</span></span>
+<span data-line=""><span>    )</span></span>
+<span data-line=""><span>  ) </span><span>AS</span><span> date</span><span>, </span></span>
+<span data-line=""><span>  md5(</span></span>
+<span data-line=""><span>    random</span><span>()</span><span>:: </span><span>text</span></span>
+<span data-line=""><span>  ):: </span><span>varchar</span><span>(</span><span>255</span><span>) </span><span>AS</span><span> name</span><span>, </span></span>
+<span data-line=""><span>  md5(</span></span>
+<span data-line=""><span>    random</span><span>()</span><span>:: </span><span>text</span></span>
+<span data-line=""><span>  ):: </span><span>varchar</span><span>(</span><span>255</span><span>) </span><span>AS</span><span> comment </span></span>
+<span data-line=""><span>FROM</span><span> </span></span>
+<span data-line=""><span>  generate_series</span><span>(</span><span>1</span><span>, </span><span>20</span><span>);</span></span></code></pre></figure>
+<p>This will push 20 dummy records into the <code>comments</code> table.</p>
+<h2 id="failover-test">Failover test</h2>
+<p>We won’t deploy any crazy chaos testing automation, but we will simulate node failure to ensure failover is working without degradation. In my case, I have 2 nodes:</p>
+<figure data-rehype-pretty-code-figure=""><pre tabindex="0" data-language="bash" data-theme=""><code data-language="bash" data-theme=""><span data-line=""><span>❯</span><span> k</span><span> describe</span><span> pod/pg-cluster-1</span><span> |</span><span> grep</span><span> -i</span><span> "Node:"</span></span>
+<span data-line=""><span>Node:</span><span>             node2/192.168.70.20</span></span>
+<span data-line=""> </span>
+<span data-line=""><span>❯</span><span> k</span><span> describe</span><span> pod/pg-cluster-0</span><span> |</span><span> grep</span><span> -i</span><span> "Node:"</span></span>
+<span data-line=""><span>Node:</span><span>             node3/192.168.70.30</span></span></code></pre></figure>
+<p>If we delete <code>pg-cluster-1</code> using <code>k delete pod/pg-cluster-1</code>, we should still be able to read &amp; write to the DB. Once the node is deleted, it will be automatically scheduled to recreate itself based on the instance count specified in the Zalando deployment yaml.</p>
+<h2 id="takeaways">Takeaways</h2>
+<p>I wouldn’t deploy this directly to production, but I think it gets a very good baseline setup. I would say next important steps would be:</p>
+<ul>
+<li>metrics with Prometheus</li>
+<li>alerting via ntfy</li>
+<li>better load balancing across nodes</li>
+</ul> </div></div>]]>
+            </description>
+            <link>https://ryan-schachte.com/blog/ha_postgres_zolando/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-38843589</guid>
+            <pubDate>Tue, 02 Jan 2024 16:40:03 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Japan Goes All In: Copyright Doesn't Apply to AI Training]]>
             </title>
             <description>
 <![CDATA[
-Score 149 | Comments 119 (<a href="https://news.ycombinator.com/item?id=38842788">thread link</a>) | @ashvardanian
+Score 157 | Comments 151 (<a href="https://news.ycombinator.com/item?id=38842788">thread link</a>) | @ashvardanian
 <br/>
 January 2, 2024 | https://www.biia.com/japan-goes-all-in-copyright-doesnt-apply-to-ai-training/ | <a href="https://web.archive.org/web/*/https://www.biia.com/japan-goes-all-in-copyright-doesnt-apply-to-ai-training/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="post-106014">
@@ -59,11 +259,26 @@ January 2, 2024 | https://www.biia.com/japan-goes-all-in-copyright-doesnt-apply-
         </item>
         <item>
             <title>
-<![CDATA[A New Blog for 2024]]>
+<![CDATA[The Infinite/Eternal Jukebox has been revived]]>
             </title>
             <description>
 <![CDATA[
-Score 68 | Comments 22 (<a href="https://news.ycombinator.com/item?id=38842116">thread link</a>) | @ctnicholas
+Score 93 | Comments 13 (<a href="https://news.ycombinator.com/item?id=38842703">thread link</a>) | @Pikamander2
+<br/>
+January 2, 2024 | https://jukebox.davi.gq/jukebox_search.html | <a href="https://web.archive.org/web/*/https://jukebox.davi.gq/jukebox_search.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
+            </description>
+            <link>https://jukebox.davi.gq/jukebox_search.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-38842703</guid>
+            <pubDate>Tue, 02 Jan 2024 15:40:42 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[A new blog for 2024]]>
+            </title>
+            <description>
+<![CDATA[
+Score 138 | Comments 81 (<a href="https://news.ycombinator.com/item?id=38842116">thread link</a>) | @ctnicholas
 <br/>
 January 2, 2024 | https://chrisnicholas.dev/blog/a-new-blog-for-2024 | <a href="https://web.archive.org/web/*/https://chrisnicholas.dev/blog/a-new-blog-for-2024">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section><p>It’s been a <em>long time</em> since I’ve published a blog post, two whole years. Part of the reason is that it took too much effort to create posts for my previous blog. I needed better DX. A few nights ago, feeling inspired after reading articles by <a target="_blank" rel="noreferrer nofollow noopener" href="https://ped.ro/writing/website-refresh-2023" data-headlessui-state="">Pedro Duarte</a>, <a target="_blank" rel="noreferrer nofollow noopener" href="https://rauno.me/craft/vercel" data-headlessui-state="">Rauno Freiberg</a>, and <a target="_blank" rel="noreferrer nofollow noopener" href="https://leerob.io/blog/2023" data-headlessui-state="">Lee Robinson</a>, I decided it was time to start over.</p>
@@ -79,11 +294,11 @@ January 2, 2024 | https://chrisnicholas.dev/blog/a-new-blog-for-2024 | <a href="
 <figure><div><div></div><p>My name’s Chris Nicholas</p></div><div><div data-slot="field" data-headlessui-state=""><p><span data-slot="control" id="headlessui-control-:R8lmuuuela:" role="checkbox" aria-checked="true" tabindex="0" data-headlessui-state="checked" data-checked=""><span><svg viewBox="0 0 14 14" fill="none"><path d="M3 8L6 11L11 3.5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path><path d="M3 7H11" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg></span></span><label data-slot="label" id="headlessui-label-:R9olmuuuela:" for="headlessui-control-:R8lmuuuela:" data-headlessui-state=""><code>mix-blend-mode: luminosity;</code></label></p></div></div></figure>
 <h3 id="noise"><a href="#noise">Noise</a></h3>
 <p>I’m applying a tiny amount of film grain to the <code><span><span>body</span></span></code>. To me, this makes the page feel like one consistent piece; as you scroll down, the noise sticks to the content, somewhat similar to seeing texture on paper.</p>
-<figure><figcaption>An interactive demo allowing you to change the noise level on the page</figcaption><pre><code>.noise <!-- -->{<br>  <!-- -->opacity:<!-- --> <span>0.018</span>;<br>}</code></pre><p><label for="change-noise-opacity"><code>opacity</code><div></div></label></p></figure>
+<figure><figcaption>An interactive demo allowing you to change the noise level on the page</figcaption><pre><code>.noise <!-- -->{<br>  <!-- -->opacity:<!-- --> <span>0.025</span>;<br>}</code></pre><p><label for="change-noise-opacity"><code>opacity</code><div></div></label></p></figure>
 <p>I wouldn’t recommend noise for most websites, and it’s very easy to overdo it, but I enjoy the subtle filmic effect on my blog.</p>
 <h3 id="catalyst"><a href="#catalyst">Catalyst</a></h3>
 <p>I’m using <a target="_blank" rel="noreferrer nofollow noopener" href="https://tailwindcss.com/blog/introducing-catalyst" data-headlessui-state="">Catalyst</a>, a new UI kit by the Tailwind team. It’s clear that a tonne of thought has gone into making these components accessible, and pixel perfect, on both light and dark modes.</p>
-<figure><figcaption>Tailwind UI Catalyst demo</figcaption><div><p><span>badge</span><span data-slot="control" id="headlessui-checkbox-:R2p3muuuela:" role="checkbox" aria-checked="true" tabindex="0" data-headlessui-state="checked" data-checked=""><span><svg viewBox="0 0 14 14" fill="none"><path d="M3 8L6 11L11 3.5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path><path d="M3 7H11" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg></span></span></p></div></figure>
+<figure><figcaption>Tailwind UI Catalyst demo</figcaption><div><p><span>badge</span><span data-slot="control" aria-label="Example checkbox" id="headlessui-checkbox-:R2p3muuuela:" role="checkbox" aria-checked="true" tabindex="0" data-headlessui-state="checked" data-checked=""><span><svg viewBox="0 0 14 14" fill="none"><path d="M3 8L6 11L11 3.5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path><path d="M3 7H11" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg></span></span></p></div></figure>
 <p>Catalyst provides you with a set of files to download into your project, and you can export your components from these. <a target="_blank" rel="noreferrer nofollow noopener" href="https://heroicons.com/" data-headlessui-state="">Heroicons</a> has also been updated with new icons that fit neatly into Catalyst.</p>
 
 <pre><code><span><span>import</span><span> </span><span>{</span><span> </span><span>Button</span><span> </span><span>}</span><span> </span><span>from</span><span> </span><span>"</span><span>../components/Button</span><span>"</span><span>;</span><span></span></span>
@@ -134,7 +349,7 @@ January 2, 2024 | https://chrisnicholas.dev/blog/a-new-blog-for-2024 | <a href="
 <span><span>}</span></span></code></pre>
 <h4>OG image generation</h4>
 <p>A major pain point on my previous blog was manually creating each social media image. Nowadays, you can <a target="_blank" rel="noreferrer nofollow noopener" href="https://nextjs.org/docs/app/api-reference/file-conventions/metadata/opengraph-image" data-headlessui-state="">generate OpenGraph images dynamically</a> in Next.js, and it’s very little effort to get started.</p>
-<p><img src="https://chrisnicholas.dev/blog/a-new-blog-for-2024/opengraph-image" alt="Open graph image for this article"></p>
+<p><img alt="Open graph image for this article" loading="lazy" width="628" height="330" decoding="async" data-nimg="1" srcset="https://chrisnicholas.dev/_next/image?url=%2Fblog%2Fa-new-blog-for-2024%2Fopengraph-image&amp;w=640&amp;q=75 1x, https://chrisnicholas.dev/_next/image?url=%2Fblog%2Fa-new-blog-for-2024%2Fopengraph-image&amp;w=1920&amp;q=75 2x" src="https://chrisnicholas.dev/_next/image?url=%2Fblog%2Fa-new-blog-for-2024%2Fopengraph-image&amp;w=1920&amp;q=75"></p>
 <pre><code><span></span>
 <span><span>export</span><span> </span><span>const</span><span> </span><span>runtime</span><span> </span><span>=</span><span> </span><span>"</span><span>edge</span><span>"</span><span>;</span><span></span></span>
 <span><span>export</span><span> </span><span>const</span><span> </span><span>alt</span><span> </span><span>=</span><span> </span><span>"</span><span>...</span><span>"</span><span>;</span><span></span></span>
@@ -182,7 +397,7 @@ It’s been a _long_ time since I’ve publis…</code></pre>
 <span><span>}</span><span></span></span></code></pre>
 <h2 id="archived-posts"><a href="#archived-posts">Archived posts</a></h2>
 <p>I’ve archived all the posts from my previous blog, <em>ctnicholas.dev</em>, as it’d take too long to transfer them to the new site, though they’re all still <a data-headlessui-state="" href="https://chrisnicholas.dev/blog">available to read</a>.</p>
-<figure><video src="https://chrisnicholas.dev/blog/a-new-blog-for-2024/old-articles.mp4" muted="" autoplay="" loop="" playsinline=""></video><figcaption>A video of my old blog</figcaption></figure>
+<p><img alt="A screenshot of my bold blog" loading="lazy" width="628" height="327" decoding="async" data-nimg="1" srcset="https://chrisnicholas.dev/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fold-articles.69315554.png&amp;w=640&amp;q=75 1x, https://chrisnicholas.dev/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fold-articles.69315554.png&amp;w=1920&amp;q=75 2x" src="https://chrisnicholas.dev/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fold-articles.69315554.png&amp;w=1920&amp;q=75"></p>
 
 <p>My blog’s a work in progress, and there's so much more I’d like to add, for example:</p>
 <ul>
@@ -202,7 +417,7 @@ It’s been a _long_ time since I’ve publis…</code></pre>
             </title>
             <description>
 <![CDATA[
-Score 66 | Comments 90 (<a href="https://news.ycombinator.com/item?id=38840766">thread link</a>) | @moritzruth
+Score 72 | Comments 105 (<a href="https://news.ycombinator.com/item?id=38840766">thread link</a>) | @moritzruth
 <br/>
 January 2, 2024 | https://www.fromjason.xyz/p/notebook/how-do-we-stop-meta-in-2024-we-fix-the-information-loop/ | <a href="https://web.archive.org/web/*/https://www.fromjason.xyz/p/notebook/how-do-we-stop-meta-in-2024-we-fix-the-information-loop/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>   
@@ -257,11 +472,33 @@ January 2, 2024 | https://www.fromjason.xyz/p/notebook/how-do-we-stop-meta-in-20
         </item>
         <item>
             <title>
+<![CDATA[Earthquake in Japan yesterday may have shifted land 1.3 meters]]>
+            </title>
+            <description>
+<![CDATA[
+Score 71 | Comments 57 (<a href="https://news.ycombinator.com/item?id=38840699">thread link</a>) | @ronyclau
+<br/>
+January 2, 2024 | https://www3.nhk.or.jp/nhkworld/en/news/20240102_22/ | <a href="https://web.archive.org/web/*/https://www3.nhk.or.jp/nhkworld/en/news/20240102_22/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+                <p>The powerful earthquake that rocked Ishikawa Prefecture on Monday may have shifted land in the Noto region near the epicenter up to 1.3 meters to the west.</p>
+                <p>Japan's Geospatial Information Authority, known as GSI, analyzed GPS data following the 7.6 magnitude quake.</p>
+                <p>GSI says preliminary figures indicate that an observation point in Wajima City in Ishikawa Prefecture saw the biggest shift, moving horizontally about 1.3 meters to the west.</p>
+                <p>The analysis also indicates a westward shift of about 1 meter in Anamizu Town and 80 centimeters in Suzu City. An observation point in Nanao City's Notojima moved 60 centimeters northwest toward the Sea of Japan coast.</p>
+                <p>Land appears to have shifted about 20 centimeters to the northwest in the prefectures of Toyama and Niigata. Several centimeters of land shifts were also observed in the Kanto-Koshin region and elsewhere.</p>
+                <p>GSI plans to continue analyzing the data for other movements.</p>
+              </div></div>]]>
+            </description>
+            <link>https://www3.nhk.or.jp/nhkworld/en/news/20240102_22/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-38840699</guid>
+            <pubDate>Tue, 02 Jan 2024 11:55:21 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[What I've learned about flow fields so far]]>
             </title>
             <description>
 <![CDATA[
-Score 168 | Comments 28 (<a href="https://news.ycombinator.com/item?id=38839506">thread link</a>) | @tehrash
+Score 226 | Comments 38 (<a href="https://news.ycombinator.com/item?id=38839506">thread link</a>) | @tehrash
 <br/>
 January 2, 2024 | https://damoonrashidi.me/articles/flow-field-methods | <a href="https://web.archive.org/web/*/https://damoonrashidi.me/articles/flow-field-methods">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article><section data-fresh-key="flow-field-methods"><p>June 15, 2021, updated December 27, 2023.</p></section><blockquote>If you feel that this article is too wordy skip all the text and play with the illustrations, they get more and more fun as the articles rambles on!<figcaption>-- Me</figcaption></blockquote><section><span>Table of contents</span><ol><li><a href="#intro">Brief introduction</a></li><li><a href="#noise-functions">Noise functions</a></li><li><a href="#drawing-lines">Drawing lines</a></li><li><a href="#noise-function-alternatives">Alternatives to noise functions</a></li><li><a href="#collision-detection">Collision detection</a><ol><li><a href="#optimizing-collision-detection">Optimizing collision detection</a></li></ol></li><li><a href="#colors">colors</a></li><li><a href="#conclusion">Conclusion</a></li></ol></section><h2 id="intro">Brief introduction.</h2><p>This article will describe the methods and concepts I used to create the series of generated artworks pictured below. I've tried to visualize the algorithms and provide some code samples. The code samples are written in a Typescript with some simplifications so that the code is readable on mobile and to make them more concise and easy to follow. The general algorithms can easily be ported to any language though, I have for instance done some <a href="https://github.com/damoonrashidi/generative-art">implementations using Rust</a>.</p><p>As a note, far more talented people than me have written <a href="https://tylerxhobbs.com/essays/2020/flow-fields">articles on the subject</a> upon which my work is very obviously based. I recommend reading that one too!</p><p><img src="https://damoonrashidi.me/articles/flow-field-methods/example-1.webp?__frsh_c=35d83479d7e5b288d9b64df7753f8a599aa80b3d" alt="Flow field example one" width="300" height="475"><img src="https://damoonrashidi.me/articles/flow-field-methods/example-2.webp?__frsh_c=35d83479d7e5b288d9b64df7753f8a599aa80b3d" alt="Flow field example two" width="300" height="475"><img src="https://damoonrashidi.me/articles/flow-field-methods/example-3.webp?__frsh_c=35d83479d7e5b288d9b64df7753f8a599aa80b3d" alt="Flow field example three" width="300" height="475"></p><h2 id="noise-functions">Noise functions</h2><p>The main driving force behind these flow field images is usually a noise function. Without regurgitating the <a href="https://en.wikipedia.org/wiki/Perlin_noise">wikipedia article</a>, a noise function is a function that takes a coordinate in 2d space (higher dimension noise-functions also exist, but are irrelevant for the purpose of this article) and returns a value in the range <code>-1..=1</code> such as points close together return similar, but slightly different, values.</p><p>The interactive illustration below shows how this works by uniformly sampling points in a grid and calling the noise function for that point. Note that the values have been rounded to one decimal for legibility, the actual values have far more precision. Click <code>Regenerate</code> to run the noise function again with a new seed to get new noise values.</p><!--frsh-articles_flow_fields_noise_noiseillustration:0:--><!--/frsh-articles_flow_fields_noise_noiseillustration:0:--><p>And here is the code that generated the image above, abbreviated for clarity.</p><!--frsh-articles_code_code:1:--><pre>[<span>object</span> <span>Object</span>]</pre><!--/frsh-articles_code_code:1:--><p>To make it a bit easier to digest, we can visualize this in a more effective manner by translating the noise values into degrees and draw lines from a starting position and a few pixels following the degree of the noise value.</p><!--frsh-articles_flow_fields_noise_angles_noiseangleillustration:2:--><!--/frsh-articles_flow_fields_noise_angles_noiseangleillustration:2:--><!--frsh-articles_code_code:3:--><pre>[<span>object</span> <span>Object</span>]</pre><!--/frsh-articles_code_code:3:--><p>This doesn't look like much currently. It would appear that lines are fairly disjointed and go off in seemingly random directions. Not at all the smooth effect we're going for.</p><p>It turns out that noise functions are pretty sensitive. You'd think that the points<code>(1.0, 1.0)</code> and <code>(1.0, 2.0)</code> would produce somewhat similar noise values, following the rule that points in close proximity yield fairly similar noise values, but they're not close enough to each other.</p><p>To combat this we can force our points to be closer together by just dividing our x and y coordinates by some smoothness constant. For example, the distance between our two example points was previously <code>1.0</code> for the y-axis, and <code>0.0</code> for the x-axis, for a total distance of <code>1.0</code>.</p><p>If we divide all our x and y values by the constant <code>smoothness = 100</code>  we'd end up with: <code>p1 = (0.01, 0.01), p2 = (0.01, 0.02)</code>, making the distance only <code>0.01</code>, but keeping the relation between the points the same.</p><p>The only change we need to make to our code is the following:</p><!--frsh-articles_code_code:4:--><pre>[<span>object</span> <span>Object</span>]</pre><!--/frsh-articles_code_code:4:--><p>You can think of it as shrinking our domain to better fit the noise values. Or zooming in on the noise function if that helps.</p><!--frsh-articles_flow_fields_noise_angles_noiseangleillustration:5:--><!--/frsh-articles_flow_fields_noise_angles_noiseangleillustration:5:--><p>As we can see by dragging the smoothness value up, closer to 100 in this case, the lines start to smooth out and patterns start to emerge.</p><h2 id="drawing-lines">Drawing lines.</h2><p>At this point we know how to navigate the flow field. Pick any point <code>P</code>, read the noise value <code>n</code> for that point and increment <code>P.x</code> by <code>cos(n)</code> and <code>P.y</code> by <code>sin(n)</code> as well as some extra pixels that represents the distance we want to travel in the direction of the field.</p><p>We did this in the previous examples by sampling points in a grid and and having a fixed line length. To approximate the effect illustrated in the images at the beginning of this article a bit better another implementation is necessary. First we need to pick a random point on the canvas and then ride the flow field until we get out of bounds.</p><!--frsh-articles_code_code:6:--><pre>[<span>object</span> <span>Object</span>]</pre><!--/frsh-articles_code_code:6:--><!--frsh-articles_flow_fields_building_line_buildingaline:7:--><!--/frsh-articles_flow_fields_building_line_buildingaline:7:--><p>Going from the above example to drawing an actual line should now be trivial. Start at any given point on the canvas an instantiate your line, move through the field just as before, but instead of drawing a new point at the given position add it to the points for the line. Stop the loop when the line has reached the end of the canvas and finally draw the line.</p><!--frsh-articles_code_code:8:--><pre>[<span>object</span> <span>Object</span>]</pre><!--/frsh-articles_code_code:8:--><p>Mouse over the illustration below to create new lines from your mouse position.</p><!--frsh-articles_flow_fields_noise_line_noiselineillustration:9:--><!--/frsh-articles_flow_fields_noise_line_noiselineillustration:9:--><h2 id="experimenting-with-lines">Experimenting with lines.</h2><p>So far not a lot of variance has been achieved. All results, no matter what the seed of the noise function is, will yield somewhat similar images. There are a few ways to combat this, one way is by warping the noise value a bit, resulting in lines exaggerating their turns, this is done by simply multiplying the noise value by some constant before applying the <code>cos()</code> and <code>sin()</code> functions.</p><!--frsh-articles_code_code:10:--><pre>[<span>object</span> <span>Object</span>]</pre><!--/frsh-articles_code_code:10:--><p>Another way is by varying the length of the steps each line takes between each step as it progresses through the field. Shorter steps yield much smoother curves while longer steps will make the lines a lot more jagged.</p><!--frsh-articles_code_code:11:--><pre>[<span>object</span> <span>Object</span>]</pre><!--/frsh-articles_code_code:11:--><!--frsh-articles_flow_fields_line_variation_linevariationillustration:12:--><div><canvas></canvas><div><p><label for="smoothness_variation">Smoothness</label><span>100</span></p><p><label for="warp_variation">Warp</label><span>1</span></p><p><label for="max_length_variation">Max length</label><span>10</span></p><p><label for="step_size_variation">Step size</label><span>2</span></p></div></div><!--/frsh-articles_flow_fields_line_variation_linevariationillustration:12:--><h2 id="noise-function-alternatives">Alternatives to noise functions</h2><p>So far we've been using a noise function called OpenSimplex.</p><blockquote>OpenSimplex noise is an n-dimensional gradient noise function that was developed in order to overcome the patent-related issues surrounding Simplex noise, while continuing to also avoid the visually-significant directional artifacts characteristic of Perlin noise.<figcaption>- Kurt Spencer</figcaption></blockquote><p>As alluded to in the quote, there are few different noise functions. A proper noise function is a bit complicated and out of scope for this article, but nothing is stopping us from writing a function that returns similar values for a given coordinate, that part can be done pretty easily.</p><p>These home grown functions won't yield as random seeming results as a noise function but they will let us control the final output much more. They will also let us be much more creative in trying new things out now that we can draw lines that reliably follow a path.</p><p>An easy first test we can do is simply taking a coordinate and return it's distance to another point that we'll call the <code>focalPoint</code>, just to see what would happen. This function would satisfy the rule that points close together yield similar values, making our lines nice and smooth.</p><!--frsh-articles_code_code:13:--><pre>[<span>object</span> <span>Object</span>]</pre><!--/frsh-articles_code_code:13:--><p>Mouse over the illustration below to set a new focal point</p><!--frsh-articles_flow_fields_distance_to_point_distancetopointillustration:14:--><!--/frsh-articles_flow_fields_distance_to_point_distancetopointillustration:14:--><p>If we instead of returning the distance to <code>focalPoint</code> we can return the angle the line has from our point to  and offset our point along the radius (with a slight distortion to the y-axis) we can get a nice swirl-like effect.</p><!--frsh-articles_code_code:15:--><pre>[<span>object</span> <span>Object</span>]</pre><!--/frsh-articles_code_code:15:--><!--frsh-articles_code_code:16:--><pre>[<span>object</span> <span>Object</span>]</pre><!--/frsh-articles_code_code:16:--><!--frsh-articles_flow_fields_angle_to_point_anglebetweenillustration:17:--><!--/frsh-articles_flow_fields_angle_to_point_anglebetweenillustration:17:--><h2 id="collision-detection">Collision Detection</h2><p>In my opinion, the real fun doesn't really begin until we start looking at having the lines interact with each other. Instead of stopping when we reach the end of the canvas or we've reached the max line length we can instead stop when this line would collide with another line.</p><p>Hover the illustration (or slide your finger over it) to add lines of varying width.</p><!--frsh-articles_flow_fields_collision_detection_collisiondetectionillustration:18:--><!--/frsh-articles_flow_fields_collision_detection_collisiondetectionillustration:18:--><p>Now, a lot can be said about collision detection and how to make it performant. I'll show only one method and a small optimization to keep the solution somewhat performant.</p><p>Checking the <a href="https://en.wikipedia.org/wiki/Line%E2%80%93line_intersection">intersection of two straight lines</a> isn't too bad and can be done in O(1) time. Our lines aren't straight however so we'll have to be a bit more clever. If we go back to the beginning of how we drew the line, it started with stepping through the noise field and adding a point for each step. If we made that point into a circle by giving it same radius as the line and kept track of each circle, not just in the line but in all lines it's a lot easier to check if the circle we are about to draw overlaps any other circle.</p><p>Checking if two circles overlap is only a matter of checking if the sum of their radii is smaller than the distance between their origo.</p><!--frsh-articles_code_code:19:--><pre>[<span>object</span> <span>Object</span>]</pre><!--/frsh-articles_code_code:19:--><p>Here is another illustration that highlights when two non-linear lines meet using this method. Play with the illustration to move the colliding line.</p><!--frsh-articles_flow_fields_collision_example_collisionexampleillustration:20:--><!--/frsh-articles_flow_fields_collision_example_collisionexampleillustration:20:--><!--frsh-articles_code_code:21:--><pre>[<span>object</span> <span>Object</span>]</pre><!--/frsh-articles_code_code:21:--><h3 id="optimizing-collision-detection">Optimizing it slightly.</h3><p>These example illustrations are fairly small so we haven't ran into any performance issues when checking if our line collides with any other line... yet. When trying to make a larger image however, in a print-friendly size for instance, we'd end up with a lot of lines with a lot of points that we could potentially collide with, meaning that for every new point we add we must check collisions against all other points. This stacks up fast and will make your render times a lot longer than desired. A way to mitigate this is to only check against points that are close enough for us to collide with.</p><p>The simplest way of doing that is by dividing our canvas up into a grid of boxes and whenever we are about to add a new point check which box it would go in, and then only check against collisions with points in that box.</p><p>Time for another illustration. This time, move your finger or mouse cursor around to see which points belong to the same box.</p><!--frsh-articles_flow_fields_pointmap_pointmapillustration:22:--><!--/frsh-articles_flow_fields_pointmap_pointmapillustration:22:--><p>Now, with 100 boxes (10 across, 10 down) and if the points are distributed uniformly on the canvas, we end up doing 1/100<sup>th</sup> as many checks that we did previously, increasing rendering performance by quite a bit! One thing to note however, is that if our boxes would be too small to reliably hold points with the radius of our lines then we'd start to get overlapping lines at the edges. This would also happen if a points origo was at the very edge of a box, causing its body to spill outside the boxes area. We could fix that by checking surrounding boxes for collisions as well, but that would mean we'd check another eight boxes besides the current one, increasing the search space a bit, but the result would be more exact.</p><p>A final optimisation we can do with this technique is that if our step size (the distance between each point in each line) is sufficiently small we could skip checking a few points in the box, since if our circle overlaps with one of the circles there's a high chance that it overlaps with some other circles as well. Now this might yield a less accurate result, but accuracy is not necessarly the end goal. Some small overlaps for a few lines might introduce some visually pleasing artifacts. Usually those kinds of details are <em>happy little accidents</em>.</p><!--frsh-articles_code_code:23:--><pre>[<span>object</span> <span>Object</span>]</pre><!--/frsh-articles_code_code:23:--><p>Here we check against every 7<sup>th</sup> circle in a box hoping to get a hit if there is one. The constant <code>7</code> might be too high in some cases, or could be increased even more, it all depends on the step size for the lines and can be tweaked to get a good balance between render times and correctness.</p><h2 id="colors">Finally, Colors.</h2><p>The theme for this article is converging to <em>"you can achieve a lot of variation with some tweaks"</em>. That's true for applying colors to these images as well. So far things in this article have been pretty monochrome to focus on the underlying techniques of how to achieve the overarching look.</p><p>The easiest way to get some color in there is to create a palette with a few different colors and picking at random when creating a new line.</p><!--frsh-articles_code_code:24:--><pre>[<span>object</span> <span>Object</span>]</pre><!--/frsh-articles_code_code:24:--><!--frsh-articles_flow_fields_color_colorillustration:25:--><!--/frsh-articles_flow_fields_color_colorillustration:25:--><p>Another coloring method is by coloring each line by the angle of the noise function where the line started. This will yield a gradient like coloring across larger images.</p><!--frsh-articles_code_code:26:--><pre>[<span>object</span> <span>Object</span>]</pre><!--/frsh-articles_code_code:26:--><!--frsh-articles_flow_fields_color_colorillustration:27:--><!--/frsh-articles_flow_fields_color_colorillustration:27:--><p>Finally, my favorite method is by subdividing the canvas into a set of regions, either by some <a href="https://en.wikipedia.org/wiki/Composition_with_Red_Blue_and_Yellow">Piet Mondrian Composition style</a>, or recursively splitting the canvas into more and more refined polygons. After the canvas has been divided I assign each region a color and whenever a line spawns assign it the color of the region it spawned in.</p><p>This method creates a nice effect where things don't look as disjointed and more like streams of paint flowing into other buckets of paint.</p><!--frsh-articles_flow_fields_color_colorillustration:28:--><!--/frsh-articles_flow_fields_color_colorillustration:28:--><h2 id="conclusion">Conclusion</h2><p>Even though this article got quite long, it only scratches the surface of all the variants that can be achieved using the fundamental techniques described. I highly recommend trying things out and experimenting, swapping a <code>cos()</code> for a <code>sin()</code> somewhere, or maybe even a <code>tan()</code> if you're crazy.</p><p>Try subdividing the canvas into subregions who all have their own rules, or maybe dive deeper into noise functions. Or have a small border around the canvas and let some small percent of the lines escape it. Why use lines at all? Why not circles or squares or blobs?</p><p>Thanks for sticking in there this long, hope it was helpful.</p></article></div>]]>
@@ -276,7 +513,7 @@ January 2, 2024 | https://damoonrashidi.me/articles/flow-field-methods | <a href
             </title>
             <description>
 <![CDATA[
-Score 126 | Comments 24 (<a href="https://news.ycombinator.com/item?id=38838946">thread link</a>) | @tomosterlund
+Score 200 | Comments 58 (<a href="https://news.ycombinator.com/item?id=38838946">thread link</a>) | @tomosterlund
 <br/>
 January 1, 2024 | https://schedule-x.dev/demos/calendar | <a href="https://web.archive.org/web/*/https://schedule-x.dev/demos/calendar">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><div><h2>Code</h2><p>The demo above is based on the code below.</p></div></div></div></div>]]>
@@ -291,7 +528,7 @@ January 1, 2024 | https://schedule-x.dev/demos/calendar | <a href="https://web.a
             </title>
             <description>
 <![CDATA[
-Score 99 | Comments 11 (<a href="https://news.ycombinator.com/item?id=38838369">thread link</a>) | @todsacerdoti
+Score 118 | Comments 17 (<a href="https://news.ycombinator.com/item?id=38838369">thread link</a>) | @todsacerdoti
 <br/>
 January 1, 2024 | https://posixcafe.org/blogs/2024/01/01/0/ | <a href="https://web.archive.org/web/*/https://posixcafe.org/blogs/2024/01/01/0/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -328,7 +565,7 @@ January 1, 2024 | https://posixcafe.org/blogs/2024/01/01/0/ | <a href="https://w
             </title>
             <description>
 <![CDATA[
-Score 51 | Comments 52 (<a href="https://news.ycombinator.com/item?id=38835994">thread link</a>) | @steveklabnik
+Score 56 | Comments 55 (<a href="https://news.ycombinator.com/item?id=38835994">thread link</a>) | @steveklabnik
 <br/>
 January 1, 2024 | https://blog.aaronballman.com/2023/12/musings-on-the-c-charter/ | <a href="https://web.archive.org/web/*/https://blog.aaronballman.com/2023/12/musings-on-the-c-charter/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -478,7 +715,7 @@ January 1, 2024 | https://blog.aaronballman.com/2023/12/musings-on-the-c-charter
             </title>
             <description>
 <![CDATA[
-Score 184 | Comments 117 (<a href="https://news.ycombinator.com/item?id=38835419">thread link</a>) | @spike021
+Score 187 | Comments 119 (<a href="https://news.ycombinator.com/item?id=38835419">thread link</a>) | @spike021
 <br/>
 January 1, 2024 | https://nerv.app/en/ | <a href="https://web.archive.org/web/*/https://nerv.app/en/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -566,7 +803,7 @@ January 1, 2024 | https://nerv.app/en/ | <a href="https://web.archive.org/web/*/
             </title>
             <description>
 <![CDATA[
-Score 93 | Comments 28 (<a href="https://news.ycombinator.com/item?id=38834780">thread link</a>) | @serverlessmom
+Score 96 | Comments 30 (<a href="https://news.ycombinator.com/item?id=38834780">thread link</a>) | @serverlessmom
 <br/>
 January 1, 2024 | https://thisisimportant.net/posts/content-as-a-graph/ | <a href="https://web.archive.org/web/*/https://thisisimportant.net/posts/content-as-a-graph/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content">
@@ -884,7 +1121,7 @@ Ideally, you want to create categories that accurately describe your content and
             </title>
             <description>
 <![CDATA[
-Score 55 | Comments 59 (<a href="https://news.ycombinator.com/item?id=38834362">thread link</a>) | @apsec112
+Score 55 | Comments 62 (<a href="https://news.ycombinator.com/item?id=38834362">thread link</a>) | @apsec112
 <br/>
 January 1, 2024 | https://nuancepill.com/has-the-sexlessness-epidemic-been-overstated/ | <a href="https://web.archive.org/web/*/https://nuancepill.com/has-the-sexlessness-epidemic-been-overstated/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1901,7 +2138,7 @@ January 1, 2024 | https://nuancepill.com/has-the-sexlessness-epidemic-been-overs
             </title>
             <description>
 <![CDATA[
-Score 294 | Comments 70 (<a href="https://news.ycombinator.com/item?id=38833747">thread link</a>) | @codyd51
+Score 302 | Comments 72 (<a href="https://news.ycombinator.com/item?id=38833747">thread link</a>) | @codyd51
 <br/>
 January 1, 2024 | https://axleos.com/writing-a-truetype-font-renderer/ | <a href="https://web.archive.org/web/*/https://axleos.com/writing-a-truetype-font-renderer/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="main-blog-post-content-container">
@@ -2339,7 +2576,7 @@ There’s an interesting inversion here. The job of this hinting program is to <
             </title>
             <description>
 <![CDATA[
-Score 440 | Comments 98 (<a href="https://news.ycombinator.com/item?id=38833658">thread link</a>) | @azhenley
+Score 453 | Comments 100 (<a href="https://news.ycombinator.com/item?id=38833658">thread link</a>) | @azhenley
 <br/>
 January 1, 2024 | https://timmastny.com/blog/a-star-tricks-for-videogame-path-finding/ | <a href="https://web.archive.org/web/*/https://timmastny.com/blog/a-star-tricks-for-videogame-path-finding/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2534,7 +2771,7 @@ in real time, given that maximum depth.</p>
             </title>
             <description>
 <![CDATA[
-Score 66 | Comments 23 (<a href="https://news.ycombinator.com/item?id=38831119">thread link</a>) | @lars512
+Score 90 | Comments 37 (<a href="https://news.ycombinator.com/item?id=38831119">thread link</a>) | @lars512
 <br/>
 January 1, 2024 | https://lars.yencken.org/fresh-start-effect | <a href="https://web.archive.org/web/*/https://lars.yencken.org/fresh-start-effect">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>I spent nearly five years working at the nutrition startup <a href="https://lifesum.com/">Lifesum</a> in Stockholm, where we built a mobile app for tracking your diet and exercise.</p>
@@ -2573,7 +2810,7 @@ January 1, 2024 | https://lars.yencken.org/fresh-start-effect | <a href="https:/
             </title>
             <description>
 <![CDATA[
-Score 101 | Comments 82 (<a href="https://news.ycombinator.com/item?id=38831083">thread link</a>) | @nmstoker
+Score 101 | Comments 86 (<a href="https://news.ycombinator.com/item?id=38831083">thread link</a>) | @nmstoker
 <br/>
 January 1, 2024 | https://blog.davep.org/2024/01/01/oshit.html | <a href="https://web.archive.org/web/*/https://blog.davep.org/2024/01/01/oshit.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2649,7 +2886,7 @@ start using it.</p>
             </title>
             <description>
 <![CDATA[
-Score 298 | Comments 227 (<a href="https://news.ycombinator.com/item?id=38830782">thread link</a>) | @ghr
+Score 312 | Comments 234 (<a href="https://news.ycombinator.com/item?id=38830782">thread link</a>) | @ghr
 <br/>
 January 1, 2024 | https://www.fullcircuit.com/blog/fixing-annoying-blue-standby-lights | <a href="https://web.archive.org/web/*/https://www.fullcircuit.com/blog/fixing-annoying-blue-standby-lights">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="page-wrapper">
@@ -2760,7 +2997,7 @@ A free fix and you get to eat the chocolate.  What could be better?
             </title>
             <description>
 <![CDATA[
-Score 270 | Comments 61 (<a href="https://news.ycombinator.com/item?id=38830281">thread link</a>) | @rntn
+Score 270 | Comments 64 (<a href="https://news.ycombinator.com/item?id=38830281">thread link</a>) | @rntn
 <br/>
 December 31, 2023 | https://www3.nhk.or.jp/nhkworld/en/news/20240101_15/ | <a href="https://web.archive.org/web/*/https://www3.nhk.or.jp/nhkworld/en/news/20240101_15/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2972,7 +3209,7 @@ December 31, 2023 | https://www.fromjason.xyz/p/notebook/copy-acquire-kill-how-m
             </title>
             <description>
 <![CDATA[
-Score 171 | Comments 160 (<a href="https://news.ycombinator.com/item?id=38823673">thread link</a>) | @tosh
+Score 172 | Comments 161 (<a href="https://news.ycombinator.com/item?id=38823673">thread link</a>) | @tosh
 <br/>
 December 31, 2023 | https://www.onsclom.net/posts/javascript-tco | <a href="https://web.archive.org/web/*/https://www.onsclom.net/posts/javascript-tco">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div> <main data-astro-cid-egg7nqdx=""><p><a href="https://bun.sh/">Bun</a> is a JavaScript runtime that just released version 1.0! Now you have three
@@ -3236,7 +3473,7 @@ December 31, 2023 | https://rnikhil.com/2023/12/31/ai-cfr-solver-poker.html | <a
             </title>
             <description>
 <![CDATA[
-Score 457 | Comments 231 (<a href="https://news.ycombinator.com/item?id=38823101">thread link</a>) | @muterad_murilax
+Score 460 | Comments 233 (<a href="https://news.ycombinator.com/item?id=38823101">thread link</a>) | @muterad_murilax
 <br/>
 December 31, 2023 | https://iliana.fyi/blog/build-your-own-steamos-updates/ | <a href="https://web.archive.org/web/*/https://iliana.fyi/blog/build-your-own-steamos-updates/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>SteamOS 3 (“Holo”) is the Arch-based Linux distribution built for the Steam Deck, Valve Software’s portable PC gaming device. It’s a very interesting Linux distribution even when you only focus on how it updates itself: updates are performed atomically by downloading a new read-only root filesystem to an inactive partition, then rebooting into that partition. But consumers can also run <code>steamos-devmode</code> to unlock the root filesystem, put the pacman database in working order, and give them a working Linux distro with a normal package manager.</p><p>This A/B atomic updates system is pretty standard for OSes these days, but there’s a lot going on in SteamOS that makes them work even with heavy customization by the end-user. I wanted to explore that while still being able to make changes to the root filesystem images. <code>steamos-devmode</code> is the easy way out; I wanted to make a proper fork. Here’s how I did it.</p><ili-callout role="note"><p>I use these instructions, but am providing them here to help publicly document some of what SteamOS does. I’m not responsible for you breaking your Steam Deck, and if you send me questions asking why these steps don’t work for you I won’t answer.</p></ili-callout><h2>Why?</h2><p>I don’t own a Steam Deck. A bunch of my friends do, but they know better than to let me have root access on a device they actually like using. What I do have is a recently-built living room PC that I wanted to play games on… and SteamOS seemed like a reasonable choice. It almost even worked perfectly out of the box, although I think that is primarily because I built a computer that looks vaguely similar to a really heavy, battery-less Steam Deck<sup><a href="#user-content-fn-fragile" aria-describedby="footnote-label" data-footnote-ref="" id="user-content-fnref-fragile">1</a></sup>.</p><p>The one thing that didn’t work was resume from suspend. Other distributions running on my computer using mainline or stable kernels did. Eventually, I found <a href="https://steamdeck-packages.steamos.cloud/archlinux-mirror/sources/">the sources for Valve’s kernel</a> (it’s weird, I’ll explain when we get there) and started a <code>git bisect</code>, leading me to a commit that seems to fix resume from suspend on Steam Deck hardware, but ultimately breaks it on mine. Needing to revert this commit and do my own build is the ultimate reason I headed down this path.</p><p>At several points in this process my partner asked if this made more sense than just using Arch or something else directly. I still don’t know the answer, although I think I still prefer relying on a Valve-tested set of packages than whatever’s current in the Arch repos. If I’m going to have to tinker with a Linux distro for running games, it may as well be one that people actually test their games on.</p><p>I apparently have a tendency to make poor choices like this, because you are reading the second post in what has become a series on <a href="https://iliana.fyi/blog/installing-fedora-on-mac-mini/">installing Linux distros onto systems they’re not ready for yet</a>.</p><h2>SteamOS in a nutshell</h2><p>A SteamOS system has eight partitions. The stage 1 bootloader is stored on the EFI system partition, along with metadata files that describe the two A/B partition sets and how to choose which one to boot. Each of the two partition sets contains a stage 2 bootloader (GRUB), the root filesystem, and a <code>/var</code> partition. Finally, there’s a single <code>home</code> partition that fills the rest of the disk.</p><pre><code>Number  Start (sector)    End (sector)  Size       Code  Name
@@ -3424,7 +3661,7 @@ file_server browse
             </title>
             <description>
 <![CDATA[
-Score 148 | Comments 29 (<a href="https://news.ycombinator.com/item?id=38822892">thread link</a>) | @rcarmo
+Score 152 | Comments 30 (<a href="https://news.ycombinator.com/item?id=38822892">thread link</a>) | @rcarmo
 <br/>
 December 31, 2023 | https://gerotakke.de/ottopot/ | <a href="https://web.archive.org/web/*/https://gerotakke.de/ottopot/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -3714,7 +3951,7 @@ December 30, 2023 | https://www.mark-pekala.dev/posts/ecs-finally | <a href="htt
             </title>
             <description>
 <![CDATA[
-Score 137 | Comments 39 (<a href="https://news.ycombinator.com/item?id=38820616">thread link</a>) | @bendauphinee
+Score 139 | Comments 42 (<a href="https://news.ycombinator.com/item?id=38820616">thread link</a>) | @bendauphinee
 <br/>
 December 30, 2023 | https://bendauphinee.com/writing/2023/12/30/to-know-where-you-are/ | <a href="https://web.archive.org/web/*/https://bendauphinee.com/writing/2023/12/30/to-know-where-you-are/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4112,7 +4349,7 @@ NONE                SFETOP106                               ANT # / TYPE        
 
 
 
-<figure><table><thead><tr><th data-align="left">Part</th><th data-align="left">Description</th></tr></thead><tbody><tr><td data-align="left"><a href="https://www.raspberrypi.com/products/raspberry-pi-3-model-b-plus/" target="_blank" rel="noreferrer noopener">Raspberry Pi 3 Model B+</a></td><td data-align="left">RTK Base server, to host the GPS unit and push data to the internet.</td></tr><tr><td data-align="left"><a href="https://support.apple.com/kb/sp726?locale=en_US" target="_blank" rel="noreferrer noopener nofollow">iPhone 6s</a></td><td data-align="left">Provides data backhaul via hotspot mode.<br>The Pi will connect automatically via Wi-Fi, since this is less fuss than tethering via USB.</td></tr><tr><td data-align="left"><a href="https://www.luckymobile.ca/shop/plans/prepaid" target="_blank" rel="noreferrer noopener nofollow">Lucky Mobile Prepaid SIM<br>$30 Unlimited Can Min</a></td><td data-align="left">No setup fee, 1 GB of 3G data / month, which should give me plenty of run time for NTRIP.<br>Cheapest data service I can find without commitment.</td></tr><tr><td data-align="left"><a href="https://www.bluettipower.ca/products/bluetti-eb3a-portable-power-station-600w-268wh" target="_blank" rel="noreferrer noopener nofollow">BLUETTI EB3A (268Wh)<br>Portable Power Station</a></td><td data-align="left">LiFePO₄ chemistry, functional down to -20 C / -4 F (needed, since it’s Dec).<br>Ran for 24 h data collection to complete antenna placement, only discharged to 45%.<br>Bluetooth connected, so I can change power settings without opening the box.</td></tr><tr><td data-align="left"><a href="https://eu.dlink.com/uk/en/products/dir-655-wireless-n-gigabit-router" target="_blank" rel="noreferrer noopener nofollow">D-Link DIR-655 Router</a></td><td data-align="left">Provides field connectivity to Pi, via wired or wireless, when powered on.<br>Allows me to check and configure RTK Base, as well as download data.<br>Saved my bacon when my laptop battery died, as I could still access via Wi-Fi on my phone.</td></tr><tr><td data-align="left">Network cables</td><td data-align="left">One short one Pi &lt;-&gt; Router, one long one Laptop &lt;-&gt; Router.</td></tr><tr><td data-align="left">USB cables</td><td data-align="left">One micro-USB to power the PI, one Lightning to power the phone, both connected to Bluetti.</td></tr><tr><td data-align="left"><a href="https://www.canadiantire.ca/en/pdp/type-a-clarity-transparent-storage-box-with-lid-2-l-0423330p.0423330.html" target="_blank" rel="noreferrer noopener nofollow">2 L plastic bin</a></td><td data-align="left">Helps segment the PI and GPS receiver, and keeps the power station from shifting around.</td></tr><tr><td data-align="left">Note</td><td data-align="left">I put a note in the box, in the hopes that maybe it’ll deter people from stealing things.<br>Also has my phone number on it if they have questions.</td></tr></tbody></table><figcaption>The base station box contents</figcaption></figure>
+<figure><table><thead><tr><th data-align="left">Part</th><th data-align="left">Description</th></tr></thead><tbody><tr><td data-align="left"><a href="https://www.raspberrypi.com/products/raspberry-pi-3-model-b-plus/" target="_blank" rel="noreferrer noopener">Raspberry Pi 3 Model B+</a></td><td data-align="left">RTK Base server, to host the GPS unit and push data to the internet.</td></tr><tr><td data-align="left"><a href="https://support.apple.com/kb/sp726?locale=en_US" target="_blank" rel="noreferrer noopener nofollow">iPhone 6s</a></td><td data-align="left">Provides data backhaul via hotspot mode. The Pi will connect automatically via Wi-Fi, since this is less fuss than tethering via USB.</td></tr><tr><td data-align="left"><a href="https://www.luckymobile.ca/shop/plans/prepaid" target="_blank" rel="noreferrer noopener nofollow">Lucky Mobile Prepaid SIM /$30 Unlimited Can Min</a></td><td data-align="left">Cheapest data service I can find without commitment.<br>No setup fee, 1 GB of 3G data / month, which should give me plenty of run time for NTRIP.<br>Edit [2024-01-02] Total data usage for 15-20 hours of surveying: 122 MB</td></tr><tr><td data-align="left"><a href="https://www.bluettipower.ca/products/bluetti-eb3a-portable-power-station-600w-268wh" target="_blank" rel="noreferrer noopener nofollow">BLUETTI EB3A (268Wh)<br>Portable Power Station</a></td><td data-align="left">LiFePO₄ chemistry, functional down to -20 C / -4 F (needed, since it’s Dec). Ran for 24 h data collection to complete antenna placement, only discharged to 45%. Bluetooth connected, so I can change power settings without opening the box.</td></tr><tr><td data-align="left"><a href="https://eu.dlink.com/uk/en/products/dir-655-wireless-n-gigabit-router" target="_blank" rel="noreferrer noopener nofollow">D-Link DIR-655 Router</a></td><td data-align="left">Provides field connectivity to Pi, via wired or wireless, when powered on.<br>Allows me to check and configure RTK Base, as well as download data.<br>Saved my bacon when my laptop battery died, as I could still access via Wi-Fi on my phone.</td></tr><tr><td data-align="left">Network cables</td><td data-align="left">One short one Pi &lt;-&gt; Router, one long one Laptop &lt;-&gt; Router.</td></tr><tr><td data-align="left">USB cables</td><td data-align="left">One micro-USB to power the PI, one Lightning to power the phone, both connected to Bluetti.</td></tr><tr><td data-align="left"><a href="https://www.canadiantire.ca/en/pdp/type-a-clarity-transparent-storage-box-with-lid-2-l-0423330p.0423330.html" target="_blank" rel="noreferrer noopener nofollow">2 L plastic bin</a></td><td data-align="left">Helps segment the PI and GPS receiver, and keeps the power station from shifting around.</td></tr><tr><td data-align="left">Note</td><td data-align="left">I put a note in the box, in the hopes that maybe it’ll deter people from stealing things. Also has my phone number on it if they have questions.</td></tr></tbody></table><figcaption>The base station box contents</figcaption></figure>
 
 
 
@@ -4889,7 +5126,7 @@ or <a href="mailto:jim.nh.us@gmail.com">drop me a line.</a></em></p></div></div>
             </title>
             <description>
 <![CDATA[
-Score 56 | Comments 2 (<a href="https://news.ycombinator.com/item?id=38817652">thread link</a>) | @jsiepkes
+Score 57 | Comments 2 (<a href="https://news.ycombinator.com/item?id=38817652">thread link</a>) | @jsiepkes
 <br/>
 December 30, 2023 | https://www.infostealers.com/article/the-0-day-all-infostealer-groups-are-exploiting/ | <a href="https://web.archive.org/web/*/https://www.infostealers.com/article/the-0-day-all-infostealer-groups-are-exploiting/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-id="2484431a" data-element_type="widget" data-widget_type="theme-post-content.default">
@@ -4957,7 +5194,7 @@ December 30, 2023 | https://www.infostealers.com/article/the-0-day-all-infosteal
             </title>
             <description>
 <![CDATA[
-Score 417 | Comments 294 (<a href="https://news.ycombinator.com/item?id=38816135">thread link</a>) | @jamghee
+Score 418 | Comments 294 (<a href="https://news.ycombinator.com/item?id=38816135">thread link</a>) | @jamghee
 <br/>
 December 30, 2023 | https://nick.scialli.me/blog/why-im-skeptical-of-low-code/ | <a href="https://web.archive.org/web/*/https://nick.scialli.me/blog/why-im-skeptical-of-low-code/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="skip">
@@ -5070,7 +5307,7 @@ December 30, 2023 | https://www.ucl.ac.uk/news/2023/dec/new-theory-seeks-unite-e
             </title>
             <description>
 <![CDATA[
-Score 225 | Comments 58 (<a href="https://news.ycombinator.com/item?id=38814599">thread link</a>) | @jiripospisil
+Score 226 | Comments 58 (<a href="https://news.ycombinator.com/item?id=38814599">thread link</a>) | @jiripospisil
 <br/>
 December 30, 2023 | https://jpospisil.com/2023/12/19/the-hidden-gems-of-moreutils | <a href="https://web.archive.org/web/*/https://jpospisil.com/2023/12/19/the-hidden-gems-of-moreutils">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -6684,7 +6921,7 @@ December 30, 2023 | https://bvisness.me/luax/ | <a href="https://web.archive.org
             </title>
             <description>
 <![CDATA[
-Score 91 | Comments 113 (<a href="https://news.ycombinator.com/item?id=38811704">thread link</a>) | @occamschainsaw
+Score 92 | Comments 113 (<a href="https://news.ycombinator.com/item?id=38811704">thread link</a>) | @occamschainsaw
 <br/>
 December 29, 2023 | https://michaelnotebook.com/mc2023/index.html | <a href="https://web.archive.org/web/*/https://michaelnotebook.com/mc2023/index.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
