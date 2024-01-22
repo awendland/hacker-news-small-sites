@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Mon, 22 Jan 2024 16:22:55 GMT</lastBuildDate>
+        <lastBuildDate>Mon, 22 Jan 2024 20:21:15 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-50.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Mon, 22 Jan 2024 16:22:55 GMT</pubDate>
+        <pubDate>Mon, 22 Jan 2024 20:21:15 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,383 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Building a fair multi-tenant queuing system]]>
+            </title>
+            <description>
+<![CDATA[
+Score 61 | Comments 27 (<a href="https://news.ycombinator.com/item?id=39092849">thread link</a>) | @tonyhb
+<br/>
+January 22, 2024 | https://www.inngest.com/blog/building-the-inngest-queue-pt-i-fairness-multi-tenancy | <a href="https://web.archive.org/web/*/https://www.inngest.com/blog/building-the-inngest-queue-pt-i-fairness-multi-tenancy">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>In software development, queueing systems are important for reliability, and they're hard to build.  There's lots of debate around <em>how</em> to build a queueing system — with <a href="https://news.ycombinator.com/item?id=35526846">Postgres</a> and <a href="https://news.ycombinator.com/item?id=37636841">SKIP LOCKED</a> <em>always</em> cropping up.</p>
+<p>We've spent a long time researching and building our own distributed queuing system, and in this post we'll explain what the challenges are, why we needed to build it, and how it works.</p>
+<h2 id="challenges-building-queueing-systems">Challenges building queueing systems</h2>
+<p>We built Inngest as a reliability layer for modern applications. It enables developers to write declarative  step functions in code by combining durable execution, event streams, and queues into a singe serverless platform.</p>
+<p>Inngest manages the event streams, queues and state all within the platform. Environments are created and functions are automatically deployed for <a href="https://www.inngest.com/blog/branch-environments">every branch of your codebase</a>. Teams might deploy <em>hundreds</em> of functions to Inngest across tens of branches, leading to thousands of functions reacting to events in real time (within ~10-100ms).</p>
+<p>As we scaled to <strong>thousands of users who have triggered billions of functions to run</strong>, we learned a great deal about the challenges developing a platform built on queues.</p>
+<p>Attempting to build a system like this with any off-the-shelf queuing system is quickly going to become a struggle. Here are some of the key challenges that you will encounter:</p>
+<ul>
+<li><strong>Fairness</strong>.  You send 5,000 events per second. Not hard to manage, but in a single queue your jobs will block other users' work from running. That's not fair. One user should not be able to block another's work.</li>
+<li><strong>Multi-tenancy</strong>.  Most queues operate on a "worker" model: you specify which queues a worker should listen to, and the amount of jobs that worker can handle. Spinning up new workers for each function is tedious and cumbersome. It's made worse given that development branches are ephemeral and bursty.</li>
+<li><strong>Contention</strong>.  With thousands of customers running thousands of step functions containing parallel steps, at any given time there are millions jobs available for work. In typical queueing systems, workers will all contend for the earliest job available, leading to <em>lots</em> of spinning and wasted effort.</li>
+<li><strong>Concurrency</strong>.  Customizing concurrency at a function level across distributed workers is not possible in other queueing systems. Typically, concurrency management is implemented within the worker polling logic. Within Inngest, you can set multiple concurrency settings on a single function using one line of code. This creates virtual queues for managing runs.</li>
+<li><strong>Read/write load</strong>. Handling tens of thousands of jobs per second leads to hundreds of thousands of requests per second: enqueues, "locks" (we'll get to that), dequeues all lead to heavy load on the backing infrastructure that runs the queue.</li>
+<li><strong>Infrastructure</strong>. The queue needs to be reliable and fault-tolerant, which means we need distributed systems built in (which also impacts latency).</li>
+<li><strong>Observability</strong>. Most queues are opaque, with little or basic observability out of the box. It's hard to build in real-time observability for step functions beyond the backlog: eg. number of functions waiting for other events, or a histogram of wall time vs execution time.</li>
+<li><strong>Customizability</strong>. It's difficult and incredibly time intensive to extend basic queueing systems with advanced functionality. Customizations include: changing backoffs function-by-function, cancelling the backlog based off of job data, batching, debounce, smart indexing, and step function parallelism.</li>
+</ul>
+<p>To solve all of these problems, we developed a brand new queue from the ground up for Inngest. It's a fair, low-latency, multi-tenant queue which operates with multiple shared-nothing workers that claim jobs in an (almost) contention-free way.</p>
+<p>In this series of blog posts, we'll explain how the queueing system works and the design decisions that solve these problems.</p>
+<h2 id="how-reliability-layers-use-queues">How reliability layers use queues</h2>
+<p>To set context, let's walk through how Inngest uses a queue, with an example function configuration using our <a href="https://www.inngest.com/docs/reference/typescript">TS SDK</a> (<a href="https://pkg.go.dev/github.com/inngest/inngestgo">Go</a> and <a href="https://www.inngest.com/docs/reference/python">Python</a> SDKs are also available, with <a href="https://roadmap.inngest.com/roadmap">more coming soon</a>):</p>
+<pre language="tsx" code="inngest.createFunction(
+  {
+    id: &quot;update-user&quot;, // Unique function ID
+    concurrency: 15,   // Concurrency controls per function (https://innge.st/concurrency)
+    debounce: {        // Debounce management (https://innge.st/debounce)
+      period: &quot;5s&quot;,
+      timeout: &quot;20s&quot;,
+    }
+  },
+  { event: &quot;clerk/user.created&quot; },
+  async ({ event, step }) => {
+    const user = await step.run(&quot;Load user info&quot;, async () => {
+      return await clerk.users.getUser(event.data.userId);
+    });
+
+    return await step.run(&quot;Update DB&quot;, async () => {
+      const updates = userFields(user); // grab fields from clerk
+      return await db.users.where({ clerk_id: user.id }).update(updates);
+    });
+  }
+);
+"><p>tsx</p><div><p><span>inngest</span><span>.createFunction</span><span>(</span></p><p><span>  {</span></p><p><span>    id</span><span>:</span><span> </span><span>"update-user"</span><span>,</span><span> </span><span>// Unique function ID</span></p><p><span>    concurrency</span><span>:</span><span> </span><span>15</span><span>,</span><span>   </span><span>// Concurrency controls per function (https://innge.st/concurrency)</span></p><p><span>    debounce</span><span>:</span><span> {        </span><span>// Debounce management (https://innge.st/debounce)</span></p><p><span>      period</span><span>:</span><span> </span><span>"5s"</span><span>,</span></p><p><span>      timeout</span><span>:</span><span> </span><span>"20s"</span><span>,</span></p><p><span>    }</span></p><p><span>  }</span><span>,</span></p><p><span>  { event</span><span>:</span><span> </span><span>"clerk/user.created"</span><span> }</span><span>,</span></p><p><span>  </span><span>async</span><span> ({ event</span><span>,</span><span> step }) </span><span>=&gt;</span><span> {</span></p><p><span>    </span><span>const</span><span> </span><span>user</span><span> </span><span>=</span><span> </span><span>await</span><span> </span><span>step</span><span>.run</span><span>(</span><span>"Load user info"</span><span>,</span><span> </span><span>async</span><span> () </span><span>=&gt;</span><span> {</span></p><p><span>      </span><span>return</span><span> </span><span>await</span><span> </span><span>clerk</span><span>.</span><span>users</span><span>.getUser</span><span>(</span><span>event</span><span>.</span><span>data</span><span>.userId);</span></p><p><span>    });</span></p><p><span>    </span><span>return</span><span> </span><span>await</span><span> </span><span>step</span><span>.run</span><span>(</span><span>"Update DB"</span><span>,</span><span> </span><span>async</span><span> () </span><span>=&gt;</span><span> {</span></p><p><span>      </span><span>const</span><span> </span><span>updates</span><span> </span><span>=</span><span> </span><span>userFields</span><span>(user); </span><span>// grab fields from clerk</span></p><p><span>      </span><span>return</span><span> </span><span>await</span><span> </span><span>db</span><span>.</span><span>users</span><span>.where</span><span>({ clerk_id</span><span>:</span><span> </span><span>user</span><span>.id })</span><span>.update</span><span>(updates);</span></p><p><span>    });</span></p><p><span>  }</span></p><p><span>);</span></p></div></pre>
+<p>If you're familiar with step functions, you probably already see what's happening here.  This code creates a function which runs automatically when the <code>clerk/user.created</code> event is received via Clerk's webhooks.  It's a step function which uses <a href="https://www.inngest.com/blog/how-durable-workflow-engines-work">durable execution</a> to reliably run code.  This means that each step is a code-level transaction backed by its own job in the queue.  If the step fails, it retries automatically.  Any data returned from the step is automatically captured into the function run's state and injected on each step call.</p>
+<p>There are a few extra nuances.  The function specifies its own concurrency limits along with a debounce.  Concurrency limits prevent any more than 15 steps running at any one time.  The debounce schedules a function run for 5 seconds, and if any other matching events are received during that period, Inngest reschedules the function to run after another 5 seconds (until the maximum timeout has passed).</p>
+<p>All of this happens automatically, without provisioning queues or infrastructure, based off of our queueing system.  Here's what happens:</p>
+<ul>
+<li>When an event is received, we <em><a href="https://www.inngest.com/docs/guides/handling-idempotency">idempotently</a></em> enqueue a job which calls the function handler. This has to be idempotent, as <a href="https://www.inngest.com/blog/message-bus-vs-queues">event streams are <em>at least once</em></a>, and we want a single function run for one event.</li>
+<li>Debounce complicates running functions: the job is scheduled with a 5 second delay (or whatever's in the function config), and any additional events delay the job again.</li>
+<li>When the job becomes "visible", we ensure functions aren't beyond their concurrency limits and begin work by calling the function with the incoming event data.</li>
+<li>Once a function runs a step, we store the step's result inside the function run's state and (worst case) enqueue <em>another</em> job to for the next step. There's some nuance here for long-running servers, though we'll talk about that in an execution deep dive separately.</li>
+</ul>
+<p>Essentially, <em>everything</em> impacts the queue. Running a function reliably has to use a queue. Concurrency, debounce, and batching all have an impact how the queue works at an individual job level.</p>
+<p>With that context, let's talk about how this works in a multi-tenant environment, with thousands of users running millions of functions at the same time.</p>
+<h2 id="unfairness-in-classic-queues">Unfairness in classic queues</h2>
+<p>Most queues are <strong>not</strong> multi-tenant.</p>
+<p>Take SQS. Typically, you'll create a queue to handle a specific job in your code.  That queue is used across every user in your system.  If one of your users (say, Mallory) sends 5,000 messages at once and then Alice enqueues something, we have to work through Mallory's 5,000 jobs before we can handle Alice's single task.  That's <em>unfair</em>.</p>
+<p>With classic queueing systems, this is almost impossible to easily solve.  Randomly sharding amongst several queues will lower the chance that blocking happens, but it's guaranteed that eventually it happens anyway.   You could try do some bookkeeping yourself <em>outside</em> of the queue and manually requeue jobs as they come in, but that increases latency, costs, churn, and doesn't provide actual fairness (along with being hard, buggy, and annoying to write).</p>
+<p>In short, it's <em>really hard</em> to make something like SQS, BullMQ, or Graphile work well in a multi-tenant environment.  Hacking around fairness costs a lot, increases latency, and without <em>very complex infrastructure</em> to provision items for each tenant doesn't actually solve the problem.</p>
+<p>So, how do we solve fairness?</p>
+<h2 id="building-a-fair-multi-tenant-queue">Building a fair multi-tenant queue</h2>
+<p>In an ideal world, fairness happens at both a function level <em>and</em> an account level.  Let's say you have 100 functions running via Inngest, and you push a million jobs to a specific function.  These jobs should <em>not</em> block other functions in your account from running.</p>
+<p><strong>This leads to the first requirement:  each function you add must get its own queue to maximize fairness.</strong></p>
+<p>This raises a few questions.  How can we make queues cheap enough to create for every function, across every branch of your code?  And, how do workers subscribe to queues created at any point in time, without requiring restarts or new processes?  Almost every queue that exists today needs you to run workers that subscribe to specific queues:</p>
+<pre language="ts" code="// ❌ classic queue workers aren't compatible with multi-tenant queues,
+// or > 1 custom concurrency limits per function
+worker.concurrency = 100;
+worker.run([&quot;queue:1&quot;, &quot;queue:2&quot;], () => {
+  // run jobs in queue 1 and 2
+})
+"><p>ts</p><div><p><span>// ❌ classic queue workers aren't compatible with multi-tenant queues,</span></p><p><span>// or &gt; 1 custom concurrency limits per function</span></p><p><span>worker</span><span>.concurrency </span><span>=</span><span> </span><span>100</span><span>;</span></p><p><span>worker</span><span>.run</span><span>([</span><span>"queue:1"</span><span>,</span><span> </span><span>"queue:2"</span><span>]</span><span>,</span><span> () </span><span>=&gt;</span><span> {</span></p><p><span>  </span><span>// run jobs in queue 1 and 2</span></p><p><span>})</span></p></div></pre>
+<p>If you add a new function to Inngest, we can't recreate workers on the fly.  It makes our code and infrastructure <em>far</em> too messy, and at worst could mean that workers cycle every second as new functions are added.</p>
+<p><strong>We have another requirement: latency must be as low as possible.</strong></p>
+<p>This adds a few more needs to the system.  We must have a pool of workers that auto-scale to make sure we're running jobs as fast as possible.  We can't reboot workers any time new queues are added.</p>
+<p>Taking all of these requirements into account, we need to:</p>
+<ul>
+<li>Write workers which automatically discover available functions</li>
+<li>Have workers automatically take work from each function</li>
+<li>And do this <em>without contention</em></li>
+</ul>
+<p><strong>Our third requirement: handling contention.</strong></p>
+<p>Contention is another key part to fairness:  two workers shouldn't compete for the same function.  But, at the same time, we can't assign functions to <em>specific</em> workers, because they might die at any time.  The solution is to create a tiered queuing system.</p>
+<ol>
+<li>Each function gets its own queue of outstanding work.</li>
+<li>We create <em>another</em> higher level queue, which records each function's earliest available job.</li>
+<li>All workers scan this queue to discover available work.</li>
+</ol>
+<p>This gives us a subset of work that's available: <code>[Function A, Function B, Function C]</code> and so on, ordered by <em>latency</em> with the oldest job first.  This solves <em>multi-tenancy</em>, but even with this list we still have fairness and contention to deal with.  100 separate workers scanning for jobs will all get the same list in the same order, leading to 100 workers trying to run jobs for function A.  This is both unfair and high contention.</p>
+<p>There are a few strategies we use to solve this.  One key part is that each worker priority shuffles the peeked jobs into a weighted random order, taking into account latency, capacity, free vs paid, etc.  Once shuffled, the worker claims the function's job queue to run work.  This ensures that every function runs independently and guarantees fairness.  It also minimizes latency, as priority shuffling still prioritizes older work.</p>
+<h2 id="conclusion">Conclusion</h2>
+<p>There's a ton more nuance to the queue, though at a high level this solves all key requirements:  contention, fairness, and latency.  A huge benefit to this model:  queues become incredibly cheap.  It's the magic that lets you create queues for each function, and it's <em>part</em> of the magic that lets us create virtual queues to add multiple concurrency levels to each function. This approach has allows us to create a queue with built-in flow control features to all users in a way that is reliable, performant, and scalable. We're <em>really</em> happy with this solution, and think it has a lot of legs.</p>
+<p>Even though queues are fundamental to how we work, we think that reliability layers like Inngest mean that you never actually need to implement queueing, or even think about how it works.  The system abstracts everything for you declaratively by code, so even the freshest of engineers can productively build reliable systems.</p>
+<p>If you found this interesting or you'd like to work on systems like this please reach out to us <a href="https://www.inngest.com/contact">by email</a>, <a href="https://twitter.com/inngest">Twitter</a>, or on our <a href="https://www.inngest.com/discord">Discord</a>. We'd love to hear your thoughts, and <a href="https://www.inngest.com/careers">we're hiring</a>!</p></div></div>]]>
+            </description>
+            <link>https://www.inngest.com/blog/building-the-inngest-queue-pt-i-fairness-multi-tenancy</link>
+            <guid isPermaLink="false">hacker-news-small-sites-39092849</guid>
+            <pubDate>Mon, 22 Jan 2024 17:59:54 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Cutting down AWS cost by $150k per year simply by shutting things off]]>
+            </title>
+            <description>
+<![CDATA[
+Score 132 | Comments 152 (<a href="https://news.ycombinator.com/item?id=39091416">thread link</a>) | @tuananh
+<br/>
+January 22, 2024 | https://tuananh.net/2024/01/21/cloud-cost-optimization-at-scale-part-1/ | <a href="https://web.archive.org/web/*/https://tuananh.net/2024/01/21/cloud-cost-optimization-at-scale-part-1/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
+
+<h5>
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round">
+<path stroke="none" d="M0 0h24v24H0z" fill="none"></path>
+<rect x="4" y="5" width="16" height="16" rx="2"></rect>
+<line x1="16" y1="3" x2="16" y2="7"></line>
+<line x1="8" y1="3" x2="8" y2="7"></line>
+<line x1="4" y1="11" x2="20" y2="11"></line>
+<rect x="8" y="15" width="2" height="2"></rect>
+</svg>
+Posted on
+January 21, 2024
+&nbsp;•&nbsp;
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round">
+<path stroke="none" d="M0 0h24v24H0z" fill="none"></path>
+<circle cx="12" cy="12" r="9"></circle>
+<polyline points="12 7 12 12 15 15"></polyline>
+</svg>
+4&nbsp;minutes
+&nbsp;•
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round">
+<path stroke="none" d="M0 0h24v24H0z" fill="none"></path>
+<path d="M3 19a9 9 0 0 1 9 0a9 9 0 0 1 9 0"></path>
+<path d="M3 6a9 9 0 0 1 9 0a9 9 0 0 1 9 0"></path>
+<line x1="3" y1="6" x2="3" y2="19"></line>
+<line x1="12" y1="6" x2="12" y2="19"></line>
+<line x1="21" y1="6" x2="21" y2="19"></line>
+</svg>
+788&nbsp;words
+</h5>
+<h2 id="the-best-optimization-is-simply-shutting-things-off">The best optimization is simply shutting things off</h2>
+<p>You work from 8am to 8pm. That’s 12 hours. What happened to the rest of the day? You go home. So you shut things down. That’s 50% cost saving right there.</p>
+<p>Simple enough right?</p>
+<p>Now add the following constraints:</p>
+<ul>
+<li>Imagine if you have an AWS organization with hundreds of workload accounts. I’ve seen org with over 700 accounts.</li>
+<li>Imagine if you want to support resources other than EC2.</li>
+<li>Now add Kubernetes to the mix. Now your EC2 VM is being controlled by autoscaling group/cluster autoscaler or karpenter. You can’t simply shut those off. They will be spin up right back.</li>
+<li>Your team is small. You cant have them support all the teams within organization. You need a solution that can be dynamic (to support multiple resources, different requirements from different teams,etc..) but also easy enough for other team to operate it themselves.</li>
+</ul>
+<h2 id="cloud-automation-platform">Cloud Automation Platform</h2>
+<p>I was thinking a bigger picture. I want a simple way to automate the whole cloud platform:</p>
+<ul>
+<li>Automate shutting down resources during off-work hours.</li>
+<li>Discover certain event, correcting things</li>
+<li>Etc…</li>
+</ul>
+<p>I like Lambda, Step Functions and EventBridge. Let’s build something out of those.</p>
+<p>Here’s what I had in mind initially</p>
+<p><img src="https://tuananh.net/img/cloud-automation.png" alt=""></p>
+<p>We changed the design a little bit by instead of assuming role, we just publish an event to the spoke account eventbus. We didn’t want the automation executor to have abilties to assume role everywhere in the org.</p>
+<p>With this system in placed, we can do lots of stuff like</p>
+<ul>
+<li>Whenever an EKS cluster is created within our org, we want to inject some security baseline policies in.</li>
+<li>Whenever a Cloudwatch logs group created, we check for certain tag and if one presented, we ship it to a centralized account.</li>
+<li>Or we can do stuff like auto-shutdown resources like we want initially at the beginning of the post.</li>
+</ul>
+<h2 id="the-deployment">The deployment</h2>
+<p>Now for this to work, we need to have:</p>
+<ul>
+<li>(1) a consistent way of deploying stuff into spoke accounts.</li>
+<li>(2) We also need a way to protect those resources (this one is actually easy, we can use tag.)</li>
+</ul>
+<p>As for (1), we are currently using <a href="https://docs.aws.amazon.com/controltower/latest/userguide/aft-overview.html" target="_blank" rel="noopener">AWS AFT</a>
+. They have a mechanism for us to define baseline.</p>
+<p>Baseline is whatever resources you want to deploy to every accounts within an Organization Unit. Sounds exactly like what we need right.</p>
+<p>This kind of “baseline” is kinda like our agents, embeded in every spoke account.</p>
+<p>The rest of this is just</p>
+<ul>
+<li>(1) agent discover stuff, send event to controlplane.</li>
+<li>(2) controlplane send command back to spoke account to act accordingly.</li>
+</ul>
+<p>We built all these with Lambda, Step Functions and EventBridge.</p>
+<p>We love EventBridge pattern matching so much we created a small, <a href="https://github.com/tuananh/py-event-ruler" target="_blank" rel="noopener">tiny Python module to be able to test pattern matching locally</a>
+.</p>
+<h2 id="back-to-the-cloud-cost-optimization-problem">Back to the cloud cost optimization problem</h2>
+<p>Now that we have a generic mechanism to automate stuff in our org. Let’s do some $$ saving.</p>
+<p>For this specific case, we don’t need our embedded agent to send us anything. We can simply send the “shutdown” command from controlplane.</p>
+<p>We have a little database for config customization if needed. This is a small Git repo where owners/operators of those spoke accounts can customize their schedule according to their need.</p>
+<p>What they can config is a pattern (EventBridge pattern style) along with what kind resouces to apply and the action accordingly. We also populate some more properties into the pattern payload like</p>
+<ul>
+<li><code>is_holiday</code>: bool. This one is pre-evaluated with our national public holiday. Users can then use this in their pattern matching. Eg. if holiday, do not turn them on at 8am.</li>
+<li><code>day_of_week</code>: Mon, Tue, etc… Users can then use this field to add a rule to turn things on at 8am from Mon to Fri.</li>
+<li>and more …</li>
+</ul>
+<p>Once the agent receives the payload, they will act accordingly. For examples, EC2 will be send to a Lambda function that handle EC2 and RDS will be sent to another Lambda function that handle RDS.
+It’s quite easy to add another resouce to the supported list by simply adding more Lambda function handler.</p>
+<p>We make this feature an opt-out feature on our non-production OU (Organization Unit). If they want to turn this off for certain resources, they will have to tag those resources accordingly.</p>
+<h2 id="the-result">The result</h2>
+<p>Our compute (EC2, RDS, etc…) non-production costs reduce by over 70% during off-work hours. We projected to save approx ~150k USD during 1 year (assume that our cost will not grow). It’s a small piece of our cost but we are going to</p>
+<p>There are certain workload that are a bit more complicated like Kubernetes I mentioned earlier. Those will be solved next in part 2 of this series. Stay tuned!</p>
+</article></div>]]>
+            </description>
+            <link>https://tuananh.net/2024/01/21/cloud-cost-optimization-at-scale-part-1/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-39091416</guid>
+            <pubDate>Mon, 22 Jan 2024 16:33:57 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[BiomeJS 2024 Roadmap]]>
+            </title>
+            <description>
+<![CDATA[
+Score 52 | Comments 19 (<a href="https://news.ycombinator.com/item?id=39089508">thread link</a>) | @conaclos
+<br/>
+January 22, 2024 | https://biomejs.dev/blog/roadmap-2024/ | <a href="https://web.archive.org/web/*/https://biomejs.dev/blog/roadmap-2024/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>   <figure><picture><img src="https://biomejs.dev/_astro/banner-light.bb3a9996_Z23iEer.webp" alt="The Prettier challenge banner, with the Biome logo over it" width="1272" height="310" loading="lazy" decoding="async"><img src="https://biomejs.dev/_astro/banner-dark.f34a99c8_Z8fP7D.webp" alt="The Prettier challenge banner, with the Biome logo over it" width="1272" height="310" loading="lazy" decoding="async"></picture></figure><div> <p><span> <span> <img src="https://biomejs.dev/_astro/602478_Z2cGx2m.webp" alt="" width="36" height="36" loading="lazy" decoding="async"> </span><span> <img src="https://biomejs.dev/img/logo-avatar.png" alt="" width="36" height="36" loading="lazy" decoding="async"> </span> </span></p> <p><time datetime="Mon Jan 08 2024 00:00:00 GMT+0000 (Coordinated Universal Time)">January 8, 2024</time> </p></div> <p>We are thrilled to share what the Core Contributors and Maintainers would like to focus on in 2024.</p>
+<p>We want to remind you that Biome is a community-driven project, so we can only promise that some of the ideas outlined below will be shipped.</p>
+<p>However, if you’re excited about some aspects of the project, and you want to see some of them developed faster than others, you can help us in many ways:</p>
+<ul>
+<li><a href="https://github.com/biomejs"><strong>Be involved in the project and the community</strong></a>. Please help us to build those features.</li>
+<li><a href="https://opencollective.com/biome"><strong>Sponsor us</strong></a>. Ask your company to sponsor us. Biome is so fast that it can reduce your company’s CI times and save money. Performance is part of our mission. Plus, sponsorship is a good medium of <em>advertisement</em> for your company.</li>
+<li><a href="https://biomejs.dev/guides/getting-started"><strong>Improve our documentation with ideas, recipes, or guides</strong></a>. Translate our documentation and help us to make Biome available to people who aren’t proficient in English.</li>
+</ul>
+
+<p>The project is young and can’t compete against giants such as Prettier, ESLint, Webpack, Vite, ESBuild, etc. However, the recent events (sponsors, bounty challenge, Biome being a fork of Rome) showed that the users <strong>have</strong> interest in the project, and we showed those users that we have the tools to fulfil a need.</p>
+<p>Moving small projects from ESLint/Prettier is easy, but moving <strong>big</strong> code bases is challenging and time-consuming; this is a big friction point in Biome.</p>
+<p>Users have different needs, though, so it will only be possible to satisfy some of them. We want to ensure that all features and contributions to our project <a href="https://biomejs.dev/internals/philosophy/">embrace our philosophy</a> and provide the best experience by default.</p>
+
+<ol>
+<li>Help users to move to Biome</li>
+<li>Expand Biome’s language support so Biome tools can span more of the web ecosystem</li>
+<li>Deepen Biome’s existing capabilities to offer more functionalities</li>
+<li>Plugins</li>
+<li>Transformations</li>
+<li>Community and content</li>
+</ol>
+
+<ul>
+<li>Offer guides on our website to users who want to migrate from Prettier (CLI commands and configuration)</li>
+<li>Offer guides on our website to users who want to migrate from ESlint (CLI commands and configuration)</li>
+<li>Offer a section on our website that shows a mapping of the ESLint rules to our rules</li>
+<li>Offer commands to ease the transition
+<ul>
+<li>A command called <code dir="auto">biome migrate prettier</code> that will read <code dir="auto">.prettierrc</code> and <code dir="auto">.prettierignore</code> will update the <code dir="auto">biome.json</code> file (or create it) with the configuration from the Prettier files.</li>
+<li>A command called <code dir="auto">biome migrate eslint</code> will read the JSON configuration of Eslint and the ignore file. There will be expectations and limitations.</li>
+</ul>
+</li>
+</ul>
+
+<p>CSS is our next language of focus, and we are making good progress. HTML and Markdown will follow. Follow our <a href="https://biomejs.dev/internals/language-support">up-to-date page</a> to keep up with the progress of our work.</p>
+<p>The CSS language will enable much work and experimentation: CSS formatting and linting, and we will port some of the lint rules from <code dir="auto">stylelint</code>. A new area of experimentation is cross-linting.</p>
+<p>The idea of cross-linting can be explained with an example: compute the CSS styles/classes defined in a project and warn a user when said styles aren’t used inside JSX/HTML files.</p>
+<p>Plus, we unlock another area of experimentation, which is embedded formatting.</p>
+<p>HTML and Markdown will be our next languages of focus. HTML will enable us to parse other variants of HTML that are popular in the frontend ecosystem: <a href="https://vuejs.org/">Vue</a>, <a href="https://svelte.dev/">Svelte</a> and <a href="https://astro.build/">Astro</a>, and this would require some exploration of how to represent super languages of HTML.</p>
+
+<ul>
+<li>Project analysis and dependency resolution</li>
+<li>Type system</li>
+<li>CLI</li>
+</ul>
+
+<p>We will provide lint rules to read the manifest and detect errors such as invalid licenses.</p>
+<p>With project resolution, we will be able to provide more lint rules, some of which will be able to detect unused modules.</p>
+<p>With dependency resolution, we can - for example - detect dependencies that aren’t used inside a project.</p>
+<p>With this infrastructure, our LSP is going to be more powerful and provide more features, for example:</p>
+<ul>
+<li>rename variables across a project;</li>
+<li>auto-complete for imports;</li>
+<li>in-line types</li>
+</ul>
+
+<p>Building a full-fledged type system such as TypeScript is a massive effort; that’s why we decided to take a different direction and start by building a subset of the type system that requires stricter typing. This approach would allow us to build some important lint rules that users have been asking for.</p>
+<p>This will come with a downside: we will have to rely on a stricter code and minimal type inference from the compiler.</p>
+<p>Once we have something we can rely on, we can slowly widen the capabilities of our type system.</p>
+
+<p>More features for the command line tool, such as:</p>
+<ul>
+<li>Add the <code dir="auto">explain</code> command for offline documentation;</li>
+<li>Allow the output to be exported in different formats (JSON, etc.)</li>
+<li>Auto-completion for other shells such as <code dir="auto">zsh</code>;</li>
+<li>Implement the <code dir="auto">--modified</code> argument, which allows to format - for example - only the modified lines of a document;</li>
+<li>Expose metrics for Biome’s operations and being able to track down possible performance bottlenecks;</li>
+</ul>
+
+<p>We will explore plugins and come up with a design that fits Biome.
+Biome is different from other tools because Biome is a toolchain that has multiple tools in it, so we have to think out of the box and propose a design that might differ from the tools people are used to.</p>
+<p>We don’t know yet what a Biome’s plugin will look like, although a plugin should be able to tap all the tools that Biome offers.</p>
+<p>Some ideas that we will consider:</p>
+<ul>
+<li>DSL</li>
+<li>WASM</li>
+<li>A Runtime</li>
+</ul>
+
+<p>Transformations and code generation will be our first steps towards our compiler.</p>
+<p>We will provide the ability to transform TypeScript and JSX files into JavaScript files.</p>
+
+<p>Biome has a growing ecosystem, with an official VSCode extension, an official IntelliJ extension, and a Discord bot. We want to grow the features these tools provide and welcome anyone who wants to help us.</p>
+<p>Our community is slowly growing, and we want to reward everyone who sticks around and contributes to Biome. At Biome, <strong>we value every contribution</strong>, so you don’t need to be proficient in Rust to help us. Even participating in discussions and helping us to shape our features or helping other people are considered <em>contributions</em>. If you’d like to continue contributing to our ecosystem, we also encourage you to <a href="https://github.com/biomejs/biome/blob/main/GOVERNANCE.md#maintainer-nomination">nominate yourself as a maintainer of the project</a>.</p>
+<p>Recently Biome started its own <a href="https://www.youtube.com/channel/UC6ssscaFgCSlbv1Pb6krGVw">YouTube Channel</a>. We will use this channel to share learning content with the community.</p>
+
+<p>With this blog post, we also want to officially announce our new logo, homepage and rebranding of the website.</p>
+<p>With this new logo, we want to give a different meaning to the project. Biome <strong>isn’t</strong> a fork of Rome anymore, but a self-sufficient project ready to bloom.</p>
+<p>The triangle of the logo represents the mountains - <strong>soil</strong> -, and the curly shape on the bottom left represents a wave of the ocean - <strong>water</strong>. Two elements that are important in creating a self-sufficient ecosystem, so it can thrive and grow.</p>    </div></div>]]>
+            </description>
+            <link>https://biomejs.dev/blog/roadmap-2024/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-39089508</guid>
+            <pubDate>Mon, 22 Jan 2024 13:52:08 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[The Downward Spiral of Technology]]>
+            </title>
+            <description>
+<![CDATA[
+Score 87 | Comments 104 (<a href="https://news.ycombinator.com/item?id=39088077">thread link</a>) | @thunderbong
+<br/>
+January 22, 2024 | https://www.creativedestruction.club/p/the-downward-spiral-of-technology | <a href="https://web.archive.org/web/*/https://www.creativedestruction.club/p/the-downward-spiral-of-technology">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><article><div><div><div dir="auto"><p><span>After writing last week’s post, “</span><a href="https://www.creativedestruction.club/p/a-frictionless-world-is-boring-as" rel="">A Frictionless World Is Boring As F*ck</a><span>”, I came across a few more interesting pieces that add another element to this issue. The crux of all of them can be boiled down to the following theory:</span></p><blockquote><p>“At first I didn’t believe it. But the evidence is overwhelming. For the first time in history, technology is getting worse, not better.” </p></blockquote><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2c2bb9a6-330e-44db-a294-5b0187ed6303_2134x1222.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2c2bb9a6-330e-44db-a294-5b0187ed6303_2134x1222.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2c2bb9a6-330e-44db-a294-5b0187ed6303_2134x1222.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2c2bb9a6-330e-44db-a294-5b0187ed6303_2134x1222.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2c2bb9a6-330e-44db-a294-5b0187ed6303_2134x1222.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2c2bb9a6-330e-44db-a294-5b0187ed6303_2134x1222.png" width="500" height="286.4010989010989" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/2c2bb9a6-330e-44db-a294-5b0187ed6303_2134x1222.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:834,&quot;width&quot;:1456,&quot;resizeWidth&quot;:500,&quot;bytes&quot;:null,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:true,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2c2bb9a6-330e-44db-a294-5b0187ed6303_2134x1222.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2c2bb9a6-330e-44db-a294-5b0187ed6303_2134x1222.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2c2bb9a6-330e-44db-a294-5b0187ed6303_2134x1222.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2c2bb9a6-330e-44db-a294-5b0187ed6303_2134x1222.png 1456w" sizes="100vw" fetchpriority="high"></picture></div></a></figure></div><p><span>The quote above comes from the always eye-opening </span></p><p><span> and his recent article </span><a href="https://www.honest-broker.com/p/what-happened-to-my-search-engine" rel="">What Happened To My Search Engine?</a><span>:</span></p><blockquote><p>“I recently bought an expensive new computer. And after a few weeks, I went back to my old computer—it ran better than the new model.</p><p>I didn’t expect that. I’ve been buying new computers for decades, and always assumed that newer is better.</p><p>And until recently it was.</p><p>But here’s the new reality: Upgrades are now actually downgrades. At first it was just software—those dreaded updates!—but increasingly it’s hardware too.</p><p>For a while, I resisted returning to my old desktop model. I assumed the problem had to be with me, not the hardware. Surely computers had gotten better over the last several years?</p><p>Tech always get better, doesn’t it?</p><p>No, it doesn’t. Not anymore. And especially not on the web.”</p></blockquote><p>Ted continues to explain the reasons why he thinks technology – particularly search engines – is getting worse and summarizes them in the following visual:</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3832dc9f-28c6-4697-8ea0-de9be648f4ca_1882x662.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3832dc9f-28c6-4697-8ea0-de9be648f4ca_1882x662.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3832dc9f-28c6-4697-8ea0-de9be648f4ca_1882x662.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3832dc9f-28c6-4697-8ea0-de9be648f4ca_1882x662.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3832dc9f-28c6-4697-8ea0-de9be648f4ca_1882x662.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3832dc9f-28c6-4697-8ea0-de9be648f4ca_1882x662.png" width="1456" height="512" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/3832dc9f-28c6-4697-8ea0-de9be648f4ca_1882x662.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:512,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:&quot;A comparison of search engines in 1994 and 2024&quot;,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="A comparison of search engines in 1994 and 2024" title="A comparison of search engines in 1994 and 2024" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3832dc9f-28c6-4697-8ea0-de9be648f4ca_1882x662.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3832dc9f-28c6-4697-8ea0-de9be648f4ca_1882x662.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3832dc9f-28c6-4697-8ea0-de9be648f4ca_1882x662.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3832dc9f-28c6-4697-8ea0-de9be648f4ca_1882x662.png 1456w" sizes="100vw"></picture></div></a><figcaption>Illustration by Ted Gioia</figcaption></figure></div><p><span>, whose writing I can full-heartedly recommend when it comes to the tech sector as well as business, has a similar observation as Ted Gioia:</span></p><blockquote><p><span>“[…] It’s been a minute since we’ve seen anything new from tech that has truly improved </span><em>most people’s</em><span> existence. People have been able to justify the opulence and societal hero complex of the Valley because of the vague promise that life would improve as a result of giving them that space. Except the last decade of tech has been filled with broken promises: the average person was not enriched by cryptocurrency, virtual reality remains and broken, and autonomous cars have mostly resulted in</span><a href="https://www.bloomberg.com/news/articles/2021-11-02/tesla-recalls-full-self-driving-system-after-fixing-software-bug" rel=""> a dangerous open-air beta test on the world’s roads</a><span>.</span></p><p><span>What do people have to be excited about?</span><a href="https://ez.substack.com/p/mark-zuckerberg-is-a-liar-and-hes" rel=""> The metaverse, a half-baked concept that is yet to be even quarter-delivered</a><span>? Generative AI has some promise, but </span><a href="https://ez.substack.com/p/degenerative-ai" rel="">also has the potential to cause genuine harm</a><span>. The average person’s life is changed when the things they do each day are both faster and better - and it’s hard to point to products that have meaningfully done that in quite some time.</span></p><p><a href="https://ez.substack.com/p/the-rot-economy" rel="">I’ve also recently made the point</a><span> that the tech regular people use has gotten significantly worse over the past few years. Google searches are obfuscated by sponsored results and SEO-gamed content, making it harder to find information. Facebook and Instagram prioritize ads over the things you actually want to see. Musk’s attempts to make Twitter profitable</span><a href="https://www.vox.com/technology/2023/2/16/23603155/elon-musk-twitter-worse-degrading-quality-glitches-superbowl-boost-feed" rel=""> have made the site slower and harder to use</a><span> (while also failing to make it profitable). Mobile gaming is almost entirely dominated by microtransactions.</span><a href="https://nymag.com/intelligencer/2023/01/why-does-it-feel-like-amazon-is-making-itself-worse.html" rel=""> Amazon is a labyrinth of dodgy brands and confusingly-placed buttons</a><span>. Netflix has become so obsessed with analytics that they’re</span><a href="https://www.forbes.com/sites/paultassi/2023/01/17/netflix-has-created-a-self-fulfilling-cancelation-loop-with-its-new-shows/?sh=420468ae784d" rel=""> better known for canceling shows</a><span> and</span><a href="https://www.theverge.com/2022/1/14/22884263/netflix-price-increases-2021-us-canada-all-plans-hd-4k" rel=""> raising prices</a><span> for a service that was once </span><em>the</em><span> default streaming platform.</span></p><p><a href="https://wheresyoured.at/p/the-uncanny-valley" rel="">The Uncanny Valley</a><span> by </span></p><span> </span></blockquote><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fae9e623d-611a-4869-b377-79b8b7e75641_1398x456.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fae9e623d-611a-4869-b377-79b8b7e75641_1398x456.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fae9e623d-611a-4869-b377-79b8b7e75641_1398x456.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fae9e623d-611a-4869-b377-79b8b7e75641_1398x456.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fae9e623d-611a-4869-b377-79b8b7e75641_1398x456.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fae9e623d-611a-4869-b377-79b8b7e75641_1398x456.png" width="674" height="219.84549356223175" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/ae9e623d-611a-4869-b377-79b8b7e75641_1398x456.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:456,&quot;width&quot;:1398,&quot;resizeWidth&quot;:674,&quot;bytes&quot;:118957,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fae9e623d-611a-4869-b377-79b8b7e75641_1398x456.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fae9e623d-611a-4869-b377-79b8b7e75641_1398x456.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fae9e623d-611a-4869-b377-79b8b7e75641_1398x456.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fae9e623d-611a-4869-b377-79b8b7e75641_1398x456.png 1456w" sizes="100vw" loading="lazy"></picture></div></a><figcaption>Confession: I hate having a call with someone who uses AirPods! The mic quality is as sh*t as the sound quality…</figcaption></figure></div><p><span>In another article called </span><a href="https://aftermath.site/the-internet-is-full-of-ai-dogshit" rel="">The Internet Is Full Of AI Dogshit</a><span>, Gita Jackson gives another comparable account:</span></p><blockquote><p><span>“The Internet used to be so simple to use that people collectively coined the term ‘</span><a href="https://letmegooglethat.com/" rel="">let me Google that for you</a><span>’ to make fun of people who had the audacity of asking other people questions online. […]</span></p><p>[But now,] the internet has been broken in a fundamental way. It is no longer a repository of people communicating with people; increasingly, it is just a series of machines communicating with machines.</p><p>The once ubiquitous phrase ‘let me Google that for you’ is now meaningless. You are as likely to return incorrect information as you are complete fabrications, and the people who put this content on the Internet do not care.”</p></blockquote><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3d3a47ec-2c39-43f4-a9ac-1988737f976d_1192x816.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3d3a47ec-2c39-43f4-a9ac-1988737f976d_1192x816.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3d3a47ec-2c39-43f4-a9ac-1988737f976d_1192x816.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3d3a47ec-2c39-43f4-a9ac-1988737f976d_1192x816.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3d3a47ec-2c39-43f4-a9ac-1988737f976d_1192x816.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3d3a47ec-2c39-43f4-a9ac-1988737f976d_1192x816.png" width="574" height="392.93959731543623" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/3d3a47ec-2c39-43f4-a9ac-1988737f976d_1192x816.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:816,&quot;width&quot;:1192,&quot;resizeWidth&quot;:574,&quot;bytes&quot;:null,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3d3a47ec-2c39-43f4-a9ac-1988737f976d_1192x816.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3d3a47ec-2c39-43f4-a9ac-1988737f976d_1192x816.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3d3a47ec-2c39-43f4-a9ac-1988737f976d_1192x816.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3d3a47ec-2c39-43f4-a9ac-1988737f976d_1192x816.png 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p><span>(And by the way, let me emphasize again that these people I just quoted aren’t tech luddites but rather tech enthusiasts. It’s not the </span><em>‘I hated tech to begin with and now the tech industry is reaffirming my previously held belief’,</em><span> but rather the </span><em>‘I want tech to be life-changing, useful and awe-inspiring again’</em><span> people.)</span></p><p><span>Increasingly, surveys indicate a similar story, with people becoming less and less fond of their digital tools and lives, as the Wall Street Journal </span><a href="https://www.wsj.com/tech/personal-tech/social-media-nobody-posting-f6c2fd3e" rel="">reports</a><span>:</span></p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F76590113-6ff4-4914-8a5f-b9275ead99d8_958x396.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F76590113-6ff4-4914-8a5f-b9275ead99d8_958x396.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F76590113-6ff4-4914-8a5f-b9275ead99d8_958x396.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F76590113-6ff4-4914-8a5f-b9275ead99d8_958x396.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F76590113-6ff4-4914-8a5f-b9275ead99d8_958x396.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F76590113-6ff4-4914-8a5f-b9275ead99d8_958x396.png" width="500" height="206.68058455114823" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/76590113-6ff4-4914-8a5f-b9275ead99d8_958x396.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:396,&quot;width&quot;:958,&quot;resizeWidth&quot;:500,&quot;bytes&quot;:74100,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F76590113-6ff4-4914-8a5f-b9275ead99d8_958x396.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F76590113-6ff4-4914-8a5f-b9275ead99d8_958x396.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F76590113-6ff4-4914-8a5f-b9275ead99d8_958x396.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F76590113-6ff4-4914-8a5f-b9275ead99d8_958x396.png 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><blockquote><p><span>“In a survey conducted in the U.S. this summer, research firm </span><a href="https://archive.is/o/6l9Ei/https://www.wsj.com/market-data/quotes/IT" rel="">Gartner</a><span> found more than half of respondents believed the quality of social media has declined in the past five years. They cited misinformation, toxicity and the proliferation of bots as reasons it has gotten worse. […] Ads and suggested posts have also </span><a href="https://archive.is/o/6l9Ei/https://www.wsj.com/articles/make-instagram-instagram-again-the-apps-evolution-is-causing-users-to-question-its-future-11658921581" rel="">sucked the joy out of apps</a><span>, some users say.&nbsp;[…] </span></p><p><span>Gartner estimates that </span><a href="https://archive.is/o/6l9Ei/https://www.gartner.com/en/newsroom/press-releases/2023-12-14-gartner-predicts-fifty-percent-of-consumers-will-significantly-limit-their-interactions-with-social-media-by-2025" rel="">50% of users will either abandon or significantly limit</a><span> their interactions with social media in the next two years.”&nbsp;</span></p></blockquote><p>And even companies are now backpedaling on, at least some, tech- or automation-related investments as things haven’t really turned out as expected:</p><blockquote><p>“For shoppers, self-checkout was supposed to provide convenience and speed. Retailers hoped it would usher in a new age of cost savings. […][But] it mostly isn't living up to expectations. </p><p>Customers are still queueing. They need store employees to help clear kiosk errors or check their identifications for age-restricted items. Stores still need to have workers on-hand to help them, and to service the machines.</p><p>The technology is, in some cases, more trouble than it's worth. […] ‘Customers hate it’.”</p><p><a href="https://www.bbc.com/worklife/article/20240111-it-hasnt-delivered-the-spectacular-failure-of-self-checkout-technology" rel="">'It hasn't delivered': The spectacular failure of self-checkout technology by Sam Becker</a><span> (and another article on this, in case you wanna dig deeper: </span><a href="https://www.theatlantic.com/technology/archive/2023/10/self-checkout-kiosks-grocery-retail-stores/675676/" rel="">Self-Checkout Is a Failed Experiment by Amanda Mull</a><span>)</span></p></blockquote><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fbf96caf4-b3ac-4217-acc5-1aa040b87c7f_1098x662.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fbf96caf4-b3ac-4217-acc5-1aa040b87c7f_1098x662.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fbf96caf4-b3ac-4217-acc5-1aa040b87c7f_1098x662.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fbf96caf4-b3ac-4217-acc5-1aa040b87c7f_1098x662.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fbf96caf4-b3ac-4217-acc5-1aa040b87c7f_1098x662.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fbf96caf4-b3ac-4217-acc5-1aa040b87c7f_1098x662.png" width="556" height="335.22040072859744" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/bf96caf4-b3ac-4217-acc5-1aa040b87c7f_1098x662.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:662,&quot;width&quot;:1098,&quot;resizeWidth&quot;:556,&quot;bytes&quot;:134683,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fbf96caf4-b3ac-4217-acc5-1aa040b87c7f_1098x662.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fbf96caf4-b3ac-4217-acc5-1aa040b87c7f_1098x662.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fbf96caf4-b3ac-4217-acc5-1aa040b87c7f_1098x662.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fbf96caf4-b3ac-4217-acc5-1aa040b87c7f_1098x662.png 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p>Don’t get me wrong here. There is definitely something about AI that is exciting and useful! But then again, there was also something about Web2, Crypto, or NFTs that was exciting and useful. 😅 </p><p>The point is: These technologies aren’t all bad! However, we now create and apply them in a way that doesn’t serve humanity (or, to even think broader, all of nature) but rather a system that prioritizes profits above all else. </p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7c315a7c-eb6b-457b-9d8d-235a43bc92f8_1528x488.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7c315a7c-eb6b-457b-9d8d-235a43bc92f8_1528x488.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7c315a7c-eb6b-457b-9d8d-235a43bc92f8_1528x488.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7c315a7c-eb6b-457b-9d8d-235a43bc92f8_1528x488.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7c315a7c-eb6b-457b-9d8d-235a43bc92f8_1528x488.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7c315a7c-eb6b-457b-9d8d-235a43bc92f8_1528x488.png" width="1456" height="465" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/7c315a7c-eb6b-457b-9d8d-235a43bc92f8_1528x488.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:465,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:193338,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7c315a7c-eb6b-457b-9d8d-235a43bc92f8_1528x488.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7c315a7c-eb6b-457b-9d8d-235a43bc92f8_1528x488.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7c315a7c-eb6b-457b-9d8d-235a43bc92f8_1528x488.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7c315a7c-eb6b-457b-9d8d-235a43bc92f8_1528x488.png 1456w" sizes="100vw" loading="lazy"></picture></div></a><figcaption><em>Business</em><span> wins at OpenAI</span></figcaption></figure></div><p><span>And things were and can be different! Look how Yahoo got started as </span></p><p><span>  explains in his </span><a href="https://www.honest-broker.com/p/what-happened-to-my-search-engine" rel="">article</a><span>: </span></p><blockquote><p>“There were no commercial search engines back in 1993. But a Stanford student named David Filo compiled a list of his 200 favorite websites.</p><p>His buddy Jerry Yang helped turn this into an online list. They called it ‘Jerry’s Guide to the Worldwide Web.’ Filo and Yang added new websites every day to their list—and classified them according to categories.</p><p>This turned into Yahoo.</p><p><span>Here’s my favorite part of the story: These two students didn’t even know they were </span><em>running a business</em><span>.”</span></p></blockquote><p><span>Today, however, watching the </span><em>‘this is how I build a 7 figure business in 6 months’</em><span> TikToks, listening to the Austin-based (apparently the new Silicon Valley…yeeha! 🤠) tech bro podcasts, or reading about the latest AI startup founders, it very much looks like the script or at least the approach has completely flipped: </span></p><p>Now, it’s about creating a business (i.e. getting rich) first, and then only it’s about how to get there (i.e. getting rich) with the latest tech and culture trends.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa5c67783-d032-4bc2-b48b-4bfb7fa0cb31_570x713.jpeg" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa5c67783-d032-4bc2-b48b-4bfb7fa0cb31_570x713.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa5c67783-d032-4bc2-b48b-4bfb7fa0cb31_570x713.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa5c67783-d032-4bc2-b48b-4bfb7fa0cb31_570x713.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa5c67783-d032-4bc2-b48b-4bfb7fa0cb31_570x713.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa5c67783-d032-4bc2-b48b-4bfb7fa0cb31_570x713.jpeg" width="440" height="550.3859649122807" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/a5c67783-d032-4bc2-b48b-4bfb7fa0cb31_570x713.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:713,&quot;width&quot;:570,&quot;resizeWidth&quot;:440,&quot;bytes&quot;:null,&quot;alt&quot;:&quot;On the Cover: Sam Bankman-Fried and the Collapse of FTX -- New York Media  Press Room&quot;,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="On the Cover: Sam Bankman-Fried and the Collapse of FTX -- New York Media  Press Room" title="On the Cover: Sam Bankman-Fried and the Collapse of FTX -- New York Media  Press Room" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa5c67783-d032-4bc2-b48b-4bfb7fa0cb31_570x713.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa5c67783-d032-4bc2-b48b-4bfb7fa0cb31_570x713.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa5c67783-d032-4bc2-b48b-4bfb7fa0cb31_570x713.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa5c67783-d032-4bc2-b48b-4bfb7fa0cb31_570x713.jpeg 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p>Why are we so business- and ego-focused in what used to be a much more creative and community-oriented endeavor? Perhaps it’s because the tech elite has broken the social contract: </p><blockquote><p>“For years the Valley has had an elevated status, forgiven for burning billions of dollars on speculative moonshot ideas because they were, theoretically, striving to improve&nbsp;society. […]</p><p>[This has now changed!] </p><p><span>Seemingly every major tech story of the past five or six years has been about</span><a href="https://www.nytimes.com/2018/01/13/style/bitcoin-millionaires.html" rel=""> the tech industry getting filthy rich</a><a href="https://www.nytimes.com/2021/04/30/technology/big-tech-pandemic.html" rel=""> while others suffered</a><span> or</span><a href="https://www.cnbc.com/2022/11/25/techs-reality-check-how-the-industry-lost-7point4-trillion-in-one-year.html" rel=""> losing unthinkable sums of money</a><span>, with no counterbalance of “but at least we got </span><em>this</em><span>” to go with it. </span></p><p><span>Tech’s heroes aren’t guys in turtlenecks who reveal the future in a cinematic presentation - they’re billionaire whiners crowing about “</span><a href="https://www.theinformation.com/articles/fighting-woke-ai-musk-recruits-team-to-develop-openai-rival" rel="">woke AI</a><span>,” or</span><a href="https://www.theguardian.com/technology/2021/dec/28/mark-zuckerberg-110-acres-hawaii" rel=""> buying up hundreds of acres of land in Hawaii</a><span>, or</span><a href="https://www.techspot.com/news/97232-salesforce-ceo-points-finger-new-remote-younger-workers.html" rel=""> claiming that remote work is bad after laying off thousands of people</a><a href="https://ca.finance.yahoo.com/news/salesforce-ceo-says-took-10-181554669.html" rel=""> before taking a 10-day “digital detox” in French Polynesia</a><span>.” </span></p><p><a href="https://wheresyoured.at/p/the-uncanny-valley" rel="">The Uncanny Valley</a><span> by</span></p><span> </span></blockquote><p>So what remains now when we look at the tech sector and its heroes is an image of an entrepreneur that has been completely stripped of things like social purpose, advancing well-being for all, and creating a more joyful future. </p><p>The entrepreneurial dream seems to now be about nothing more than becoming rich and influential. So, technology becomes nothing more than a vehicle for wealth and power.</p><p><span>Philosopher </span><a href="https://en.wikipedia.org/wiki/Ivan_Illich" rel="">Ivan Illich</a><span> described this phenomenon as </span><em>overgrowth of tools</em><span>:</span></p><blockquote><p>“Illich coined the term to describe the&nbsp;situation where we created and came to rely on various tools to solve problems, but then we became overly dependent on these tools and those who wield control over them. </p><p>This dependency reaches the point where the tools, rather than&nbsp;serving us, start dictating and molding our lives&nbsp;until we’ve lost sight of their original purpose.” </p><p><a href="https://www.youtube.com/watch?v=bP2rObVK1zg" rel="">We need better tools by andreism</a></p></blockquote><p><span>, who writes a lot about Illich’s philosophy, further notes that: </span></p><blockquote><p><span>“Illich understood that if we proceed on the assumption that we need better tools to work </span><em>for</em><span> us, we will eventually end up ‘degraded to the status of mere consumers.’</span></p><p>A condition aptly summed up by Illich when he feared that we were traveling along a path that would lead to ‘a further increase of useful things for useless people.’”</p></blockquote><p><span>Those words – “</span><em>useful things for useless people”</em><span> – resonated with me when I read Cal Newport’s recent </span><a href="https://www.newyorker.com/culture/office-space/solving-the-productivity-paradox#:~:text=During%20the%20past%20two%20decades,not%20getting%20much%20more%20done." rel="">article</a><span> in the New York Times that looks at the paradox of workplace productivity growth </span><a href="https://www.bls.gov/opub/mlr/2021/article/the-us-productivity-slowdown-the-economy-wide-and-industry-level-analysis.htm" rel="">slowing down</a><span> during the past two decades despite us getting so many new, shiny productivity tools:</span></p><blockquote><p>“[…] The existing strategy of making applications increasingly powerful has stopped making us better at our jobs. </p><p>During the past two decades or so—a period of rapid technology innovation, which produced laptops, smartphones, ubiquitous cloud computing, and Google—American productivity growth has suffered a sustained slowdown. We gained access to an armada of supercharged workplace tools, and yet we’re not getting much more done.</p><p>There are many explanations for this paradox, including, notably, the theory that these tools counterbalanced new capabilities with new distractions.” </p></blockquote><p><span>But Cal goes on to explain that this is not the entire story here as he reminds us that Henry Ford’s famous productivity innovation, for instance, wasn’t really a technical one but a new way of thinking about the production process, inspired by looking outside his industry (in this case </span><a href="https://51154787.weebly.com/the-swift-meatpacking-plant.html" rel="">the meat-packing industry</a><span>) or what Cal Newport also calls “smarter ways of arranging what you’re already doing”:</span></p><blockquote><p>“The assembly line was a productivity miracle, decreasing the worker hours required to produce a Model T by nearly a factor of ten. Its effectiveness, however, had less to do with ingenious new inventions than it did with an ingenious new insight about how to rearrange the manufacturing process: bringing the car to the worker instead of the worker to the car.”</p></blockquote><p><span>And while Cal Newport focuses specifically on workplace productivity, I think that this concept links very well with the bigger point I made in last week’s </span><a href="https://www.creativedestruction.club/p/a-frictionless-world-is-boring-as" rel="">piece</a><span>. Namely, that one of the key problems of our current age is that we’ve focused too much on the ideas of “the engineer” – I mean this in the broadest sense – and their mechanistic perspective rather than looking at non-technological or non-mechanistic solutions and innovations to our problems.</span></p><p>Said differently, maybe we don’t need better, more humane, more useful technology, but rather better non-technological process and system innovations triggered by out-of-the-box perspectives and new ways of looking at the world – “smarter ways of arranging what you’re already doing”. Hey and if, through this approach, we end up arriving at a solution that includes some type of technology, then why not. </p><p>The crucial thing however, is the approach! Solving climate change requires system change, solving inequality requires system change, solving racism requires system change, solving the mental health crisis requires system change…</p><p>The problem is not that the “machine” of humanity, of earth is broken and therefore needs an upgrade. The problem is that we think of it as a “machine”. </p><div id="youtube2-7apLcaSvZlw" data-attrs="{&quot;videoId&quot;:&quot;7apLcaSvZlw&quot;,&quot;startTime&quot;:null,&quot;endTime&quot;:null}" data-component-name="Youtube2ToDOM"><p><iframe src="https://www.youtube-nocookie.com/embed/7apLcaSvZlw?rel=0&amp;autoplay=0&amp;showinfo=0&amp;enablejsapi=0" frameborder="0" loading="lazy" gesture="media" allow="autoplay; fullscreen" allowautoplay="true" allowfullscreen="true" width="728" height="409"></iframe></p></div><p>That’s it for this Friday edition! Thank you for making it to the end!</p><p>Thanks for supporting my work! 😊</p><p><a href="https://www.linkedin.com/in/thomasklaffke/" rel="">Thomas</a></p></div></div></div></article></div></div></div>]]>
+            </description>
+            <link>https://www.creativedestruction.club/p/the-downward-spiral-of-technology</link>
+            <guid isPermaLink="false">hacker-news-small-sites-39088077</guid>
+            <pubDate>Mon, 22 Jan 2024 10:35:24 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Ten Simple IT Security Rules for Early-Stage Startups]]>
+            </title>
+            <description>
+<![CDATA[
+Score 61 | Comments 59 (<a href="https://news.ycombinator.com/item?id=39087016">thread link</a>) | @PaterPeng
+<br/>
+January 21, 2024 | https://chris-haarburger.com/posts/security_startups.html | <a href="https://web.archive.org/web/*/https://chris-haarburger.com/posts/security_startups.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section>
+        <p>Jan 20, 2024</p>
+        <h2>Ten Simple IT Security Rules for Early-Stage Startups</h2>
+            <p>
+            In the earliest days of a startup, there are almost no rules and processes. Nonetheless, as soon as the first few employees join, the risk of data breaches, phishing, or getting <a href="https://haveibeenpwned.com/">pwned</a> is increasing.
+            </p>
+            <p>
+            It is essential to introduce formal processes and rules as slowly as possible to keep these early days' speed as long as possible. Therefore, I created a minimal set of rules that are easy to digest for everybody but can significantly reduce the most relevant IT security risks. From my experience, the more elaborate these kinds of rules are formalized, the less likely that they are read or even adhered to. Therefore, I did my best to boil it down to 10 simple rules:
+            </p><ol>
+            <li>Generate and save all your passwords in our password manager, for which we have a company license. Save all company-related sensitive information (passwords, credit card data, bank accounts, etc.) in that account. Don’t save such information anywhere else. </li>
+            <li> Enable 2-factor authentication based on one-time-password (OTP) for every service that offers 2FA. Sync OTPs using the password manager. Never reveal OTPs on the phone, not even to colleagues or superiors (phishing alert!). The password manager will show you automatically for which services you can enable 2FA and have yet to do so.</li>
+            <li>Always use unique (i.e., separate passwords for separate services) automatically-generated passwords that your password manager suggests—minimum requirements: 10 characters using letters, numbers and special symbols. On mobile, use a strong passcode to unlock your phone. Avoid being watched when typing passwords.</li>
+            <li>If there is any sign of a breach on your accounts, change your password to the respective affected service and notify your superior. Generally, don’t trust e-mails and never open attachments from unknown senders.</li>
+            <li>Encrypt your hard drives using FileVault (macOS) or Bitlocker (Windows) and never leave your machine without locking it.</li>
+            <li>Watch out for phishing e-mails. If in doubt, ask the sender on another channel if the e-mail is actually from that sender, especially if the e-mail is about transferring money.</li>
+            <li>Only use our company Google Account (Gmail, GDrive) to store files, not your laptop hard drive. Only data from your Google-account is backed up regularly.</li>
+            <li>If you need to share passwords/credentials, always use the “share” feature in the password manager. Don’t send passwords via text/e-mail/WhatsApp/</li>
+            <li>Perform all regular software updates for apps and operating systems on your computer and smartphone.</li>
+            <li>SAAS tools: Only use software that the company provides. When sharing data with 3rd parties, don't share publicly. Instead, always restrict sharing to specific individuals.</li>
+            </ol>
+        
+
+            Thanks a lot to my friend Flo for feedback and refinement.
+
+            
+    </section></div>]]>
+            </description>
+            <link>https://chris-haarburger.com/posts/security_startups.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-39087016</guid>
+            <pubDate>Mon, 22 Jan 2024 06:50:20 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Why isn't Bluesky a peer-to-peer network?]]>
             </title>
             <description>
 <![CDATA[
-Score 181 | Comments 113 (<a href="https://news.ycombinator.com/item?id=39086244">thread link</a>) | @jakebsky
+Score 189 | Comments 146 (<a href="https://news.ycombinator.com/item?id=39086244">thread link</a>) | @jakebsky
 <br/>
 January 21, 2024 | https://www.pfrazee.com/blog/why-not-p2p | <a href="https://web.archive.org/web/*/https://www.pfrazee.com/blog/why-not-p2p">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><p>It's a good idea to jot down a couple of notes on our decision-making at Bluesky. These notes won't be extensive.</p><p>Also in this series:</p><ul><li><a href="https://www.pfrazee.com/blog/why-not-rdf">Why not RDF in the AT Protocol?</a></li><li><a href="https://www.pfrazee.com/blog/why-facets">Why RichText facets in Bluesky</a></li></ul><h2 id="the-2014-generation-of-p2p">The 2014 generation of P2P</h2><p>The indie hacker spirit was strong in the NodeJS &amp; Web community in 2014. There was a brief surge of interest in CouchDB and the potential for CouchApps. WebRTC had just stabilized and was being fiddled with.</p><p>A couple of things then happened all at once:</p><ul><li>Distributed systems theory became more mainstream</li><li>Bitcoin showed that novel protocols could make waves</li><li>DJB's <a target="_blank" rel="noopener noreferrer" href="https://en.wikipedia.org/wiki/NaCl_(software)">NaCl</a> became widely available, and, with it, more compact public keys</li></ul><p>Devs discouraged with the Web began to look at BitTorrent and ask whether its networking model could be applied to other kinds of data-structures, and, if so, could p2p networks be useful for general computing in a way that BitTorrent is not?</p><p>This led to the formation of <a target="_blank" rel="noopener noreferrer" href="https://en.wikipedia.org/wiki/InterPlanetary_File_System">IPFS</a>, <a target="_blank" rel="noopener noreferrer" href="https://en.wikipedia.org/wiki/Secure_Scuttlebutt">Secure Scuttlebutt</a>, <a target="_blank" rel="noopener noreferrer" href="https://en.wikipedia.org/wiki/Dat_(software)">Dat</a> and <a target="_blank" rel="noopener noreferrer" href="https://en.wikipedia.org/wiki/WebTorrent">WebTorrent</a> at all roughly the same time.</p><h2 id="the-bittorrent-variants">The BitTorrent variants</h2><p>BitTorrent uses a Merkle Tree to represent datasets. This means that a torrent represents one static collection of files. Each project looked to replace the Merkle Tree with a new data structure which would still benefit from shared hosting and strong authentication while adding support for more dynamic data.</p><div><p><img src="https://www.pfrazee.com/static/images/why-not-p2p/ipfs.png"></p><h3>IPFS: the Merkle DAG</h3></div><p>IPFS still focused on content-hashes, but essentially broke each chunk of data into its own torrent that could be cross-referenced by the hash. A public key or DNS name could point to a hash to support dynamism. It used a DHT to look up and connect machines.</p><div><p><img src="https://www.pfrazee.com/static/images/why-not-p2p/ssb.png"></p><h3>SSB: the append-only log</h3></div><p>SSB used an append-only log which was modeled as a signed linked list. Back references were content-hashes, making the HEAD a rolling hash. It used a gossip model to distribute data and "pubs" to connect peers.</p><div><p><img src="https://www.pfrazee.com/static/images/why-not-p2p/dat.png"></p><h3>Dat: the merkle log</h3></div><p>Dat also used a signed append-only log, but it used a merkle tree to reference nodes rather than a linked list. This gave a nice performance benefit over SSB, since it was able to verify signed heads against partial datasets using the tree structure. It used a DHT to look up and connect machines.</p><h2 id="my-personal-timeline">My personal timeline</h2><p>I bounced around between these projects and collected a number of lessons along the way. Here's a condensed view of it.</p><div><div><p>2014</p><p>I joined the scene in 2014 by the good graces of Dominic Tarr, who allowed me to join him as the first application developer for SSB.</p></div></div><div><div><p>2016</p><p>I paired Electron with the Dat protocol and declared it a "peer-to-peer web browser." I then stuffed in APIs for reading and writing the p2p files and started pitching it as the <a target="_blank" rel="noopener noreferrer" href="https://en.wikipedia.org/wiki/Beaker_(web_browser)">Beaker browser</a>.</p></div></div><div><div><p>2017</p><p>Beaker supported the ability to "fork" p2p websites, so an indie social network called Rotonde briefly emerged on it where you created accounts by forking existing user sites. Simultaneously, the Beaker team created a Twitter clone on the tech called Fritter.</p></div></div><div><div><p>2018-2020</p><p>The Beaker team experimented heavily with baked-in APIs for interacting with user data on the Dat network. This included an indexer in the browser which would create computed views from user data.</p></div></div><div><div><p>2021</p><p>Discouraged with the outcomes thus far — for reasons I'll explain shortly — I embarked on the another social networking project CTZN <a target="_blank" rel="noopener noreferrer" href="https://www.youtube.com/playlist?list=PLBND3AXbdG40F0KY9dDi5JzFBGceGvu0m">which I livestreamed</a>. I began experimenting with hybrid p2p &amp; server models.</p></div></div><div><div><p>2022</p><p>I joined Bluesky with a pocket full of dreams and a huge backlog of <del>failed projects</del> learnings.</p></div></div><h2 id="what-went-right">What went right</h2><p><img src="https://www.pfrazee.com/static/images/why-not-p2p/good-job.png"></p><p>P2P makes some things extraordinarily easy. Beaker browser demoed one-click website creation and the ability to fork other people's sites. You could write entire applications as SPAs that would simply read &amp; write files instead of relying on a server.</p><p>Developers responded very positively to the ability to publish networked applications that don't require hosting and operations. FOSS enthusiasts were extremely happy to have a distribution system that matched their core ethos.</p><p>The data structures built by each protocol evolved significantly. There were some very innovative improvements in each technology.</p><p>We learned a huge amount about how to design large-scale applications against decentralized data-sources.</p><h2 id="what-went-wrong">What went wrong</h2><p><img src="https://www.pfrazee.com/static/images/why-not-p2p/bad-job.png"></p><p>People won't sacrifice features for hypothetical improvements. The pure p2p model suffered from an introductions problem (how do two users meet for the first time?) and so reliable delivery of events such as replies or likes was never solved. It didn't take long to hit data-scales that an individual device couldn't manage.</p><p>We never solved multi-device syncronization in a way that preserved the convenience of the technology. Same for key backup/sync.</p><p>DHTs were not reliable or performant. We were way too optimistic about device discovery and NAT traversal.</p><p>Doing everything on the user device opened new and difficult questions about resource management. When is it safe to clear cached data? How many connections can we keep open? How much CPU and RAM can our daemon eat before people notice? Mobile was a non-starter.</p><h2 id="how-this-synthesized-for-bluesky">How this synthesized for Bluesky</h2><p><img src="https://www.pfrazee.com/static/images/why-not-p2p/at-job.png"></p><p>By 2022, a number of us in the community had begun to re-examine our original premises from 2014. We generally agreed that device-hosted network software was simply infeasible, but we still saw a lot of potential in the data structures we had been using.</p><h3 id="hosting-agility">Hosting agility</h3><p>The general benefit from p2p we looked at preserving was hosting agility. Host-based addressing (the Web's traditional model) means that data published under a server's name becomes immovable from that server. Redirects may be suitable for an individual page, but large datasets will cross-reference records extensively and those references cannot be reliably migrated every time a user wants to move to a new server.</p><p>The peer-to-peer networks we had been developing were designed for hosting agility. Published data is addressed under a cryptographic identifier and then resolved to a host at read-time. There's no reason that host resolution has to be via a DHT connecting user devices; it can instead resolve to always-online services, which is how we ended up designing the AT Protocol with the PDS (Personal Data Server).</p><p>As our goal was to guard against lockin to social networking providers, this seemed like an obvious benefit.</p><h3 id="cryptographic-structures">Cryptographic structures</h3><p>User data is encoded in a cryptographic structure called a Merkle Search Tree which was chosen for optimal proof sizes. This is a direct carry-over from our peer-to-peer work, and is what drives hosting agility.</p><p>In protocol terminology, we call this structure a "repository."</p><p>The repositories are designed to be highly cacheable and efficient to replicate. The cryptographic structure makes it cheap to verify the authenticity; you can get some guarantee that it's canonical data without speaking directly to the PDS.</p><p>A downside of this model is that the entirety of the repository is meant to be broadcast publicly. Selectively-shared data will require a separate channel within the protocol.</p><h3 id="host-discovery">Host discovery</h3><p>Once we moved to the PDS model, the requirements for looking up hosts from cryptographic identifiers got less intense. A DHT maintains an unverified one-to-many table using a mesh of volunteer servers. The PDS model meant we could drop to a verified one-to-one table for finding the host of a given cryptograhic ID.</p><p>Having spent a fair amount of pain debugging DHTs, we chose not to use a hosting mesh for these lookups either. Instead we created the <code>did:plc</code> registry service which uses a <a target="_blank" rel="noopener noreferrer" href="https://certificate.transparency.dev/">Certificate-Transparency</a>-inspired cryptographic log for external auditing.</p><p>For now, PLC stands for "Placeholder" because we're not in love with a single service model. We either want this registry to move into an ICANN-style org, or we want to use a closed, non-PoW blockchain<sup>2</sup> for multi-org consortium operation. The data structure is designed to work under either outcome.</p><h3 id="aggregation-data-modeling">Aggregation data modeling</h3><p>The data model we refined through the p2p era was an aggregation-based indexes. Users would subscribe to each others' datasets and ingest them into local indexes. Those local indexes could then be queried to provide a view of the application state.</p><p>This works well because it preserves the fact that each user's own dataset is an isolated space. You don't have to coordinate permissions between users because they never transact on the same primary records; instead you treat each user as the sole owner of their dataset, producing interactions which then form a cumulative view. That's how a lot of social applications already work.</p><p>This model also benefits from eventually-consistent convergence. Shared-ownership data requires transactional guarantees which behave unreliably in an open/decentralized WAN. While eventually-consistent comes with its own surprises (we've had a few conversations about whether a PDS is "read-sticky" or not) it tends to hide the performance costs of a global network well, and it preserves the independence of each user.</p><p>With Bluesky, the major difference from our p2p work was deciding that these aggregations would happen via large services (the AppViews) rather than on each user's own infra (their PDS or their device). This makes it possible to provide the high-scale networking that people expect from social experiences.</p><p>We felt comfortable with this approach in the context of our mission because the aggregators are kept separate from hosts, creating yet another form of agility. Anyone is free to spin up a new aggregator<sup>1</sup>, and they'll have access to the same datasets that everyone else has access to — a very Webby notion.</p><h2 id="not-quite-p2p-not-quite-federation">Not quite P2P, not quite Federation</h2><p><img src="https://www.pfrazee.com/static/images/why-not-p2p/hmm.png"></p><p>We ended up calling the AT Protocol a "federated" network because we couldn't think of a more appropriate term, but it's not really a kind of federation that anyone is familiar with. The peer-to-peer influence is too significant to neatly slot into that archetype. It also confuses with ActivityPub's model of federation which is now popularly understood.</p><p>To the chagrin of my coworkers, I've begun calling this model <em>Internection</em>, a portmandeu of "inter-connection." I like that term because it reminds me of the whimsical nerdiness of the seventies, when people started using the term "hyperlink" and not batting an eye. I think the team might light my apartment on fire if I don't stop though.</p><p>It might be even more accurate to call this a Cryptographic Data Web. Every user's data repository is, in essence, a website. The aggregating applications are, in essence, search spiders. The Web never quite mastered structured data for a variety of reasons; the AT Protocol embraces it fundamentally. Rather than fetching views from sites, you fetch records from users. Our aggregators produce data indexes rather than search pages.</p><p>You can see why we settled on the name <em>AT Protocol</em>. In the technical sense, AT — Authenticated Transfer — references the use of the cryptographic structures, data which is inherently authenticated. In the social sense, the "AT" is the "@", the sygil for referencing the network's core primitive: users.</p><hr><p><sup>1</sup> It is not cheap to do so, but we did not discover any innovations in distributed indexing or querying that would enable cost sharing within a high-scale network. In essence, you're going to pay as much to run an AppView with 10mm users as you would a traditional service with 10mm users. You can cut users if you want to cut costs, or you can invent a federated query model that works. If you accomplish the later, let me know.</p><p><sup>2</sup> "Closed blockchains" are the unloved middle child of the crypto world, rejected by blockchain enthusiasts for not being decentralized enough, and ignored by everybody else for being too blockchainy. They were largely developed as a pitch to enterprises who wanted to tell their shareholders they had a blockchain strategy, and were accordingly abandoned when the bubble popped. Naturally, I think they're pretty interesting. I'll need to write about them more at some point, but for people who are vaguely concerned by this you should know that this tech doesn't involve proof-of-work or any kind of open market tokenomics, and is essentially a way to get multiple orgs to govern a dataset with low trust between each organization, which is something you might want for key distribution.</p></div></div></div>]]>
@@ -39,7 +411,7 @@ January 21, 2024 | https://www.pfrazee.com/blog/why-not-p2p | <a href="https://w
             </title>
             <description>
 <![CDATA[
-Score 397 | Comments 120 (<a href="https://news.ycombinator.com/item?id=39086106">thread link</a>) | @goranmoomin
+Score 434 | Comments 134 (<a href="https://news.ycombinator.com/item?id=39086106">thread link</a>) | @goranmoomin
 <br/>
 January 21, 2024 | https://iter.ca/post/gpt-crash/ | <a href="https://web.archive.org/web/*/https://iter.ca/post/gpt-crash/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -89,7 +461,7 @@ January 21, 2024 | https://iter.ca/post/gpt-crash/ | <a href="https://web.archiv
             </title>
             <description>
 <![CDATA[
-Score 123 | Comments 84 (<a href="https://news.ycombinator.com/item?id=39081894">thread link</a>) | @lordnacho
+Score 127 | Comments 84 (<a href="https://news.ycombinator.com/item?id=39081894">thread link</a>) | @lordnacho
 <br/>
 January 21, 2024 | https://www.andreinc.net/2024/01/09/the-most-important-math-exams-of-my-life | <a href="https://web.archive.org/web/*/https://www.andreinc.net/2024/01/09/the-most-important-math-exams-of-my-life">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1032,11 +1404,439 @@ January 21, 2024 | https://www.andreinc.net/2024/01/09/the-most-important-math-e
         </item>
         <item>
             <title>
+<![CDATA[Datalog in 100 lines of JavaScript (2022)]]>
+            </title>
+            <description>
+<![CDATA[
+Score 51 | Comments 18 (<a href="https://news.ycombinator.com/item?id=39080793">thread link</a>) | @stopachka
+<br/>
+January 21, 2024 | https://www.instantdb.com/essays/datalogjs | <a href="https://web.archive.org/web/*/https://www.instantdb.com/essays/datalogjs">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>Query engines make me feel like a wizard. I cast my incantation: “Give me all the directors and the movies where Arnold Schwarzenegger was a cast member”. Then charges zip through wires, algorithms churn on CPUs, and voila, an answer bubbles up.</p>
+<p>How do they work? In this essay, we will build a query engine from scratch and find out. In 100 lines of Javascript, we’ll supports joins, indexes, <em>and</em> find our answer for Arnold! Let’s get into it.</p>
+
+<p>Our first step is to choose which language we’ll support. SQL is the most popular, but we wouldn’t get far in 100 lines. I suggest we amble off the beaten path and make Datalog instead.</p>
+<p>If you haven’t heard of Datalog, you’re in for a treat. It’s a logic-based query language that’s as powerful as SQL. We won’t cover it completely, but we’ll cover enough to fit a good weekend’s worth of hacking.</p>
+<p>To grok Datalog, we need to understand three ideas:</p>
+
+<p>The first idea is about how we store data.</p>
+<h2 id="sql-tables">SQL Tables</h2>
+<p>SQL databases store data in different tables:</p>
+<p><img src="https://paper-attachments.dropbox.com/s_FD7FF9539594E6B532630EAEC892A2984C0B1FD8174F6609827754AA4559A821_1650557040594_image.png" alt=""></p>
+<p>Here we have a <code>movie</code> table, which stores one movie per row. The record with the id <code>200</code> is <code>"The Terminator"</code>.</p>
+<p>Notice the <code>director_id</code>. This points to a row in yet another <code>person</code> table, which keeps the director’s name, and so on.</p>
+<h2 id="datalog-triples">Datalog Triples</h2>
+<p>In Datalog databases, there are no tables. Or really everything is just stored in one table, the <code>triple</code> table:</p>
+<p><img src="https://paper-attachments.dropbox.com/s_FD7FF9539594E6B532630EAEC892A2984C0B1FD8174F6609827754AA4559A821_1650653844960_image.png" alt=""></p>
+<p>A <code>triple</code> is a row with an <code>id</code>, <code>attribute</code>, and <code>value</code>. Triples have a curious property; with just these three columns, they can describe any kind of information!</p>
+<p>How? Imagine describing a movie to someone:</p>
+<blockquote>
+<p>It's called "The Terminator"
+It was released in 1987</p>
+</blockquote>
+<p>Those sentences conveniently translate to triples:</p>
+<pre data-reactroot=""><code><span>[</span><span>200</span><span>,</span><span> movie</span><span>/</span><span>title</span><span>,</span><span> </span><span>"The Terminator"</span><span>]</span><span></span>
+<span></span><span>[</span><span>200</span><span>,</span><span> movie</span><span>/</span><span>year</span><span>,</span><span> </span><span>1987</span><span>]</span>
+</code></pre><p>And those sentences have a general structure; if you can describe a movie this way, you can describe tomatoes or airplanes just as well.</p>
+
+<p>The second idea is about how we search for information.</p>
+<h2 id="sql-algebra">SQL Algebra</h2>
+<p>SQL has roots in relational algebra. You give the query engine a combination of clauses and statements, and it gets you back your data:</p>
+<pre data-reactroot=""><code><span>SELECT</span><span> id </span><span>FROM</span><span> movie </span><span>WHERE</span><span> </span><span>year</span><span> </span><span>=</span><span> </span><span>1987</span>
+</code></pre><p>This returns:</p>
+<pre data-reactroot=""><code><span>[</span><span>{</span><span>id</span><span>:</span><span> </span><span>202</span><span>}</span><span>,</span><span> </span><span>{</span><span>id</span><span>:</span><span> </span><span>203</span><span>}</span><span>,</span><span> </span><span>{</span><span>id</span><span>:</span><span> </span><span>204</span><span>}</span><span>]</span>
+</code></pre><p>Voila, the movie ids for Predator, Lethal Weapon, and RoboCop.</p>
+<h2 id="datalog-pattern-matching">Datalog Pattern Matching</h2>
+<p>Datalog databases rely on pattern matching. We create “patterns” that match against triples. For example, to find all the movies released in 1987, we could use this pattern:</p>
+<pre data-reactroot=""><code><span>[</span><span>?</span><span>id</span><span>,</span><span> movie</span><span>/</span><span>year</span><span>,</span><span> </span><span>1987</span><span>]</span>
+</code></pre><p>Here, <code>?id</code> is a variable: we’re telling the query engine that it can be <em>any</em> value. But, the <code>attribute</code> <em>must</em> be <code>movie/year</code>, and the <code>value</code> <em>must</em> be <code>1987</code>.</p>
+<p><img src="https://paper-attachments.dropbox.com/s_FD7FF9539594E6B532630EAEC892A2984C0B1FD8174F6609827754AA4559A821_1650395773008_image.png" alt=""></p>
+<p>Our query engine runs through triple after triple. Since <code>?id</code> can be anything, this matches every triple. But, the attribute <code>movie/year</code> and the value <code>1987</code> filter us down to <em>just</em> the triples we care about:</p>
+<pre data-reactroot=""><code><span>[</span><span></span>
+<span>  </span><span>[</span><span>202</span><span>,</span><span> movie</span><span>/</span><span>year</span><span>,</span><span> </span><span>1987</span><span>]</span><span>,</span><span></span>
+<span>  </span><span>[</span><span>203</span><span>,</span><span> movie</span><span>/</span><span>year</span><span>,</span><span> </span><span>1987</span><span>]</span><span>,</span><span></span>
+<span>  </span><span>[</span><span>204</span><span>,</span><span> movie</span><span>/</span><span>year</span><span>,</span><span> </span><span>1987</span><span>]</span><span>,</span><span></span>
+<span></span><span>]</span>
+</code></pre><p>Notice the <code>?id</code> portion; those are the ids for Predator, Lethal Weapon, and RoboCop!</p>
+<h2 id="datalog-find">Datalog <code>find</code></h2>
+<p>In SQL, we <em>just</em> got back ids though, while our query engine returned more. How can we support returning ids only? Let’s adjust our syntax; here’s <code>find</code>:</p>
+<pre data-reactroot=""><code><span>{</span><span> </span><span>find</span><span>:</span><span> </span><span>[</span><span>?</span><span>id</span><span>]</span><span>,</span><span></span>
+<span>  </span><span>where</span><span>:</span><span> </span><span>[</span><span></span>
+<span>    </span><span>[</span><span>?</span><span>id</span><span>,</span><span> movie</span><span>/</span><span>year</span><span>,</span><span> </span><span>1987</span><span>]</span><span></span>
+<span>  </span><span>]</span><span> </span><span>}</span>
+</code></pre><p>Our query engine can now use the <code>find</code> section to return what we care about. If we implement this right, we should get back:</p>
+<pre data-reactroot=""><code><span>[</span><span>[</span><span>202</span><span>]</span><span>,</span><span> </span><span>[</span><span>203</span><span>]</span><span>,</span><span> </span><span>[</span><span>204</span><span>]</span><span>]</span>
+</code></pre><p>And now we’re as dandy as SQL.</p>
+
+<p>The third idea is about how joins work. Datalog and SQL’s magic comes from them.</p>
+<h2 id="sql-clauses">SQL clauses</h2>
+<p>In SQL, if we wanted to find “The Terminator’s” director, we could write:</p>
+<pre data-reactroot=""><code><span>SELECT</span><span></span>
+<span>  person</span><span>.</span><span>name</span><span></span>
+<span></span><span>FROM</span><span> movie</span>
+<span></span><span>JOIN</span><span> person </span><span>ON</span><span> movie</span><span>.</span><span>director_id</span><span> </span><span>=</span><span> person</span><span>.</span><span>id</span><span></span>
+<span></span><span>WHERE</span><span> movie</span><span>.</span><span>title</span><span> </span><span>=</span><span> </span><span>"The Terminator"</span>
+</code></pre><p>Which gets us:</p>
+<pre data-reactroot=""><code><span>[</span><span>{</span><span>name</span><span>:</span><span> </span><span>"James Cameron"</span><span>}</span><span>]</span>
+</code></pre><p>Pretty cool. We used the <code>JOIN</code> clause to connect the movie table with the person table, and bam, we got our director’s name.</p>
+<h2 id="datalogpattern-matching">Datalog…Pattern Matching</h2>
+<p>In Datalog, we still rely on pattern matching. The trick is to match <em>multiple</em> patterns:</p>
+<pre data-reactroot=""><code><span>{</span><span></span>
+<span>  </span><span>find</span><span>:</span><span> </span><span>[</span><span>?</span><span>directorName</span><span>]</span><span>,</span><span></span>
+<span>  </span><span>where</span><span>:</span><span> </span><span>[</span><span></span>
+<span>    </span><span>[</span><span>?</span><span>movieId</span><span>,</span><span> movie</span><span>/</span><span>title</span><span>,</span><span> </span><span>"The Terminator"</span><span>]</span><span>,</span><span></span>
+<span>    </span><span>[</span><span>?</span><span>movieId</span><span>,</span><span> movie</span><span>/</span><span>director</span><span>,</span><span> </span><span>?</span><span>directorId</span><span>]</span><span>,</span><span></span>
+<span>    </span><span>[</span><span>?</span><span>directorId</span><span>,</span><span> person</span><span>/</span><span>name</span><span>,</span><span> </span><span>?</span><span>directorName</span><span>]</span><span>,</span><span></span>
+<span>  </span><span>]</span><span>,</span><span></span>
+<span></span><span>}</span>
+</code></pre><p>Here we tell the query engine to match <em>three</em> patterns. The first pattern produces a list of successful triples. For each successful triple, we search again with the <em>second</em> pattern, and so on. Notice how the <code>?movieId</code> and <code>?directorId</code> are repeated; this tells our query engine that for a successful match, those values would need to be the <em>same</em> across our different searches.</p>
+<p>What do I mean? Let’s make this concrete; here’s how our query engine could find The Terminator’s director:</p>
+<p><img src="https://paper-attachments.dropbox.com/s_FD7FF9539594E6B532630EAEC892A2984C0B1FD8174F6609827754AA4559A821_1650461792727_image.png" alt=""></p>
+<p>The first pattern finds:</p>
+<pre data-reactroot=""><code><span>[</span><span>200</span><span>,</span><span> movie</span><span>/</span><span>title</span><span>,</span><span> </span><span>"The Terminator"</span><span>]</span><span>.</span>
+</code></pre><p>We bind <code>?movieId</code> to <code>200</code>. Now we start searching for the second pattern:</p>
+<pre data-reactroot=""><code><span>[</span><span>?</span><span>movieId</span><span>,</span><span> movie</span><span>/</span><span>director</span><span>,</span><span> </span><span>?</span><span>directorName</span><span>]</span><span>.</span>
+</code></pre><p>Since <code>?movieId</code> needs to be <code>200</code>, this finds us</p>
+<pre data-reactroot=""><code><span>[</span><span>200</span><span>,</span><span> movie</span><span>/</span><span>director</span><span>,</span><span> </span><span>100</span><span>]</span>
+</code></pre><p>And we can now bind <code>?directorId</code> to <code>100</code>. Time for the third pattern:</p>
+<pre data-reactroot=""><code><span>[</span><span>?</span><span>directorId</span><span>,</span><span> person</span><span>/</span><span>name</span><span>,</span><span> </span><span>?</span><span>directorName</span><span>]</span>
+</code></pre><p>Because <code>?directorId</code> has to be <code>100</code>, our engine finds us:</p>
+<pre data-reactroot=""><code><span>[</span><span>100</span><span>,</span><span> person</span><span>/</span><span>name</span><span>,</span><span> </span><span>"James Cameron"</span><span>]</span>
+</code></pre><p>And perfecto, the <code>?directorName</code>  is now bound to <code>"James Cameron"</code>! The <code>find</code> section would then return <code>["James Cameron"]</code>.</p>
+<hr>
+<p>Oky doke, now we grok the basics of Datalog! Let’s get to the code.</p>
+
+<p>First things first, we need a way to represent this syntax. If you look at:</p>
+<pre data-reactroot=""><code><span>{</span><span> </span><span>find</span><span>:</span><span> </span><span>[</span><span>?</span><span>id</span><span>]</span><span>,</span><span></span>
+<span>  </span><span>where</span><span>:</span><span> </span><span>[</span><span></span>
+<span>    </span><span>[</span><span>?</span><span>id</span><span>,</span><span> movie</span><span>/</span><span>year</span><span>,</span><span> </span><span>1987</span><span>]</span><span></span>
+<span>  </span><span>]</span><span> </span><span>}</span>
+</code></pre><p>We could <em>almost</em> write this in Javascript. We use objects and arrays, but <code>?id</code> and <code>movie/year</code> get in the way; they would throw an error. We can fix this with a hack: let’s turn them into strings.</p>
+<pre data-reactroot=""><code><span>{</span><span> </span><span>find</span><span>:</span><span> </span><span>[</span><span>"?id"</span><span>]</span><span>,</span><span></span>
+<span>  </span><span>where</span><span>:</span><span> </span><span>[</span><span></span>
+<span>    </span><span>[</span><span>"?id"</span><span>,</span><span> </span><span>"movie/year"</span><span>,</span><span> </span><span>1987</span><span>]</span><span></span>
+<span>  </span><span>]</span><span> </span><span>}</span>
+</code></pre><p>It’s less pretty, but we can now express our queries without fanfare. If a string begins with a question mark, it’s a variable. An attribute is just a string; it’s a good idea to include a namespace like <code>"movie/*"</code>, but we won’t force our users.</p>
+
+<p>The next thing we’ll need is sample data to play with. There’s a great datalog tutorial <sup id="marked-fnref-1"><a href="#marked-fn-1">[1]</a></sup>, which has the movie dataset we’ve been describing. I’ve taken it and adapted it to Javascript. <a href="https://github.com/stopachka/datalogJS/blob/main/src/exampeTriples.js">Here’s the file</a>.</p>
+<pre data-reactroot=""><code><span></span>
+<span></span><span>export</span><span> </span><span>default</span><span> </span><span>[</span><span></span>
+<span>  </span><span>[</span><span>100</span><span>,</span><span> </span><span>"person/name"</span><span>,</span><span> </span><span>"James Cameron"</span><span>]</span><span>,</span><span></span>
+<span>  </span><span>[</span><span>100</span><span>,</span><span> </span><span>"person/born"</span><span>,</span><span> </span><span>"1954-08-16T00:00:00Z"</span><span>]</span><span>,</span><span></span>
+<span>  </span><span></span>
+<span></span><span>]</span>
+</code></pre><p>Let’s plop this in and require it:</p>
+<pre data-reactroot=""><code><span>import</span><span> </span><span>exampleTriples</span><span> </span><span>from</span><span> </span><span>'./exampleTriples'</span><span>;</span>
+</code></pre><p>Now for our query engine!</p>
+
+<h2 id="goal">Goal</h2>
+<p>Our first goal is to match <em>one</em> pattern with <em>one</em> triple. Here’s an example:</p>
+<p><img src="https://paper-attachments.dropbox.com/s_FD7FF9539594E6B532630EAEC892A2984C0B1FD8174F6609827754AA4559A821_1650419195277_image.png" alt=""></p>
+<p>We have some variable bindings: <code>{"?movieId": 200}</code>. Let’s call this a <code>context</code>.</p>
+<p>Our goal is to take a pattern, a triple, and a context. We’ll either return a new context:</p>
+<pre data-reactroot=""><code><span>{</span><span>"?movieId"</span><span>:</span><span> </span><span>200</span><span>,</span><span> </span><span>"?directorId"</span><span>:</span><span> </span><span>100</span><span>}</span>
+</code></pre><p>Or a failure. We can just say <code>null</code> means failure.</p>
+<p>This could be the test we play with:</p>
+<pre data-reactroot=""><code><span>expect</span><span>(</span><span></span>
+<span>  </span><span>matchPattern</span><span>(</span><span></span>
+<span>    </span><span>[</span><span>"?movieId"</span><span>,</span><span> </span><span>"movie/director"</span><span>,</span><span> </span><span>"?directorId"</span><span>]</span><span>,</span><span></span>
+<span>    </span><span>[</span><span>200</span><span>,</span><span> </span><span>"movie/director"</span><span>,</span><span> </span><span>100</span><span>]</span><span>,</span><span></span>
+<span>    </span><span>{</span><span> </span><span>"?movieId"</span><span>:</span><span> </span><span>200</span><span> </span><span>}</span><span></span>
+<span>  </span><span>)</span><span></span>
+<span></span><span>)</span><span>.</span><span>toEqual</span><span>(</span><span>{</span><span> </span><span>"?movieId"</span><span>:</span><span> </span><span>200</span><span>,</span><span> </span><span>"?directorId"</span><span>:</span><span> </span><span>100</span><span> </span><span>}</span><span>)</span><span>;</span><span></span>
+<span></span><span>expect</span><span>(</span><span></span>
+<span>  </span><span>matchPattern</span><span>(</span><span></span>
+<span>    </span><span>[</span><span>"?movieId"</span><span>,</span><span> </span><span>"movie/director"</span><span>,</span><span> </span><span>"?directorId"</span><span>]</span><span>,</span><span></span>
+<span>    </span><span>[</span><span>200</span><span>,</span><span> </span><span>"movie/director"</span><span>,</span><span> </span><span>100</span><span>]</span><span>,</span><span></span>
+<span>    </span><span>{</span><span> </span><span>"?movieId"</span><span>:</span><span> </span><span>202</span><span> </span><span>}</span><span></span>
+<span>  </span><span>)</span><span></span>
+<span></span><span>)</span><span>.</span><span>toEqual</span><span>(</span><span>null</span><span>)</span><span>;</span>
+</code></pre><h2 id="code">Code</h2>
+<p>Nice, we have a plan. Let’s write the larger function first:</p>
+<pre data-reactroot=""><code><span>function</span><span> </span><span>matchPattern</span><span>(</span><span>pattern</span><span>,</span><span> triple</span><span>,</span><span> context</span><span>)</span><span> </span><span>{</span><span></span>
+<span>  </span><span>return</span><span> pattern</span><span>.</span><span>reduce</span><span>(</span><span>(</span><span>context</span><span>,</span><span> patternPart</span><span>,</span><span> idx</span><span>)</span><span> </span><span>=&gt;</span><span> </span><span>{</span><span></span>
+<span>    </span><span>const</span><span> triplePart </span><span>=</span><span> triple</span><span>[</span><span>idx</span><span>]</span><span>;</span><span></span>
+<span>    </span><span>return</span><span> </span><span>matchPart</span><span>(</span><span>patternPart</span><span>,</span><span> triplePart</span><span>,</span><span> context</span><span>)</span><span>;</span><span></span>
+<span>  </span><span>}</span><span>,</span><span> context</span><span>)</span><span>;</span><span></span>
+<span></span><span>}</span>
+</code></pre><p>We take our pattern, and compare each part to the corresponding one in our triple:</p>
+<p><img src="https://paper-attachments.dropbox.com/s_FD7FF9539594E6B532630EAEC892A2984C0B1FD8174F6609827754AA4559A821_1650457636669_image.png" alt=""></p>
+<p>So, we’d compare <code>"?movieId"</code> with <code>200</code>, and so on.</p>
+<h2 id="matchpart">matchPart</h2>
+<p>We can delegate this comparison to <code>matchPart</code>:</p>
+<pre data-reactroot=""><code><span>function</span><span> </span><span>matchPart</span><span>(</span><span>patternPart</span><span>,</span><span> triplePart</span><span>,</span><span> context</span><span>)</span><span> </span><span>{</span><span></span>
+<span>  </span><span>if</span><span> </span><span>(</span><span>!</span><span>context</span><span>)</span><span> </span><span>return</span><span> </span><span>null</span><span>;</span><span></span>
+<span>  </span><span>if</span><span> </span><span>(</span><span>isVariable</span><span>(</span><span>patternPart</span><span>)</span><span>)</span><span> </span><span>{</span><span></span>
+<span>    </span><span>return</span><span> </span><span>matchVariable</span><span>(</span><span>patternPart</span><span>,</span><span> triplePart</span><span>,</span><span> context</span><span>)</span><span>;</span><span></span>
+<span>  </span><span>}</span><span></span>
+<span>  </span><span>return</span><span> patternPart </span><span>===</span><span> triplePart </span><span>?</span><span> context </span><span>:</span><span> </span><span>null</span><span>;</span><span></span>
+<span></span><span>}</span>
+</code></pre><p>First we address <code>context</code>; if <code>context</code> was <code>null</code> we must have failed before, so we just return early.</p>
+<h2 id="isvariable">isVariable</h2>
+<p>Next, we check if we’re looking at a variable. <code>isVariable</code> is simple enough:</p>
+<pre data-reactroot=""><code><span>function</span><span> </span><span>isVariable</span><span>(</span><span>x</span><span>)</span><span> </span><span>{</span><span></span>
+<span>  </span><span>return</span><span> </span><span>typeof</span><span> x </span><span>===</span><span> </span><span>'string'</span><span> </span><span>&amp;&amp;</span><span> x</span><span>.</span><span>startsWith</span><span>(</span><span>"?"</span><span>)</span><span>;</span><span></span>
+<span></span><span>}</span>
+</code></pre><h2 id="matchvariable">matchVariable</h2>
+<p>Now, if we <em>are</em> looking at a variable, we’d want to handle it especially:</p>
+<pre data-reactroot=""><code><span>function</span><span> </span><span>matchVariable</span><span>(</span><span>variable</span><span>,</span><span> triplePart</span><span>,</span><span> context</span><span>)</span><span> </span><span>{</span><span></span>
+<span>  </span><span>if</span><span> </span><span>(</span><span>context</span><span>.</span><span>hasOwnProperty</span><span>(</span><span>variable</span><span>)</span><span>)</span><span> </span><span>{</span><span></span>
+<span>    </span><span>const</span><span> bound </span><span>=</span><span> context</span><span>[</span><span>variable</span><span>]</span><span>;</span><span></span>
+<span>    </span><span>return</span><span> </span><span>matchPart</span><span>(</span><span>bound</span><span>,</span><span> triplePart</span><span>,</span><span> context</span><span>)</span><span>;</span><span></span>
+<span>  </span><span>}</span><span></span>
+<span>  </span><span>return</span><span> </span><span>{</span><span> </span><span>...</span><span>context</span><span>,</span><span> </span><span>[</span><span>variable</span><span>]</span><span>:</span><span> triplePart </span><span>}</span><span>;</span><span></span>
+<span></span><span>}</span>
+</code></pre><p>We would check if we <em>already</em> have a binding for this variable. For example, when comparing <code>?movieId</code>, we’d already have the binding: “<code>200</code>”. In this case, we just compare the bound value with what’s in our triple.</p>
+<pre data-reactroot=""><code><span></span>
+<span></span><span>if</span><span> </span><span>(</span><span>context</span><span>.</span><span>hasOwnProperty</span><span>(</span><span>variable</span><span>)</span><span>)</span><span> </span><span>{</span><span></span>
+<span>  </span><span>const</span><span> bound </span><span>=</span><span> context</span><span>[</span><span>variable</span><span>]</span><span>;</span><span></span>
+<span>  </span><span>return</span><span> </span><span>matchPart</span><span>(</span><span>bound</span><span>,</span><span> triplePart</span><span>,</span><span> context</span><span>)</span><span>;</span><span></span>
+<span></span><span>}</span><span></span>
+<span></span>
+</code></pre><p>When we compare <code>?directorId</code> though, we’d see that this variable wasn’t bound. In this case, we’d want to <em>expand</em> our context. We’d attach <code>?directorId</code> to the corresponding part in our triple (<code>100</code>).</p>
+<pre data-reactroot=""><code><span>return</span><span> </span><span>{</span><span> </span><span>...</span><span>context</span><span>,</span><span> </span><span>[</span><span>variable</span><span>]</span><span>:</span><span> triplePart </span><span>}</span><span>;</span>
+</code></pre><p>Finally, if we weren’t looking at a variable, we would have skipped this and just checked for equality. If the pattern part and the triple part match, we keep the context; otherwise we return null:</p>
+<pre data-reactroot=""><code><span></span>
+<span></span><span>return</span><span> patternPart </span><span>===</span><span> triplePart </span><span>?</span><span> context </span><span>:</span><span> </span><span>null</span><span>;</span><span></span>
+<span></span>
+</code></pre><p>And with that, <code>matchPattern</code> works as we like!</p>
+
+<h2 id="goal-1">Goal</h2>
+<p>Now for our second goal. We can already match one pattern with one triple. Let’s now match <em>one</em> pattern with <em>multiple</em> triples. Here’s the idea:</p>
+<p><img src="https://paper-attachments.dropbox.com/s_FD7FF9539594E6B532630EAEC892A2984C0B1FD8174F6609827754AA4559A821_1650458051668_image.png" alt=""></p>
+<p>We’ll have <em>one</em> pattern and a database of triples. We’ll want to return the contexts for all the successful matches. Here’s the test we can play with:</p>
+<pre data-reactroot=""><code><span>expect</span><span>(</span><span></span>
+<span>  </span><span>querySingle</span><span>(</span><span>[</span><span>"?movieId"</span><span>,</span><span> </span><span>"movie/year"</span><span>,</span><span> </span><span>1987</span><span>]</span><span>,</span><span> exampleTriples</span><span>,</span><span> </span><span>{</span><span>}</span><span>)</span><span></span>
+<span></span><span>)</span><span>.</span><span>toEqual</span><span>(</span><span>[</span><span>{</span><span> </span><span>"?movieId"</span><span>:</span><span> </span><span>202</span><span> </span><span>}</span><span>,</span><span> </span><span>{</span><span> </span><span>"?movieId"</span><span>:</span><span> </span><span>203</span><span> </span><span>}</span><span>,</span><span> </span><span>{</span><span> </span><span>"?movieId"</span><span>:</span><span> </span><span>204</span><span> </span><span>}</span><span>]</span><span>)</span><span>;</span>
+</code></pre><h2 id="code-1">Code</h2>
+<p>Well, much of the work comes down to <code>matchPattern</code>. Here’s all <code>querySingle</code> needs to do:</p>
+<pre data-reactroot=""><code><span>function</span><span> </span><span>querySingle</span><span>(</span><span>pattern</span><span>,</span><span> db</span><span>,</span><span> context</span><span>)</span><span> </span><span>{</span><span></span>
+<span>  </span><span>return</span><span> db</span>
+<span>    </span><span>.</span><span>map</span><span>(</span><span>(</span><span>triple</span><span>)</span><span> </span><span>=&gt;</span><span> </span><span>matchPattern</span><span>(</span><span>pattern</span><span>,</span><span> triple</span><span>,</span><span> context</span><span>)</span><span>)</span><span></span>
+<span>    </span><span>.</span><span>filter</span><span>(</span><span>(</span><span>x</span><span>)</span><span> </span><span>=&gt;</span><span> x</span><span>)</span><span>;</span><span></span>
+<span></span><span>}</span>
+</code></pre><p>We go over each triple and run <code>matchPattern</code>. This would return either a <code>context</code> (it’s a match!), or <code>null</code> (it’s a failure). We <code>filter</code> to remove the failures, and querySingle works like a charm!</p>
+
+<h2 id="goal-2">Goal</h2>
+<p>Closer and closer. Now to support joins. We need to handle <em>multiple</em> patterns:</p>
+<p><img src="https://paper-attachments.dropbox.com/s_FD7FF9539594E6B532630EAEC892A2984C0B1FD8174F6609827754AA4559A821_1650462526590_image.png" alt=""></p>
+<p>So we go pattern by pattern, and find successful triples. For each successful triple, we apply the next pattern. At the end, we’ll have produced progressively larger contexts.</p>
+<p>Here’s the test we can play with:</p>
+<pre data-reactroot=""><code><span>expect</span><span>(</span><span></span>
+<span>  </span><span>queryWhere</span><span>(</span><span></span>
+<span>    </span><span>[</span><span></span>
+<span>      </span><span>[</span><span>"?movieId"</span><span>,</span><span> </span><span>"movie/title"</span><span>,</span><span> </span><span>"The Terminator"</span><span>]</span><span>,</span><span></span>
+<span>      </span><span>[</span><span>"?movieId"</span><span>,</span><span> </span><span>"movie/director"</span><span>,</span><span> </span><span>"?directorId"</span><span>]</span><span>,</span><span></span>
+<span>      </span><span>[</span><span>"?directorId"</span><span>,</span><span> </span><span>"person/name"</span><span>,</span><span> </span><span>"?directorName"</span><span>]</span><span>,</span><span></span>
+<span>    </span><span>]</span><span>,</span><span></span>
+<span>    exampleTriples</span><span>,</span><span></span>
+<span>    </span><span>{</span><span>}</span><span></span>
+<span>  </span><span>)</span><span></span>
+<span></span><span>)</span><span>.</span><span>toEqual</span><span>(</span><span>[</span><span></span>
+<span>  </span><span>{</span><span> </span><span>"?movieId"</span><span>:</span><span> </span><span>200</span><span>,</span><span> </span><span>"?directorId"</span><span>:</span><span> </span><span>100</span><span>,</span><span> </span><span>"?directorName"</span><span>:</span><span> </span><span>"James Cameron"</span><span> </span><span>}</span><span>,</span><span></span>
+<span></span><span>]</span><span>)</span><span>;</span>
+</code></pre><h2 id="code-2">Code</h2>
+<p>This too, is not so difficult. Here’s queryWhere:</p>
+<pre data-reactroot=""><code><span>function</span><span> </span><span>queryWhere</span><span>(</span><span>patterns</span><span>,</span><span> db</span><span>)</span><span> </span><span>{</span><span></span>
+<span>  </span><span>return</span><span> patterns</span><span>.</span><span>reduce</span><span>(</span><span></span>
+<span>    </span><span>(</span><span>contexts</span><span>,</span><span> pattern</span><span>)</span><span> </span><span>=&gt;</span><span> </span><span>{</span><span></span>
+<span>      </span><span>return</span><span> contexts</span><span>.</span><span>flatMap</span><span>(</span><span>(</span><span>context</span><span>)</span><span> </span><span>=&gt;</span><span> </span><span>querySingle</span><span>(</span><span>pattern</span><span>,</span><span> db</span><span>,</span><span> context</span><span>)</span><span>)</span><span>;</span><span></span>
+<span>    </span><span>}</span><span>,</span><span></span>
+<span>    </span><span>[</span><span>{</span><span>}</span><span>]</span><span></span>
+<span>  </span><span>)</span><span>;</span><span></span>
+<span></span><span>}</span>
+</code></pre><p>We start off with one empty context. We then go pattern by pattern; for each pattern, we find all the successful contexts. We then take those contexts, and use them for the next pattern. By the end, we’ll have all the expanded contexts, and <code>queryWhere</code> works like a charm too!</p>
+
+<h2 id="goal-3">Goal</h2>
+<p>And now we’ve just about built ourselves the whole query engine! Next let’s handle <code>where</code> and <code>find</code>.</p>
+<p>This could be the test we can play with:</p>
+<pre data-reactroot=""><code><span>expect</span><span>(</span><span></span>
+<span>  </span><span>query</span><span>(</span><span></span>
+<span>    </span><span>{</span><span></span>
+<span>      </span><span>find</span><span>:</span><span> </span><span>[</span><span>"?directorName"</span><span>]</span><span>,</span><span></span>
+<span>      </span><span>where</span><span>:</span><span> </span><span>[</span><span></span>
+<span>        </span><span>[</span><span>"?movieId"</span><span>,</span><span> </span><span>"movie/title"</span><span>,</span><span> </span><span>"The Terminator"</span><span>]</span><span>,</span><span></span>
+<span>        </span><span>[</span><span>"?movieId"</span><span>,</span><span> </span><span>"movie/director"</span><span>,</span><span> </span><span>"?directorId"</span><span>]</span><span>,</span><span></span>
+<span>        </span><span>[</span><span>"?directorId"</span><span>,</span><span> </span><span>"person/name"</span><span>,</span><span> </span><span>"?directorName"</span><span>]</span><span>,</span><span></span>
+<span>      </span><span>]</span><span>,</span><span></span>
+<span>    </span><span>}</span><span>,</span><span></span>
+<span>    exampleTriples</span>
+<span>  </span><span>)</span><span></span>
+<span></span><span>)</span><span>.</span><span>toEqual</span><span>(</span><span>[</span><span>[</span><span>"James Cameron"</span><span>]</span><span>]</span><span>)</span><span>;</span>
+</code></pre><h2 id="code-3">Code</h2>
+<p>Here’s <code>query</code>:</p>
+<pre data-reactroot=""><code><span>function</span><span> </span><span>query</span><span>(</span><span>{</span><span> find</span><span>,</span><span> where </span><span>}</span><span>,</span><span> db</span><span>)</span><span> </span><span>{</span><span></span>
+<span>  </span><span>const</span><span> contexts </span><span>=</span><span> </span><span>queryWhere</span><span>(</span><span>where</span><span>,</span><span> db</span><span>)</span><span>;</span><span></span>
+<span>  </span><span>return</span><span> contexts</span><span>.</span><span>map</span><span>(</span><span>(</span><span>context</span><span>)</span><span> </span><span>=&gt;</span><span> </span><span>actualize</span><span>(</span><span>context</span><span>,</span><span> find</span><span>)</span><span>)</span><span>;</span><span></span>
+<span></span><span>}</span>
+</code></pre><p>Our <code>queryWhere</code> returns all the successful contexts. We can then map those, and <code>actualize</code> our <code>find</code>:</p>
+<pre data-reactroot=""><code><span>function</span><span> </span><span>actualize</span><span>(</span><span>context</span><span>,</span><span> find</span><span>)</span><span> </span><span>{</span><span></span>
+<span>  </span><span>return</span><span> find</span><span>.</span><span>map</span><span>(</span><span>(</span><span>findPart</span><span>)</span><span> </span><span>=&gt;</span><span> </span><span>{</span><span></span>
+<span>    </span><span>return</span><span> </span><span>isVariable</span><span>(</span><span>findPart</span><span>)</span><span> </span><span>?</span><span> context</span><span>[</span><span>findPart</span><span>]</span><span> </span><span>:</span><span> findPart</span><span>;</span><span></span>
+<span>  </span><span>}</span><span>)</span><span>;</span><span></span>
+<span></span><span>}</span>
+</code></pre><p>All <code>actualize</code> does is handle variables; if we see a variable in find, we just replace it with its bound value. <sup id="marked-fnref-2"><a href="#marked-fn-2">[2]</a></sup></p>
+
+<p>And voila! We have a query engine. Let’s see what we can do.</p>
+<p><strong>When was Alien released?</strong></p>
+<pre data-reactroot=""><code><span>query</span><span>(</span><span></span>
+<span>  </span><span>{</span><span></span>
+<span>    </span><span>find</span><span>:</span><span> </span><span>[</span><span>"?year"</span><span>]</span><span>,</span><span></span>
+<span>    </span><span>where</span><span>:</span><span> </span><span>[</span><span></span>
+<span>      </span><span>[</span><span>"?id"</span><span>,</span><span> </span><span>"movie/title"</span><span>,</span><span> </span><span>"Alien"</span><span>]</span><span>,</span><span></span>
+<span>      </span><span>[</span><span>"?id"</span><span>,</span><span> </span><span>"movie/year"</span><span>,</span><span> </span><span>"?year"</span><span>]</span><span>,</span><span></span>
+<span>    </span><span>]</span><span>,</span><span></span>
+<span>  </span><span>}</span><span>,</span><span></span>
+<span>  exampleTriples</span>
+<span></span><span>)</span>
+</code></pre><pre data-reactroot=""><code><span>[</span><span>[</span><span>1979</span><span>]</span><span>]</span>
+</code></pre><p><strong>What do I know about the entity with the id <code>200</code> ?</strong></p>
+<pre data-reactroot=""><code><span>query</span><span>(</span><span></span>
+<span>  </span><span>{</span><span></span>
+<span>    </span><span>find</span><span>:</span><span> </span><span>[</span><span>"?attr"</span><span>,</span><span> </span><span>"?value"</span><span>]</span><span>,</span><span></span>
+<span>    </span><span>where</span><span>:</span><span> </span><span>[</span><span>[</span><span>200</span><span>,</span><span> </span><span>"?attr"</span><span>,</span><span> </span><span>"?value"</span><span>]</span><span>]</span><span>,</span><span></span>
+<span>  </span><span>}</span><span>,</span><span></span>
+<span>  exampleTriples</span>
+<span></span><span>)</span>
+</code></pre><pre data-reactroot=""><code><span>[</span><span></span>
+<span>  </span><span>[</span><span>"movie/title"</span><span>,</span><span> </span><span>"The Terminator"</span><span>]</span><span>,</span><span></span>
+<span>  </span><span>[</span><span>"movie/year"</span><span>,</span><span> </span><span>1984</span><span>]</span><span>,</span><span></span>
+<span>  </span><span>[</span><span>"movie/director"</span><span>,</span><span> </span><span>100</span><span>]</span><span>,</span><span></span>
+<span>  </span><span>[</span><span>"movie/cast"</span><span>,</span><span> </span><span>101</span><span>]</span><span>,</span><span></span>
+<span>  </span><span>[</span><span>"movie/cast"</span><span>,</span><span> </span><span>102</span><span>]</span><span>,</span><span></span>
+<span>  </span><span>[</span><span>"movie/cast"</span><span>,</span><span> </span><span>103</span><span>]</span><span>,</span><span></span>
+<span>  </span><span>[</span><span>"movie/sequel"</span><span>,</span><span> </span><span>207</span><span>]</span><span>,</span><span></span>
+<span></span><span>]</span>
+</code></pre><p>And, last by not least…</p>
+<p><strong>Which directors shot Arnold for which movies?</strong></p>
+<pre data-reactroot=""><code><span>query</span><span>(</span><span></span>
+<span>  </span><span>{</span><span></span>
+<span>    </span><span>find</span><span>:</span><span> </span><span>[</span><span>"?directorName"</span><span>,</span><span> </span><span>"?movieTitle"</span><span>]</span><span>,</span><span></span>
+<span>    </span><span>where</span><span>:</span><span> </span><span>[</span><span></span>
+<span>      </span><span>[</span><span>"?arnoldId"</span><span>,</span><span> </span><span>"person/name"</span><span>,</span><span> </span><span>"Arnold Schwarzenegger"</span><span>]</span><span>,</span><span></span>
+<span>      </span><span>[</span><span>"?movieId"</span><span>,</span><span> </span><span>"movie/cast"</span><span>,</span><span> </span><span>"?arnoldId"</span><span>]</span><span>,</span><span></span>
+<span>      </span><span>[</span><span>"?movieId"</span><span>,</span><span> </span><span>"movie/title"</span><span>,</span><span> </span><span>"?movieTitle"</span><span>]</span><span>,</span><span></span>
+<span>      </span><span>[</span><span>"?movieId"</span><span>,</span><span> </span><span>"movie/director"</span><span>,</span><span> </span><span>"?directorId"</span><span>]</span><span>,</span><span></span>
+<span>      </span><span>[</span><span>"?directorId"</span><span>,</span><span> </span><span>"person/name"</span><span>,</span><span> </span><span>"?directorName"</span><span>]</span><span>,</span><span></span>
+<span>    </span><span>]</span><span>,</span><span></span>
+<span>  </span><span>}</span><span>,</span><span></span>
+<span>  exampleTriples</span>
+<span></span><span>)</span>
+</code></pre><p>🤯</p>
+<pre data-reactroot=""><code><span>[</span><span></span>
+<span>  </span><span>[</span><span>"James Cameron"</span><span>,</span><span> </span><span>"The Terminator"</span><span>]</span><span>,</span><span></span>
+<span>  </span><span>[</span><span>"John McTiernan"</span><span>,</span><span> </span><span>"Predator"</span><span>]</span><span>,</span><span></span>
+<span>  </span><span>[</span><span>"Mark L. Lester"</span><span>,</span><span> </span><span>"Commando"</span><span>]</span><span>,</span><span></span>
+<span>  </span><span>[</span><span>"James Cameron"</span><span>,</span><span> </span><span>"Terminator 2: Judgment Day"</span><span>]</span><span>,</span><span></span>
+<span>  </span><span>[</span><span>"Jonathan Mostow"</span><span>,</span><span> </span><span>"Terminator 3: Rise of the Machines"</span><span>]</span><span>,</span><span></span>
+<span></span><span>]</span>
+</code></pre><p>Now this is cool!</p>
+
+<h2 id="problem">Problem</h2>
+<p>Okay, but you may have already been thinking, “Our query engine will get slow”.</p>
+<p>Let’s remember <code>querySingle</code>:</p>
+<pre data-reactroot=""><code><span>function</span><span> </span><span>querySingle</span><span>(</span><span>pattern</span><span>,</span><span> db</span><span>,</span><span> context</span><span>)</span><span> </span><span>{</span><span></span>
+<span>  </span><span>return</span><span> db</span>
+<span>    </span><span>.</span><span>map</span><span>(</span><span>(</span><span>triple</span><span>)</span><span> </span><span>=&gt;</span><span> </span><span>matchPattern</span><span>(</span><span>pattern</span><span>,</span><span> triple</span><span>,</span><span> context</span><span>)</span><span>)</span><span></span>
+<span>    </span><span>.</span><span>filter</span><span>(</span><span>(</span><span>x</span><span>)</span><span> </span><span>=&gt;</span><span> x</span><span>)</span><span>;</span><span></span>
+<span></span><span>}</span>
+</code></pre><p>This is fine and dandy, but consider this query:</p>
+<pre data-reactroot=""><code><span>querySingle</span><span>(</span><span>[</span><span>200</span><span>,</span><span> </span><span>"movie/title"</span><span>,</span><span> </span><span>?</span><span>movieTitle</span><span>]</span><span>,</span><span> db</span><span>,</span><span> </span><span>{</span><span>}</span><span>)</span>
+</code></pre><p>We want to find the movie title for the entity with the id <code>200</code>. SQL would have used an index to quickly nab this for us.</p>
+<p>But what about our query engine? It’ll have to search every single triple in our database!</p>
+<h2 id="goal-4">Goal</h2>
+<p>Let’s solve that. We shouldn’t need to search <em>every</em> triple for a query like this; it’s time for indexes.</p>
+<p>Here’s what we can do; Let’s create <code>entity</code>, <code>attribute</code>, and <code>value</code> indexes. Something like:</p>
+<pre data-reactroot=""><code><span>{</span><span></span>
+<span>  </span><span>entityIndex</span><span>:</span><span> </span><span>{</span><span></span>
+<span>    </span><span>200</span><span>:</span><span> </span><span>[</span><span></span>
+<span>      </span><span>[</span><span>200</span><span>,</span><span> </span><span>"movie/title"</span><span>,</span><span> </span><span>"The Terminator"</span><span>]</span><span>,</span><span> </span><span>[</span><span>200</span><span>,</span><span> </span><span>"movie/year"</span><span>,</span><span> </span><span>1984</span><span>]</span><span>,</span><span></span>
+<span>      </span><span></span>
+<span>    </span><span>]</span><span>,</span><span></span>
+<span>    </span><span></span>
+<span>  </span><span>}</span><span>,</span><span></span>
+<span>  </span><span>attrIndex</span><span>:</span><span> </span><span>{</span><span></span>
+<span>    </span><span>"movie/title"</span><span>:</span><span> </span><span>[</span><span></span>
+<span>      </span><span>[</span><span>200</span><span>,</span><span> </span><span>"movie/title"</span><span>,</span><span> </span><span>"The Terminator"</span><span>]</span><span>,</span><span></span>
+<span>      </span><span>[</span><span>202</span><span>,</span><span> </span><span>"movie/title"</span><span>,</span><span> </span><span>"Predator"</span><span>]</span><span>,</span><span></span>
+<span>      </span><span></span>
+<span>    </span><span>]</span><span>,</span><span></span>
+<span>    </span><span></span>
+<span>  </span><span>}</span><span>,</span><span></span>
+<span></span><span>}</span>
+</code></pre><p>Now, if we had a pattern like this:</p>
+<pre data-reactroot=""><code><span>[</span><span>200</span><span>,</span><span> </span><span>"movie/title"</span><span>,</span><span> </span><span>?</span><span>movieTitle</span><span>]</span>
+</code></pre><p>We could be smart about how to get all the relevant triples: since <code>200</code> isn’t a variable, we could just use the <code>entityIndex</code>. We’d grab <code>entityIndex[200]</code> , and voila we’d have reduced our search to just 7 triples!</p>
+<p>We can do more, but with this we’d already have a big win.</p>
+<h2 id="createdb">createDB</h2>
+<p>Okay, let’s turn this into reality. We can start with a proper <code>db</code> object. We were just using <code>exampleTriples</code> before; now we’ll want to keep track of indexes too. Here’s what we can do:</p>
+<pre data-reactroot=""><code><span>function</span><span> </span><span>createDB</span><span>(</span><span>triples</span><span>)</span><span> </span><span>{</span><span></span>
+<span>  </span><span>return</span><span> </span><span>{</span><span></span>
+<span>    triples</span><span>,</span><span></span>
+<span>    </span><span>entityIndex</span><span>:</span><span> </span><span>indexBy</span><span>(</span><span>triples</span><span>,</span><span> </span><span>0</span><span>)</span><span>,</span><span></span>
+<span>    </span><span>attrIndex</span><span>:</span><span> </span><span>indexBy</span><span>(</span><span>triples</span><span>,</span><span> </span><span>1</span><span>)</span><span>,</span><span></span>
+<span>    </span><span>valueIndex</span><span>:</span><span> </span><span>indexBy</span><span>(</span><span>triples</span><span>,</span><span> </span><span>2</span><span>)</span><span>,</span><span></span>
+<span>  </span><span>}</span><span></span>
+<span></span><span>}</span>
+</code></pre><p>We’ll take our triples, and start to index them.</p>
+<h2 id="indexby">indexBy</h2>
+<p>And <code>indexBy</code> will handle that. It can just take the triples and create a mapping:</p>
+<pre data-reactroot=""><code><span>function</span><span> </span><span>indexBy</span><span>(</span><span>triples</span><span>,</span><span> idx</span><span>)</span><span> </span><span>{</span><span></span>
+<span>  </span><span>return</span><span> triples</span><span>.</span><span>reduce</span><span>(</span><span>(</span><span>index</span><span>,</span><span> triple</span><span>)</span><span> </span><span>=&gt;</span><span> </span><span>{</span><span></span>
+<span>    </span><span>const</span><span> k </span><span>=</span><span> triple</span><span>[</span><span>idx</span><span>]</span><span>;</span><span></span>
+<span>    index</span><span>[</span><span>k</span><span>]</span><span> </span><span>=</span><span> index</span><span>[</span><span>k</span><span>]</span><span> </span><span>||</span><span> </span><span>[</span><span>]</span><span>;</span><span></span>
+<span>    index</span><span>[</span><span>k</span><span>]</span><span>.</span><span>push</span><span>(</span><span>triple</span><span>)</span><span>;</span><span></span>
+<span>    </span><span>return</span><span> index</span><span>;</span><span></span>
+<span>  </span><span>}</span><span>,</span><span> </span><span>{</span><span>}</span><span>)</span><span>;</span><span></span>
+<span></span><span>}</span>
+</code></pre><p>Here <code>idx</code> represents the position in the triple; 0 would be <code>entity</code>, 1 would be <code>attribute</code>, 2 would be <code>value</code>.</p>
+<h2 id="querysingle-updated">querySingle, updated</h2>
+<p>Now that we have indexes, we can use them in querySingle:</p>
+<pre data-reactroot=""><code><span>export</span><span> </span><span>function</span><span> </span><span>querySingle</span><span>(</span><span>pattern</span><span>,</span><span> db</span><span>,</span><span> context</span><span>)</span><span> </span><span>{</span><span></span>
+<span>  </span><span>return</span><span> </span><span>relevantTriples</span><span>(</span><span>pattern</span><span>,</span><span> db</span><span>)</span><span></span>
+<span>    </span><span>.</span><span>map</span><span>(</span><span>(</span><span>triple</span><span>)</span><span> </span><span>=&gt;</span><span> </span><span>matchPattern</span><span>(</span><span>pattern</span><span>,</span><span> triple</span><span>,</span><span> context</span><span>)</span><span>)</span><span></span>
+<span>    </span><span>.</span><span>filter</span><span>(</span><span>(</span><span>x</span><span>)</span><span> </span><span>=&gt;</span><span> x</span><span>)</span><span>;</span><span></span>
+<span></span><span>}</span>
+</code></pre><p>The only change is <code>relevantTriples</code>. We’ll lean on it to figure out which index to use.</p>
+<h2 id="relevanttriples">relevantTriples</h2>
+<p>Here’s all relevantTriples does:</p>
+<pre data-reactroot=""><code><span>function</span><span> </span><span>relevantTriples</span><span>(</span><span>pattern</span><span>,</span><span> db</span><span>)</span><span> </span><span>{</span><span></span>
+<span>  </span><span>const</span><span> </span><span>[</span><span>id</span><span>,</span><span> attribute</span><span>,</span><span> value</span><span>]</span><span> </span><span>=</span><span> pattern</span><span>;</span><span></span>
+<span>  </span><span>if</span><span> </span><span>(</span><span>!</span><span>isVariable</span><span>(</span><span>id</span><span>)</span><span>)</span><span> </span><span>{</span><span></span>
+<span>    </span><span>return</span><span> db</span><span>.</span><span>entityIndex</span><span>[</span><span>id</span><span>]</span><span>;</span><span></span>
+<span>  </span><span>}</span><span></span>
+<span>  </span><span>if</span><span> </span><span>(</span><span>!</span><span>isVariable</span><span>(</span><span>attribute</span><span>)</span><span>)</span><span> </span><span>{</span><span></span>
+<span>    </span><span>return</span><span> db</span><span>.</span><span>attrIndex</span><span>[</span><span>attribute</span><span>]</span><span>;</span><span></span>
+<span>  </span><span>}</span><span></span>
+<span>  </span><span>if</span><span> </span><span>(</span><span>!</span><span>isVariable</span><span>(</span><span>value</span><span>)</span><span>)</span><span> </span><span>{</span><span></span>
+<span>    </span><span>return</span><span> db</span><span>.</span><span>valueIndex</span><span>[</span><span>value</span><span>]</span><span>;</span><span></span>
+<span>  </span><span>}</span><span></span>
+<span>  </span><span>return</span><span> db</span><span>.</span><span>triples</span><span>;</span><span></span>
+<span></span><span>}</span>
+</code></pre><p>We take the pattern. We check the id, attribute, and the value. If <em>any</em> of them aren’t variables, we can safely use the corresponding index.</p>
+<p>With that, we’ve made our query engine faster 🙂</p>
+
+<p>I hope you had a blast making this and got a sense of how query engines work to boot. If you’d like to see the source in one place, <a href="https://github.com/stopachka/datalogJS/blob/main/src/index.js">here it is</a>.</p>
+<h2 id="more">More</h2>
+<p>This is just the beginning. How about functions like “greater than” or “smaller than”? How about an “or” query? Let’s not forget aggregate functions. If you’re curious about this, I’d suggest three things:</p>
+<p>First go through the <a href="http://www.learndatalogtoday.org/">Learn Datalog</a> website; that’ll give you a full overview Datalog. Next, I’d suggest you go through the <a href="https://sarabander.github.io/sicp/html/4_002e4.xhtml#g_t4_002e4">SICP chapter on logic programming</a>. They go much further than this essay. Finally, you can look at Nikita Tonsky’s <a href="https://tonsky.me/blog/datascript-internals/">datascript internals</a>, for what a true production version could look like.</p>
+<h2 id="credits">Credits</h2>
+<p>Huge credit goes to SICP. When I completed their logic chapter, I realized that query languages didn't have to be so daunting. This essay is just a simplification of their chapter, translated into Javascript. The second credit needs to go to Nikita Tonsky’s essays. His <a href="https://tonsky.me/blog/unofficial-guide-to-datomic-internals/">Datomic</a> and <a href="https://tonsky.me/blog/datascript-internals/">Datascript</a> internals essays are a goldmine. Finally, I really enjoyed <a href="http://www.learndatalogtoday.org/">Learn Datalog</a>, and used their dataset for this essay.</p>
+<p><em>Thanks to Joe Averbukh, Irakli Safareli, Daniel Woelfel, Mark Shlick, Alex Reichert, Ian Sinnott, for reviewing drafts of this essay.</em></p>
+<p><a id="marked-fn-1" href="#marked-fnref-1">[1]</a>  ​​<a href="http://www.learndatalogtoday.org/">Learn Datalog Today</a> — very fun!</p>
+<p><a id="marked-fn-2" href="#marked-fnref-2">[2]</a>  You may be wondering, won’t <code>find</code> always have variables? Well, not always. You could include some constant, like <code>{find: ["movie/title", "?title"]}</code></p>
+</div></div>]]>
+            </description>
+            <link>https://www.instantdb.com/essays/datalogjs</link>
+            <guid isPermaLink="false">hacker-news-small-sites-39080793</guid>
+            <pubDate>Sun, 21 Jan 2024 17:56:52 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[BusPirate V5 Now Shipping]]>
             </title>
             <description>
 <![CDATA[
-Score 66 | Comments 18 (<a href="https://news.ycombinator.com/item?id=39080525">thread link</a>) | @grymoire1
+Score 68 | Comments 19 (<a href="https://news.ycombinator.com/item?id=39080525">thread link</a>) | @grymoire1
 <br/>
 January 21, 2024 | https://buspirate.com/bus-pirate-5-rev-10-now-available/ | <a href="https://web.archive.org/web/*/https://buspirate.com/bus-pirate-5-rev-10-now-available/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section>
@@ -1066,7 +1866,7 @@ January 21, 2024 | https://buspirate.com/bus-pirate-5-rev-10-now-available/ | <a
             </title>
             <description>
 <![CDATA[
-Score 96 | Comments 70 (<a href="https://news.ycombinator.com/item?id=39076908">thread link</a>) | @nevodavid
+Score 96 | Comments 72 (<a href="https://news.ycombinator.com/item?id=39076908">thread link</a>) | @nevodavid
 <br/>
 January 21, 2024 | https://www.taipy.io/posts/augmenting-the-markdown-language-for-great-python-graphical-interfaces | <a href="https://web.archive.org/web/*/https://www.taipy.io/posts/augmenting-the-markdown-language-for-great-python-graphical-interfaces">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>In the past few years, several Python packages have proposed Python API to build web-based interfaces such as:</p><p>- <a href="https://dash.plotly.com/minimal-app">Plotly Dash</a></p><p><a href="https://dash.plotly.com/minimal-app">- </a><a href="https://docs.streamlit.io/library/api-reference">Streamlit</a></p><p>- And more recently <a href="https://links.taipy.io/WebtoGitHub">Taipy</a></p><p>However, one of the most underrated work has been with the creation by the <a href="https://links.taipy.io/WebtoGitHub">Taipy </a>R&amp;D team of an alternative API: an Augmented Markdown API for Python developers. Markdown is one of the most used markup languages: starting from a simple text document, Markdown allows the generation of HTML pages with high presentation quality, immediately deployable on a network. For those of you not familiar with the markdown language, have a look <a href="https://www.markdownguide.org/basic-syntax/">here</a></p><p>Based on the work of Dr. Neil Bruce [1], the <a href="https://links.taipy.io/WebtoGitHub">Taipy </a>team has extended the very simple syntax of Markdown by allowing the writer to add tags that would trigger the generation of a graphical interface element directly in their content.</p><p>‍</p><p>In his 2020 seminal article, “A Framework for Dynamic Data-Driven User Interfaces”[2], Mirovic proposes a model for controlling an application based on its underlying data model. However, a significant disadvantage of this approach is that it requires programmers to explicitly define the data sources they wish to use to construct their interface.</p><p>‍</p><p>The proposed solution involves directly connecting graphical components to application data. Programmers can simply use the name of the variable they wish to be reflected in the GUI during the development of their Markdown source. For instance, if a variable 'value' appears in the code, adding the tag &lt;{value}&gt; in the text itself will display it. To make the variable editable by the end user, it can be contained within an editable text area: &lt;{value}|text_input&gt;.</p><p>‍</p><p>In the graphical interface development stage, programmers don't need to worry about the layout of these elements relative to each other. The conversion from Markdown to HTML ensures that elements are appropriately placed within the surrounding text flow.</p><p>‍</p><p>This approach does not require Python developers/Data scientists to learn new tools. They can create a text page, adding formatting tags and interface elements.</p><p>‍</p><p>The next steps consisted of providing all types of graphical elements that users want in their application, ensuring each graphical component can graphically represent the connected data, synchronizing the GUI with the application managing the variables, enabling experienced GUI developers to refine the graphical representation of components, and adapting the generated GUIs to usability and accessibility needs.</p><p>‍</p><p>Web-Based User Interfaces: The choice was made to deploy interfaces through web browsers for portability and adaptation to various situations. This involved proposing a client-server architecture where the server hosts the main application (data and algorithms) and the client is a simple web browser connecting to the server using standard market protocols (HTTP, WebSocket).</p><p>‍</p><p>Data Transformation and User Interface Generation: The project involved transforming Python data types into Markdown-like representations based on client-side component types (text, buttons, selectors, charts, etc.). Other syntaxes like XUL or XAML could have been selected but the major drawback of these syntaxes is the need for detailed knowledge of graphical representation programming interfaces to create a functioning user interface.</p><p>‍</p><p>Here are the different issues that had to be implemented to transform data on the server side into a representation on the Web client:</p><p><strong>1- Data Transformation and Interface Representation</strong></p><p><strong>‍</strong>The project focused on automatically converting server-side data into a format suitable for web client representation. This involved considering various data types and corresponding interface elements, such as text in a button or a numeric value in a slider.</p><p><strong>2- Data Type to Representation</strong> <strong>Mapping</strong></p><p><strong>‍</strong>The initial work was with basic Python data types (Boolean, integer, float, string, lists, dictionaries, etc.) and transformed these into representations based on the type of component desired on the client side, like editable text, buttons, selectors, etc.</p><p><strong>3- User Interface Design Approach</strong></p><p>The goal was to enable users with minimal technical skills to describe how these elements would be organized on a Markdown page. This enhanced/augmented Markdown needed to integrate control elements within the markdown text, which would be transformed into active graphical components on the client side.</p><p><strong>4- Communication Protocol </strong></p><p>To establish a connection between the server (hosting the application) and the client (displaying the control elements), they opted for WebSocket (after having evaluated other protocols such as RPC, Apache Arrow Flight). This protocol is lightweight, efficient, and requires minimal configuration. It allows for the serialization of necessary data structures, supported on both the server side (Python) and the client side (JavaScript).</p><p><strong>5- User Actions and Data Transmission: </strong></p><p>WebSocket converts user actions into messages, which are sent to the application for processing changes in application variables. Conversely, changes in application data are transmitted back to the client, impacting the graphical components.</p><p><strong>6- Specific Focus on complex data: </strong></p><p>A key focus was on transferring data from the server to the client, especially in complex cases like maps or graphs, without overwhelming network and processing capacities. Solutions were developed to manage large volumes of data in complex graphical objects, ensuring efficient data transfer and minimizing user wait times. The goal was to transmit only the displayable data, using intelligent sampling techniques to avoid network and process saturation.</p><p>Here’s the result with a sample code written using <a href="https://links.taipy.io/WebtoGitHub">Taipy </a>augmented markdown syntax:</p><div><pre><code>
@@ -1099,7 +1899,7 @@ Gui(page).run(use_reloader=True, port=5002)
             </title>
             <description>
 <![CDATA[
-Score 170 | Comments 94 (<a href="https://news.ycombinator.com/item?id=39075316">thread link</a>) | @pangey
+Score 172 | Comments 95 (<a href="https://news.ycombinator.com/item?id=39075316">thread link</a>) | @pangey
 <br/>
 January 20, 2024 | https://klimer.eu/2015/05/01/use-midnight-commander-like-a-pro/ | <a href="https://web.archive.org/web/*/https://klimer.eu/2015/05/01/use-midnight-commander-like-a-pro/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content-wrapper">
@@ -1293,7 +2093,7 @@ January 20, 2024 | https://www.news.com.au/finance/work/leaders/tech-boss-sanjay
             </title>
             <description>
 <![CDATA[
-Score 334 | Comments 324 (<a href="https://news.ycombinator.com/item?id=39074062">thread link</a>) | @methou
+Score 337 | Comments 325 (<a href="https://news.ycombinator.com/item?id=39074062">thread link</a>) | @methou
 <br/>
 January 20, 2024 | https://hitregbroke.com/anime/ | <a href="https://web.archive.org/web/*/https://hitregbroke.com/anime/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1440,7 +2240,7 @@ January 20, 2024 | https://digialps.com/meta-research-introduces-revolutionary-s
             </title>
             <description>
 <![CDATA[
-Score 149 | Comments 182 (<a href="https://news.ycombinator.com/item?id=39072319">thread link</a>) | @tosh
+Score 150 | Comments 182 (<a href="https://news.ycombinator.com/item?id=39072319">thread link</a>) | @tosh
 <br/>
 January 20, 2024 | https://wordsandbuttons.online/so_you_think_you_know_c.html | <a href="https://web.archive.org/web/*/https://wordsandbuttons.online/so_you_think_you_know_c.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1536,7 +2336,7 @@ To unscreen the right answers and to see your score, press the button below.
             </title>
             <description>
 <![CDATA[
-Score 201 | Comments 49 (<a href="https://news.ycombinator.com/item?id=39070871">thread link</a>) | @timschumi
+Score 201 | Comments 50 (<a href="https://news.ycombinator.com/item?id=39070871">thread link</a>) | @timschumi
 <br/>
 January 20, 2024 | https://blog.timschumi.net/2024/01/20/ah532-bios-investigation.html | <a href="https://web.archive.org/web/*/https://blog.timschumi.net/2024/01/20/ah532-bios-investigation.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div aria-label="Content">
@@ -1813,7 +2613,7 @@ two, so stay tuned. (Apparently Jekyll supports RSS?)</p>
             </title>
             <description>
 <![CDATA[
-Score 93 | Comments 139 (<a href="https://news.ycombinator.com/item?id=39067536">thread link</a>) | @valkrieco
+Score 93 | Comments 141 (<a href="https://news.ycombinator.com/item?id=39067536">thread link</a>) | @valkrieco
 <br/>
 January 20, 2024 | https://www.karlsnotes.com/lee-kuan-yew-on-malta/ | <a href="https://web.archive.org/web/*/https://www.karlsnotes.com/lee-kuan-yew-on-malta/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1830,7 +2630,7 @@ January 20, 2024 | https://www.karlsnotes.com/lee-kuan-yew-on-malta/ | <a href="
             </title>
             <description>
 <![CDATA[
-Score 218 | Comments 149 (<a href="https://news.ycombinator.com/item?id=39067496">thread link</a>) | @amadeuspagel
+Score 219 | Comments 149 (<a href="https://news.ycombinator.com/item?id=39067496">thread link</a>) | @amadeuspagel
 <br/>
 January 20, 2024 | https://coffeehouse.chat/hn | <a href="https://web.archive.org/web/*/https://coffeehouse.chat/hn">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
@@ -1845,7 +2645,7 @@ January 20, 2024 | https://coffeehouse.chat/hn | <a href="https://web.archive.or
             </title>
             <description>
 <![CDATA[
-Score 53 | Comments 48 (<a href="https://news.ycombinator.com/item?id=39066795">thread link</a>) | @kkoncevicius
+Score 58 | Comments 64 (<a href="https://news.ycombinator.com/item?id=39066795">thread link</a>) | @kkoncevicius
 <br/>
 January 20, 2024 | https://www.jdemeta.net/p/the-dawn-of-cultural-schizophrenia | <a href="https://web.archive.org/web/*/https://www.jdemeta.net/p/the-dawn-of-cultural-schizophrenia">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><article><div><div><div dir="auto"><p><span>Way back in 2006 John Michael Greer wrote a piece called </span><em><a href="https://thearchdruidreport-archive.200605.xyz/2006/05/knowing-only-one-story.html" rel="">Knowing Only One Story</a><span>. </span></em><span>The crux of which relies of this statement: </span></p><ul><li><p><em>Knowing many stories is wisdom.</em></p></li><li><p><em>Knowing no stories is ignorance.</em></p></li><li><p><em>Knowing only one story is death.</em></p></li></ul><p><span>Greer’s point was in relation to tradition, myth, and culture, in that one who knows a singular story end up filtering </span><em>everything </em><span>via a single lens, therein killing any possibility of exo-default growth. With one of the great pitfalls of knowing a single story being that upon meeting with a contradiction, one simply erases that facet of reality as opposed to being able to apprehend its complexity, or, in the words of Anthony Wilden, </span><em>“Reality is what trips you up when you don't pay attention to it."</em></p><p><span>Those that know </span><em>no </em><span>stories are ignorant, both generally, but also - in my opinion (and likely Greer’s) - to the single, contemporary default story they inhabit and that rules the day, i.e. The Myth of Progress. If you know no stories at all, you are simply at the whim of whateve scapegoat or cultural force is seizing the day and will follow it wherever it shall lead. </span></p><p><span>Those that know many stories are wise, and thus able to deal with the complexity of the universe and thus their immediate reality. Basically, knowing many stories allows one to enter into a relationship with the only constant of the universe, namely, </span><em>change. </em></p><p>This isn’t a criticism of Greer - and 2006 was vastly different in terms of information acceleration compared to now - but I think his hierarchy of complexity: Death &gt; Ignorance &gt; Wisdom (One Story &gt; No Stories &gt; Many Stories) stops short. For there is something beyond wisdom and it isn’t necessarily good. Let me extend Greer’s statement by a single line to clarify what I’m talking about:</p><ul><li><p><em>Knowing only one story is death. </em></p></li><li><p><em>Knowing no stories is ignorance. </em></p></li><li><p><em>Knowing many stories is wisdom. </em></p></li><li><p><em>Knowing too many stories is schizo.</em></p></li></ul><p>Before going on I want to clarify that there is difference between medical and cultural ‘schizophrenia’, because I will be utilizing the latter. Medical schizophrenia is serious medical condition that I don’t intend to make light of. As is stands, however, multiple philosophers and theorists (Deleuze, Guattari, Becker, etc.) have utilized ‘schizophrenia/schizophrenic’ as a signifier in relation to culture and communication. For my own case here I want to use Ernest Becker’s spectrum of depression-schizophrenia to open up this fourth ‘story point’. </p><p><em>The second major idea Becker pursued during this period was to reimagine two major mental “illnesses” of his time (depression and schizophrenia) within a nonmedical, relational, problems of living frame of reference. Here he emphasized the place of life-meaning as a cultural product, and its relationship to language. Specifically, “normal” human life is maintained by an ongoing sense of positive self-regard (self-esteem) grounded in the proper use of language within a specific cultural setting. As Becker pictured it, this balance can falter in either of two main directions. On the one hand, we can become so mired in the established meaning system of culture that we in effect lose the language/narrative/self-talk we need to see ourselves as free agents within that system. On the other hand, we can become so lost in language games themselves that the grounded connection of language to the cultural meaning system is lost, and we end up desperately spewing out word-salads in a frantic attempt to find that lost connection. The former problem of living Becker linked to states of depression, while the latter he linked to schizophrenia. </em><span>(</span><a href="https://ernestbecker.org/becker-and-mental-illness/" rel="">Link</a><span>)</span></p><p><span>On the one hand, then, we have ‘depression’ as an understanding of a relationality that is so locked into a singular frame of reference that any sense of sovereignty is usurped by the self-imposed dogma of the system itself, leading to both the former ignorance Greer writes of </span><em>and </em><span>a personal form of melancholic depression. On the other hand we have schizophrenia, a relationality so unkept than anything and everything is packed full of meaning, connections are drawn between everything, and existence is pure pattern and relation. But, if everything means something, nothing means anything. Meanings needs limits, yet can’t be dogmatically limited. Meaning, then, needs equilibrium. </span></p><p>As it is, in this glorious age of the internet, us moderns have access to every story known to man (practically speaking). At the click of a button we can gain access to literally millions upon millions of books, texts, tales, stories, fables, religions, systems, incantations, philosophies, and theories, that, in decades gone by, would have taken the majority of people lifetimes to find. There has been little in the way of gradual transition to this state of affairs. Man has moved quite swiftly from an existence of geographically/nationally contextual knowledge to complete, unbridled cultural schizophrenia in no time at all. If anything, we can perhaps state that the age of newspapers and the paperback boom was a middle stage, but that was shortlived in the grand scheme of things. </p><p><span>But there is an interesting side-note to be made regarding this form of cultural schizophrenia that certainly pertains to our current malaise. Modern, cultural schizophrenia is </span><em>as wide as the ocean and as deep as a puddle. </em><span>The problem being that if one has access to millions upon millions of stories, one also doesn’t have the time to research or meditate on those stories in any deep manner. Everyone ends up with a veil-thin sporadic knowledge of many stories and their relations, without ever attending to their depths. Leading masses of conversations to become little more than titbits of information and data flung in solely as signifiers of knowledge and meaning, yet never actually adhereing to any form of practice or purpose.</span></p><p><span>Ever since Nietzsche was on the scene, it has been said time and time again by multiple philosophers that we are living within an existential crises. That our pools of meaning are running out. That there is no meaning in the universe. This is an easy-out for the fact meaning is quite a difficult thing to hold onto, but it isn’t necessarily difficult to procure. There’s meaning </span><em>everywhere </em><span>and in </span><em>everything, </em><span>it’s just a matter of finding the meaning that’s…meaningful. This search is itself a problem made all the more difficult by the ongoing cultural schizophrenia crisis. Everywhere I look there’s some new meaningful system being built or spoken about, some new philosophy or insitution etc. We are absolutely swamped in meaning, we are sick to death of meaning. There’s too much bloody meaning.</span></p><p>The problem itself is due to another factor outlined by Becker, that of ‘free agency’. Within the depressive side of the spectrum the matter of freedom is inherently negated by the depression itself. Dogmatism is inherently self-limiting. It is a prison that begets its own walls. Schizophrenia, at the other end of the spectrum, is completely the opposite to this. Schizophrenia (cultural) is inherently self-emancipating (where meaning is concerned). It is a party that refuses to end. </p><p><span>It is of no surprise, then, that within the modern, consumerist age that prides itself on freedom-of-choice that cultural schizophrenia only ever accelerates. We find ourselves not only completely mired in ever-changing meaning, but equally such a state gives us an anxiety in relation to choice. Afforded a million-and-one meanings there is no hope for actual fulfilment, but only anxiety and stress as to whether or not one has picked the ‘correct’ meaning. Thus, when the selected ‘meaning’ doesn’t appear to give us what we assumed we desired we can just as quickly move onto the next and the next and the next, all the while not realizing that our </span><em>true </em><span>system of meaning is the one that is allowing us to make these nomadic leaps in the first place.</span></p><p><span>The question, then, is to what extent limitation is healthy? To what extent are we to limit our personal contexts and understandings as to actually form something of substance? This isn’t a question I can answer except for myself because each person’s path is their own. Like most things today, one need only step back and ask the question, ‘What is it I </span><em>actually </em><span>want?’ to begin unravelling all the nonsense meaning, and head back towards a more harmonious balance of stories and meaning. </span></p></div></div></div></article></div></div></div>]]>
@@ -1860,7 +2660,7 @@ January 20, 2024 | https://www.jdemeta.net/p/the-dawn-of-cultural-schizophrenia 
             </title>
             <description>
 <![CDATA[
-Score 159 | Comments 20 (<a href="https://news.ycombinator.com/item?id=39066165">thread link</a>) | @agnosis
+Score 160 | Comments 20 (<a href="https://news.ycombinator.com/item?id=39066165">thread link</a>) | @agnosis
 <br/>
 January 20, 2024 | https://technistuff.com/posts/simulating-a-minimal-cell/ | <a href="https://web.archive.org/web/*/https://technistuff.com/posts/simulating-a-minimal-cell/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2056,7 +2856,7 @@ At the moment scientists are still missing a lot of data and software capabiliti
             </title>
             <description>
 <![CDATA[
-Score 164 | Comments 73 (<a href="https://news.ycombinator.com/item?id=39065320">thread link</a>) | @r4um
+Score 166 | Comments 74 (<a href="https://news.ycombinator.com/item?id=39065320">thread link</a>) | @r4um
 <br/>
 January 19, 2024 | https://cghlewis.com/blog/joins/ | <a href="https://web.archive.org/web/*/https://cghlewis.com/blog/joins/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2633,7 +3433,7 @@ January 19, 2024 | https://app.vnote.fun/en_us/ | <a href="https://web.archive.o
             </title>
             <description>
 <![CDATA[
-Score 183 | Comments 46 (<a href="https://news.ycombinator.com/item?id=39063572">thread link</a>) | @mikerg87
+Score 185 | Comments 46 (<a href="https://news.ycombinator.com/item?id=39063572">thread link</a>) | @mikerg87
 <br/>
 January 19, 2024 | https://www.verandavikings.com/blog/building-lego-iglos | <a href="https://web.archive.org/web/*/https://www.verandavikings.com/blog/building-lego-iglos">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-block-type="2" data-border-radii="{&quot;topLeft&quot;:{&quot;unit&quot;:&quot;px&quot;,&quot;value&quot;:0.0},&quot;topRight&quot;:{&quot;unit&quot;:&quot;px&quot;,&quot;value&quot;:0.0},&quot;bottomLeft&quot;:{&quot;unit&quot;:&quot;px&quot;,&quot;value&quot;:0.0},&quot;bottomRight&quot;:{&quot;unit&quot;:&quot;px&quot;,&quot;value&quot;:0.0}}" id="block-c3229d8cc76210de6614"><div>
@@ -2734,7 +3534,7 @@ January 19, 2024 | https://www.verandavikings.com/blog/building-lego-iglos | <a 
             </title>
             <description>
 <![CDATA[
-Score 1827 | Comments 538 (<a href="https://news.ycombinator.com/item?id=39063242">thread link</a>) | @todsacerdoti
+Score 1849 | Comments 548 (<a href="https://news.ycombinator.com/item?id=39063242">thread link</a>) | @todsacerdoti
 <br/>
 January 19, 2024 | https://laplab.me/posts/whats-that-touchscreen-in-my-room/ | <a href="https://web.archive.org/web/*/https://laplab.me/posts/whats-that-touchscreen-in-my-room/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -2782,7 +3582,7 @@ January 19, 2024 | https://laplab.me/posts/whats-that-touchscreen-in-my-room/ | 
 <p>…Socket.IO! Wow, I honestly did not expect that. Client literally needs to receive 5 numbers from the server, Socket.IO seems to be a complete overkill for this usecase. The client code also looks very complicated for what it does. There are at least 6 RequireJS modules, all loading dynamically through different requests of course. There is Handlebars, Backbone.js, Underscore.js… I feel like I am in high school again. These are all technologies I was very interested when I just <a href="https://laplab.me/posts/how-did-i-become-database-engineer-at-23/">started web development</a>.</p>
 <p>But wait a second, Socket.IO would mean that an embedded device in my meters cupboard is running JavaScript? This must be weirdest Edge Computing Platform I have seen in my life. I want to deploy <em>something</em> there!</p>
 <p>Totally forgetting the idea with Raspberry Pico fetching the data from the server, I put on my hacker hat and started poking around. IoT devices have a terrible reputation from the security perspective, so I expected it to be an easy run for a couple of hours tops. Boy was I wrong.</p>
-<p>Direct SSH using <code>ssh <a href="https://laplab.me/cdn-cgi/l/email-protection" data-cfemail="a9dbc6c6dde9989e9b87989f8799879b9c9d">[email&nbsp;protected]</a></code> immediately fails with “Connection refused” error. That could mean a number of things, let’s see which ports are available:</p>
+<p>Direct SSH using <code>ssh <a href="https://laplab.me/cdn-cgi/l/email-protection" data-cfemail="21534e4e55611016130f10170f110f131415">[email&nbsp;protected]</a></code> immediately fails with “Connection refused” error. That could mean a number of things, let’s see which ports are available:</p>
 <div><pre tabindex="0"><code data-lang="bash"><span><span>$ sudo nmap -p- -sV -O 172.16.0.254
 </span></span><span><span>... truncated output ...
 </span></span><span><span>Nmap scan report <span>for</span> 172.16.0.254
@@ -2895,7 +3695,7 @@ January 19, 2024 | https://laplab.me/posts/whats-that-touchscreen-in-my-room/ | 
 <p>Pulse app reads the data from the GPIO pins and stores the results in CSV files. These CSV files are split by month, day and hour in the directories with the respective names, still in the <code>bin</code> folder. Such separation is no coincidence. Historical data view in the web UI of the energy manager supports displaying the data only by month, by day and by hour.</p>
 <p>Along with the Pulse app, there is the second part of the application. A Node.js app reads CSV files populated with energy usage data and displays them to the user in the web UI. It uses Node.js 0.10.26, Express.js 4.13.3 and Socket.io 1.3.6.</p>
 <p>Scrolling through the dependencies, I noticed an <code>mqtt</code> package. This was intriguing, because I did not see any message broker interaction until now. After reading the sources for a little while, this seemed to be an unfinished cloud integration that Netthings promised in their brochure. There are even some hardcoded IPs mentioned in the source, which are used to connect to a message broker. Unsurprisingly, none of them are up any more. I am not even sure how that would work, since the device does not have an internet access.</p>
-<p>All in all, this was a very fun investigation! I grew accustomed to calling it “my urban archeology project”. I now have access to one of the weirdest Edge Computing platforms imaginable. If you have any fun ideas on what to do with it, feel free to drop me a line at <a href="https://laplab.me/cdn-cgi/l/email-protection#254d4c654944554944470b4840"><span data-cfemail="d5bdbc95b9b4a5b9b4b7fbb8b0">[email&nbsp;protected]</span></a>!</p>
+<p>All in all, this was a very fun investigation! I grew accustomed to calling it “my urban archeology project”. I now have access to one of the weirdest Edge Computing platforms imaginable. If you have any fun ideas on what to do with it, feel free to drop me a line at <a href="https://laplab.me/cdn-cgi/l/email-protection#3b53527b575a4b575a5915565e"><span data-cfemail="2e46476e424f5e424f4c00434b">[email&nbsp;protected]</span></a>!</p>
 <p>P.S. As a final touch, I decided to leave a small note in the home directory. It’s kind of weird to realise that I am probably the only person who would actually read it. But maybe in some distant future another software engineer will live in this apartment and discover it. Time will tell :)</p>
 <p><img src="https://laplab.me/img/netthings/letter-to-the-void.png" alt="Note to the next tinkerer"></p>
 <p>P.P.S. HackerNews user <a href="https://news.ycombinator.com/item?id=39065780">M6WIQ</a> pointed out <a href="https://strugglers.net/~andy/blog/2018/12/24/the-internet-of-unprofitable-things/">another article</a> about consequences of engineering decisions by NetThings. It’s a great read!</p>
@@ -2914,7 +3714,7 @@ January 19, 2024 | https://laplab.me/posts/whats-that-touchscreen-in-my-room/ | 
             </title>
             <description>
 <![CDATA[
-Score 180 | Comments 155 (<a href="https://news.ycombinator.com/item?id=39061839">thread link</a>) | @lukastyrychtr
+Score 182 | Comments 155 (<a href="https://news.ycombinator.com/item?id=39061839">thread link</a>) | @lukastyrychtr
 <br/>
 January 19, 2024 | https://nullderef.com/blog/rust-async-sync/ | <a href="https://web.archive.org/web/*/https://nullderef.com/blog/rust-async-sync/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><h2 id="_introduction">Introduction</h2><div><p>Imagine you want to create a new library in Rust. All it does is wrap up a
@@ -3363,7 +4163,7 @@ January 19, 2024 | https://blog.chybby.com/posts/building-a-usb-snes-controller 
             </title>
             <description>
 <![CDATA[
-Score 557 | Comments 470 (<a href="https://news.ycombinator.com/item?id=39051655">thread link</a>) | @kfogel
+Score 558 | Comments 472 (<a href="https://news.ycombinator.com/item?id=39051655">thread link</a>) | @kfogel
 <br/>
 January 18, 2024 | https://social.clawhammer.net/blog/posts/2024-01-19-CultureChange/ | <a href="https://web.archive.org/web/*/https://social.clawhammer.net/blog/posts/2024-01-19-CultureChange/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
