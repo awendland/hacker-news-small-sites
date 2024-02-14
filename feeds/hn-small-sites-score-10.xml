@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Wed, 14 Feb 2024 12:23:31 GMT</lastBuildDate>
+        <lastBuildDate>Wed, 14 Feb 2024 16:22:44 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-10.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Wed, 14 Feb 2024 12:23:31 GMT</pubDate>
+        <pubDate>Wed, 14 Feb 2024 16:22:44 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,325 @@
         <ttl>240</ttl>
         <item>
             <title>
-<![CDATA[Popular XMPP App "Conversations" Removed from PlayStore by Google]]>
+<![CDATA[We sped up time series by 20-30x]]>
             </title>
             <description>
 <![CDATA[
-Score 38 | Comments 20 (<a href="https://news.ycombinator.com/item?id=39368233">thread link</a>) | @bertman
+Score 47 | Comments 7 (<a href="https://news.ycombinator.com/item?id=39369853">thread link</a>) | @Tycho87
+<br/>
+February 14, 2024 | https://www.rerun.io/blog/primary-query-caching | <a href="https://web.archive.org/web/*/https://www.rerun.io/blog/primary-query-caching">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="__next"><div><div><div><p>This is a follow up post to the post <a href="https://www.rerun.io/blog/fast-plots">Real-time kHz time series in a multimodal visualizer</a> that dives into how we managed to achieve such huge performance gains for time series (among other things), and why it was so hard in the first place.</p>
+<p><img src="https://www.rerun.io/blog/1M_series_before_v_after.png" alt="Before and after graph of time taken to draw a 1M point time series in Rerun"></p>
+<p><em>Comparison of time taken to draw a time series plot in Rerun with 1M points between version 0.12 and 0.13. The numbers come from profiling on a 2021 M1 MacBook Pro.</em></p>
+<h2 id="flexible-multimodal-data-is-hard-to-combine-with-fast-plots">Flexible multimodal data is hard to combine with fast plots<!-- --> <a href="#flexible-multimodal-data-is-hard-to-combine-with-fast-plots"></a></h2>
+<p>Ever since the first release of Rerun, plotting larger time series has been painfully slow.
+<a href="https://github.com/rerun-io/rerun/releases/tag/0.13.0">0.13</a> is the first release where we think they're actually usable.
+It’s worth taking a step back to explain why making plots fast in Rerun was hard, before getting into what we did about it.
+To do that, we need some more background on how Rerun, the in-memory database, works.</p>
+<h3 id="rerun-as-a-multimodal-time-series-database">Rerun as a multimodal time series database<!-- --> <a href="#rerun-as-a-multimodal-time-series-database"></a></h3>
+<p>One way of looking at Rerun is as an in-memory multimodal time series database with visualization on top.</p>
+<ul>
+<li>You can throw many kinds of data at it, from simple metrics to big multi dimensional tensors, point clouds, and text documents.</li>
+<li>Data is indexed along multiple user defined timelines, and can come in out of order.</li>
+<li>The Rerun data model is a temporal Entity Component System (ECS) that allows updating single components at a time.</li>
+</ul>
+<p>Let's look at a small example of updating a colored point cloud in parts and out of order:</p>
+<p><img src="https://www.rerun.io/blog/data-model-example.png" alt="Overview of Rerun's ECS updated out of order"></p>
+<p>For any given time point, the datastore needs to be able to collect the latest components of any entity, and join them against the primary component (3D positions in this case). Queries run every time Rerun renders a frame, which should be 60 times per second.</p>
+<p>Getting all this to be both correct and fast took considerable effort during the first year of Rerun. The combination of all these features is what makes Rerun so versatile and easy to use.</p>
+<p><iframe src="https://player.vimeo.com/video/910960113?autoplay=1&amp;loop=1&amp;autopause=0&amp;background=1&amp;muted=1&amp;ratio=1920:1080&amp;transparent=false&amp;dnt=1" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen=""></iframe></p>
+<h3 id="overhead-from-flexibility-make-simple-time-series-the-worst-case">Overhead from flexibility make simple time series the worst case<!-- --> <a href="#overhead-from-flexibility-make-simple-time-series-the-worst-case"></a></h3>
+<p>Flexibility comes at the cost of added overhead. That matters less for larger data, but dominates performance for small data like scalars. In Rerun, time series are created by querying the datastore for all scalars on an entity for a range of time.
+Before 0.13, the worst case was therefore simple time series plots, since you'd have to pay all that overhead many times for very little data.</p>
+<h2 id="speeding-up-time-series-by-a-factor-of-2030">Speeding up time series by a factor of 20-30<!-- --> <a href="#speeding-up-time-series-by-a-factor-of-2030"></a></h2>
+<p>On Rerun 0.12, rendering a single frame of a 1M point time series plot takes ~600ms on a 2021 M1 MacBook Pro. On 0.13 it takes ~20ms, a 30x speedup. For smaller series the speedup tends to come closer to 20x, which is still huge. How did we get there?</p>
+<h3 id="sources-of-overhead-in-time-series-plots">Sources of overhead in time series plots<!-- --> <a href="#sources-of-overhead-in-time-series-plots"></a></h3>
+<p>Let’s sum up the main sources of overhead in producing data for and rendering a time series plot:</p>
+<ol>
+<li><strong>Bookkeeping</strong>: Keeping track of which components exist at each timestamp is relatively costly for small data.</li>
+<li><strong>Data locality</strong>: For small data, the flexible data model (both in time and data type) bottoms out in a lack of data locality, which is bad for CPU cache efficiency.</li>
+<li><strong>Redundant work</strong>: When plotting a moving time window, data is usually only changing at the edges of the window. Repeatedly running the full range query creates lots of redundant work.</li>
+<li><strong>Rendering</strong>: For large time series, there may be more points than pixels to draw them on along the time dimension (x-axis). This leads to redundant tessellation and overdraw in the rendering pipeline.</li>
+</ol>
+<h3 id="why-we-didnt-just-special-case-metrics">Why we didn't just special case metrics<!-- --> <a href="#why-we-didnt-just-special-case-metrics"></a></h3>
+<p>The easiest solution for speeding up time series plots would be to special case the path for metrics. A specialized code path for simple metrics would make huge gains relatively easy.</p>
+<p>Unfortunately this isn’t good enough because our users need good performance for more kinds of range queries. Here is an example using time ranges to show an aggregate point cloud in a structure from motion setting:</p>
+<p><iframe src="https://player.vimeo.com/video/910977084?autoplay=1&amp;loop=1&amp;autopause=0&amp;background=1&amp;muted=1&amp;ratio=1920:1080&amp;transparent=false&amp;dnt=1" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen=""></iframe></p>
+<p>In addition, our motivating example for kHz plots was <a href="https://en.wikipedia.org/wiki/Inertial_measurement_unit">IMU</a> samples, which usually come as messages containing multiple values to plot. That makes special casing the single metrics less useful. For example:</p>
+<pre><p><code><span>typedef</span> <span>struct</span> <span>{</span>
+    <span>float</span> acc<span>[</span><span>3</span><span>]</span><span>;</span>
+
+    <span>float</span> gyro<span>[</span><span>3</span><span>]</span><span>;</span>  
+    
+    <span>unsigned</span> <span>long</span> timestamp<span>;</span>
+<span>}</span> IMUSample<span>;</span>
+</code></p></pre>
+<p>Rerun doesn’t yet support visualizing time series from single fields of larger structs directly, but we will soon and our approach needs to support this as a first class use-case.</p>
+<h3 id="caching-is-difficult-but-necessary">Caching is difficult but necessary<!-- --> <a href="#caching-is-difficult-but-necessary"></a></h3>
+<blockquote>
+<p>There are only two hard things in Computer Science: cache invalidation and naming things.</p>
+<p>Phil Karlton</p>
+</blockquote>
+<p>The non-rendering sources of overhead just scream caching, but as usual the devil is in the details, in particular the details of cache invalidation. In our case, out of order insertions combined with composing multiple components over time make invalidation particularly gnarly.</p>
+<h3 id="datastore-changelogs-make-invalidation-manageable">Datastore changelogs make invalidation manageable<!-- --> <a href="#datastore-changelogs-make-invalidation-manageable"></a></h3>
+<p>Except for garbage collection (dropping old data to free up memory), the Rerun datastore is immutable. Data is always dropped through snapshotting so that query semantics are left unchanged. Every single change results in adding or removing rows to the store.</p>
+<p>The first step we took after deciding it was time for caching was a refactor that turned every system that maintains a derived dataset in Rerun (timeline widget, view heuristics engine, etc) into a store subscriber, which listens to changelogs of added or removed rows in the datastore.</p>
+<p>Cache invalidation is yet another store subscriber, and having this protocol in place is what made it manageable to deal with all the complexity.</p>
+<h3 id="caches-are-built-lazily-at-query-time">Caches are built lazily at query time<!-- --> <a href="#caches-are-built-lazily-at-query-time"></a></h3>
+<p>Cache invalidation only sets a dirty flag. Actually building the cache happens lazily at query time. Since Rerun uses an end to end immediate mode architecture, we query the datastore on every frame, ideally 60 times per second.</p>
+<p>This acts as a natural micro-batching mechanism where we first accumulate changes while we render the current frame and then handle all these changes at the start of the next frame. Batching updates like this is great for performance.</p>
+<p>Visible views query the datastore right before rendering. Building caches lazily therefore means we never spend time updating a cache that isn’t used.</p>
+<h3 id="multitenancy-requires-fine-grained-locking">Multi-tenancy requires fine grained locking<!-- --> <a href="#multitenancy-requires-fine-grained-locking"></a></h3>
+<p>When not on the web, each space view (draggable visualization panel) runs and queries the datastore in parallel. Many of these queries might overlap so we need to make sure to share data and cache resources appropriately.</p>
+<p>Supporting this multi-tenancy requires fine grained locking on the combination of store (there are multiple), entity, set of components, and the component “point of view” (the component we join against).</p>
+<h3 id="aggregating-subpixel-points-speeds-up-rendering">Aggregating sub-pixel points speeds up rendering<!-- --> <a href="#aggregating-subpixel-points-speeds-up-rendering"></a></h3>
+<p>There are only so many pixels available to draw on along the x-axis. For large time series, that means you need to aggregate points that would show up on the same x-axis tick to avoid overdraw and redundant tessellation in the render pipeline.</p>
+<p><iframe src="https://player.vimeo.com/video/910983296?autoplay=1&amp;loop=1&amp;autopause=0&amp;background=1&amp;muted=1&amp;ratio=1920:1080&amp;transparent=false&amp;dnt=1" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen=""></iframe></p>
+<p>We compute these aggregations on every frame and let users choose between a set of basic options.</p>
+<h3 id="a-caveat-on-performance-for-out-of-order-logs">A caveat on performance for out of order logs<!-- --> <a href="#a-caveat-on-performance-for-out-of-order-logs"></a></h3>
+<p>The speedups added in 0.13 slow down ingestion speed for out of order logs.
+In practice this only matters for scalars logged out of order at high frequency,
+but it does mean that live time series plots are slow in this case.
+An update that fixes this is planned for 0.13.1.
+Follow the progress <a href="https://github.com/rerun-io/rerun/issues/4810">here</a>.</p>
+<h2 id="huge-wins-already-but-there-is-more-to-be-had">Huge wins already but there is more to be had<!-- --> <a href="#huge-wins-already-but-there-is-more-to-be-had"></a></h2>
+<p>Adding a caching layer to the Rerun datastore has taken lots of effort over the last months, but the performance gains are clearly worth the added complexity.</p>
+<p>There are still lots of gains to be had by adding secondary caches on top, for scalars and other data. For example, slowly changing 3D geometry could be cached on the GPU to avoid redundant CPU -&gt; GPU transfers, which are currently the performance bottleneck for point clouds.</p>
+<p>Join us on <a href="https://github.com/rerun-io/rerun">Github</a> or <a href="https://discord.gg/PXtCgFBSmH">Discord</a>
+and let us know what if these performance improvement made a difference for you,
+and what areas you'd love to see us speed up next.</p></div></div></div></div></div>]]>
+            </description>
+            <link>https://www.rerun.io/blog/primary-query-caching</link>
+            <guid isPermaLink="false">hacker-news-small-sites-39369853</guid>
+            <pubDate>Wed, 14 Feb 2024 14:03:37 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[PySimpleGUI 4 will be sunsetted in Q2 2024]]>
+            </title>
+            <description>
+<![CDATA[
+Score 43 | Comments 45 (<a href="https://news.ycombinator.com/item?id=39369353">thread link</a>) | @joshuaissac
+<br/>
+February 14, 2024 | https://docs.PySimpleGUI.com/en/latest/readme/sunset/ | <a href="https://web.archive.org/web/*/https://docs.PySimpleGUI.com/en/latest/readme/sunset/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-md-component="container">
+      
+      
+        
+      
+      <main data-md-component="main">
+        <div>
+          
+            
+              
+              
+            
+            
+          
+          
+            <div data-md-component="content">
+              <article>
+                
+                  
+
+
+  
+
+<p><img src="https://docs.pysimplegui.com/en/latest/readme/sunset/sunset-thumbnail.png"></p>
+
+<h2 id="pysimplegui-4-will-be-sunsetted-in-q2-2024">PySimpleGUI 4 will be sunsetted in Q2 2024.</h2>
+<p>PySimpleSoft expects PySimpleGUI 4 users to upgrade promply to PySimpleGUI 5. Supporting your success with PySimpleGUI is an important goal of PySimpleSoft, and your application's transition to PySimpleGUI 5 is an essential step.</p>
+<p>If you use PySimpleGUI 4, don't worry!  PySimpleGUI 5 is backward compatible with PySimpleGUI 4. Upgrade to PySimpleGUI 5, and your applications will continue to perform as expected.</p>
+<p>With no other changes, your applications will benefit in many ways:</p>
+<ul>
+<li>Hundreds of performance improvements and bug fixes (see the <a href="https://docs.pysimplegui.com/en/latest/documentation/versions/psg5/">Release Notes</a>),</li>
+<li>Improved robustness: crash prevention and/or recovery,</li>
+<li>Ongoing product support via GitHub Issues,</li>
+<li>Broader target platform support (particularly MacOS 14),</li>
+<li>Tamper detection, to help prevent malware attacks,</li>
+<li>Future proofing, so that your application will continue to run on future updates of Windows, MacOS, Linux, etc.</li>
+</ul>
+<p>With minor enhancements, your application will benefit in many ways:</p>
+<ul>
+<li>Persistence. For example,</li>
+<li>Application windows will open where they were last placed,</li>
+<li>Elements can remember values between runs,</li>
+<li>New APIs provide additional functionality:</li>
+<li>Timer APIs</li>
+</ul>
+<p>PySimpleGUI 4 will be sunsetted in Q2 2024, giving all developers time to make the transition. If you encounter any issues, refer to our GitHub Issues page at <a href="https://issues.pysimplegui.com/">Issues.PySimpleGUI.com</a>.</p>
+
+
+  
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+        </div>
+        
+          
+        
+      </main>
+      
+        
+      
+    </div></div>]]>
+            </description>
+            <link>https://docs.PySimpleGUI.com/en/latest/readme/sunset/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-39369353</guid>
+            <pubDate>Wed, 14 Feb 2024 13:06:13 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Australian Federal Police would repeat undercover operation on autistic teenager]]>
+            </title>
+            <description>
+<![CDATA[
+Score 14 | Comments 8 (<a href="https://news.ycombinator.com/item?id=39369158">thread link</a>) | @BLKNSLVR
+<br/>
+February 14, 2024 | https://www.abc.net.au/news/2024-02-14/afp-says-it-would-repeat-undercover-terror-operation-on-autistic/103467546 | <a href="https://web.archive.org/web/*/https://www.abc.net.au/news/2024-02-14/afp-says-it-would-repeat-undercover-terror-operation-on-autistic/103467546">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><p>Greens senator David Shoebridge has labelled comments by the Australian Federal Police as "chilling" and "extraordinary" after it defended its handling of terror charges against an autistic teenager.</p><p>The 13-year-old boy had become fixated with the Islamic State terror group ISIS before his parents took him to a Victoria Police station seeking help.</p><p>While he was receiving support from a therapeutic team, a covert operation with undercover police was launched, which saw the boy charged with terror offences.</p><p><span data-component="Loading" data-print="inline-media"><span></span><span role="alert" aria-live="assertive">Loading...</span></span></p><p>In a scathing Victorian Children's Court ruling, a magistrate dismissed the charges and said police attempted to radicalise the boy to gain evidence to prosecute him.</p><p>It included an undercover officer targeting the boy online and telling him he would make a good sniper or suicide bomber.</p><p>Despite the ruling the operation fell "profoundly short of the minimum standards expected of law enforcement," AFP Deputy Commissioner Ian McCartney told Senate estimates he would sign off on the operation again.</p><p>"He had [a] long-standing fixation on ISIS. He had expressed a desire to carry out a violent act. He expressed the desire to carry out a school shooting. He was researching material on how to build a bomb, he was engaging with like-minded individuals," the deputy commissioner said.</p><p>"I would say in relation to that, there was a conservative three-and-a-half month effort by the Victoria Police Countering Violent Extremism team to deradicalise him. The decision that was made by the team, it wasn't being effective. He was becoming more and more radicalised.</p><p>"I think from our view, and again, we go to the damage control operation — if the same set of circumstances, I would sign that again."</p><p>Deputy Commissioner McCartney previously noted that the operational decisions were taken jointly by the AFP, Victoria Police and ASIO.</p><p>The AFP and Victoria Police acknowledged the court ruling criticising them for attempting to radicalise the boy.</p><h2 data-component="Heading">Calls mounting for disciplinary review</h2><p>While an internal review of the AFP is underway, Senator Shoebridge is calling for an independent review to hold those involved accountable.</p><p>"An undercover operative who went in and instead of trying to assist the child… whose actions actively radicalised a 13-year-old boy with autism when the family had come to him for help, who put ideas of becoming a sniper and a suicide bomber, who put ideas of radical Islam into the child's mind? Surely there should be some disciplinary proceedings against that," the senator said.</p><p>"We had the family of the then 13-year-old boy with autism and… an IQ in the 70s, deeply concerned about what their child was doing."</p><p>Earlier this week, Acting Director of the Commonwealth Public Prosecutions Scott Bruckard told Senate estimates the decision to charge the boy was in the public interest.</p><p>"It was a very serious allegation that was made against this young person, and applying the prosecution policy of the Commonwealth, aware of his tender years — it was our view that given the very serious nature of the allegations, it was appropriate to proceed with the prosecution."</p><p>In late October last year, Magistrate Lesley Fleming ruled that the rehabilitation of the boy was "doomed" when he connected online with the officer.</p><p>"It is a nonsense to expect this Court to accept that an effective rehabilitation process can be undertaken when there is a seasoned covert operator online engaging TC (the teenager), encouraging TC's fixation and that TC's rehabilitation team, his parents and his psychologist are oblivious to the existence of the OCO (the online persona)," Ms Fleming said in her judgement.</p><p><span data-component="Loading" data-print="inline-media"><span></span><span role="alert" aria-live="assertive">Loading...</span></span></p></div></div></div>]]>
+            </description>
+            <link>https://www.abc.net.au/news/2024-02-14/afp-says-it-would-repeat-undercover-terror-operation-on-autistic/103467546</link>
+            <guid isPermaLink="false">hacker-news-small-sites-39369158</guid>
+            <pubDate>Wed, 14 Feb 2024 12:41:44 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[What made Earth a giant snowball 700M years ago? Scientists have an answer]]>
+            </title>
+            <description>
+<![CDATA[
+Score 91 | Comments 71 (<a href="https://news.ycombinator.com/item?id=39369040">thread link</a>) | @dragonbonheur
+<br/>
+February 14, 2024 | https://www.sydney.edu.au/news-opinion/news/2024/02/08/geoscientists-discover-what-turned-snowball-earth-sturtian-ice-age-earthbyte.html | <a href="https://web.archive.org/web/*/https://www.sydney.edu.au/news-opinion/news/2024/02/08/geoscientists-discover-what-turned-snowball-earth-sturtian-ice-age-earthbyte.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+
+
+
+	<div>
+		<div>
+			<div><figure>
+
+	
+		
+
+			<img src="https://www.sydney.edu.au/content/dam/corporate/images/news-and-opinion/news/2024/february/dr-adriana-dutkiewicz-geosciences-in-the-flinders-ranges,-south-australia.jpg/_jcr_content/renditions/cq5dam.web.1280.1280.jpeg" alt="Research lead author Dr Adriana Dutkiewicz pointing to a thick bed of glacial deposits.  ">
+
+			
+			
+		
+	
+
+	<figcaption>
+		<p> Deposits from the Sturtian Glaciation 717­–664 million years ago in the northern Flinders Ranges, Australia. Research lead author Dr Adriana Dutkiewicz pointing to a thick bed of glacial deposits. &nbsp;<em>Photo: Professor Dietmar Müller/University of Sydney</em></p>
+
+	</figcaption>
+</figure>
+</div>
+			
+			
+
+			
+
+			
+		</div>
+		
+			<p>Australian geologists have used plate tectonic modelling to determine what most likely caused an extreme ice-age climate in Earth’s history, more than 700 million years ago.</p>
+<p>The study, published in<em> </em><a href="https://pubs.geoscienceworld.org/geology"><em>Geology</em></a>, helps our understanding of the functioning of the Earth's built-in thermostat that prevents the Earth from getting stuck in overheating mode. It also shows how sensitive global climate is to atmospheric carbon concentration.</p>
+<p>“Imagine the Earth almost completely frozen over,” said the study’s lead author, ARC Future Fellow <a href="https://sydney.edu.au/science/people/adriana.dutkiewicz.php">Dr Adriana Dutkiewicz</a>. “That’s just what happened about 700 million years ago; the planet was blanketed in ice from poles to equator and temperatures plunged. However, just what caused this has been an open question.</p>
+<p>“We now think we have cracked the mystery: historically low volcanic carbon dioxide emissions, aided by weathering of a large pile of volcanic rocks in what is now Canada; a process that absorbs atmospheric carbon dioxide.”</p>
+<p>The project was inspired by the glacial debris left by the ancient glaciation from this period that can be spectacularly observed in the Flinders Ranges in South Australia.</p>
+<p>A recent geological field trip to the Ranges, led by co-author <a href="https://www.adelaide.edu.au/directory/alan.collins">Professor Alan Collins</a> from the University of Adelaide, prompted the team to use the University of Sydney <a href="https://www.earthbyte.org/">EarthByte</a> computer models to investigate the cause and the exceptionally long duration of this ice age.</p>
+<p>The extended ice age, also called the Sturtian glaciation after the 19th century European colonial explorer of central Australia, Charles Sturt, stretched from 717 to 660 million years ago, a period well before the dinosaurs and complex plant life on land existed.</p>
+
+		
+		
+	</div>
+
+</div><div>
+
+
+
+	<div>
+		
+		
+			<p>Dr Dutkiewicz said: “Various causes have been proposed for the trigger and the end of this extreme ice age, but the most mysterious aspect is why it lasted for 57 million years – a time span hard for us humans to imagine.”</p>
+<p>The team went back to a plate tectonic model that shows the evolution of continents and ocean basins at a time after the breakup of the ancient supercontinent Rodina. They connected it to a computer model that calculates CO2&nbsp;degassing of underwater volcanoes along mid-ocean ridges – the sites where plates diverge and new ocean crust is born.</p>
+<p>They soon realised that the start of the Sturtian ice age precisely correlates with an all-time low in volcanic CO2&nbsp;emissions. In addition, the CO2&nbsp;outflux remained relatively low for the entire duration of the ice age.</p>
+<p>Dr Dutkiewicz said: “At this time, there were no multicellular animals or land&nbsp;plants on Earth. The greenhouse gas concentration of the atmosphere was almost entirely dictated by CO2&nbsp;outgassing from volcanoes and by silicate rock weathering processes, which consume CO2.”</p>
+
+		
+		
+	</div>
+
+</div><div>
+
+
+
+	<div>
+		<div>
+			<div><figure>
+
+	
+		
+
+			<img src="https://www.sydney.edu.au/content/dam/corporate/images/news-and-opinion/news/2024/february/dietmar-m%C3%BCller-pointing-to-carbonates-overlying-sturt-formation-flinders-ranges-photo-by-adriana-dutkiewicz.jpg/_jcr_content/renditions/cq5dam.web.1280.1280.jpeg" alt="Professor Dietmar Müller points to carbonates overlying glacial deposits in the Flinders Ranges.">
+
+			
+			
+		
+	
+
+	<figcaption>
+		<p>Professor Dietmar Müller points to carbonates overlying glacial deposits in the Flinders Ranges. <em>Photo: Dr Adriana Dutkiewicz</em></p>
+
+	</figcaption>
+</figure>
+</div>
+			
+			
+
+			
+
+			
+		</div>
+		
+			<p>Co-author&nbsp;<a href="https://www.sydney.edu.au/science/about/our-people/academic-staff/dietmar-muller.html">Professor Dietmar Müller</a>&nbsp;from the University of Sydney said: "Geology ruled climate at this time. We think the Sturtian ice age kicked in due to a double whammy: a plate tectonic reorganisation brought volcanic degassing to a minimum, while simultaneously a continental volcanic province in Canada started eroding away, consuming atmospheric CO2.</p>
+<p>“The result was that atmospheric CO2&nbsp;fell to a level where glaciation kicks in – which we estimate to be below 200 parts per million, less than half today’s level.”</p>
+<p>The team's work raises intriguing questions about Earth's long-term future.&nbsp; A&nbsp;<a href="https://www.nature.com/articles/s41561-023-01259-3">recent theory proposed</a>&nbsp;that over the next 250 million years, Earth would evolve towards Pangea Ultima, a supercontinent so hot that mammals might become extinct.</p>
+<p>However, the Earth is also currently on a trajectory of lower volcanic CO2&nbsp;emissions, as continental collisions increase and the plates slow down. So, perhaps Pangea Ultima will turn into a snowball again.</p>
+<p>Dr Dutkiewicz said: “Whatever the future holds, it is important to note that geological climate change, of the type studied here, happens extremely slowly.&nbsp;<a href="https://climate.nasa.gov/evidence/">According to NASA</a>, human-induced climate change is happening at a pace 10 times faster than we have seen before.”</p>
+<h2>Research</h2>
+<p>‘Duration of Sturtian “Snowball Earth” glaciation linked to exceptionally low mid-ocean ridge outgassing’, Dutkiewicz, A. et al (<em>Geology</em>, 2024). DOI: 10.1130/G51669.1</p>
+<h2>EarthByte Group<br>
+</h2>
+<p>This work was enabled by the&nbsp;<a href="https://www.gplates.org/">GPlates</a>&nbsp;plate tectonic software, developed by the&nbsp;<a href="https://www.earthbyte.org/">EarthByte Group</a>&nbsp;at the University of Sydney, which has been the basis of a slew of discoveries over the past decade, contributing significant knowledge to how geology is a central long-term driver of climate and biodiversity. GPlates development is supported by the AuScope National Collaborative Research Infrastructure System (NCRIS) program.</p>
+<h2>Declaration</h2>
+<p>The authors declare no competing interests. Research was in part funded by the Australian Research Council.</p>
+
+		
+		
+	</div>
+
+</div></div>]]>
+            </description>
+            <link>https://www.sydney.edu.au/news-opinion/news/2024/02/08/geoscientists-discover-what-turned-snowball-earth-sturtian-ice-age-earthbyte.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-39369040</guid>
+            <pubDate>Wed, 14 Feb 2024 12:24:57 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Google has removed Conversations_im from the Play Store]]>
+            </title>
+            <description>
+<![CDATA[
+Score 224 | Comments 129 (<a href="https://news.ycombinator.com/item?id=39368233">thread link</a>) | @bertman
 <br/>
 February 14, 2024 | https://gultsch.social/@daniel/111929074071688694 | <a href="https://web.archive.org/web/*/https://gultsch.social/@daniel/111929074071688694">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -39,7 +353,7 @@ February 14, 2024 | https://gultsch.social/@daniel/111929074071688694 | <a href=
             </title>
             <description>
 <![CDATA[
-Score 171 | Comments 113 (<a href="https://news.ycombinator.com/item?id=39365142">thread link</a>) | @geox
+Score 233 | Comments 151 (<a href="https://news.ycombinator.com/item?id=39365142">thread link</a>) | @geox
 <br/>
 February 13, 2024 | https://lgrmag.com/news/light-bio-to-introduce-bioluminescent-petunias-into-u-s-market/ | <a href="https://web.archive.org/web/*/https://lgrmag.com/news/light-bio-to-introduce-bioluminescent-petunias-into-u-s-market/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -93,7 +407,7 @@ February 13, 2024 | https://lgrmag.com/news/light-bio-to-introduce-bioluminescen
             </title>
             <description>
 <![CDATA[
-Score 182 | Comments 37 (<a href="https://news.ycombinator.com/item?id=39365104">thread link</a>) | @ao98
+Score 209 | Comments 44 (<a href="https://news.ycombinator.com/item?id=39365104">thread link</a>) | @ao98
 <br/>
 February 13, 2024 | https://warwick.ac.uk/newsandevents/pressreleases/?newsItem=8a17841a8d79730b018d9e2bbb0e054b | <a href="https://web.archive.org/web/*/https://warwick.ac.uk/newsandevents/pressreleases/?newsItem=8a17841a8d79730b018d9e2bbb0e054b">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -336,7 +650,7 @@ February 13, 2024 | https://gamesfray.com/apple-effectively-kills-numerous-brows
             </title>
             <description>
 <![CDATA[
-Score 89 | Comments 26 (<a href="https://news.ycombinator.com/item?id=39362777">thread link</a>) | @fagnerbrack
+Score 92 | Comments 27 (<a href="https://news.ycombinator.com/item?id=39362777">thread link</a>) | @fagnerbrack
 <br/>
 February 13, 2024 | https://www.deusinmachina.net/p/compiling-history-a-brief-tour-of | <a href="https://web.archive.org/web/*/https://www.deusinmachina.net/p/compiling-history-a-brief-tour-of">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><article><div><div><div dir="auto"><p><span>As the story of C’s birth goes hand in hand with the creation of Unix, the first C compiler can be traced back to the early 1970’s. I've detailed the history of C in my previous article </span><a href="https://www.deusinmachina.net/p/history-of-unix" rel="">Tracing the Lines: From the Telephone to Unix</a><span>, which includes a brief summary of this history.</span></p><blockquote><p><span>Around 1971, Ken decided that Unix needed to be ported to a higher level language. Dennis Ritchie took on the task, evolving Ken’s B language into something more feature rich. It was first called New B (NB), but each time Ken tried to rewrite the kernel in New B he would run into a roadblock. He would then ask Dennis to add more features. Eventually after structures were invented, there were enough features that Ken could rewrite version 4 of the whole Unix kernel in it. After a new compiler was written for this new language, it was renamed to C, and the rest is history. This was a significant breakthrough, as, until then, kernels were written in Assembly. For perspective, as late as 1983, Microsoft was still programming </span><a href="https://github.com/microsoft/MS-DOS/tree/master/v2.0/source" rel="">MS-DOS v2.0</a><span> in Assembly. Unix was truly ahead of its time.</span></p></blockquote><p><span>Since Unix was created on a PDP-10/11, it makes sense that the first compiler for C was created for the PDP-11. This is usually just referred to as the PDP C Compiler. The earliest known version of this compiler’s source code can still </span><a href="https://github.com/mortdeus/legacy-cc" rel="">be viewed here</a><span>, and is an interesting time capsule of computing history.</span></p><p><span>This was succeeded by the Portable C Compiler, developed by Stephen C. Johnson of Bell Labs, and one of the first compilers that was capable of generating machine independent C code. In Section 2.1 of Bjarne Stroustrup’s article titled </span><a href="https://stroustrup.com/sibling_rivalry.pdf" rel="">Sibling Rivalry: C and C++</a><span>, he details key aspects of this compiler and why it was so important</span></p><blockquote><p>Pre-ANSI C is often referred to as K&amp;R C. However, that is slightly incorrect. The C described in [Kernighan,1978] lacks three features of the language used by almost all C programmers before the emergenceof C89: void, enumerations, and structure assignment. These three features were added in PCC, the Portable C Compiler, developed by Steve Johnson and distributed as the C compiler by Bell Labs (with the ‘‘blessing’’ of Dennis Ritchie).</p><p>Adding void (used as a possible return type for functions only) allows a programmer to directly express that a function doesn’t return a value, and allows the compiler to check that. Similarly, adding enumerations allows a programmer to directly express that a group of values in some way belong together. It also supports the notion of manifest constants in a way that does not rely on macros.</p><p>Adding structure assignment (and also structure copy initialization, argument passing, and function return) makes struct values first-class citizens of C.</p><p>Thus, two of the three last additions to Classic C add to the expressive power of the type system without actually allowing a programmer to express any new computations. The third makes user-defined types, as then existing, equal to built-in types. In addition, one of the additions provides an alternative to the use of macros. These are all themes that recur in the design of C++.</p></blockquote><p>The Portable C Compiler was distributed with version 7 of Unix, the last version of Unix released before it was commercialized. Due to its early mover advantage, and the fact that it could be adapted to produce assembly for different architectures, meant that it enjoyed much success in the nascent years of C. </p><p>But it was not the only compiler to pop up during that time. The 1970s also saw the Small-C compiler created by Ron Cain. It was a minimalist subset of C that could run on 8-bit microcomputers. It’s hard to believe now a days that computers at one point struggled to compile C code, let alone a subset of it, but that was indeed the case. The PDP-11 that C was developed on was a 16-bit broom closet sized computer, which was still considerably more powerful than the 8-bit home computers of the day. This is often why programs from that era were written in Assembly, Basic, and Pascal instead of C.</p><p><span>Another commercial compiler to come out during this time was the Lattice C compiler, one of the first C compilers written for the IBM Personal Computer. It was created by </span><a href="https://en.wikipedia.org/wiki/Lifeboat_Associates" rel="">Lifeboat Associates</a><span> and retailed for $500 ($1,628 in today’s money), and it ran on PC-DOS and MS-DOS. Microsoft used this as the basis for their Microsoft C Compiler (MSC). During this time many compilers were produced including, the Mark Williams Compiler, the Green Hills compiler, the Aztec C compiler and many others.</span></p><p>These developments however, navigated a landscape devoid of an official C standard, leading to varied interpretations and implementations. They were based on "The C Programming Language" book by Brian Kernighan and Dennis M. Ritchie published on February 22, 1978. The eventual release of the standard, known as C89 or C90, brought much needed uniformity and clarity to the language. The preface in the 2nd edition of the book, published in April of 1988, highlights the importance.</p><blockquote><p>The standard formalizes constructions that were hinted but not described in the first edition, particularly structure assignment and enumerations. It provides a new form of function declaration that permits cross-checking of definition with use. It specifies a standard library, with an extensive set of functions for performing input and output, memory management, string manipulation, and similar tasks. It makes precise the behavior of features that were not spelled out in the original definition, and at the same time states explicitly which aspects of the language remain machine-dependent.</p></blockquote><p>With the publishing of the standard, C became a much more consistent language to program across environments. </p><p>Fast forward to the present, the GNU Compiler Collection (GCC) stands as a testament to the evolution of compilers, supporting not just multiple platforms, but also multiple languages.</p><p><span>One of my favorite things about computer lore is that many of the most instrumental people are still alive today, and we still have records of when they made history. This is no different for GCC, and we actual have the text </span><a href="https://gcc.gnu.org/wiki/History" rel="">Richard Stallman sent</a><span>, introducing the GCC beta back in 87. </span></p><pre><code>   Date: Sun, 22 Mar 87 10:56:56 EST
@@ -378,11 +692,11 @@ February 13, 2024 | https://www.deusinmachina.net/p/compiling-history-a-brief-to
             </title>
             <description>
 <![CDATA[
-Score 105 | Comments 116 (<a href="https://news.ycombinator.com/item?id=39361279">thread link</a>) | @arthurdenture
+Score 106 | Comments 118 (<a href="https://news.ycombinator.com/item?id=39361279">thread link</a>) | @arthurdenture
 <br/>
 February 13, 2024 | https://climate.benjames.io/someone-is-going-to-dim-the-sun/ | <a href="https://web.archive.org/web/*/https://climate.benjames.io/someone-is-going-to-dim-the-sun/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
-            <p>I’m going to lay out some fascinating facts, and let you decide whether we are likely to dim the sun within the next 10 years.</p><p>Firstly, it’s much easier to artificially dim the sun than most people imagine.</p><p>100 planes injecting sulfur particles into the stratosphere would dim the sun by about 1%, and cool the earth by about 1°C.</p><figure><img src="https://lh7-us.googleusercontent.com/FNKxDvFN2dsBKjnHBGn31nQFgSxL8Ob50wXGQ8c8Fr8V9ocWvEJJ3Depj08MKlZRTftHmEw8XjLbKUIlbBT1rFa3EZ7FivhAGpUX-nS3v1HT6qPO8ZHxpKu-Oc7gbD7RJ4pE0M8csC_2BlEHqVviems" alt="" loading="lazy" width="666" height="457"><figcaption><a href="https://ben-james.notion.site/Sources-geoengineering-925832b122304a3b83c5d889acdea2fd?ref=climate.benjames.io">Sources</a></figcaption></figure><p>For context, our current sulfur dioxide emissions (from fossil fuels) <a href="https://ourworldindata.org/grapher/so-emissions-by-world-region-in-million-tonnes?ref=climate.benjames.io">are</a> &gt;10x bigger than the 1.2m tons shown above. The difference is the height of injection. We’d be putting sulfur into the <em>stratosphere</em>, which is higher up than our normal sulfur emissions in the <em>troposphere</em>.</p><p>Spraying a form of sulfur from a plane is incredibly cheap. A full programme <a href="https://iopscience.iop.org/article/10.1088/1748-9326/aba7e7/meta?ref=climate.benjames.io">would cost less</a> than $20b per year. That’s <strong>much</strong> cheaper than carbon removal ($600b per year,<em> </em>to remove just 10% of annual emissions @ $100 / tCO2).</p><p>Modifying the earth like this is called geoengineering, and blocking out the sun with particles is called <strong>Solar Radiation Management (SRM)</strong>.</p><h2 id="srm-awoke-in-2023">SRM awoke in 2023</h2><p>Interest in SRM spiked in 2023, after years of being too controversial to discuss. Here are a few reasons why.</p><h4 id="1we-don%E2%80%99t-know-why-2023-was-so-hot">#1 - We don’t know why 2023 was so hot</h4><p>The climate data from 2023 is scary, because we <em>do not understand </em>why 2023 was so warm. El Niño and low-sulfur fuels had an impact, but their effects were anticipated, and don’t fully explain the temperatures that we saw.</p><p>The actual warming in 2023 <a href="https://www.theclimatebrink.com/p/2023s-unexpected-and-unexplained?ref=climate.benjames.io">fell far outside of scientists’ predictions</a>. This is what hitting a climate feedback loop looks like.</p><figure><img src="https://lh7-us.googleusercontent.com/VDFNQQrVahE_NxvPW4IgvmtB_L7EzgyLr2wA5L2jeGNpz8IkrPu_oNnRsRxctbTELDsyRjwsJHgHBOoNy5NoBtpCzsd6ki1uu-bvJiJHO1oLYJ7AcxzX6oFgbrcV-BDvQIy4o56X4TCei0Pcmyu4b94" alt="" loading="lazy" width="702" height="500"></figure><h4 id="2billionaires-are-getting-interested">#2 - Billionaires are getting interested</h4><p>It only takes one person rich enough to start a geoengineering programme. In 2023, some powerful and wealthy people started talking publicly about geoengineering.</p><figure><img src="https://lh7-us.googleusercontent.com/ySAJFEj0H3NqY1wHcM5NBj2qsEE0WfeUxEt8yH4uR1tgF2RVANhzHjJBCfB8b6LQT5Jp-ufBVcCRCwLWfXEoh_8wn6QlxsDvLFIzK6HNXcnsaKkt9KZii619fP20uNv9RnN_h0eUOsX3KTRIFOo2yEs" alt="" loading="lazy" width="737" height="389"></figure><h4 id="3institutions-are-awakening-to-geoengineering">#3 - Institutions are awakening to geoengineering</h4><ul><li>In 2023, both the <a href="https://www.whitehouse.gov/ostp/news-updates/2023/06/30/congressionally-mandated-report-on-solar-radiation-modification/?ref=climate.benjames.io#:~:text=The%20White%20House%20Office%20of,also%20known%20as%20solar%20geoengineering.">US</a> and <a href="https://www.ft.com/content/8196059a-ecdf-4615-9f5d-ed1d4ab70cbd?ref=climate.benjames.io">EU</a> commissioned research on solar geoengineering. In the past, state governments have refused to fund anything related.</li><li>Climate scientists are starting to seriously talk about solar geoengineering. Traditionally, they’ve self-censored on this topic, but this is changing. I highly recommend Robinson Meyer’s <a href="https://heatmap.news/technology/climate-tech-geoengineering-carbon-removal?ref=climate.benjames.io">fascinating account of this</a>.</li><li>The internet noise is rising from a stutter to a low hum. In 2023/24, people are talking about SRM. <a href="https://caseyhandmer.wordpress.com/2023/06/06/we-should-not-let-the-earth-overheat/?ref=climate.benjames.io">Casey Handmer</a>, <a href="https://www.keepcool.co/p/forcing-the-issue?ref=climate.benjames.io">Keep Cool</a>, <a href="https://www.economist.com/science-and-technology/2023/11/22/solar-geoengineering-is-becoming-a-respectable-idea?ref=climate.benjames.io">The Economist</a>, and the <a href="https://www.bbc.com/future/article/20231010-sun-solar-geoengineering-ministry-for-the-future-kim-stanley-robinson?ref=climate.benjames.io">BBC</a>, to name just a few. I personally feel that 2023 was the year that SRM broke a critical threshold in the broader climate consciousness.</li></ul><div><p>Btw, if you want to get an email when I post future climate blogs, you can leave your email <a href="https://climate.benjames.io/someone-is-going-to-dim-the-sun/#/portal/signup">here</a>.</p></div><p>Ok, let’s rewind for a sec.</p><h2 id="you%E2%80%99re-telling-me-that-sulfur-reflects-the-sun">You’re telling me that sulfur reflects the sun?</h2><p>If reflecting the sun with sulfur sounds far fetched - well, we’re already doing it. </p><p>The two best examples:</p><ol><li>In 1991, Mount Pinatubo erupted and ejected millions of tons of sulfur dioxide. It cooled the earth by <a href="https://www.usgs.gov/observatories/hvo/news/volcano-watch-pinatubo-effect-can-geoengineering-mimic-volcanic-processes?ref=climate.benjames.io">around 0.5°C</a>, and lasted for around <a href="https://earthobservatory.nasa.gov/images/1510/global-effects-of-mount-pinatubo?ref=climate.benjames.io">two years</a>.</li><li>We already put sulfur into the atmosphere by burning fossil fuels. The sulfur that we’ve emitted so far is already reflecting sunlight, and is currently “masking” <a href="https://www.ipcc.ch/report/ar6/wg1/downloads/report/IPCC_AR6_WGI_SPM.pdf?ref=climate.benjames.io">about 0.5°C of warming</a>. Without these particles, we’d already be at 1.8°C warming, not <a href="https://essd.copernicus.org/articles/15/2295/2023/?ref=climate.benjames.io">1.3°C</a>.</li></ol><p>In 2020, the International Maritime Organisation introduced limits on the sulfur content of shipping fuel. It reduced sulfur dioxide emissions by about 8 million tons in its first year - about 10% of the global total.</p><figure><img src="https://lh7-us.googleusercontent.com/F39rdFdSBFguRtWFaPpY4HOSWeqqytXmssL5o7borhUOQUUtS3PETnP7VGvsVAsBHA1JbcTQKXLTDSQGW55RfyGCpRieV35ms81F_XaTJ99wOPHwlHeaMRAqwnEQcuWU5FBmTjNLYdZXOWZnLW9Tu2Y" alt="" loading="lazy" width="726" height="462"><figcaption>Src: <a href="https://www.carbonbrief.org/analysis-how-low-sulphur-shipping-rules-are-affecting-global-warming/?ref=climate.benjames.io">CarbonBrief</a></figcaption></figure><p>This reduction in sulfur emissions has “un-masked” warming that was already there. It’s one of the reasons for the jump in warming in 2023 (though it doesn’t fully explain the abnormality).</p><h4 id="instant-effect">Instant effect</h4><p>Because SRM acts almost instantly, we’d need to phase it in gradually. If we began blasting maximum sulfur tomorrow, we’d cause a sharp fall in temperature that would be a nasty shock to the climate.</p><p>A better plan is to use sulfur to pause our warming at its current level (<a href="https://essd.copernicus.org/articles/15/2295/2023/?ref=climate.benjames.io">about 1.3 °C</a>) whilst we slash emissions. Eventually SRM would become redundant as methane’s warming falls off, and carbon removal takes effect.</p><figure><img src="https://lh7-us.googleusercontent.com/xAXIhmrdzEFZoqH_V00_M0aiSGrbVNC1Go1yBboTfvXXQxdiMHBjwNwRJI7I_9mYD0WIAR24E1bD-xV6bTfB2h75fCMTa1IcuuTcu8_Jygd6NuI0SudNXestPzAYGopfFiOWJD7OZEOg00W7FHOMKjA" alt="" loading="lazy" width="689" height="431"></figure><p>Sulfur disappears from the atmosphere quickly - it rains out after about a year. This means that once we’ve started SRM, it’s dangerous to suddenly stop. We need to keep spraying particles, all the time. If we suddenly stopped, the warming would spring back rapidly, causing a bad temperature shock. The correct way to stop is a gradual phase out.</p><figure><img src="https://lh7-us.googleusercontent.com/n5M4khdhMEN_Jad0vDJxJ5w3FyWgYN5btp5WGDa_FNMjqi0yI2RfiUKxDx7QjPhSIv3-0glODN_JqLe6PIxNwT0tVGuuRAXlZ_z7OJQL7mO0UbVyDKDG_X06BOHF2BHkpCiYHzCNO0VacEqJjXBo_aA" alt="" loading="lazy" width="716" height="262"><figcaption>Piles of sulfur in Canada - a by-product of sweetening oil from Alberta. Photo: <a href="https://www.flickr.com/photos/gord99/4449228768/sizes/l/?ref=climate.benjames.io">Gord McKenna</a>.</figcaption></figure><h2 id="the-rub">The rub</h2><p>Unfortunately, Solar Radiation Management (SRM) has some fairly gigantic problems.</p><ol><li>It doesn’t fix the root cause. Cooling the planet does not remove the CO2 which has accumulated in our atmosphere. It doesn’t stop that CO2 from acidifying the oceans and irreversibly destroying marine biodiversity.</li><li>SRM could make us complacent about dramatically cutting emissions.</li><li>Sulfur increases acid rain (harmful to many life forms) and will likely harm the ozone.</li><li>If SRM is poorly implemented, it could dramatically change weather and rainfall patterns. For example, if sulfur is not injected near the equator, it will not evenly mix into the stratosphere, causing uneven cooling and heating.</li></ol><p>Shifted weather and rainfall patterns are one of the scariest possibilities of SRM. Even if deployed “correctly”, it’s unclear how SRM would affect rainfall and monsoons. Our <a href="https://geoengineering.environment.harvard.edu/sites/hwpi.harvard.edu/files/sgrp/files/irvine_etal_ncc_solar_geoengineering.pdf?m=1564406944&amp;ref=climate.benjames.io">current research</a> suggests that <em>when deployed in the correct locations and volumes</em>, SRM significantly moderates climate hazards everywhere, and significantly exacerbates them nowhere. But we will not know until we try.</p><p>Crucially, the biggest problems with SRM are probably not yet known. The side effects of putting sulfur into the stratosphere could be some of the most consequential unknowns in human history. Clearly, that’s a huge reason to do more research. But still - no matter how much research is done, when humanity tries to bend nature to its will, we can be sure that unintended consequences won’t be far behind.</p><h2 id="srm-will-be-deployed-without-your-consent">SRM will be deployed without your consent</h2><p>Geoengineering will not happen by international consensus. I find it impossible to imagine a UN mechanism approving something so universally contentious. </p><p>Rather, <em>someone will probably just do it</em>.</p><figure><img src="https://lh7-us.googleusercontent.com/w_CJlxp6lHw5zMWwjTP3ejL0S2YFJ7gVE-aWiSbxJUHSOkayvRJUoiu6KncEYOTmGYxGVsqTpu7A5ldyeqUC33ymMJkV9Zkby7yQwGlIAxeV_hk0peDJHY9Bqwwi1zio2QhW4vNFoBrSLVmAh5Z2i5A" alt="" loading="lazy" width="688" height="214"></figure><h4 id="a-country-with-no-choice">A country with no choice</h4><p>Some nations will soon have a simple choice: deploy geoengineering or cease to exist.</p><p>People underestimate how controversial it can become to <strong>not </strong>do SRM. Imagine you are the leader of a country close to the equator. Crop failures, extreme heat, and city-destroying cyclones mean that your people are without drinkable water, have nowhere to sleep, and cannot feed their children. Mass social unrest and physical violence become normal for your country. SRM is the only action that you can take to turn off the disasters, and prevent your government being overthrown.</p><p>Because SRM is so cheap, it’s completely feasible that one country could do this alone. (<a href="https://www.goodreads.com/en/book/show/50998056?ref=climate.benjames.io">The Ministry for the Future</a> and <a href="https://www.goodreads.com/book/show/57094295-termination-shock?ref=climate.benjames.io">Termination Shock</a> imagine interest from India, Singapore, Venice, Texas and The Netherlands)</p><p>Ultimately, the decision to turn on the SRM machines will not be made by climate scientists, or carefully calculated risks. It will be made on the basis of nations rising or falling - by starving populations, revolutionaries, and leaders with their back against a wall.</p><p><strong>The conditions only have to align for one country, at one time, to begin geoengineering.</strong></p><h4 id="a-billionaire">A billionaire</h4><p>There are three important things to know about billionaires:</p><ol><li>The business interests of many billionaires face total decimation at the hand of climate-induced conflict and destabilisation.</li><li>Many billionaires attribute their success to being hyper-logical, no-BS, getting shit done, and acting upon contrarian beliefs (sometimes this is even correct). The appeal of SRM to this mindset needs no explanation 🤠</li><li>Some billionaires want to use their money for good. The great challenge of the billionaire is how to convert a fortune into a timeless legacy.</li></ol><p><strong>It doesn’t matter if 99.9% of billionaires think that geoengineering is a terrible idea. It only takes one person rich enough to implement it.</strong></p><h2 id="every-year-srm-inches-towards-%E2%80%9Cthe-logical-choice%E2%80%9D">Every year, SRM inches towards “the logical choice”.</h2><p>Deploying SRM in 2024 is probably not the logical choice. But it’s not long before that changes.</p><h4 id="taking-climate-catastrophe-off-the-table">Taking climate catastrophe off the table</h4><p>The further that we depart from our current temperature, the more we risk runaway changes that we can't control. We don’t know much about when tipping points will occur - we just know that they are out there.</p><p>Why risk the arctic permafrost melting? Why risk losing the Greenland ice sheet? Why risk the tipping points that we don’t even know about?</p><p>These risks increase every year that our emissions are above zero - including every year that we are dramatically reducing emissions. SRM gives us the ability to lop off the most catastrophic outcomes from the end of the probability distribution.</p><p>Geoengineering is no replacement for getting our shit together. But there would be no honour in allowing the deaths of hundreds of millions of people, simply because they could have theoretically been avoided through more mitigation.</p><h4 id="let%E2%80%99s-check-in-on-global-emissions">Let’s check in on global emissions</h4><figure><img src="https://lh7-us.googleusercontent.com/wmHcuJTgR7bv7NjfhsluANEGlcLYlzLpdH0RZT6N85q2hbRGSDOaxCP-oM4MKQAyfvnTvqF1gyMbPVs1-vtXGdzgEOFJYuZbZTIqTC3tnYX531DiSSCSjf_VEKEvonD22TDAXo_iZIV-ayoAXibS2G0" alt="" loading="lazy" width="620" height="345"><figcaption>Src: <a href="https://www.theclimatebrink.com/p/the-rapidly-shrinking-carbon-budget?ref=climate.benjames.io">Zeke Hausfather - The Climate Brink</a></figcaption></figure><p>Here’s the actual forecast from the US Energy Information Administration (for energy-related CO2 only).</p><figure><img src="https://lh7-us.googleusercontent.com/NG4pXg7XHbytq_henE2RnSHGAkU9S4BGmR3JhKS4TSHDqU--l4IZAfxT7Od4NykK1_RfSOOBLUbY3qoh3wMttaM6eRyLUq8lYY83OxsDnM0S4mTTaC_LfIjq0jt6V5RgVphvExaqJMsM0V9trZF8WjE" alt="" loading="lazy" width="687" height="443"></figure><p>Whilst the EIA is usually wrong, it’s true that things are going to get bad before they get better. The maths no longer checks out to hit 1.5 degrees, and even succeeding in holding 2 degrees would be a disastrous outcome.</p><p>I don’t point this out because emissions cuts are hopeless. On the contrary - we <em>will </em>electrify everything, solar &amp; batteries will eat the world, and emissions will plummet. But it still might take a decade or two too long. It would be a shame to die in the meantime.</p><p>To be clear: there is no valid argument that SRM should replace deep emissions cuts. But deploying it <em>alongside</em> deep emissions cuts could reduce risk and deaths from climate change.</p><h2 id="climate-controversy-repeats-itself">Climate controversy repeats itself</h2><p>SRM is the last of the four climate solution<em>s </em>to become widely discussed. It seems to me that their entry into the zeitgeist is ordered like this:</p><figure><img src="https://lh7-us.googleusercontent.com/URYF8spFIfUIhCTecWHrh2q3YJZNFBN_ry_uGRIt2WEcM6-I0e5Dy0OqPgKGkC6uF3X4GAEOlLw5FDtB7JPjmbIpKqRcdad8L5PSyVg6VvClw0BJP2JiIaSk0vECc5lvFh4CclRDo1N4QEdV5hXxkns" alt="" loading="lazy" width="684" height="46"></figure><div><div><p>In the 90s, <strong>adaptation </strong>was controversial because we thought we’d fix everything with mitigation. This changed in the 2000s.</p><p>In the 2000s, <strong>carbon removal</strong> was controversial, because we thought we’d fix everything with mitigation (and a bit of adaptation). This changed in the early 2020s (though CDR is still controversial, and for <a href="https://climate.benjames.io/energy-carbon-removal/">good reason</a>).</p><p>Today, <strong>SRM </strong>is controversial, because we maintain we’ll fix everything with mitigation, adaptation, and carbon removal. I predict that this will soon change.</p></div></div><p>Take a look at this flow of climate effects.</p><figure><img src="https://climate.benjames.io/content/images/2024/02/Climate-effects-chain--5-.png" alt="" loading="lazy" width="2000" height="762" srcset="https://climate.benjames.io/content/images/size/w600/2024/02/Climate-effects-chain--5-.png 600w, https://climate.benjames.io/content/images/size/w1000/2024/02/Climate-effects-chain--5-.png 1000w, https://climate.benjames.io/content/images/size/w1600/2024/02/Climate-effects-chain--5-.png 1600w, https://climate.benjames.io/content/images/size/w2400/2024/02/Climate-effects-chain--5-.png 2400w" sizes="(min-width: 720px) 720px"></figure><p>The best blend of future solutions to minimise human suffering probably includes some SRM. This is because:</p><ul><li>Mitigation can’t go fast enough to do 100% by 2050.</li><li>Carbon removal is too expensive to do more than a few percent.</li><li>Adaptation doesn’t actually stop temperatures rising.</li></ul><h2 id="final-thoughts">Final thoughts</h2><h4 id="so-how-would-we-actually-put-sulfur-into-the-stratosphere">So how would we actually put sulfur into the stratosphere?</h4><p>The most widely discussed method uses customised planes to fly missions into the stratosphere and release sulfur dioxide. People also talk about cannons that launch sulfur rockets, and (more practically) high-altitude balloons filled with sulfur and hydrogen/helium.</p><p>It’s easy to imagine a world where amateur enthusiasts launch large sulfur balloons from their backyard, just like hobbyists launch weather balloons today. Scientifically, this would be a terrible idea (remember, we only want to inject sulfur near the equator, in a controlled way). But it’s easy to see the individual appeal of offsetting the warming of<em> hundreds of thousands of people</em> with just a few balloons.</p><h4 id="is-it-only-sulfur-that-will-work">Is it only sulfur that will work?</h4><p>No. In fact, sulfur is unideal for a lot of reasons (it causes acid rain, could harm the ozone, and in general is not friendly to humans). But it mimics the “natural” effects of volcanoes, and our human sulfur emissions already do a lot of cooling, so we know <em>some </em>things about its effects on the atmosphere.</p><p>One promising alternative is calcium carbonate (chalk). Unlike sulfur, it is alkaline, not acidic - which means that it would accelerate the healing of the ozone hole as a co-benefit. <a href="https://nephewjonathan.substack.com/p/diy-geoengineering-the-whitepaper?ref=climate.benjames.io">Here’s a long blog post</a> on the details of calcite geoengineering. </p><p>Harvard has been trying to run a small <a href="https://geoengineering.environment.harvard.edu/frank-keutsch-stratospheric-controlled-perturbation-experiment?ref=climate.benjames.io">experiment called SCoPEx</a> to investigate calcium geoengineering. Despite being a fairly basic experiment (injecting less than a kg of calcium into the atmosphere from a balloon), the project has been stuck in approval committees for several years, because of the controversy of researching geoengineering.</p><h2 id="conclusion">Conclusion</h2><p>SRM might not make sense in your mind (it certainly doesn’t in mine). But do you view the world in the same way as a military dictator, “benevolent” billionaire, or leader of a starving country?</p><p>It's 2024, and for better or for worse, people are starting to take geoengineering seriously.</p><h2 id="the-end">The end</h2><p>Thanks to <a href="https://www.linkedin.com/in/macleaned/?ref=climate.benjames.io">Ed Maclean</a> (writes <a href="https://breakfastofchallengers.substack.com/?ref=climate.benjames.io">Breakfast of Challengers</a>), <a href="https://www.linkedin.com/in/laura-lock-09b1891a5/?ref=climate.benjames.io">Laura Lock</a>, and <a href="https://artlapinsch.com/?ref=climate.benjames.io">Art Lapinsch</a> (writes <a href="https://delphizero.substack.com/?ref=climate.benjames.io">Delphi Zero</a>) for their thoughtful comments on this one. All opinions are mine, not theirs (in fact they all disagree with at least one thing I’ve written above).</p><h3 id="other-writing">Other writing</h3><p>If you enjoyed reading this, you might like some of my other posts:</p><ul><li><a href="https://climate.benjames.io/batteries/">The Big Guide to Batteries</a></li><li><a href="https://climate.benjames.io/energy-carbon-removal/">The Energy Fundamentals of Carbon Removal</a></li><li><a href="https://climate.benjames.io/three-inputs/">Three Inputs = All Decarbonisation Tech</a></li></ul>
+            <p>I’m going to lay out some fascinating facts, and let you decide whether we are likely to dim the sun within the next 10 years.</p><p>Firstly, it’s much easier to artificially dim the sun than most people imagine.</p><p>100 planes injecting sulfur particles into the stratosphere would dim the sun by about 1%, and cool the earth by about 1°C.</p><figure><img src="https://lh7-us.googleusercontent.com/FNKxDvFN2dsBKjnHBGn31nQFgSxL8Ob50wXGQ8c8Fr8V9ocWvEJJ3Depj08MKlZRTftHmEw8XjLbKUIlbBT1rFa3EZ7FivhAGpUX-nS3v1HT6qPO8ZHxpKu-Oc7gbD7RJ4pE0M8csC_2BlEHqVviems" alt="" loading="lazy" width="666" height="457"><figcaption><a href="https://ben-james.notion.site/Sources-geoengineering-925832b122304a3b83c5d889acdea2fd?ref=climate.benjames.io">Sources</a></figcaption></figure><p>For context, our current sulfur dioxide emissions (from fossil fuels) <a href="https://ourworldindata.org/grapher/so-emissions-by-world-region-in-million-tonnes?ref=climate.benjames.io">are</a> &gt;10x bigger than the 1.2m tons shown above. The difference is the height of injection. We’d be putting sulfur into the <em>stratosphere</em>, which is higher up than our normal sulfur emissions in the <em>troposphere</em>.</p><p>Spraying a form of sulfur from a plane is incredibly cheap. A full programme <a href="https://iopscience.iop.org/article/10.1088/1748-9326/aba7e7/meta?ref=climate.benjames.io">would cost less</a> than $20b per year. That’s <strong>much</strong> cheaper than carbon removal ($600b per year,<em> </em>to remove just 10% of annual emissions @ $100 / tCO2).</p><p>Modifying the earth like this is called geoengineering, and blocking out the sun with particles is called <strong>Solar Radiation Management (SRM)</strong>.</p><h2 id="srm-awoke-in-2023">SRM awoke in 2023</h2><p>Interest in SRM spiked in 2023, after years of being too controversial to discuss. Here are a few reasons why.</p><h4 id="1we-don%E2%80%99t-know-why-2023-was-so-hot">#1 - We don’t know why 2023 was so hot</h4><p>The climate data from 2023 is scary, because we <em>do not understand </em>why 2023 was so warm. El Niño and low-sulfur fuels had an impact, but their effects were anticipated, and don’t fully explain the temperatures that we saw.</p><p>The actual warming in 2023 <a href="https://www.theclimatebrink.com/p/2023s-unexpected-and-unexplained?ref=climate.benjames.io">fell far outside of scientists’ predictions</a>. This is what hitting a climate feedback loop looks like.</p><figure><img src="https://lh7-us.googleusercontent.com/VDFNQQrVahE_NxvPW4IgvmtB_L7EzgyLr2wA5L2jeGNpz8IkrPu_oNnRsRxctbTELDsyRjwsJHgHBOoNy5NoBtpCzsd6ki1uu-bvJiJHO1oLYJ7AcxzX6oFgbrcV-BDvQIy4o56X4TCei0Pcmyu4b94" alt="" loading="lazy" width="702" height="500"></figure><h4 id="2billionaires-are-getting-interested">#2 - Billionaires are getting interested</h4><p>It only takes one person rich enough to start a geoengineering programme. In 2023, some powerful and wealthy people started talking publicly about geoengineering.</p><figure><img src="https://lh7-us.googleusercontent.com/ySAJFEj0H3NqY1wHcM5NBj2qsEE0WfeUxEt8yH4uR1tgF2RVANhzHjJBCfB8b6LQT5Jp-ufBVcCRCwLWfXEoh_8wn6QlxsDvLFIzK6HNXcnsaKkt9KZii619fP20uNv9RnN_h0eUOsX3KTRIFOo2yEs" alt="" loading="lazy" width="737" height="389"></figure><h4 id="3institutions-are-awakening-to-geoengineering">#3 - Institutions are awakening to geoengineering</h4><ul><li>In 2023, both the <a href="https://www.whitehouse.gov/ostp/news-updates/2023/06/30/congressionally-mandated-report-on-solar-radiation-modification/?ref=climate.benjames.io#:~:text=The%20White%20House%20Office%20of,also%20known%20as%20solar%20geoengineering.">US</a> and <a href="https://www.ft.com/content/8196059a-ecdf-4615-9f5d-ed1d4ab70cbd?ref=climate.benjames.io">EU</a> commissioned research on solar geoengineering. In the past, state governments have refused to fund anything related.</li><li>Climate scientists are starting to seriously talk about solar geoengineering. Traditionally, they’ve self-censored on this topic, but this is changing. I highly recommend Robinson Meyer’s <a href="https://heatmap.news/technology/climate-tech-geoengineering-carbon-removal?ref=climate.benjames.io">fascinating account of this</a>.</li><li>The internet noise is rising from a stutter to a low hum. In 2023/24, people are talking about SRM. <a href="https://caseyhandmer.wordpress.com/2023/06/06/we-should-not-let-the-earth-overheat/?ref=climate.benjames.io">Casey Handmer</a>, <a href="https://www.keepcool.co/p/forcing-the-issue?ref=climate.benjames.io">Keep Cool</a>, <a href="https://www.economist.com/science-and-technology/2023/11/22/solar-geoengineering-is-becoming-a-respectable-idea?ref=climate.benjames.io">The Economist</a>, and the <a href="https://www.bbc.com/future/article/20231010-sun-solar-geoengineering-ministry-for-the-future-kim-stanley-robinson?ref=climate.benjames.io">BBC</a>, to name just a few. I personally feel that 2023 was the year that SRM broke a critical threshold in the broader climate consciousness.</li></ul><div><p>Btw, if you want to get an email when I post future climate blogs, you can leave your email <a href="https://climate.benjames.io/someone-is-going-to-dim-the-sun/#/portal/signup">here</a>.</p></div><p>Ok, let’s rewind for a sec.</p><h2 id="you%E2%80%99re-telling-me-that-sulfur-reflects-the-sun">You’re telling me that sulfur reflects the sun?</h2><p>If reflecting the sun with sulfur sounds far fetched - well, we’re already doing it. </p><p>The two best examples:</p><ol><li>In 1991, Mount Pinatubo erupted and ejected millions of tons of sulfur dioxide. It cooled the earth by <a href="https://www.usgs.gov/observatories/hvo/news/volcano-watch-pinatubo-effect-can-geoengineering-mimic-volcanic-processes?ref=climate.benjames.io">around 0.5°C</a>, and lasted for around <a href="https://earthobservatory.nasa.gov/images/1510/global-effects-of-mount-pinatubo?ref=climate.benjames.io">two years</a>.</li><li>We already put sulfur into the atmosphere by burning fossil fuels. The sulfur that we’ve emitted so far is already reflecting sunlight, and is currently “masking” <a href="https://www.ipcc.ch/report/ar6/wg1/downloads/report/IPCC_AR6_WGI_SPM.pdf?ref=climate.benjames.io">about 0.5°C of warming</a>. Without these particles, we’d already be at 1.8°C warming, not <a href="https://essd.copernicus.org/articles/15/2295/2023/?ref=climate.benjames.io">1.3°C</a>.</li></ol><p>In 2020, the International Maritime Organisation introduced limits on the sulfur content of shipping fuel. It reduced sulfur dioxide emissions by about 8 million tons in its first year - about 10% of the global total.</p><figure><img src="https://lh7-us.googleusercontent.com/F39rdFdSBFguRtWFaPpY4HOSWeqqytXmssL5o7borhUOQUUtS3PETnP7VGvsVAsBHA1JbcTQKXLTDSQGW55RfyGCpRieV35ms81F_XaTJ99wOPHwlHeaMRAqwnEQcuWU5FBmTjNLYdZXOWZnLW9Tu2Y" alt="" loading="lazy" width="726" height="462"><figcaption>Src: <a href="https://www.carbonbrief.org/analysis-how-low-sulphur-shipping-rules-are-affecting-global-warming/?ref=climate.benjames.io">CarbonBrief</a></figcaption></figure><p>This reduction in sulfur emissions has “un-masked” warming that was already there. It’s one of the reasons for the jump in warming in 2023 (though it doesn’t fully explain the abnormality).</p><h4 id="instant-effect">Instant effect</h4><p>Because SRM acts almost instantly, we’d need to phase it in gradually. If we began blasting maximum sulfur tomorrow, we’d cause a sharp fall in temperature that would be a nasty shock to the climate.</p><p>A better plan is to use sulfur to pause our warming at its current level (<a href="https://essd.copernicus.org/articles/15/2295/2023/?ref=climate.benjames.io">about 1.3 °C</a>) whilst we slash emissions. Eventually SRM would become redundant as methane’s warming falls off, and carbon removal takes effect.</p><figure><img src="https://lh7-us.googleusercontent.com/xAXIhmrdzEFZoqH_V00_M0aiSGrbVNC1Go1yBboTfvXXQxdiMHBjwNwRJI7I_9mYD0WIAR24E1bD-xV6bTfB2h75fCMTa1IcuuTcu8_Jygd6NuI0SudNXestPzAYGopfFiOWJD7OZEOg00W7FHOMKjA" alt="" loading="lazy" width="689" height="431"></figure><p>Sulfur disappears from the atmosphere quickly - it rains out after about a year. This means that once we’ve started SRM, it’s dangerous to suddenly stop. We need to keep spraying particles, all the time. If we suddenly stopped, the warming would spring back rapidly, causing a bad temperature shock. The correct way to stop is a gradual phase out.</p><figure><img src="https://lh7-us.googleusercontent.com/n5M4khdhMEN_Jad0vDJxJ5w3FyWgYN5btp5WGDa_FNMjqi0yI2RfiUKxDx7QjPhSIv3-0glODN_JqLe6PIxNwT0tVGuuRAXlZ_z7OJQL7mO0UbVyDKDG_X06BOHF2BHkpCiYHzCNO0VacEqJjXBo_aA" alt="" loading="lazy" width="716" height="262"><figcaption>Piles of sulfur in Canada - a by-product of sweetening oil from Alberta. Photo: <a href="https://www.flickr.com/photos/gord99/4449228768/sizes/l/?ref=climate.benjames.io">Gord McKenna</a>.</figcaption></figure><h2 id="the-rub">The rub</h2><p>Unfortunately, Solar Radiation Management (SRM) has some fairly gigantic problems.</p><ol><li>It doesn’t fix the root cause. Cooling the planet does not remove the CO2 which has accumulated in our atmosphere. It doesn’t stop that CO2 from acidifying the oceans and irreversibly destroying marine biodiversity.</li><li>SRM could make us complacent about dramatically cutting emissions.</li><li>Sulfur increases acid rain (harmful to many life forms) and will likely harm the ozone.</li><li>If SRM is poorly implemented, it could dramatically change weather and rainfall patterns. For example, if sulfur is not injected near the equator, it will not evenly mix into the stratosphere, causing uneven cooling and heating.</li></ol><p>Shifted weather and rainfall patterns are one of the scariest possibilities of SRM. Even if deployed “correctly”, it’s unclear how SRM would affect rainfall and monsoons. Our <a href="https://geoengineering.environment.harvard.edu/sites/hwpi.harvard.edu/files/sgrp/files/irvine_etal_ncc_solar_geoengineering.pdf?m=1564406944&amp;ref=climate.benjames.io">current research</a> suggests that <em>when deployed in the correct locations and volumes</em>, SRM significantly moderates climate hazards everywhere, and significantly exacerbates them nowhere. But we will not know until we try.</p><p>Crucially, the biggest problems with SRM are probably not yet known. The side effects of putting sulfur into the stratosphere could be some of the most consequential unknowns in human history. Clearly, that’s a huge reason to do more research. But still - no matter how much research is done, when humanity tries to bend nature to its will, we can be sure that unintended consequences won’t be far behind.</p><h2 id="srm-will-be-deployed-without-your-consent">SRM will be deployed without your consent</h2><p>Geoengineering will not happen by international consensus. I find it impossible to imagine a UN mechanism approving something so universally contentious. </p><p>Rather, <em>someone will probably just do it</em>.</p><figure><img src="https://lh7-us.googleusercontent.com/w_CJlxp6lHw5zMWwjTP3ejL0S2YFJ7gVE-aWiSbxJUHSOkayvRJUoiu6KncEYOTmGYxGVsqTpu7A5ldyeqUC33ymMJkV9Zkby7yQwGlIAxeV_hk0peDJHY9Bqwwi1zio2QhW4vNFoBrSLVmAh5Z2i5A" alt="" loading="lazy" width="688" height="214"></figure><h4 id="a-country-with-no-choice">A country with no choice</h4><p>Some nations will soon have a simple choice: deploy geoengineering or cease to exist.</p><p>People underestimate how controversial it can become to <strong>not </strong>do SRM. Imagine you are the leader of a country close to the equator. Crop failures, extreme heat, and city-destroying cyclones mean that your people are without drinkable water, have nowhere to sleep, and cannot feed their children. Mass social unrest and physical violence become normal for your country. SRM is the only action that you can take to turn off the disasters, and prevent your government being overthrown.</p><p>Because SRM is so cheap, it’s completely feasible that one country could do this alone. (<a href="https://www.goodreads.com/en/book/show/50998056?ref=climate.benjames.io">The Ministry for the Future</a> and <a href="https://www.goodreads.com/book/show/57094295-termination-shock?ref=climate.benjames.io">Termination Shock</a> imagine interest from India, Singapore, Venice, Texas and The Netherlands)</p><p>Ultimately, the decision to turn on the SRM machines will not be made by climate scientists, or carefully calculated risks. It will be made on the basis of nations rising or falling - by starving populations, revolutionaries, and leaders with their back against a wall.</p><p><strong>The conditions only have to align for one country, at one time, to begin geoengineering.</strong></p><h4 id="a-billionaire">A billionaire</h4><p>There are three important things to know about billionaires:</p><ol><li>The business interests of many billionaires face total decimation at the hand of climate-induced conflict and destabilisation.</li><li>Many billionaires attribute their success to being hyper-logical, no-BS, getting shit done, and acting upon contrarian beliefs (sometimes this is even correct). The appeal of SRM to this mindset needs no explanation 🤠</li><li>Some billionaires want to use their money for good. The great challenge of the billionaire is how to convert a fortune into a timeless legacy.</li></ol><p><strong>It doesn’t matter if 99.9% of billionaires think that geoengineering is a terrible idea. It only takes one person rich enough to implement it.</strong></p><h2 id="every-year-srm-inches-towards-%E2%80%9Cthe-logical-choice%E2%80%9D">Every year, SRM inches towards “the logical choice”.</h2><p>Deploying SRM in 2024 is probably not the logical choice. But it’s not long before that changes.</p><h4 id="taking-climate-catastrophe-off-the-table">Taking climate catastrophe off the table</h4><p>The further that we depart from our current temperature, the more we risk runaway changes that we can't control. We don’t know much about when tipping points will occur - we just know that they are out there.</p><p>Why risk the arctic permafrost melting? Why risk losing the Greenland ice sheet? Why risk the tipping points that we don’t even know about?</p><p>These risks increase every year that our emissions are above zero - including every year that we are dramatically reducing emissions. SRM gives us the ability to lop off the most catastrophic outcomes from the end of the probability distribution.</p><p>Geoengineering is no replacement for getting our shit together. But there would be no honour in allowing the deaths of hundreds of millions of people, simply because they could have theoretically been avoided through more mitigation.</p><h4 id="let%E2%80%99s-check-in-on-global-emissions">Let’s check in on global emissions</h4><figure><img src="https://lh7-us.googleusercontent.com/wmHcuJTgR7bv7NjfhsluANEGlcLYlzLpdH0RZT6N85q2hbRGSDOaxCP-oM4MKQAyfvnTvqF1gyMbPVs1-vtXGdzgEOFJYuZbZTIqTC3tnYX531DiSSCSjf_VEKEvonD22TDAXo_iZIV-ayoAXibS2G0" alt="" loading="lazy" width="620" height="345"><figcaption>Src: <a href="https://www.theclimatebrink.com/p/the-rapidly-shrinking-carbon-budget?ref=climate.benjames.io">Zeke Hausfather - The Climate Brink</a></figcaption></figure><p>Here’s the actual forecast from the US Energy Information Administration (for energy-related CO2 only).</p><figure><img src="https://lh7-us.googleusercontent.com/NG4pXg7XHbytq_henE2RnSHGAkU9S4BGmR3JhKS4TSHDqU--l4IZAfxT7Od4NykK1_RfSOOBLUbY3qoh3wMttaM6eRyLUq8lYY83OxsDnM0S4mTTaC_LfIjq0jt6V5RgVphvExaqJMsM0V9trZF8WjE" alt="" loading="lazy" width="687" height="443"></figure><p>Whilst the EIA is usually wrong, it’s true that things are going to get bad before they get better. The maths no longer checks out to hit 1.5 degrees, and even succeeding in holding 2 degrees would be a disastrous outcome.</p><p>I don’t point this out because emissions cuts are hopeless. On the contrary - we <em>will </em>electrify everything, solar &amp; batteries will eat the world, and emissions will plummet. But it still might take a decade or two too long. It would be a shame to die in the meantime.</p><p>To be clear: there is no valid argument that SRM should replace deep emissions cuts. But deploying it <em>alongside</em> deep emissions cuts could reduce risk and deaths from climate change.</p><h2 id="climate-controversy-repeats-itself">Climate controversy repeats itself</h2><p>SRM is the last of the four climate solution<em>s </em>to become widely discussed. It seems to me that their entry into the zeitgeist is ordered like this:</p><figure><img src="https://lh7-us.googleusercontent.com/URYF8spFIfUIhCTecWHrh2q3YJZNFBN_ry_uGRIt2WEcM6-I0e5Dy0OqPgKGkC6uF3X4GAEOlLw5FDtB7JPjmbIpKqRcdad8L5PSyVg6VvClw0BJP2JiIaSk0vECc5lvFh4CclRDo1N4QEdV5hXxkns" alt="" loading="lazy" width="684" height="46"></figure><div><div><p>In the 90s, <strong>adaptation </strong>was controversial because we thought we’d fix everything with mitigation. This changed in the 2000s.</p><p>In the 2000s, <strong>carbon removal</strong> was controversial, because we thought we’d fix everything with mitigation (and a bit of adaptation). This changed in the early 2020s (though CDR is still controversial, and for <a href="https://climate.benjames.io/energy-carbon-removal/">good reason</a>).</p><p>Today, <strong>SRM </strong>is controversial, because we maintain we’ll fix everything with mitigation, adaptation, and carbon removal. I predict that this will soon change.</p></div></div><p>Take a look at this flow of climate effects.</p><figure><img src="https://climate.benjames.io/content/images/2024/02/Climate-effects-chain--5-.png" alt="" loading="lazy" width="2000" height="762" srcset="https://climate.benjames.io/content/images/size/w600/2024/02/Climate-effects-chain--5-.png 600w, https://climate.benjames.io/content/images/size/w1000/2024/02/Climate-effects-chain--5-.png 1000w, https://climate.benjames.io/content/images/size/w1600/2024/02/Climate-effects-chain--5-.png 1600w, https://climate.benjames.io/content/images/size/w2400/2024/02/Climate-effects-chain--5-.png 2400w" sizes="(min-width: 720px) 720px"></figure><p>The best blend of future solutions to minimise human suffering probably includes some SRM. This is because:</p><ul><li>Mitigation can’t go fast enough to do 100% by 2050.</li><li>Carbon removal is too expensive to do more than a few percent.</li><li>Adaptation doesn’t actually stop temperatures rising.</li></ul><h2 id="final-thoughts">Final thoughts</h2><h4 id="so-how-would-we-actually-put-sulfur-into-the-stratosphere">So how would we actually put sulfur into the stratosphere?</h4><p>The most widely discussed method uses customised planes to fly missions into the stratosphere and release sulfur dioxide. People also talk about cannons that launch sulfur rockets, and (more practically) high-altitude balloons filled with sulfur and hydrogen/helium.</p><p>It’s easy to imagine a world where amateur enthusiasts launch large sulfur balloons from their backyard, just like hobbyists launch weather balloons today. Scientifically, this would be a terrible idea (remember, we only want to inject sulfur near the equator, in a controlled way). But it’s easy to see the individual appeal of offsetting the warming of<em> hundreds of thousands of people</em> with just a few balloons.</p><h4 id="is-it-only-sulfur-that-will-work">Is it only sulfur that will work?</h4><p>No. In fact, sulfur is unideal for a lot of reasons (it causes acid rain, could harm the ozone, and in general is not friendly to humans). But it mimics the “natural” effects of volcanoes, and our human sulfur emissions already do a lot of cooling, so we know <em>some </em>things about its effects on the atmosphere.</p><p>One promising alternative is calcium carbonate (chalk). Unlike sulfur, it is alkaline, not acidic - which means that it would accelerate the healing of the ozone hole as a co-benefit. <a href="https://nephewjonathan.substack.com/p/diy-geoengineering-the-whitepaper?ref=climate.benjames.io">Here’s a long blog post</a> on the details of calcite geoengineering. </p><p>Harvard has been trying to run a small <a href="https://geoengineering.environment.harvard.edu/frank-keutsch-stratospheric-controlled-perturbation-experiment?ref=climate.benjames.io">experiment called SCoPEx</a> to investigate calcium geoengineering. Despite being a fairly basic experiment (injecting less than a kg of calcium into the atmosphere from a balloon), the project has been stuck in approval committees for several years, because of the controversy of researching geoengineering.</p><h2 id="conclusion">Conclusion</h2><p>SRM might not make sense in your mind (it certainly doesn’t in mine). But do you view the world in the same way as a military dictator, “benevolent” billionaire, or leader of a starving country?</p><p>It's 2024, and for better or for worse, people are starting to take geoengineering seriously.</p><h2 id="the-end">The end</h2><p>Thanks to <a href="https://www.linkedin.com/in/macleaned/?ref=climate.benjames.io">Ed Maclean</a> (writes <a href="https://breakfastofchallengers.substack.com/?ref=climate.benjames.io">Breakfast of Challengers</a>), <a href="https://www.linkedin.com/in/laura-lock-09b1891a5/?ref=climate.benjames.io">Laura Lock</a>, and <a href="https://artlapinsch.com/?ref=climate.benjames.io">Art Lapinsch</a> (writes <a href="https://delphizero.substack.com/?ref=climate.benjames.io">Delphi Zero</a>) for their thoughtful comments on this one. All opinions are mine, not theirs (in fact they all disagree with at least one thing I’ve written above).</p><p>📫 If you enjoyed reading this and want to get my future climate blogs in your inbox, you can drop your email <a href="https://climate.benjames.io/someone-is-going-to-dim-the-sun/#/portal/signup">here</a>.</p><h3 id="other-writing">Other writing</h3><p>If you enjoyed reading this, you might like some of my other posts:</p><ul><li><a href="https://climate.benjames.io/batteries/">The Big Guide to Batteries</a></li><li><a href="https://climate.benjames.io/energy-carbon-removal/">The Energy Fundamentals of Carbon Removal</a></li><li><a href="https://climate.benjames.io/three-inputs/">Three Inputs = All Decarbonisation Tech</a></li></ul>
         </div></div>]]>
             </description>
             <link>https://climate.benjames.io/someone-is-going-to-dim-the-sun/</link>
@@ -395,7 +709,7 @@ February 13, 2024 | https://climate.benjames.io/someone-is-going-to-dim-the-sun/
             </title>
             <description>
 <![CDATA[
-Score 90 | Comments 82 (<a href="https://news.ycombinator.com/item?id=39360258">thread link</a>) | @bookofjoe
+Score 91 | Comments 81 (<a href="https://news.ycombinator.com/item?id=39360258">thread link</a>) | @bookofjoe
 <br/>
 February 13, 2024 | https://www.zainrizvi.io/blog/falsehoods-programmers-believe-about-time-zones/ | <a href="https://web.archive.org/web/*/https://www.zainrizvi.io/blog/falsehoods-programmers-believe-about-time-zones/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -412,7 +726,7 @@ February 13, 2024 | https://www.zainrizvi.io/blog/falsehoods-programmers-believe
             </title>
             <description>
 <![CDATA[
-Score 49 | Comments 18 (<a href="https://news.ycombinator.com/item?id=39359976">thread link</a>) | @jcrnkovic
+Score 49 | Comments 19 (<a href="https://news.ycombinator.com/item?id=39359976">thread link</a>) | @jcrnkovic
 <br/>
 February 13, 2024 | https://crnkovic.me/filtering-out-vague-business-advice | <a href="https://web.archive.org/web/*/https://crnkovic.me/filtering-out-vague-business-advice">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>If you're a software developer, at some point in your career, you probably had an idea for an app or a SaaS that you wanted to build. You dreamed of making more than your job, so that you could focus on it full-time, or just have some disposable income. And that's great! You can (most likely) build the product from the development perspective, but you have zero idea where to go from there. You have no idea where and how to get people to use your product and have even less clue on how to get them to actually pay you for the product.</p>
@@ -978,7 +1292,7 @@ February 13, 2024 | https://lhostis.me/what-i-learned-joining-a-climate-civil-re
             </title>
             <description>
 <![CDATA[
-Score 88 | Comments 34 (<a href="https://news.ycombinator.com/item?id=39357155">thread link</a>) | @rsaarelm
+Score 128 | Comments 57 (<a href="https://news.ycombinator.com/item?id=39357155">thread link</a>) | @rsaarelm
 <br/>
 February 13, 2024 | https://adam.nels.onl//blog/maybe-everything-is-a-coroutine/ | <a href="https://web.archive.org/web/*/https://adam.nels.onl//blog/maybe-everything-is-a-coroutine/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1806,7 +2120,7 @@ February 13, 2024 | https://www.antithesis.com/blog/is_something_bugging_you/ | 
 <h4>What We've Built</h4>
 <p>Sure enough, the $100 bill is surrounded by an entire <em>field</em> of poisonous spike-pits, nay, a <em>continent</em> of them. Hereâ€™s an obvious one: how do you take an arbitrary piece of software, which is probably doing stuff like spawning threads, checking the time, asking the kernel for random numbers, and talking to other software over a network, and make it deterministic? At FoundationDB we had the benefit of a green-field project that we knew we wanted to test this way, and we had no dependencies (or at least, we didnâ€™t once weâ€™d deleted them all). But any new software development methodology that requires everybody to rewrite everything from scratch isnâ€™t going to get very far. We thought about this and decided to just go all out and write a hypervisor which emulates a deterministic <em>computer</em>. Consequently, we can force anything inside it to be deterministic. That meant learning lots of fun new things about how Intel CPUs handle extended page tables and other related horrors. Itâ€™s a story for another time, but itâ€™s a good example of the kind of poisonous spike-pit weâ€™ve gotten to explore (and itâ€™s far from the worst one!).<sup><a href="#fn2" id="ref2">[2]</a></sup></p>
 <p>Anyway, weâ€™ve built a platform that takes your software and hunts for bugs in it. When it finds one, that bug is always perfectly reproducible, no matter what crazy thing your software was doingâ€“even if it involves multiple services communicating across a network. Also, once weâ€™ve found a bug, we can bring some relatively space-age and insane debugging capabilities to bear on it. The platform is designed to be able to someday find many kinds of bugs in many kinds of software, but for now, weâ€™re focused solely on distributed systems reliability / fault tolerance testing, because itâ€™s an area where we already know what weâ€™re doing.</p>
-<p>Over the past several years weâ€™ve partnered with engineering teams at a bunch of organizations with big and complicated systems whose reliability they consider critical. Weâ€™ve worked with <a href="https://www.antithesis.com/case_studies/mongodb_productivity">MongoDB for several years</a>, helping them test their core server software as well as their WiredTiger storage engine. We began working with the Ethereum Foundation about a year ahead of the Merge in order to <a href="https://www.antithesis.com/case_studies/ethereum_merge">help them test it</a>, and continue working with them today. And weâ€™re working with Palantirâ€”but when I told them I was writing this blog post they just glared at me and said â€œno commentâ€�, so thatâ€™s all I can say about that.</p>
+<p>Over the past several years weâ€™ve partnered with engineering teams at a bunch of organizations with big and complicated systems whose reliability they consider critical. Weâ€™ve worked with <a href="https://www.antithesis.com/case_studies/mongodb_productivity">MongoDB for several years</a>, helping them test their core server software as well as their WiredTiger storage engine. We began working with the Ethereum Foundation about a year ahead of the Merge in order to <a href="https://www.antithesis.com/case_studies/ethereum_merge">help them test it</a>, and continue working with them today. And weâ€™re working with Palantir.</p>
 <p>Initially, these customers thought of Antithesis as a â€œspecial forcesâ€� tool that primarily helped them find and replicate their most elusive and dangerous bugs. But as our platform has become more mature and interactive, weâ€™ve shifted to being an â€œalways onâ€� service that continuously tests the most recent builds of their software, thus shortening the time from bug introduction to bug discovery. When building FoundationDB, we found that this made diagnosing and fixing bugs dramatically easier, increasing our efficiency and improving our software quality. Our customers are seeing this effect now, and weâ€™re excited to help many more of you reach the ~zero bugs promised land in the years to come.</p>
 <h4>Get In Touch?</h4>
 <p>If your organization runs a distributed system and values reliability and engineering productivity, <a href="https://www.antithesis.com/contact">weâ€™d love to talk</a>.</p>
@@ -1832,7 +2146,7 @@ February 13, 2024 | https://www.antithesis.com/blog/is_something_bugging_you/ | 
             </title>
             <description>
 <![CDATA[
-Score 1037 | Comments 375 (<a href="https://news.ycombinator.com/item?id=39356920">thread link</a>) | @wwilson
+Score 1081 | Comments 385 (<a href="https://news.ycombinator.com/item?id=39356920">thread link</a>) | @wwilson
 <br/>
 February 13, 2024 | https://antithesis.com/blog/is_something_bugging_you/ | <a href="https://web.archive.org/web/*/https://antithesis.com/blog/is_something_bugging_you/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1867,7 +2181,7 @@ February 13, 2024 | https://antithesis.com/blog/is_something_bugging_you/ | <a h
 <h4>What We've Built</h4>
 <p>Sure enough, the $100 bill is surrounded by an entire <em>field</em> of poisonous spike-pits, nay, a <em>continent</em> of them. Hereâ€™s an obvious one: how do you take an arbitrary piece of software, which is probably doing stuff like spawning threads, checking the time, asking the kernel for random numbers, and talking to other software over a network, and make it deterministic? At FoundationDB we had the benefit of a green-field project that we knew we wanted to test this way, and we had no dependencies (or at least, we didnâ€™t once weâ€™d deleted them all). But any new software development methodology that requires everybody to rewrite everything from scratch isnâ€™t going to get very far. We thought about this and decided to just go all out and write a hypervisor which emulates a deterministic <em>computer</em>. Consequently, we can force anything inside it to be deterministic. That meant learning lots of fun new things about how Intel CPUs handle extended page tables and other related horrors. Itâ€™s a story for another time, but itâ€™s a good example of the kind of poisonous spike-pit weâ€™ve gotten to explore (and itâ€™s far from the worst one!).<sup><a href="#fn2" id="ref2">[2]</a></sup></p>
 <p>Anyway, weâ€™ve built a platform that takes your software and hunts for bugs in it. When it finds one, that bug is always perfectly reproducible, no matter what crazy thing your software was doingâ€“even if it involves multiple services communicating across a network. Also, once weâ€™ve found a bug, we can bring some relatively space-age and insane debugging capabilities to bear on it. The platform is designed to be able to someday find many kinds of bugs in many kinds of software, but for now, weâ€™re focused solely on distributed systems reliability / fault tolerance testing, because itâ€™s an area where we already know what weâ€™re doing.</p>
-<p>Over the past several years weâ€™ve partnered with engineering teams at a bunch of organizations with big and complicated systems whose reliability they consider critical. Weâ€™ve worked with <a href="https://antithesis.com/case_studies/mongodb_productivity">MongoDB for several years</a>, helping them test their core server software as well as their WiredTiger storage engine. We began working with the Ethereum Foundation about a year ahead of the Merge in order to <a href="https://antithesis.com/case_studies/ethereum_merge">help them test it</a>, and continue working with them today. And weâ€™re working with Palantirâ€”but when I told them I was writing this blog post they just glared at me and said â€œno commentâ€�, so thatâ€™s all I can say about that.</p>
+<p>Over the past several years weâ€™ve partnered with engineering teams at a bunch of organizations with big and complicated systems whose reliability they consider critical. Weâ€™ve worked with <a href="https://antithesis.com/case_studies/mongodb_productivity">MongoDB for several years</a>, helping them test their core server software as well as their WiredTiger storage engine. We began working with the Ethereum Foundation about a year ahead of the Merge in order to <a href="https://antithesis.com/case_studies/ethereum_merge">help them test it</a>, and continue working with them today. And weâ€™re working with Palantir.</p>
 <p>Initially, these customers thought of Antithesis as a â€œspecial forcesâ€� tool that primarily helped them find and replicate their most elusive and dangerous bugs. But as our platform has become more mature and interactive, weâ€™ve shifted to being an â€œalways onâ€� service that continuously tests the most recent builds of their software, thus shortening the time from bug introduction to bug discovery. When building FoundationDB, we found that this made diagnosing and fixing bugs dramatically easier, increasing our efficiency and improving our software quality. Our customers are seeing this effect now, and weâ€™re excited to help many more of you reach the ~zero bugs promised land in the years to come.</p>
 <h4>Get In Touch?</h4>
 <p>If your organization runs a distributed system and values reliability and engineering productivity, <a href="https://antithesis.com/contact">weâ€™d love to talk</a>.</p>
@@ -1893,7 +2207,7 @@ February 13, 2024 | https://antithesis.com/blog/is_something_bugging_you/ | <a h
             </title>
             <description>
 <![CDATA[
-Score 44 | Comments 11 (<a href="https://news.ycombinator.com/item?id=39356530">thread link</a>) | @transpute
+Score 64 | Comments 13 (<a href="https://news.ycombinator.com/item?id=39356530">thread link</a>) | @transpute
 <br/>
 February 13, 2024 | https://kernel-recipes.org/en/2023/schedule/getting-the-rk3588-soc-supported-upstream/ | <a href="https://web.archive.org/web/*/https://kernel-recipes.org/en/2023/schedule/getting-the-rk3588-soc-supported-upstream/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="main-content">
@@ -1998,7 +2312,7 @@ February 13, 2024 | https://kernel-recipes.org/en/2023/schedule/getting-the-rk35
             </title>
             <description>
 <![CDATA[
-Score 13 | Comments 4 (<a href="https://news.ycombinator.com/item?id=39356410">thread link</a>) | @p4bl0
+Score 16 | Comments 4 (<a href="https://news.ycombinator.com/item?id=39356410">thread link</a>) | @p4bl0
 <br/>
 February 13, 2024 | http://whois.ai/faq.html | <a href="https://web.archive.org/web/*/http://whois.ai/faq.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><b>UDRP</b><br>
@@ -2246,7 +2560,7 @@ February 13, 2024 | https://bloomberry.com/why-i-threw-away-your-resume-from-the
             </title>
             <description>
 <![CDATA[
-Score 469 | Comments 127 (<a href="https://news.ycombinator.com/item?id=39356042">thread link</a>) | @ChrisArchitect
+Score 474 | Comments 130 (<a href="https://news.ycombinator.com/item?id=39356042">thread link</a>) | @ChrisArchitect
 <br/>
 February 13, 2024 | https://blog.gitbutler.com/git-tips-and-tricks/ | <a href="https://web.archive.org/web/*/https://blog.gitbutler.com/git-tips-and-tricks/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -2266,7 +2580,7 @@ February 13, 2024 | https://blog.gitbutler.com/git-tips-and-tricks/ | <a href="h
             </title>
             <description>
 <![CDATA[
-Score 232 | Comments 283 (<a href="https://news.ycombinator.com/item?id=39355744">thread link</a>) | @shubhamjain
+Score 238 | Comments 295 (<a href="https://news.ycombinator.com/item?id=39355744">thread link</a>) | @shubhamjain
 <br/>
 February 13, 2024 | https://textquery.app/2024/02/06/nokia-made-too-many-phones/ | <a href="https://web.archive.org/web/*/https://textquery.app/2024/02/06/nokia-made-too-many-phones/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="article">  <p><img src="https://images.textquery.app/nokia-phone-launches.png" alt="&quot;Chart of Nokia Phone Lanunches by Year (1982-22)&quot;"></p>
@@ -2392,7 +2706,7 @@ February 12, 2024 | https://getwaitlist.com/blog/blogging_software | <a href="ht
             </title>
             <description>
 <![CDATA[
-Score 91 | Comments 53 (<a href="https://news.ycombinator.com/item?id=39353784">thread link</a>) | @pabs3
+Score 92 | Comments 53 (<a href="https://news.ycombinator.com/item?id=39353784">thread link</a>) | @pabs3
 <br/>
 February 12, 2024 | https://marcin.juszkiewicz.com.pl/2024/02/12/twenty-years-of-my-work-with-arm-architecture/ | <a href="https://web.archive.org/web/*/https://marcin.juszkiewicz.com.pl/2024/02/12/twenty-years-of-my-work-with-arm-architecture/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2711,7 +3025,7 @@ February 12, 2024 | https://www.magiclasso.co/insights/advertising-carbon-emmiss
             </title>
             <description>
 <![CDATA[
-Score 171 | Comments 52 (<a href="https://news.ycombinator.com/item?id=39350866">thread link</a>) | @rdli
+Score 172 | Comments 52 (<a href="https://news.ycombinator.com/item?id=39350866">thread link</a>) | @rdli
 <br/>
 February 12, 2024 | https://www.amorphousdata.com/blog/time-series-vs-regression | <a href="https://web.archive.org/web/*/https://www.amorphousdata.com/blog/time-series-vs-regression">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>The application of historical data for predicting future outcomes is pivotal across various domains, encompassing revenue projections, weather forecasts, stock market trends, sports predictions, and beyond. This dependence on predictive analytics relies on extracting valuable insights from historical data, addressing diverse forecasting challenges.</p>
@@ -2859,7 +3173,7 @@ February 12, 2024 | https://templaradvisors.com/2015/12/10/vocal-fry-big-deal/ |
             </title>
             <description>
 <![CDATA[
-Score 116 | Comments 104 (<a href="https://news.ycombinator.com/item?id=39349817">thread link</a>) | @Tomte
+Score 117 | Comments 104 (<a href="https://news.ycombinator.com/item?id=39349817">thread link</a>) | @Tomte
 <br/>
 February 12, 2024 | https://www.isihac.net/mornington_crescent.php | <a href="https://web.archive.org/web/*/https://www.isihac.net/mornington_crescent.php">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><p>
@@ -2935,7 +3249,7 @@ I'd use a hash table, much like this:
             </title>
             <description>
 <![CDATA[
-Score 152 | Comments 126 (<a href="https://news.ycombinator.com/item?id=39345439">thread link</a>) | @aendruk
+Score 152 | Comments 128 (<a href="https://news.ycombinator.com/item?id=39345439">thread link</a>) | @aendruk
 <br/>
 February 12, 2024 | https://unterwaditzer.net/2023/cool-uris.html | <a href="https://web.archive.org/web/*/https://unterwaditzer.net/2023/cool-uris.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -3015,7 +3329,7 @@ routing layer of a random cloud service.</p>
             </title>
             <description>
 <![CDATA[
-Score 52 | Comments 72 (<a href="https://news.ycombinator.com/item?id=39345309">thread link</a>) | @joshstrange
+Score 52 | Comments 74 (<a href="https://news.ycombinator.com/item?id=39345309">thread link</a>) | @joshstrange
 <br/>
 February 12, 2024 | https://joshstrange.com/2024/02/11/krogers-digital-struggle/ | <a href="https://web.archive.org/web/*/https://joshstrange.com/2024/02/11/krogers-digital-struggle/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4496,7 +4810,7 @@ February 12, 2024 | https://akko.erincandescent.net/objects/0b812887-3946-4722-a
             </title>
             <description>
 <![CDATA[
-Score 248 | Comments 231 (<a href="https://news.ycombinator.com/item?id=39343919">thread link</a>) | @onnimonni
+Score 250 | Comments 233 (<a href="https://news.ycombinator.com/item?id=39343919">thread link</a>) | @onnimonni
 <br/>
 February 12, 2024 | https://flaky.build/built-in-workaround-for-applications-hiding-under-the-macbook-pro-notch | <a href="https://web.archive.org/web/*/https://flaky.build/built-in-workaround-for-applications-hiding-under-the-macbook-pro-notch">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -4511,7 +4825,7 @@ February 12, 2024 | https://flaky.build/built-in-workaround-for-applications-hid
             </title>
             <description>
 <![CDATA[
-Score 360 | Comments 89 (<a href="https://news.ycombinator.com/item?id=39343746">thread link</a>) | @RafelMri
+Score 362 | Comments 89 (<a href="https://news.ycombinator.com/item?id=39343746">thread link</a>) | @RafelMri
 <br/>
 February 12, 2024 | https://thekalmanfilter.com/kalman-filter-explained-simply/ | <a href="https://web.archive.org/web/*/https://thekalmanfilter.com/kalman-filter-explained-simply/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="post-1">
@@ -4965,7 +5279,7 @@ February 12, 2024 | https://t-shaped.nl/understanding-complexity-like-an-enginee
             </title>
             <description>
 <![CDATA[
-Score 138 | Comments 40 (<a href="https://news.ycombinator.com/item?id=39342863">thread link</a>) | @bo0tzz
+Score 139 | Comments 41 (<a href="https://news.ycombinator.com/item?id=39342863">thread link</a>) | @bo0tzz
 <br/>
 February 12, 2024 | https://arathunku.com/b/2024/shell-scripting-with-elixir/ | <a href="https://web.archive.org/web/*/https://arathunku.com/b/2024/shell-scripting-with-elixir/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section id="wrapper"><article><header><h2>Feb 11, 2024</h2></header><section id="post-body"><p>When simple bash scripts start to become unwieldy, you may consider reaching out for something “higher” level, like Perl, Ruby or Python. I’m reaching out for Elixir. Maybe the startup times are not perfect for every use case, but Elixir is extremely versatile. It’s easy to add dependencies, debug, iterate and even write tests, all in a single file! I believe, due to <a href="https://arathunku.com/b/2024/shell-scripting-with-elixir/livebook.dev">LiveBook</a>, it really hits its stride in recent years; the ecosystem leans heavily into ergonomic developer experience and great out-of-the-box defaults (<a href="https://github.com/wojtekmach/req">Req</a> is amazing!). In few lines of code, you can connect to Postgres, send HTTP requests or start HTTP server.</p><p>For my own use cases I’ve written scripts for displaying weather(focus only on rain, v. important for dog walks when your dog hates rain) in <a href="https://github.com/greshake/i3status-rust"><code>i3status-rust</code></a>, transforming various CSV files from bank exports into <a href="https://beancount.github.io/"><code>beancount</code></a> format, or creating <a href="https://github.com/visciang/telegram">Telegram bots</a>.</p><p>A simple script may be just:</p><div><pre tabindex="0"><code data-lang="elixir"><span><span><span>#!/usr/bin/env elixir</span>
@@ -5115,7 +5429,7 @@ end
             </title>
             <description>
 <![CDATA[
-Score 14 | Comments 1 (<a href="https://news.ycombinator.com/item?id=39342392">thread link</a>) | @doctor_phil
+Score 109 | Comments 2 (<a href="https://news.ycombinator.com/item?id=39342392">thread link</a>) | @doctor_phil
 <br/>
 February 11, 2024 | https://blog.stenmans.org/theBeamBook/ | <a href="https://web.archive.org/web/*/https://blog.stenmans.org/theBeamBook/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><p>Redbug is safe to be used in production, thanks to a self-protecting
@@ -5316,7 +5630,7 @@ available options for redbug, you can ask the tool itself:</p></div>]]>
             </title>
             <description>
 <![CDATA[
-Score 91 | Comments 193 (<a href="https://news.ycombinator.com/item?id=39342346">thread link</a>) | @precompute
+Score 91 | Comments 194 (<a href="https://news.ycombinator.com/item?id=39342346">thread link</a>) | @precompute
 <br/>
 February 11, 2024 | https://andreyor.st/posts/2020-12-03-we-need-to-talk-about-parentheses/ | <a href="https://web.archive.org/web/*/https://andreyor.st/posts/2020-12-03-we-need-to-talk-about-parentheses/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -5950,7 +6264,7 @@ February 11, 2024 | https://www.philoinvestor.com/p/downside-at-nvidia-and-the-n
             </title>
             <description>
 <![CDATA[
-Score 85 | Comments 99 (<a href="https://news.ycombinator.com/item?id=39340998">thread link</a>) | @andsoitis
+Score 86 | Comments 99 (<a href="https://news.ycombinator.com/item?id=39340998">thread link</a>) | @andsoitis
 <br/>
 February 11, 2024 | https://geneticsunzipped.com/transcripts/2021/8/26/where-did-dna-come-from | <a href="https://web.archive.org/web/*/https://geneticsunzipped.com/transcripts/2021/8/26/where-did-dna-come-from">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-block-type="2" id="block-7160b7dc760c6219d0be"><div>
@@ -5992,7 +6306,7 @@ February 11, 2024 | https://geneticsunzipped.com/transcripts/2021/8/26/where-did
             </title>
             <description>
 <![CDATA[
-Score 59 | Comments 59 (<a href="https://news.ycombinator.com/item?id=39340146">thread link</a>) | @laurex
+Score 60 | Comments 59 (<a href="https://news.ycombinator.com/item?id=39340146">thread link</a>) | @laurex
 <br/>
 February 11, 2024 | https://openpath.chadwhitacre.com/2024/questioning-the-value-of-open-source-software/ | <a href="https://web.archive.org/web/*/https://openpath.chadwhitacre.com/2024/questioning-the-value-of-open-source-software/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article><div>
@@ -6356,7 +6670,7 @@ February 11, 2024 | https://bits.danielrothmann.com/corporate-agile | <a href="h
             </title>
             <description>
 <![CDATA[
-Score 223 | Comments 174 (<a href="https://news.ycombinator.com/item?id=39337923">thread link</a>) | @mooreds
+Score 224 | Comments 174 (<a href="https://news.ycombinator.com/item?id=39337923">thread link</a>) | @mooreds
 <br/>
 February 11, 2024 | https://www.zainrizvi.io/blog/why-software-engineers-like-woodworking/ | <a href="https://web.archive.org/web/*/https://www.zainrizvi.io/blog/why-software-engineers-like-woodworking/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -6373,7 +6687,7 @@ February 11, 2024 | https://www.zainrizvi.io/blog/why-software-engineers-like-wo
             </title>
             <description>
 <![CDATA[
-Score 2433 | Comments 374 (<a href="https://news.ycombinator.com/item?id=39336139">thread link</a>) | @dutchkiwifruit
+Score 2440 | Comments 375 (<a href="https://news.ycombinator.com/item?id=39336139">thread link</a>) | @dutchkiwifruit
 <br/>
 February 11, 2024 | https://willempennings.nl/balancing-cube/ | <a href="https://web.archive.org/web/*/https://willempennings.nl/balancing-cube/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="post-1940">
@@ -6948,7 +7262,7 @@ fg<span>.</span>language<span>(</span><span>'en'</span><span>)</span>
             </title>
             <description>
 <![CDATA[
-Score 221 | Comments 66 (<a href="https://news.ycombinator.com/item?id=39335509">thread link</a>) | @patelajay285
+Score 222 | Comments 66 (<a href="https://news.ycombinator.com/item?id=39335509">thread link</a>) | @patelajay285
 <br/>
 February 11, 2024 | https://datadreamer.dev/docs/latest/pages/get_started/quick_tour/aligning.html | <a href="https://web.archive.org/web/*/https://datadreamer.dev/docs/latest/pages/get_started/quick_tour/aligning.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -7226,7 +7540,7 @@ xato-net-10-million-passwords.txt: 755 matches</code></pre><figure><img src="htt
             </title>
             <description>
 <![CDATA[
-Score 85 | Comments 100 (<a href="https://news.ycombinator.com/item?id=39334685">thread link</a>) | @DeathArrow
+Score 86 | Comments 100 (<a href="https://news.ycombinator.com/item?id=39334685">thread link</a>) | @DeathArrow
 <br/>
 February 11, 2024 | https://geoffgraham.me/css-is-logical/ | <a href="https://web.archive.org/web/*/https://geoffgraham.me/css-is-logical/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -7703,7 +8017,7 @@ an email under <code>https://your.tld.com/admin/master/console/#/master/realm-se
             </title>
             <description>
 <![CDATA[
-Score 423 | Comments 535 (<a href="https://news.ycombinator.com/item?id=39333220">thread link</a>) | @aragilar
+Score 424 | Comments 535 (<a href="https://news.ycombinator.com/item?id=39333220">thread link</a>) | @aragilar
 <br/>
 February 10, 2024 | https://yorickpeterse.com/articles/what-it-was-like-working-for-gitlab/ | <a href="https://web.archive.org/web/*/https://yorickpeterse.com/articles/what-it-was-like-working-for-gitlab/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><section><header><time datetime="2024-02-08T19:00:00Z">February 8, 2024</time></header><p>
