@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Tue, 19 Mar 2024 12:23:41 GMT</lastBuildDate>
+        <lastBuildDate>Tue, 19 Mar 2024 20:20:39 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-50.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Tue, 19 Mar 2024 12:23:41 GMT</pubDate>
+        <pubDate>Tue, 19 Mar 2024 20:20:39 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,1050 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Understanding Google's File System (2020)]]>
+            </title>
+            <description>
+<![CDATA[
+Score 63 | Comments 14 (<a href="https://news.ycombinator.com/item?id=39756262">thread link</a>) | @tosh
+<br/>
+March 19, 2024 | https://www.micahlerner.com/2020/03/22/understanding-googles-file-system.html | <a href="https://web.archive.org/web/*/https://www.micahlerner.com/2020/03/22/understanding-googles-file-system.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section id="post-content">
+<p>
+<em>
+These paper reviews can <a href="https://newsletter.micahlerner.com/">be delivered weekly to your inbox</a>, or you can subscribe to the <a href="https://www.micahlerner.com/feed.xml">Atom feed</a>. As always, feel free to reach out on <a href="https://twitter.com/micahlerner">Twitter</a> with feedback or suggestions!
+</em>
+</p>
+<p>Today I read <a href="https://static.googleusercontent.com/media/research.google.com/en//archive/gfs-sosp2003.pdf">the original paper</a> about the Google File System (GFS), a system that provided the storage layer for many of Google’s applications in the company’s early days. The original implementation has reportedly been replaced by a newer version called Colossus, but reading about the original approach was still illuminating and I thought I’d do a quick write up about it.</p>
+<h3 id="why-iswas-gfs-such-a-big-deal">Why is/was GFS such a big deal?</h3>
+<p>The original paper was published in 2003 at SOSP (Symposium on Operating Systems Principles - one of, if not the, best conferences for operating systems research).</p>
+<p>GFS made it onto the program because of how revolutionary it was at the time - the accompanying paper detailed how Google had successfully implemented academic ideas of weak consistency and reliance on a single master controller (more on this later) at tremendous scale in an industry application.</p>
+<p>The ultimate goal of GFS was to provide a replicated storage layer (redundant copies of data are kept across many machines) across the commodity level machines in a Google datacenter. The original motivation for developing such a system was to power batch jobs, although the system eventually powered other projects.</p>
+<p>Because GFS was designed for batch jobs, it primarily optimized for appending to, rather than modifying, files. Users of the program were generally writing large files out at once rather than making modifications to specific parts of a file.</p>
+<h3 id="what-are-the-abstractions-that-power-gfs">What are the abstractions that power GFS?</h3>
+<p>At the core of GFS is a concept called <strong>chunks</strong>. Chunks are used to split up files into fixed-size 64MB segments that are then replicated around the datacenter <a href="#footnotes">†</a>. Chunks are referred to by <strong>chunk handles</strong>, basically unique ids for a chunk. Splitting a large file into many chunks, then replicating those chunks across many machines accomplished two goals: improving performance (as there could now be many readers and writers of a single file), and allowing huge files to exist behind a simple abstraction.</p>
+<p>To make the idea of how this abstraction works more concrete, imagine using a library to open a file on a disk. Behind the scenes, that library now goes out and fetches all of the different pieces of the file you requested from computers all around your datacenter, then provides a transparent way to interact with the stitched together data <a href="#footnotes">†</a>.</p>
+<p>The aforementioned library (called by your user program, the Client) performs fetching and writing operations by interacting with several components of GFS:</p>
+<ul>
+<li><strong>Master</strong>: The master has a few responsibilties. To start, it is the first point of contact for a client when they want to interact with GFS. In addition to that function, the master is also responsible for communicating with a set of <strong>chunk servers</strong> that host chunks. To perform its functions, the master stores a few tables in RAM:
+<ul>
+<li>A mapping from filenames to <strong>chunk handles</strong> (chunk handles are basically IDs for chunks).</li>
+<li>A mapping from <strong>chunk handles</strong> to a list of the machines that the chunk is on, versioning information about the chunk (a piece of data to help with managing multiple writes to the same chunk), and two pieces of information related to managing writes to that chunk - the primary and the lease. I’ll cover the primary and the lease in the next section.</li>
+</ul>
+</li>
+<li><strong>Chunk Server</strong>: Chunk servers handle work around writing to and reading from disk. A client starts talking to them after being told to do so by the master.</li>
+</ul>
+<h3 id="how-does-writing-and-reading-to-gfs-work">How does writing and reading to GFS work?</h3>
+<h4 id="reading-from-gfs">Reading from GFS</h4>
+<p>To read a file to GFS, a client says to the master, “I would like to read this byte offset in this file”, where the file looks like a regular file system path.</p>
+<p>The master then receives the request from the client and calculates which chunk corresponds to the associated file and byte offset. Using the chunk handle of the calculated chunk, the master then gets the list of chunk servers that store the aforementioned chunk and provides it to the client. The client then chooses a chunk server, contacting it with the chunk and offset it wants, then is provided with the requested data.</p>
+<p>Along the way, the client also caches information about the chunk and the chunkservers it can find that chunk on if it needs to rerequest the chunk.</p>
+<h4 id="writing-to-gfs">Writing to GFS</h4>
+<p>Writing (in this case, appending) to files in GFS is significantly more complicated than reading from GFS.</p>
+<p>To start a client, asks the master for a specific file’s last chunk (the end of the file is necessary because we are appending). The master then checks its tables for information on that chunk, using the returned chunk handle (the chunk handle is essentially the ID of the chunk).</p>
+<p>The master then inspects two pieces of information that it is storing about each chunk - the primary and lease fields.</p>
+<p>The <strong>primary</strong> is a reference to a chunk server that has been assigned to coordinate writes among chunk servers. This assignment is short lived, and is governed by the expiration of the <strong>lease</strong>. When the lease runs out, the master can assign a new chunk server to coordinate writes.</p>
+<p>If the chunk that a client requests does not have a <strong>primary</strong> assigned, the master assigns one, and increments the version of the data. Incrementing the version number allows the master to keep track of which data is the most recent. If the chunk already has a primary, this step is skipped.</p>
+<p>The next step is to transmit information about the primary and secondaries (chunk servers that have the chunk, but aren’t the primary) to the client. From there, the client sends the data it wants to write to the respective chunk servers. After all chunk servers have the data, the client tells the primary to write it. The primary chunk server chooses a byte offset in the chunk (whatever the end of the file is), and sends it to all of the secondaries, after which all of them perform the right.</p>
+<p>If the primary and all secondaries write, the client receives a success! If not all secondaries write, the client receives a failure, at which point it needs to recontact the master and repeat the process from the beginning.</p>
+<h3 id="wrapping-up">Wrapping up</h3>
+<p>I <a href="https://queue.acm.org/detail.cfm?id=1594206">found an interview</a> with one of the engineers who worked on GFS to be fairly interesting. GFS was very successful for the applications it was designed for and reached wide adoption within Google.</p>
+<p>Unfortunately, it didn’t scale as well to new use cases for a few reasons. First off, the system used a single master process to store of chunk servers in addition to other metadata. Having all of this information in RAM on a single machine only went so far.</p>
+<p>Another issue that GFS ran into was in storing small files. For example, if a user wanted to store many files smaller than the chunk size, the master needed to store an entry for each file, and allocate the full chunk size on disk. Google ended up working on other systems and making tweaks to GFS to solve this problem (in particular, one of the systems that is discusses is BigTable).</p>
+<h3 id="footnotes">Footnotes:</h3>
+<ul>
+<li><a name="#1">[1]</a> Google’s new storage system would try to decrease the chunk size for reasons that I talk about at the end of this post.</li>
+<li><a name="#2">[2]</a> Whether the data is actually stitched together or not is somewhat of an implementation detail</li>
+</ul>
+<h3 id="references">References:</h3>
+<ul>
+<li>[1] <a href="https://static.googleusercontent.com/media/research.google.com/en//archive/gfs-sosp2003.pdf">GFS paper</a></li>
+<li>[2] <a href="https://www.youtube.com/watch?v=EpIgvowZr00&amp;feature=emb_title">MIT Distributed Systems lecture on GFS</a></li>
+<li>[3] <a href="https://cs.stanford.edu/~matei/courses/2015/6.S897/slides/gfs.pdf">Talk about GFS from Firas Abuzaid</a></li>
+</ul>
+
+</section></div>]]>
+            </description>
+            <link>https://www.micahlerner.com/2020/03/22/understanding-googles-file-system.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-39756262</guid>
+            <pubDate>Tue, 19 Mar 2024 14:48:12 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Practical Railway-Oriented Pipelines in Ruby]]>
+            </title>
+            <description>
+<![CDATA[
+Score 61 | Comments 35 (<a href="https://news.ycombinator.com/item?id=39754651">thread link</a>) | @ismaelct
+<br/>
+March 19, 2024 | https://ismaelcelis.com/posts/practical-railway-oriented-pipelines-in-ruby/ | <a href="https://web.archive.org/web/*/https://ismaelcelis.com/posts/practical-railway-oriented-pipelines-in-ruby/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section><p>Some years ago I <a href="https://ismaelcelis.com/posts/composable-pipelines-in-ruby/">explored patterns</a> for building composable processing pipelines in Ruby, using a Railway-oriented paradigm.</p>
+<p>Here, I describe a simplified implementation for practical use.</p>
+<div><pre tabindex="0"><code data-lang="ruby"><span># An illustrative data processing pipeline</span>
+<span>DataImporter</span> <span>=</span> <span>Pipeline</span><span>.</span>new <span>do</span> <span>|</span>pl<span>|</span>
+  pl<span>.</span>step <span>ExtractData</span>
+  pl<span>.</span>step <span>TransformData</span>
+  pl<span>.</span>step <span>LoadData</span>
+<span>end</span>
+</code></pre></div><p>I’ve relied on versions of this approach in various projects for some time now, and I’ve found it to be a very effective way to build and maintain complex data processing workflows.</p>
+<h2 id="the-result-class">The result class</h2>
+<p>A generic <code>Result</code> wraps values passed through the pipeline, and can be in one of two states: <code>Continue</code> or <code>Halt</code>.
+The values themselves can be anything relevant to the domain, but <code>Result</code> offers a consistent interface for handling them in the pipeline, as well as metadata such as user input, errors and arbitrary context.</p>
+<div><pre tabindex="0"><code data-lang="ruby"><span># Initial result</span>
+result <span>=</span> <span>Result</span><span>.</span>continue(<span>[</span><span>1</span>, <span>2</span>, <span>3</span>, <span>4</span><span>]</span>)
+result<span>.</span>input <span># {}</span>
+result<span>.</span>errors <span># {}</span>
+result<span>.</span>context <span># {}</span>
+result<span>.</span>continue? <span># =&gt; true</span>
+result <span>=</span> result<span>.</span>halt
+result<span>.</span>continue? <span># =&gt; false</span>
+</code></pre></div><p><code>Result</code> instances can be initialised or copied to add input, errors or context data.</p>
+<div><pre tabindex="0"><code data-lang="ruby">result <span>=</span> <span>Result</span><span>.</span>continue(<span>[</span><span>1</span>, <span>2</span>, <span>3</span>, <span>4</span><span>]</span>, <span>input</span>: { <span>limit</span>: <span>2</span> })
+result<span>.</span>input <span># { limit: 2 }</span>
+<span># Produce a new Result with some context data.</span>
+result <span>=</span> result<span>.</span>with_context(<span>:count</span>, <span>4</span>)
+result<span>.</span>context<span>[</span><span>:count</span><span>]</span> <span>=</span> <span>4</span>
+</code></pre></div><ul>
+<li>The <code>input</code> Hash is meant to pass external user or system input relevant for processing.</li>
+<li>The <code>errors</code> Hash is meant to accumulate errors during processing.</li>
+<li>The <code>context</code> Hash is meant to pass arbitrary data between pipeline steps.</li>
+</ul>
+<p>Helper methods such as <code>#with_context</code> and <code>#with_error</code> as well as <code>#halt</code> and <code>#continue</code> work to help manipulate result instances as it moves through the pipeline.</p>
+<div><pre tabindex="0"><code data-lang="ruby">result <span>=</span> result<span>.</span>halt<span>.</span>with_error(<span>:limit</span>, <span>"Exceeded"</span>)
+<span># result.continue? =&gt; false</span>
+<span># result.errors =&gt; { limit: "Exceeded" }</span>
+</code></pre></div><h2 id="the-pipeline">The pipeline</h2>
+<p>A pipeline is a sequence of steps that process a <code>Result</code> and return a new <code>Result</code>.
+a <code>Step</code> is a simple object that responds to <code>#call</code> and takes a <code>Result</code> as input, returning a new <code>Result</code>.</p>
+<div><pre tabindex="0"><code data-lang="ruby"><span>MyPipeline</span> <span>=</span> <span>Pipeline</span><span>.</span>new <span>do</span> <span>|</span>pl<span>|</span>
+  <span># Anything that responds to #call can be a step</span>
+  pl<span>.</span>step <span>MyCustomStep</span><span>.</span>new
+
+  <span># Or a simple proc. This one limits the set by the :limit input</span>
+  pl<span>.</span>step <span>do</span> <span>|</span>result<span>|</span>
+    set <span>=</span> result<span>.</span>value<span>.</span>first(result<span>.</span>input<span>[</span><span>:limit</span><span>]</span>)
+    result<span>.</span>continue(set)
+  <span>end</span>
+<span>end</span>
+
+<span># Usage</span>
+initial_result <span>=</span> <span>Result</span><span>.</span>continue((<span>1</span><span>..</span><span>100</span>), <span>input</span>: { <span>limit</span>: <span>5</span> })
+result <span>=</span> <span>MyPipeline</span><span>.</span>call(initial_result)
+result<span>.</span>value <span># =&gt; [1, 2, 3, 4, 5]</span>
+</code></pre></div><p>There’s very little to the <code>Pipeline</code> class itself.</p>
+<div><pre tabindex="0"><code data-lang="ruby"><span>class</span> <span>Pipeline</span>
+  <span>attr_reader</span> <span>:steps</span>
+
+  <span>def</span> <span>initialize</span>(<span>&amp;</span>block)
+    @steps <span>=</span> <span>[]</span>
+    block<span>.</span>call(self) <span>and</span> @steps<span>.</span>freeze <span>if</span> block_given?
+  <span>end</span>
+
+  <span>def</span> <span>step</span>(callable, <span>&amp;</span>block)
+    callable <span>||=</span> block
+    <span>raise</span> <span>ArgumentError</span>, <span>"Step must respond to #call"</span> <span>unless</span> callable<span>.</span>respond_to?(<span>:call</span>)
+    steps <span>&lt;&lt;</span> callable
+    self
+  <span>end</span>
+
+  <span># Iterate steps, call each one in turn,</span>
+  <span># passing the result of the previous step to the next.</span>
+  <span>def</span> <span>call</span>(result)
+    steps<span>.</span>reduce(result) { <span>|</span>r, step<span>|</span> step<span>.</span>call(r) }
+  <span>end</span>
+<span>end</span>
+</code></pre></div><h2 id="the-railway-bit">The Railway bit</h2>
+<p>Where this becomes useful is in the ability to “halt” processing at any point in the pipeline.</p>
+<div><pre tabindex="0"><code data-lang="ruby"><span>MyPipeline</span> <span>=</span> <span>Pipeline</span><span>.</span>new <span>do</span> <span>|</span>pl<span>|</span>
+  <span># This step halts processing if the set size is greater than 100</span>
+  pl<span>.</span>step <span>do</span> <span>|</span>result<span>|</span>
+    <span>if</span> result<span>.</span>value<span>.</span>size <span>&gt;</span> <span>100</span>
+      <span>return</span> result<span>.</span>halt<span>.</span>with_error(<span>:value</span>, <span>"Too many elements"</span>)
+    <span>end</span>
+    result
+  <span>end</span>
+
+  <span># This step should never be called if the previous one halted the result</span>
+  pl<span>.</span>step <span>do</span> <span>|</span>result<span>|</span>
+    result<span>.</span>continue(result<span>.</span>value<span>.</span>map { <span>|</span>n<span>|</span> n <span>*</span> <span>2</span> })
+  <span>end</span>
+<span>end</span>
+</code></pre></div><p>To make this work, we just need to make a small tweak to the <code>#call</code> method in the <code>Pipeline</code> class.</p>
+<div><pre tabindex="0"><code data-lang="ruby"><span>def</span> <span>call</span>(result)
+  steps<span>.</span>reduce(result) <span>do</span> <span>|</span>r, step<span>|</span>
+    <span># If the result is halted, return it untouched.</span>
+    r<span>.</span>continue? ? step<span>.</span>call(r) : r
+  <span>end</span>
+<span>end</span>
+</code></pre></div><p>Now, any step that returns a <em>halt</em> will just skip further steps downstream. Lets do some number crunching:</p>
+<div><pre tabindex="0"><code data-lang="ruby"><span># A portable step to validate set size</span>
+<span>class</span> <span>ValidateSetSize</span>
+  <span>def</span> <span>initialize</span>(<span>lte</span>:) <span>=</span> @lte <span>=</span> lte
+
+  <span>def</span> <span>call</span>(result)
+    <span>return</span> result<span>.</span>halt<span>.</span>with_error(<span>:value</span>, <span>"Too many elements"</span>) <span>if</span> result<span>.</span>value<span>.</span>size <span>&gt;</span> @lte
+    result
+  <span>end</span>
+<span>end</span>
+
+<span># A step to multiply each number in the set by a factor</span>
+<span># This one is a Proc that returns a Proc.</span>
+<span>MultiplyBy</span> <span>=</span> proc <span>do</span> <span>|</span>factor<span>|</span>
+  proc <span>do</span> <span>|</span>result<span>|</span>
+    result<span>.</span>continue(result<span>.</span>value<span>.</span>map { <span>|</span>n<span>|</span> n <span>*</span> factor })
+  <span>end</span>
+<span>end</span>
+
+<span># A step to limit the set to the first N elements, as per input[:limit]</span>
+<span>LimitSet</span> <span>=</span> proc <span>do</span> <span>|</span>result<span>|</span>
+  set <span>=</span> result<span>.</span>value<span>.</span>first(result<span>.</span>input<span>[</span><span>:limit</span><span>]</span>)
+  result<span>.</span>continue(set)
+<span>end</span>
+
+<span># Compose the pipeline</span>
+<span>NumberCruncher</span> <span>=</span> <span>Pipeline</span><span>.</span>new <span>do</span> <span>|</span>pl<span>|</span>
+  pl<span>.</span>step <span>ValidateSetSize</span><span>.</span>new(<span>lte</span>: <span>100</span>)
+  pl<span>.</span>step <span>MultiplyBy</span><span>.</span>(<span>2</span>)
+  pl<span>.</span>step <span>LimitSet</span>
+<span>end</span>
+</code></pre></div><p>In this example, the first <code>ValidateSetSize</code> step will halt the pipeline if the set size is greater than 100, preventing <code>MultiplyBy</code> and <code>LimitSet</code> steps from running.</p>
+<div><pre tabindex="0"><code data-lang="ruby">initial_result <span>=</span> <span>Result</span><span>.</span>continue((<span>1</span><span>..</span><span>101</span>), <span>input</span>: { <span>limit</span>: <span>5</span> })
+result <span>=</span> <span>NumberCruncher</span><span>.</span>call(initial_result)
+result<span>.</span>continue? <span># =&gt; false</span>
+result<span>.</span>errors <span># =&gt; { value: "Too many elements" }</span>
+</code></pre></div>
+<ul>
+    <li>1. <code>ValidateSetSize.new(lte: 100)</code></li>
+    <li>2. <code>MultiplyBy.(2)</code></li>
+    <li>3. <code>LimitSet</code></li>
+</ul>
+<p>However, if all steps return a <em>continue</em> result, the pipeline processes all steps and returns the final result.</p>
+<div><pre tabindex="0"><code data-lang="ruby">initial_result <span>=</span> <span>Result</span><span>.</span>continue((<span>1</span><span>..</span><span>99</span>), <span>input</span>: { <span>limit</span>: <span>5</span> })
+result <span>=</span> <span>MyPipeline</span><span>.</span>call(initial_result)
+result<span>.</span>continue? <span># =&gt; true</span>
+<span># Each number in set was multiplied by 2, then limited to the first 5</span>
+result<span>.</span>value <span># =&gt; [2, 4, 6, 8, 10]</span>
+</code></pre></div><ul>
+    <li>1. <code>ValidateSetSize.new(lte: 100)</code></li>
+    <li>2. <code>MultiplyBy.(2)</code></li>
+    <li>3. <code>LimitSet</code></li>
+</ul>
+<h2 id="composing-pipelines">Composing pipelines</h2>
+<p>Since <code>Pipeline</code> itself implements the <code>#call(Result) Result</code> interface, it can be used as a step in another pipeline.</p>
+<div><pre tabindex="0"><code data-lang="ruby"><span>BigPipeline</span> <span>=</span> <span>Pipeline</span><span>.</span>new <span>do</span> <span>|</span>pl<span>|</span>
+  pl<span>.</span>step <span>Step1</span> <span># a regular step</span>
+  pl<span>.</span>step <span>NumberCruncher</span> <span>#&nbsp;a nested pipeline</span>
+  pl<span>.</span>step <span>Step3</span> <span># another regular step</span>
+<span>end</span>
+</code></pre></div><p>This allows “packaging up” complex processing workflows into reusable components, where each component can be composed of multiple steps if need be.
+It’s also possible to have factory methods that parameterise the creation of pipelines.</p>
+<div><pre tabindex="0"><code data-lang="ruby"><span># A component to validate and coerce a set of numbers</span>
+<span># It returns a 2-step pipeline that can be composed into a larger pipeline</span>
+<span>module</span> NumberValidation
+  <span>def</span> <span>self</span><span>.</span><span>new</span>(<span>lte</span>:)
+    <span>Pipeline</span><span>.</span>new <span>do</span> <span>|</span>pl<span>|</span>
+      pl<span>.</span>step <span>ValidateSetSize</span><span>.</span>new(<span>lte</span>: lte)
+      pl<span>.</span>step <span>CoerceToIntegers</span>
+    <span>end</span>
+  <span>end</span>
+
+  <span>CoerceToIntegers</span> <span>=</span> proc <span>do</span> <span>|</span>result<span>|</span>
+    result<span>.</span>continue(result<span>.</span>value<span>.</span>map(<span>&amp;</span><span>:to_i</span>))
+  <span>end</span>
+<span>end</span>
+
+<span># Compose a larger pipeline</span>
+<span>BigPipeline</span> <span>=</span> <span>Pipeline</span><span>.</span>new <span>do</span> <span>|</span>pl<span>|</span>
+  pl<span>.</span>step <span>Step1</span>
+  pl<span>.</span>step <span>NumberValidation</span><span>.</span>new(<span>lte</span>: <span>100</span>) <span># a nested pipeline</span>
+  pl<span>.</span>step <span>Step3</span>
+<span>end</span>
+</code></pre></div><p>Pipelines can also be used internally by custom classes.</p>
+<div><pre tabindex="0"><code data-lang="ruby"><span>class</span> <span>NumberValidation</span>
+  <span>def</span> <span>initialize</span>(<span>lte</span>:)
+    @pipeline <span>=</span> <span>Pipeline</span><span>.</span>new <span>do</span> <span>|</span>pl<span>|</span>
+      pl<span>.</span>step <span>ValidateSetSize</span><span>.</span>new(<span>lte</span>: lte)
+      <span># Use a Method object as step</span>
+      pl<span>.</span>step method(<span>:coerce_to_integers</span>)
+    <span>end</span>
+  <span>end</span>
+
+  <span># The Step interface</span>
+  <span>def</span> <span>call</span>(result) <span>=</span> @pipeline<span>.</span>call(result)
+
+  <span>private</span> <span>def</span> <span>coerce_to_integers</span>(result)
+    result<span>.</span>continue(result<span>.</span>value<span>.</span>map(<span>&amp;</span><span>:to_i</span>))
+  <span>end</span>
+<span>end</span>
+</code></pre></div><p>Which approach to use will depend on each step’s internals. Other than the simple <code>#call</code> interface, steps are effective black boxes and refactoring them is straightforward.</p>
+<h2 id="extending-the-pipeline">Extending the pipeline</h2>
+<p>The <code>Pipeline</code> class itself can be subclassed or extended to add domain-specific functionality. One that I’ve found helpful is to add a terse DSL for input validation.</p>
+<div><pre tabindex="0"><code data-lang="ruby"><span>NumberCruncher</span> <span>=</span> <span>Pipeline</span><span>.</span>new <span>do</span> <span>|</span>pl<span>|</span>
+  <span># the #input helper adds a step to validate input</span>
+  pl<span>.</span>input <span>do</span>
+    field(<span>:limit</span>)<span>.</span>type(<span>:integer</span>)<span>.</span>required<span>.</span>default(<span>5</span>)
+    field(<span>:lte</span>)<span>.</span>type(<span>:integer</span>)<span>.</span>required
+  <span>end</span>
+
+  <span># ... other steps here</span>
+<span>end</span>
+</code></pre></div><p>All <code>#input</code> does is register a step using a specialised class that knows how to validate input. That class exposes the <code>#call(Result) Result</code> interface, and halts the pipeline if input is invalid.</p>
+<div><pre tabindex="0"><code data-lang="ruby"><span>class</span> <span>Pipeline</span>
+  <span># ... etc</span>
+
+  <span>def</span> <span>input</span>(<span>&amp;</span>block)
+    step <span>InputValidator</span><span>.</span>new(<span>&amp;</span>block)
+  <span>end</span>
+<span>end</span>
+</code></pre></div><p>I use my <a href="https://github.com/ismasan/parametric">Parametric</a> gem for this, but anything that makes sense for your domain will do. <a href="https://dry-rb.org/gems/dry-types/">Dry::Types</a> is another good option. Or Rails' <a href="https://api.rubyonrails.org/classes/ActiveModel/Validations.html">ActiveModel::Validations</a> if you’re in a Rails app.</p>
+<p>This means that complex operations can now be packaged up and validate their own inputs.</p>
+<div><pre tabindex="0"><code data-lang="ruby"><span># A portable step to multiply each number in the set by a factor.</span>
+<span>Multiplier</span> <span>=</span> <span>Pipeline</span><span>.</span>new <span>do</span> <span>|</span>pl<span>|</span>
+  pl<span>.</span>input <span>do</span>
+    field(<span>:factor</span>)<span>.</span>type(<span>:integer</span>)<span>.</span>required<span>.</span>default(<span>1</span>)
+  <span>end</span>
+
+  pl<span>.</span>step <span>do</span> <span>|</span>result<span>|</span>
+    factor <span>=</span> result<span>.</span>input<span>[</span><span>:factor</span><span>]</span>
+    result<span>.</span>continue(result<span>.</span>value<span>.</span>map { <span>|</span>n<span>|</span> n <span>*</span> factor })
+  <span>end</span>
+<span>end</span>
+
+<span># A portable step to limit the set to the first N elements.</span>
+<span>#&nbsp;It defines its own required input.</span>
+<span>Limiter</span> <span>=</span> <span>Pipeline</span><span>.</span>new <span>do</span> <span>|</span>pl<span>|</span>
+  pl<span>.</span>input <span>do</span>
+    field(<span>:limit</span>)<span>.</span>type(<span>:integer</span>)<span>.</span>required<span>.</span>default(<span>5</span>)
+  <span>end</span>
+
+  pl<span>.</span>step <span>do</span> <span>|</span>result<span>|</span>
+    set <span>=</span> result<span>.</span>value<span>.</span>first(result<span>.</span>input<span>[</span><span>:limit</span><span>]</span>)
+    result<span>.</span>continue(set)
+  <span>end</span>
+<span>end</span>
+</code></pre></div><div><pre tabindex="0"><code data-lang="ruby"><span>NumberCruncher</span> <span>=</span> <span>Pipeline</span><span>.</span>new <span>do</span> <span>|</span>pl<span>|</span>
+  pl<span>.</span>step <span>NumberValidation</span><span>.</span>new(<span>lte</span>: <span>100</span>)
+  pl<span>.</span>step <span>Multiplier</span>
+  pl<span>.</span>step <span>Limiter</span>
+<span>end</span>
+</code></pre></div><p>I use helper methods to simplify domain-specific pipelines. Some other examples include:</p>
+<div><pre tabindex="0"><code data-lang="ruby"><span>MyPipeline</span> <span>=</span> <span>Pipeline</span><span>.</span>new <span>do</span> <span>|</span>pl<span>|</span>
+  <span># A helper to filter elements in a set.</span>
+  <span># Returns a new [Result] with the filtered set.</span>
+  pl<span>.</span>filter <span>do</span> <span>|</span>element<span>|</span>
+    element <span>&gt;</span> <span>10</span>
+  <span>end</span>
+
+  <span># A helper to sort elements in a set</span>
+  pl<span>.</span>sort <span>do</span> <span>|</span>a, b<span>|</span>
+    a <span>&lt;=&gt;</span> b
+  <span>end</span>
+
+  <span># A development helper to invoke a Byebug or Pry session at this point</span>
+  pl<span>.</span>debugger
+<span>end</span>
+</code></pre></div><p>For most, the implementation is trivial.</p>
+<div><pre tabindex="0"><code data-lang="ruby"><span>def</span> <span>filter</span>(<span>&amp;</span>block)
+  step <span>do</span> <span>|</span>result<span>|</span>
+    set <span>=</span> result<span>.</span>value<span>.</span>filter(<span>&amp;</span>block)
+    result<span>.</span>continue(set)
+  <span>end</span>
+<span>end</span>
+
+<span>def</span> <span>sort</span>(<span>&amp;</span>block)
+  step <span>do</span> <span>|</span>result<span>|</span>
+    set <span>=</span> result<span>.</span>value<span>.</span>sort(<span>&amp;</span>block)
+    result<span>.</span>continue(set)
+  <span>end</span>
+<span>end</span>
+
+<span>def</span> <span>debugger</span>
+  step <span>do</span> <span>|</span>result<span>|</span>
+    binding<span>.</span>pry
+    result
+  <span>end</span>
+<span>end</span>
+</code></pre></div><h2 id="tracing-step-positions">Tracing step positions</h2>
+<p>As workflows become more complex, it’s helpful to have ways to trace and instrospect execution.
+For example, when a step halts the pipeline, I would like to know exactly what step it was, and at what depth in the pipeline it sits.</p>
+<p>Well deal with the latter first. The following tweaks <code>Pipeline#call</code> to keep track of the current step position relative to its parent pipeline.</p>
+<div><pre tabindex="0"><code data-lang="ruby"><span>class</span> <span>Pipeline</span>
+  <span># ... etc</span>
+
+  <span># For each step, keep track of its position in the pipeline</span>
+  <span># in the result context.</span>
+  <span>def</span> <span>call</span>(result)
+    trace <span>=</span> result<span>.</span>context<span>[</span><span>:trace</span><span>]</span> <span>||</span> <span>[]</span>
+    steps<span>.</span>each<span>.</span>with_index(<span>1</span>)<span>.</span>reduce(result) <span>do</span> <span>|</span>res, (step, position)<span>|</span>
+      <span>if</span> res<span>.</span>continue?
+        step<span>.</span>call(res<span>.</span>with_context(<span>:trace</span>, trace <span>+</span> <span>[</span>position<span>]</span>))
+      <span>else</span>
+        res
+      <span>end</span>
+    <span>end</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div><p>With this, the <code>Result</code> instance passed to each step will have a <code>:trace</code> key in its context, which is an array of integers representing the position of the step in the pipeline.</p>
+<p>For example:</p>
+<div><pre tabindex="0"><code data-lang="ruby"><span>OkStep</span> <span>=</span> <span>-&gt;</span>(result) { result<span>.</span>continue }
+
+<span>FailStep</span> <span>=</span> <span>-&gt;</span>(result) { result<span>.</span>halt }
+
+<span>ChildPipeline</span> <span>=</span> <span>Pipeline</span><span>.</span>new <span>do</span> <span>|</span>pl<span>|</span>
+  pl<span>.</span>step <span>OkStep</span>
+  pl<span>.</span>step <span>FailedStep</span> <span># &lt;- this one halts the pipeline</span>
+  pl<span>.</span>step <span>OkStep</span>
+<span>end</span>
+
+<span>BigPipeline</span> <span>=</span> <span>Pipeline</span><span>.</span>new <span>do</span> <span>|</span>pl<span>|</span>
+  pl<span>.</span>step <span>OkStep</span>
+  pl<span>.</span>step <span>OkStep</span>
+  pl<span>.</span>step <span>ChildPipeline</span> <span># &lt;- 2nd step in this pipeline halts</span>
+  pl<span>.</span>step <span>OkStep</span>
+<span>end</span>
+</code></pre></div><p><code>FailedStep</code> inside the child pipeline will be the last step in the trace, and <code>#context[:trace]</code> will be <code>[3, 2]</code>, because it’s the third step in the child pipeline, and the child pipeline is the second step in the parent pipeline.</p>
+<div><pre tabindex="0"><code data-lang="ruby">result <span>=</span> <span>BigPipeline</span><span>.</span>call(<span>Result</span><span>.</span>continue)
+result<span>.</span>continue? <span># =&gt; false</span>
+result<span>.</span>context<span>[</span><span>:trace</span><span>]</span> <span># =&gt; [3, 2]</span>
+</code></pre></div><p>In other words:</p>
+<ul>
+    <li>[1] <code>OkStep</code></li>
+    <li>[2] <code>OkStep</code></li>
+    <li>
+        [3] <code>ChildPipeline</code>
+        <ul>
+            <li>[3,1] <code>OkStep</code></li>
+            <li>[3,2] <code>FailedStep</code></li>
+            <li>[3,3] <code>OkStep</code></li>
+        </ul>
+    </li>
+    <li>[4] <code>OkStep</code></li>
+</ul>
+<h2 id="middleware">Middleware</h2>
+<p>Now we’ll add <code>context[:halted_step]</code> to the <code>Result</code> instance, so that we know exactly what step halted the pipeline.
+For that, we’ll use a middleware approach. We’ll tweak <code>Pipeline#step</code> to wrap all registered steps with a middleware that adds the <code>halted_step</code> to the result context if the step halts the pipeline.</p>
+<div><pre tabindex="0"><code data-lang="ruby"><span>class</span> <span>Pipeline</span>
+  <span># ... etc</span>
+
+  <span>def</span> <span>step</span>(callable, <span>&amp;</span>block)
+    callable <span>||=</span> block
+    <span>raise</span> <span>ArgumentError</span>, <span>"Step must respond to #call"</span> <span>unless</span> callable<span>.</span>respond_to?(<span>:call</span>)
+
+    <span># Wrap the step with a middleware</span>
+    callable <span>=</span> <span>StepTracker</span><span>.</span>new(callable)
+    steps <span>&lt;&lt;</span> callable
+    self
+  <span>end</span>
+<span>end</span>
+</code></pre></div><p>A middleware step wraps around the execution of another step.</p>
+<div><pre tabindex="0"><code data-lang="ruby"><span>class</span> <span>StepTracker</span> <span>&lt;</span> <span>SimpleDelegator</span>
+  <span>def</span> <span>call</span>(result)
+    step <span>=</span> __getobj__
+    result <span>=</span> step<span>.</span>call(result)
+    <span>return</span> result<span>.</span>with_context(<span>:halted_step</span>, step) <span>unless</span> result<span>.</span>continue?
+    result
+  <span>end</span>
+<span>end</span>
+</code></pre></div><p>Now, <code>context[:halted_step]</code> will be set to the step that halted the pipeline, and <code>context[:trace]</code> will be set to the position of that step in the pipeline.</p>
+<div><pre tabindex="0"><code data-lang="ruby">result <span>=</span> <span>BigPipeline</span><span>.</span>call(<span>Result</span><span>.</span>continue)
+result<span>.</span>continue? <span># =&gt; false</span>
+result<span>.</span>context<span>[</span><span>:halted_step</span><span>]</span> <span># =&gt; FailedStep</span>
+result<span>.</span>context<span>[</span><span>:trace</span><span>]</span> <span># =&gt; [3, 2]</span>
+</code></pre></div><p>Note that the same middleware approach can be used to add other tracing and introspection features to the pipeline. Some examples:</p>
+<div><pre tabindex="0"><code data-lang="ruby">callable <span>=</span> <span>Instrumentation</span><span>.</span>new(callable)
+callable <span>=</span> <span>Logging</span><span>.</span>new(callable, <span>Rails</span><span>.</span>logger)
+callable <span>=</span> <span>StepTracker</span><span>.</span>new(callable)
+steps <span>&lt;&lt;</span> callable
+</code></pre></div><p>It’s also possible to add class-level configuration to register middleware for <code>Pipeline</code> subclasses.</p>
+<div><pre tabindex="0"><code data-lang="ruby"><span>class</span> <span>MyPipeline</span> <span>&lt;</span> <span>Pipeline</span>
+  middleware <span>Instrumentation</span><span>.</span>new(<span>api_key</span>: <span>ENV</span><span>.</span>fetch(<span>'API_KEY'</span>))
+  middleware <span>Logging</span><span>.</span>new(<span>Rails</span><span>.</span>logger)
+<span>end</span>
+</code></pre></div><p>A framework-agnostic implementation for that is included in the <a href="https://gist.github.com/ismasan/0bdcc76c2ea48f4259b38fafe131edb8">code gist</a></p>
+<blockquote>
+<p>Middleware steps might look similar to regular steps, but they are not.
+Each registered middleware step wraps around every regular step, including in nested pipelines.</p>
+</blockquote>
+<h2 id="clis">CLIs</h2>
+<p>A CLI-tailored pipeline class can leverage step tracing to print step positions and halt reasons to the console.</p>
+<div><pre tabindex="0"><code data-lang="ruby"><span>class</span> <span>StepPrinter</span> <span>&lt;</span> <span>SimpleDelegator</span>
+  <span>def</span> <span>call</span>(result)
+    step <span>=</span> __getobj__
+    position <span>=</span> result<span>.</span>context<span>[</span><span>:trace</span><span>].</span>join(<span>"."</span>)
+    result <span>=</span> step<span>.</span>call(result)
+    status <span>=</span> result<span>.</span>success? ? <span>'OK'</span> : <span>'ERROR'</span>
+    errors <span>=</span> result<span>.</span>errors<span>.</span>any? ? <span>"Errors: </span><span>#{</span>result<span>.</span>errors<span>}</span><span>"</span> : <span>""</span>
+    puts <span>"</span><span>#{</span>position<span>}</span><span>. [</span><span>#{</span>status<span>}</span><span>] </span><span>#{</span>step<span>}</span><span> </span><span>#{</span>errors<span>}</span><span>"</span>
+    result
+  <span>end</span>
+<span>end</span>
+</code></pre></div><pre tabindex="0"><code>1. [OK] InputStep
+2. [OK] ParseCSV
+3. [OK] ValidateCSV
+3.1. [OK] ValidateHeaders
+3.2. [ERROR] ValidateRows Errors: { 1: "Invalid format" }
+</code></pre><h2 id="caching-middleware">Caching middleware</h2>
+<p>A piece of middleware can optimise expensive operations by caching their results.</p>
+<div><pre tabindex="0"><code data-lang="ruby"><span>class</span> <span>CachedStep</span> <span>&lt;</span> <span>SimpleDelegator</span>
+  <span>def</span> <span>initialize</span>(step, cache)
+    @cache <span>=</span> cache
+    <span>super</span>(step)
+  <span>end</span>
+
+  <span>def</span> <span>call</span>(result)
+    cache_key <span>=</span> result<span>.</span>value<span>.</span>hash <span># or something else</span>
+    <span># Only call expensive operation if not in cache</span>
+    <span># and store the result in the cache</span>
+    @cache<span>.</span>fetch(cache_key) <span>do</span>
+      __getobj__<span>.</span>call(result)
+    <span>end</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div><ul>
+    <li>1. <code>Expensive Operation 1</code><span>cached, skipped</span></li>
+    <li>2. <code>Expensive Operation 2</code><span>cached, skipped</span></li>
+    <li>3. <code>Expensive Operation 3</code><span>not cached, running</span></li>
+    <li>4. <code>ExpensiveOperation4</code><span>pending</span></li>
+</ul>
+<p>Caching can also be controlled selectively for one or more steps, via a custom sub-pipeline and a helper method.</p>
+<div><pre tabindex="0"><code data-lang="ruby">pl<span>.</span>step <span>OkStep</span>
+pl<span>.</span>cached <span>do</span> <span>|</span>ch<span>|</span>
+  ch<span>.</span>step <span>ExpensiveStep</span>
+  ch<span>.</span>step <span>AnotherExpensiveStep</span>
+<span>end</span>
+pl<span>.</span>step <span>OkStep</span>
+</code></pre></div><h2 id="other-use-cases">Other use cases</h2>
+<p>I’ve found that these pipelines make it simple to assemble a wide range of processing workflows big and small. Most specialisation can be contained in the steps themselves, and the pipeline class can be kept simple and generic.</p>
+<h3 id="query-builders">Query builders</h3>
+<p>You can use it to build complex queries for databases or APIs.</p>
+<div><pre tabindex="0"><code data-lang="ruby">pl<span>.</span>step <span>do</span> <span>|</span>result<span>|</span>
+  query <span>=</span> result<span>.</span>value <span># An ActiveRecord::Relation or a Sequel::Dataset</span>
+  account_id <span>=</span> result<span>.</span>input<span>[</span><span>:account_id</span><span>]</span>
+  query <span>=</span> query<span>.</span>where(<span>account_id</span>:) <span>if</span> account_id
+  result<span>.</span>continue(query)
+<span>end</span>
+
+<span># Composable query components</span>
+pl<span>.</span>step <span>FullTextSearch</span>
+</code></pre></div><h3 id="durable-execution">Durable execution</h3>
+<p>You can use it to build durable execution workflows, where each step is a task that can be retried or rolled back.
+This can be used to build robust and fault-tolerant operations. For example background jobs, or long-running <a href="https://learn.microsoft.com/en-us/azure/architecture/reference-architectures/saga/saga">sagas</a>.</p>
+<div><pre tabindex="0"><code data-lang="ruby"><span>HolidayBookingSaga</span> <span>=</span> <span>Pipeline</span><span>.</span>new <span>do</span> <span>|</span>pl<span>|</span>
+  <span># Custom middleware to store the result of last successful step</span>
+  <span># In case of failure, the pipeline can be resumed from the last successful step</span>
+  middleware <span>DurableExecution</span><span>.</span>new(<span>store</span>: <span>Redis</span><span>.</span>new)
+
+  pl<span>.</span>step <span>BookFlights</span>
+  pl<span>.</span>step <span>BookHotel</span>
+  pl<span>.</span>step <span>BookCarRental</span>
+  pl<span>.</span>step <span>SendConfirmationEmail</span>
+<span>end</span>
+</code></pre></div><h3 id="concurrent-execution">Concurrent execution</h3>
+<p>It’s reasonably straightforward to build a pipeline that runs steps concurrently, for example to optimise I/O-bound operations.</p>
+<div><pre tabindex="0"><code data-lang="ruby"><span>HolidayBookingSaga</span> <span>=</span> <span>Pipeline</span><span>.</span>new <span>do</span> <span>|</span>pl<span>|</span>
+  <span># .. etc</span>
+
+  <span># Run these steps concurrently, then collect their results in order.</span>
+  <span># For example using Fibers or Threads.</span>
+  <span># This block can implement _all_ or _any_ semantics.</span>
+  pl<span>.</span>concurrent <span>do</span> <span>|</span>c<span>|</span>
+    c<span>.</span>step <span>BookFlights</span>
+    c<span>.</span>step <span>BookHotel</span>
+    c<span>.</span>step <span>BookCarRental</span>
+  <span>end</span>
+
+  <span># Send email once all bookings are confirmed</span>
+  pl<span>.</span>step <span>SendConfirmationEmail</span>
+<span>end</span>
+</code></pre></div><h3 id="http-handlers">HTTP handlers</h3>
+<p>In Ruby we have plenty of incredible web frameworks to choose from, but a pipeline-oriented approach to web handling could be a good fit for some use cases. A bit like Elixir’s <a href="https://hexdocs.pm/plug/readme.html">Plug</a>.</p>
+<div><pre tabindex="0"><code data-lang="ruby"><span>module</span> API
+  <span>CreateUserHandler</span> <span>=</span> <span>HTTPPipeline</span><span>.</span>new <span>do</span> <span>|</span>pl<span>|</span>
+    pl<span>.</span>input <span>do</span>
+      field(<span>:name</span>)<span>.</span>type(<span>:string</span>)<span>.</span>required
+      field(<span>:email</span>)<span>.</span>type(<span>:string</span>)<span>.</span>required
+    <span>end</span>
+
+    pl<span>.</span>step <span>ValidateUserInput</span>
+    pl<span>.</span>step <span>CreateUser</span>
+    pl<span>.</span>step <span>SendWelcomeEmail</span>
+    pl<span>.</span>respond_with(<span>201</span>, <span>:created</span>)
+    pl<span>.</span>respond_with(<span>400</span>, <span>:bad_request</span>)
+  <span>end</span>
+<span>end</span>
+</code></pre></div><h2 id="testability">Testability</h2>
+<p>Testing any complex workflow can be challenging. Composable pipelines allows me to use a “divide and conquer” approach to testing.</p>
+<ol>
+<li>Unit test each step in isolation.</li>
+</ol>
+<div><pre tabindex="0"><code data-lang="ruby">step <span>=</span> <span>MultiplyBy</span><span>.</span>(<span>2</span>)
+initial_result <span>=</span> <span>Result</span><span>.</span>continue(<span>[</span><span>1</span>, <span>2</span>, <span>3</span>, <span>4</span><span>]</span>)
+result <span>=</span> step<span>.</span>call(initial_result)
+expect(result<span>.</span>value)<span>.</span>to eq(<span>[</span><span>2</span>, <span>4</span>, <span>6</span>, <span>8</span><span>]</span>)
+</code></pre></div><ol start="2">
+<li>Test that the pipeline is composed correctly.</li>
+</ol>
+<div><pre tabindex="0"><code data-lang="ruby"><span># An RSpec helper to assert that a pipeline is composed of a sequence of steps</span>
+expect(<span>NumberCruncher</span>)<span>.</span>to be_composed_of_steps(
+  <span>ValidateSetSize</span>,
+  <span>MultiplyBy</span><span>.</span>(<span>2</span>),
+  <span>LimitSet</span>
+)
+</code></pre></div><h2 id="conclusion">Conclusion</h2>
+<p>Like anything, this approach has its trade-offs. If you prefer inheritance over composition, or the processing required can’t be easily broken down into steps, then this approach might not be the best fit.</p>
+<p>In general, I’ve found it provides a <em>simple</em> mental model to reason about problems (in <a href="https://www.youtube.com/watch?v=SxdOUGdseq4">the Rick Hickey sense</a>).</p>
+<p>Any operation that can be coerced into complying with the <a href="https://blog.ploeh.dk/2017/10/06/monoids/">Monoid Laws</a> can be a good candidate.</p>
+<p>The basic implementation used in this article is <a href="https://gist.github.com/ismasan/0bdcc76c2ea48f4259b38fafe131edb8">here</a>.</p>
+</section></div>]]>
+            </description>
+            <link>https://ismaelcelis.com/posts/practical-railway-oriented-pipelines-in-ruby/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-39754651</guid>
+            <pubDate>Tue, 19 Mar 2024 11:22:37 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[How to write a QML effect for KWin]]>
+            </title>
+            <description>
+<![CDATA[
+Score 85 | Comments 42 (<a href="https://news.ycombinator.com/item?id=39753210">thread link</a>) | @jandeboevrie
+<br/>
+March 18, 2024 | https://blog.vladzahorodnii.com/2024/03/18/how-to-write-a-qml-effect-for-kwin/ | <a href="https://web.archive.org/web/*/https://blog.vladzahorodnii.com/2024/03/18/how-to-write-a-qml-effect-for-kwin/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="post-818">
+	
+	<!-- .entry-header -->
+
+	<div>
+		
+<p>Since the dawn of the times, the only way to implement any effect that has fancy user interface used to be in C++. It would be rather an understatement to say that the C++ API is difficult to use or get it right so there are no glitches. On the other hand, it would be really nice to be able to implement dashboard-like effects while not compromise on code simplicity and maintainability, especially given the rise of popularity of overview effects a few years ago, which indicated that there is demand for such effects.</p>
+
+
+
+<p>In order solve that problem, we started looking for some options and the most obvious one was QtQuick. It’s a quite powerful framework and it’s already used extensively in Plasma. So, in Plasma 5.24, we introduced basic support for implementing kwin effects written in QML and even added a new overview effect. Unfortunately, if you wanted to implement a QtQuick-based effect yourself, you would still have to write a bit of C++ glue yourself. This is not great because effects that use C++ are a distribution nightmare. They can’t be just uploaded to the KDE Store and then installed by clicking “Get New Effects…”. Furthermore, libkwin is a fast moving target with lots of ABI and API incompatible changes in every release. That’s not good if you’re an effect developer because it means you will need to invest a bit of time after every plasma release to port the effects to the new APIs or at least rebuild the effects to resolve ABI incompatibilities.</p>
+
+
+
+<p>This has been changed in Plasma 6.0.</p>
+
+
+
+<p>In Plasma 6, we’ve had the opportunity to address that pesky problem of requiring some C++ code and also improve the declarative effect API after learning some lessons while working on the overview and other effects. So, enough of history and let’s jump to the good stuff, shall we? 🙂</p>
+
+
+
+<h2>Project Structure</h2>
+
+
+
+<p>Declarative effects require some particular project structure that we need to learn first before writing any code</p>
+
+
+
+<pre>└── package<br>    ├── contents<br>    │&nbsp;&nbsp; └── ui<br>    │&nbsp;&nbsp;     └── main.qml<br>    └── metadata.json</pre>
+
+
+
+<p>The <code>package</code> directory is a toplevel directory, it should contain two things: a <code>metadata.json</code> file and a <code>contents</code> directory. The <code>metadata.json</code> file contains information about the name of the effect, what API it uses, the author, etc.</p>
+
+
+
+<pre>{<br>    "KPackageStructure": "KWin/Effect",<br>    "KPlugin": {<br>        "Authors": [<br>            {<br>                "Email": "user@example.com",<br>                "Name": "Name"<br>            }<br>        ],<br>        "Category": "Appearance",<br>        "Description": "Yo",<br>        "EnabledByDefault": false,<br>        "Id": "hello-world",<br>        "License": "MIT",<br>        "Name": "Hello World"<br>    },<br>    "X-KDE-Ordering": 60,<br>    "X-Plasma-API": "declarativescript"<br>}</pre>
+
+
+
+<p>The <code>contents</code> directory contains the rest of QML code, config files, assets, etc. Keep in mind that <code>ui/main.qml</code> is a “magical” file, it acts as an entry point, every effect must have it.</p>
+
+
+
+<p>In order to install the effect and make it visible in Desktop Effects settings, you will need to run the following command</p>
+
+
+
+<pre>kpackagetool6 --type KWin/Effect --install package/</pre>
+
+
+
+<p>This is quite a lot to memorize. That’s why kwin provides an example qtquick effect that you can grab, tweak some metadata and you’re good to go. You can find the example project at <a href="https://invent.kde.org/plasma/kwin/-/tree/master/examples/quick-effect?ref_type=heads">https://invent.kde.org/plasma/kwin/-/tree/master/examples/quick-effect?ref_type=heads</a>. Note that the example project also contains a <code>CMakeLists.txt</code> file, which provides an alternative way to install the effect by the means of cmake, i.e. <code>make install</code> or <code>cmake --install builddir</code>.</p>
+
+
+
+<h2>Hello World</h2>
+
+
+
+<p>Let’s start with an effect that simply shows a hello world message on the screen:</p>
+
+
+
+<pre><code>import QtQuick<br>import org.kde.kwin<p>SceneEffect {<br>    id: effect</p><p>    delegate: Rectangle {<br>        color: "blue"</p><p>        Text {<br>            anchors.centerIn: parent<br>            color: "white"<br>            text: "Hello world!"<br>        }<br>    }</p><p>    ScreenEdgeHandler {<br>        enabled: true<br>        edge: ScreenEdgeHandler.TopEdge<br>        onActivated: effect.visible = !effect.visible<br>    }</p><p>    ShortcutHandler {<br>        name: "Toggle Hello World Effect"<br>        text: "Toggle Hello World Effect"<br>        sequence: "Meta+H"<br>        onActivated: effect.visible = !effect.visible<br>    }</p><p>    PinchGestureHandler {<br>        direction: PinchGestureHandler.Direction.Contracting<br>        fingerCount: 3<br>        onActivated: effect.visible = !effect.visible<br>    }<br>}</p></code></pre>
+
+
+
+<p><code>import QtQuick</code> is needed to use basic QtQuick components such as <code>Rectangle</code>. <code>import org.kde.kwin</code> imports kwin specific components.</p>
+
+
+
+<p>The <code>SceneEffect</code> is a special type that every declarative effect must use. Its <code>delegate</code> property specifies the content for every screen. In this case, it’s a blue rectangle with a “Hello World!” label in the center.</p>
+
+
+
+<p>The <code>ShortcutHandler</code> is a helper that’s used to register global shortcuts. <code>ShortcutHandler.name</code> is the key of the global shortcut, it’s going to be used to store the shortcut in the config and other similar purposes. <code>ShortcutHandler.text</code> is a human readable description of the global shortcut, it’s going to be visible in the Shortcuts settings.</p>
+
+
+
+<p>The <code>ScreenEdgeHandler</code> allows to reserve a screen edge. When the pointer hits that screen edge, some code can be executed by listening to the <code>activated</code> signal.</p>
+
+
+
+<p>The <code>PinchGestureHandler</code> and <code>SwipeGestureHandler</code> allow to execute some code when the user makes a pinch or a swipe gesture, respectively.</p>
+
+
+
+<p><code>effect.visible = !effect.visible</code> toggles the visibility of the effect. When <code>effect.visible</code>  is <code>true</code>, the effect is active and visible on the screen; otherwise it’s hidden. You need to set <code>effect.visible</code> to <code>true</code> in order to show the effect.</p>
+
+
+
+<p>If you press <code>Meta+H</code> or make a pinch gesture or move the pointer to the top screen edge, you’re going to see something like this</p>
+
+
+
+<figure><img fetchpriority="high" decoding="async" width="660" height="495" data-attachment-id="838" data-permalink="https://blog.vladzahorodnii.com/2024/03/18/how-to-write-a-qml-effect-for-kwin/screenshot_20240317_170123/" data-orig-file="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_170123.png?fit=1280%2C960&amp;ssl=1" data-orig-size="1280,960" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="Screenshot_20240317_170123" data-image-description="" data-image-caption="" data-medium-file="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_170123.png?fit=300%2C225&amp;ssl=1" data-large-file="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_170123.png?fit=660%2C495&amp;ssl=1" src="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_170123.png?resize=660%2C495&amp;ssl=1" alt="" srcset="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_170123.png?resize=1024%2C768&amp;ssl=1 1024w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_170123.png?resize=300%2C225&amp;ssl=1 300w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_170123.png?resize=768%2C576&amp;ssl=1 768w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_170123.png?resize=1200%2C900&amp;ssl=1 1200w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_170123.png?resize=800%2C600&amp;ssl=1 800w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_170123.png?resize=600%2C450&amp;ssl=1 600w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_170123.png?resize=400%2C300&amp;ssl=1 400w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_170123.png?resize=200%2C150&amp;ssl=1 200w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_170123.png?resize=363%2C272&amp;ssl=1 363w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_170123.png?w=1280&amp;ssl=1 1280w" sizes="(max-width: 660px) 100vw, 660px" data-recalc-dims="1"></figure>
+
+
+
+
+
+
+
+<p>Note that there are no windows visible anymore, it is the responsibility of the effect to decide what should be displayed on the screen now.</p>
+
+
+
+<h2>Displaying Windows</h2>
+
+
+
+<p>Being able to display text is great, but it’s not useful. Usually, effects need to display some windows, so let’s display the active window</p>
+
+
+
+<pre><code>    delegate: Rectangle {<br>        color: "blue"<p>        WindowThumbnail {<br>            anchors.centerIn: parent<br>            client: Workspace.activeWindow<br>        }<br>    }</p></code></pre>
+
+
+
+<p>The change is quite simple. Instead of displaying a <code>Text</code> component, there’s a <code>WindowThumbnail</code> component now. The <code>WindowThumbnail</code> type is provided by the <code>org.kde.kwin</code> module. <code>WindowThumbnail.client</code> indicates what window the thumbnail item should display.</p>
+
+
+
+<figure><img decoding="async" width="660" height="495" data-attachment-id="842" data-permalink="https://blog.vladzahorodnii.com/2024/03/18/how-to-write-a-qml-effect-for-kwin/screenshot_20240317_172450/" data-orig-file="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_172450.png?fit=1280%2C960&amp;ssl=1" data-orig-size="1280,960" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="Screenshot_20240317_172450" data-image-description="" data-image-caption="" data-medium-file="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_172450.png?fit=300%2C225&amp;ssl=1" data-large-file="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_172450.png?fit=660%2C495&amp;ssl=1" src="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_172450.png?resize=660%2C495&amp;ssl=1" alt="" srcset="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_172450.png?resize=1024%2C768&amp;ssl=1 1024w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_172450.png?resize=300%2C225&amp;ssl=1 300w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_172450.png?resize=768%2C576&amp;ssl=1 768w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_172450.png?resize=1200%2C900&amp;ssl=1 1200w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_172450.png?resize=800%2C600&amp;ssl=1 800w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_172450.png?resize=600%2C450&amp;ssl=1 600w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_172450.png?resize=400%2C300&amp;ssl=1 400w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_172450.png?resize=200%2C150&amp;ssl=1 200w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_172450.png?resize=363%2C272&amp;ssl=1 363w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_172450.png?w=1280&amp;ssl=1 1280w" sizes="(max-width: 660px) 100vw, 660px" data-recalc-dims="1"></figure>
+
+
+
+
+
+
+
+<h2>Input</h2>
+
+
+
+<p>Input processing contains no kwin specific APIs. <code>TapHandler</code>, <code>MouseArea</code>, <code>Keys</code> and other stuff available in QtQuick should just work. For example, let’s implement an effect that arranges windows in a grid and if somebody middle clicks a window, it will be closed</p>
+
+
+
+<pre><code>    delegate: Rectangle {<br>        color: "pink"<p>        GridView {<br>            id: grid<br>            anchors.fill: parent<br>            cellWidth: 300<br>            cellHeight: 300</p><p>            model: WindowModel {}<br>            delegate: WindowThumbnail {<br>                client: model.window<br>                width: grid.cellWidth<br>                height: grid.cellHeight</p><p>                TapHandler {<br>                    acceptedButtons: Qt.MiddleButton<br>                    onTapped: client.closeWindow()<br>                }<br>            }<br>        }<br>    }</p></code></pre>
+
+
+
+<p>The code looks pretty straightforward except maybe the model of the <code>GridView</code>. <code>WindowModel</code> is a helper provided by <code>org.kde.kwin</code> module that lists all the windows. It can be passed to various views, <code>Repeater</code>, and so on.</p>
+
+
+
+<p>The result can be seen here</p>
+
+
+
+<figure><p><span><iframe width="660" height="372" src="https://www.youtube.com/embed/lrAmDSjzhQ4?version=3&amp;rel=1&amp;showsearch=0&amp;showinfo=1&amp;iv_load_policy=1&amp;fs=1&amp;hl=en-US&amp;autohide=2&amp;wmode=transparent" allowfullscreen="true" sandbox="allow-scripts allow-same-origin allow-popups allow-presentation allow-popups-to-escape-sandbox"></iframe></span>
+</p></figure>
+
+
+
+
+
+
+
+<h2>Delegates are Per Screen</h2>
+
+
+
+<p>One thing to keep in mind is that the delegates are instantiated per screen. For example, </p>
+
+
+
+<pre><code>    delegate: Rectangle {<br>        color: "yellow"<p>        Text {<br>            anchors.centerIn: parent<br>            color: "black"<br>            text: SceneView.screen.name<br>        }<br>    }</p></code></pre>
+
+
+
+<p>When you activate the effect on a setup with several outputs, each output will be filled with yellow color and the output name in the center</p>
+
+
+
+<figure><img loading="lazy" decoding="async" width="660" height="263" data-attachment-id="854" data-permalink="https://blog.vladzahorodnii.com/2024/03/18/how-to-write-a-qml-effect-for-kwin/screenshot_20240317_181544/" data-orig-file="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_181544.png?fit=2643%2C1053&amp;ssl=1" data-orig-size="2643,1053" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="Screenshot_20240317_181544" data-image-description="" data-image-caption="" data-medium-file="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_181544.png?fit=300%2C120&amp;ssl=1" data-large-file="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_181544.png?fit=660%2C263&amp;ssl=1" src="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_181544.png?resize=660%2C263&amp;ssl=1" alt="" srcset="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_181544.png?resize=1024%2C408&amp;ssl=1 1024w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_181544.png?resize=300%2C120&amp;ssl=1 300w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_181544.png?resize=768%2C306&amp;ssl=1 768w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_181544.png?resize=1536%2C612&amp;ssl=1 1536w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_181544.png?resize=2048%2C816&amp;ssl=1 2048w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_181544.png?resize=1200%2C478&amp;ssl=1 1200w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_181544.png?resize=683%2C272&amp;ssl=1 683w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_181544.png?w=1320&amp;ssl=1 1320w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_181544.png?w=1980&amp;ssl=1 1980w" sizes="(max-width: 660px) 100vw, 660px" data-recalc-dims="1"></figure>
+
+
+
+
+
+
+
+<p>Usually, the output is irrelevant, but if you need to know what output particular delegate is displayed on, you could use the <code>SceneView.screen</code> attached property.</p>
+
+
+
+<h2>Configuration</h2>
+
+
+
+<p>As your effect grows, you will probably face the need to provide an option or two. Let’s say that we want the background color in our hello world effect to be configurable. How do we achieve that? The first step, is to add a <code>main.xml</code> file in <code>package/contents/config</code> directory, i.e.</p>
+
+
+
+<pre>package/<br>├── contents<br>│&nbsp;&nbsp; ├── config<br>│&nbsp;&nbsp; │&nbsp;&nbsp; └── <strong>main.xml</strong><br>│&nbsp;&nbsp; └── ui<br>│&nbsp;&nbsp;     └── main.qml<br>└── metadata.json<br></pre>
+
+
+
+<p>The <code>main.xml</code> file lists all options</p>
+
+
+
+<pre>&lt;?xml version="1.0" encoding="UTF-8"?&gt;<br>&lt;kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"<br>      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"<br>      xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0<br>                          http://www.kde.org/standards/kcfg/1.0/kcfg.xsd" &gt;<br>    &lt;kcfgfile name=""/&gt;<br>    &lt;group name=""&gt;<br>        &lt;entry name="BackgroundColor" type="Color"&gt;<br>            &lt;default&gt;#ff00ff&lt;/default&gt;<br>        &lt;/entry&gt;<br>    &lt;/group&gt;<br>&lt;/kcfg&gt;</pre>
+
+
+
+<p>In our case, only one option is needed: <code>BackgroundColor</code>, which has <code>Color</code> type and <code>#ff00ff</code> default value. You can refer to the <a href="https://develop.kde.org/docs/features/configuration/kconfig_xt/">KConfigXT</a> documentation to learn more what other entry types are supported.</p>
+
+
+
+<p>The next step is to actually use the <code>BackgroundColor</code> option</p>
+
+
+
+<pre><code>    delegate: Rectangle {<br>        color: effect.configuration.BackgroundColor<p>        Text {<br>            anchors.centerIn: parent<br>            color: "white"<br>            text: "Hello world!"<br>        }<br>    }</p></code></pre>
+
+
+
+<p><code>effect.configuration</code> is a map object that contains all the options listed in the <code>main.xml</code>.</p>
+
+
+
+<p>Now, if you toggle the hello world effect, you’re going to see</p>
+
+
+
+<figure><img loading="lazy" decoding="async" width="660" height="495" data-attachment-id="890" data-permalink="https://blog.vladzahorodnii.com/2024/03/18/how-to-write-a-qml-effect-for-kwin/screenshot_20240318_000709/" data-orig-file="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_000709.png?fit=1280%2C960&amp;ssl=1" data-orig-size="1280,960" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="Screenshot_20240318_000709" data-image-description="" data-image-caption="" data-medium-file="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_000709.png?fit=300%2C225&amp;ssl=1" data-large-file="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_000709.png?fit=660%2C495&amp;ssl=1" src="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_000709.png?resize=660%2C495&amp;ssl=1" alt="" srcset="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_000709.png?resize=1024%2C768&amp;ssl=1 1024w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_000709.png?resize=300%2C225&amp;ssl=1 300w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_000709.png?resize=768%2C576&amp;ssl=1 768w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_000709.png?resize=1200%2C900&amp;ssl=1 1200w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_000709.png?resize=800%2C600&amp;ssl=1 800w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_000709.png?resize=600%2C450&amp;ssl=1 600w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_000709.png?resize=400%2C300&amp;ssl=1 400w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_000709.png?resize=200%2C150&amp;ssl=1 200w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_000709.png?resize=363%2C272&amp;ssl=1 363w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_000709.png?w=1280&amp;ssl=1 1280w" sizes="(max-width: 660px) 100vw, 660px" data-recalc-dims="1"></figure>
+
+
+
+
+
+
+
+<p>There are a few more thing left to do though. If you navigate to Desktop Effects settings, you’re not going a configure button next to the hello world effect</p>
+
+
+
+<figure><img loading="lazy" decoding="async" width="660" height="97" data-attachment-id="892" data-permalink="https://blog.vladzahorodnii.com/2024/03/18/how-to-write-a-qml-effect-for-kwin/screenshot_20240318_001125/" data-orig-file="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_001125.png?fit=884%2C130&amp;ssl=1" data-orig-size="884,130" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="Screenshot_20240318_001125" data-image-description="" data-image-caption="" data-medium-file="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_001125.png?fit=300%2C44&amp;ssl=1" data-large-file="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_001125.png?fit=660%2C97&amp;ssl=1" src="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_001125.png?resize=660%2C97&amp;ssl=1" alt="" srcset="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_001125.png?w=884&amp;ssl=1 884w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_001125.png?resize=300%2C44&amp;ssl=1 300w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_001125.png?resize=768%2C113&amp;ssl=1 768w" sizes="(max-width: 660px) 100vw, 660px" data-recalc-dims="1"></figure>
+
+
+
+
+
+
+
+<p>Besides providing a <code>main.xml</code> file, the effect also needs to provide a <code>config.ui</code> file containing a configuration ui</p>
+
+
+
+<pre>package/<br>├── contents<br>│&nbsp;&nbsp; ├── config<br>│&nbsp;&nbsp; │&nbsp;&nbsp; └── main.xml<br>│&nbsp;&nbsp; └── ui<br>│&nbsp;&nbsp;     ├── <strong>config.ui</strong><br>│&nbsp;&nbsp;     └── main.qml<br>└── metadata.json</pre>
+
+
+
+<p>The <code>config.ui</code> file is a regular Qt Designer UI file. The only special thing about it is that the controls that represent options should have special name format: <code>kcfg_</code> + <code>OptionName</code>. For example, <code>kcfg_BackgroundColor</code></p>
+
+
+
+<pre><code>&lt;?xml version="1.0" encoding="UTF-8"?&gt;<br>&lt;ui version="4.0"&gt;<br> &lt;class&gt;QuickEffectConfig&lt;/class&gt;<br> &lt;widget class="QWidget" name="QuickEffectConfig"&gt;<br>  &lt;property name="geometry"&gt;<br>   &lt;rect&gt;<br>    &lt;x&gt;0&lt;/x&gt;<br>    &lt;y&gt;0&lt;/y&gt;<br>    &lt;width&gt;455&lt;/width&gt;<br>    &lt;height&gt;177&lt;/height&gt;<br>   &lt;/rect&gt;<br>  &lt;/property&gt;<br>  &lt;layout class="QFormLayout" name="formLayout"&gt;<br>   &lt;item row="0" column="0"&gt;<br>    &lt;widget class="QLabel" name="label"&gt;<br>     &lt;property name="text"&gt;<br>      &lt;string&gt;Background color:&lt;/string&gt;<br>     &lt;/property&gt;<br>    &lt;/widget&gt;<br>   &lt;/item&gt;<br>   &lt;item row="0" column="1"&gt;<br>    &lt;widget class="KColorButton" name="kcfg_BackgroundColor"&gt;<br>     &lt;property name="flat"&gt;<br>      &lt;bool&gt;false&lt;/bool&gt;<br>     &lt;/property&gt;<br>    &lt;/widget&gt;<br>   &lt;/item&gt;<br>  &lt;/layout&gt;<br> &lt;/widget&gt;<br> &lt;customwidgets&gt;<br>  &lt;customwidget&gt;<br>   &lt;class&gt;KColorButton&lt;/class&gt;<br>   &lt;extends&gt;QPushButton&lt;/extends&gt;<br>   &lt;header&gt;kcolorbutton.h&lt;/header&gt;<br>  &lt;/customwidget&gt;<br> &lt;/customwidgets&gt;<br> &lt;resources/&gt;<br> &lt;connections/&gt;<br>&lt;/ui&gt;</code></pre>
+
+
+
+<p>The last final piece in order to expose the configuration ui is to add the following line in the <code>metadata.json</code> file</p>
+
+
+
+<pre>"X-KDE-ConfigModule": "kcm_kwin4_genericscripted"</pre>
+
+
+
+<p>With all of that, the effect is finally displayed as configurable in the system settings and the background color can be changed</p>
+
+
+
+<figure><img loading="lazy" decoding="async" width="660" height="252" data-attachment-id="897" data-permalink="https://blog.vladzahorodnii.com/2024/03/18/how-to-write-a-qml-effect-for-kwin/screenshot_20240318_002244/" data-orig-file="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_002244.png?fit=1005%2C384&amp;ssl=1" data-orig-size="1005,384" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="Screenshot_20240318_002244" data-image-description="" data-image-caption="" data-medium-file="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_002244.png?fit=300%2C115&amp;ssl=1" data-large-file="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_002244.png?fit=660%2C252&amp;ssl=1" src="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_002244.png?resize=660%2C252&amp;ssl=1" alt="" srcset="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_002244.png?w=1005&amp;ssl=1 1005w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_002244.png?resize=300%2C115&amp;ssl=1 300w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_002244.png?resize=768%2C293&amp;ssl=1 768w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240318_002244.png?resize=712%2C272&amp;ssl=1 712w" sizes="(max-width: 660px) 100vw, 660px" data-recalc-dims="1"></figure>
+
+
+
+<h2>Sharing Your Effect With Other People</h2>
+
+
+
+<p>The preferred method to distribute third party extensions is via the <a href="https://store.kde.org/browse/">KDE Store</a>. Both JS and QML effects can be uploaded to the same “<a href="https://store.kde.org/browse?cat=719">KWin Effects</a>” category.</p>
+
+
+
+<h2>Documentation and Other Useful Resources</h2>
+
+
+
+<p>Documentation is still something that needs a lot of work (and writing it is no fun 🙁 ). KWin scripting API documentation can be found here <a href="https://develop.kde.org/docs/plasma/kwin/api/">https://develop.kde.org/docs/plasma/kwin/api/</a>.</p>
+
+
+
+<p>Besides the link above, it’s worth having a look at the examples <a href="https://invent.kde.org/plasma/kwin/-/tree/master/examples?ref_type=heads">https://invent.kde.org/plasma/kwin/-/tree/master/examples?ref_type=heads</a> in kwin git repository.</p>
+
+
+
+<h2>Window Heap</h2>
+
+
+
+<p>If you need to pack or arrange windows like how the overview effect does, you could use the <code>WindowHeap</code> component from <code>org.kde.kwin.private.effects</code> module. BUT you need to keep in mind that that helper is private and has no stable API yet, so use it on your own risk (or copy paste the relevant code in kwin). Eventually, the <code>WindowHeap</code> will be stabilized once we are confident about its API.</p>
+
+
+
+<p>The <code>WindowHeap</code> source code can be found at <a href="https://invent.kde.org/plasma/kwin/-/tree/2a13a330404c8d8a95f6264512aa06b0a560f55b/src/plugins/private">https://invent.kde.org/plasma/kwin/-/tree/2a13a330404c8d8a95f6264512aa06b0a560f55b/src/plugins/private</a>.</p>
+
+
+
+<h2>More Examples</h2>
+
+
+
+<p>If you need more examples, I suggest to have a look at the desktop cube effect in <code>kdeplasma-addons</code>. It’s implemented using the same QML effect API in kwin + QtQuick3D. The source code can be found at <a href="https://invent.kde.org/plasma/kdeplasma-addons/-/tree/master/kwin/effects/cube?ref_type=heads">https://invent.kde.org/plasma/kdeplasma-addons/-/tree/master/kwin/effects/cube?ref_type=heads</a></p>
+
+
+
+<figure><img loading="lazy" decoding="async" width="660" height="371" data-attachment-id="858" data-permalink="https://blog.vladzahorodnii.com/2024/03/18/how-to-write-a-qml-effect-for-kwin/screenshot_20240317_182738/" data-orig-file="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_182738.png?fit=3840%2C2160&amp;ssl=1" data-orig-size="3840,2160" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="Screenshot_20240317_182738" data-image-description="" data-image-caption="" data-medium-file="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_182738.png?fit=300%2C169&amp;ssl=1" data-large-file="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_182738.png?fit=660%2C371&amp;ssl=1" src="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_182738.png?resize=660%2C371&amp;ssl=1" alt="" srcset="https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_182738.png?resize=1024%2C576&amp;ssl=1 1024w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_182738.png?resize=300%2C169&amp;ssl=1 300w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_182738.png?resize=768%2C432&amp;ssl=1 768w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_182738.png?resize=1536%2C864&amp;ssl=1 1536w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_182738.png?resize=2048%2C1152&amp;ssl=1 2048w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_182738.png?resize=1200%2C675&amp;ssl=1 1200w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_182738.png?resize=484%2C272&amp;ssl=1 484w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_182738.png?w=1320&amp;ssl=1 1320w, https://i0.wp.com/blog.vladzahorodnii.com/wp-content/uploads/2024/03/Screenshot_20240317_182738.png?w=1980&amp;ssl=1 1980w" sizes="(max-width: 660px) 100vw, 660px" data-recalc-dims="1"></figure>
+
+
+
+<h2>Conclusion</h2>
+
+
+
+<p>I hope that some people find this quick introduction to QML-based effects in KWin useful. Despite being a couple years old, declarative effects can be still considered being in the infancy stage and there’s a lot of untapped potential in them yet. The QML effect API is not perfect, and that’s why we are interested in feedback from third party extension developers. If you have some questions or feedback, feel free to reach out us at <a href="https://webchat.kde.org/#/room/#kwin:kde.org">https://webchat.kde.org/#/room/#kwin:kde.org</a>. Happy hacking!</p>
+
+	</div><!-- .entry-content -->
+
+	
+	<!-- .entry-footer -->
+
+</article></div>]]>
+            </description>
+            <link>https://blog.vladzahorodnii.com/2024/03/18/how-to-write-a-qml-effect-for-kwin/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-39753210</guid>
+            <pubDate>Tue, 19 Mar 2024 05:29:19 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Show HN: File-based cache for slow Python functions]]>
+            </title>
+            <description>
+<![CDATA[
+Score 64 | Comments 51 (<a href="https://news.ycombinator.com/item?id=39750077">thread link</a>) | @williamzeng0
+<br/>
+March 18, 2024 | https://docs.sweep.dev/blogs/file-cache | <a href="https://web.archive.org/web/*/https://docs.sweep.dev/blogs/file-cache">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><article><main>
+<p><strong>William Zeng</strong> - March 18th, 2024</p>
+<hr>
+<p>We wrote a file cache - it's like Python's <code dir="ltr">lru_cache</code>, but it stores the values in files instead of in memory. This has saved us hours of time running our LLM benchmarks, and we'd like to share it as its own Python module. Thanks to <a href="https://github.com/lukejagg" target="_blank" rel="noreferrer">Luke Jaggernauth<span> (opens in a new tab)</span></a> (former Sweep engineer) for building the initial version of this!</p>
+<p>Here's the link:
+<a href="https://github.com/sweepai/sweep/blob/main/docs/public/file_cache.py" target="_blank" rel="noreferrer">https://github.com/sweepai/sweep/blob/main/docs/public/file_cache.py<span> (opens in a new tab)</span></a>. To use it, simply add the <code dir="ltr">file_cache</code> decorator to your function. Here's an example:</p>
+
+<h2>Background<a href="#background" id="background" aria-label="Permalink for this section"></a></h2>
+<p>We spend a lot of time prompt engineering our agents at Sweep. Our agents take a set of input strings, formats them as a prompt, then sends the prompt and any other information off to the LLM. We chain multiple agents to turn a GitHub issue to a pull request.
+For example, to modify code we'll input the old code, any relevant context, and instructions then output the new code.</p>
+<p><img src="https://docs.sweep.dev/assets/multi_llm_step.png" alt="Multiple llm steps being chained"></p>
+<p>A typical improvement involves tweaking a small part of our pipeline (like improving our planning algorithm), then running the entire pipeline again.
+We use pdb (python's native debugger) to set breakpoints and inspect the state of our prompts, input values, and parsing logic.
+For example, we can check whether a certain string matches a regex:</p>
+
+<p>This lets us debug at runtime with the actual data.</p>
+<h2>Cached pdb<a href="#cached-pdb" id="cached-pdb" aria-label="Permalink for this section"></a></h2>
+<p>pdb works great, but we have to wait for the entire pipeline to run again.
+Imagine a version of pdb that not only interrupted execution, but also cached the entire program state up to that point.
+Our time to hit that same bug could be cut from 10 minutes to 15 seconds (a 40x improvement).</p>
+<p>We didn't build this, but we think our file_cache works just as well.</p>
+<p>LLM calls are slow but their inputs and outputs are easy to cache, saving a lot of time. We can use the input prompt/string as the cache key, and the output string as the cache value.</p>
+<h3>What's different from lru_cache?<a href="#whats-different-from-lru_cache" id="whats-different-from-lru_cache" aria-label="Permalink for this section"></a></h3>
+<p>lru_cache is great for memoizing repeated function calls, but it doesn't support two key features.</p>
+<ol>
+<li>
+<p>we need to persist the cache between runs.</p>
+<ul>
+<li>lru_cache stores the results in-memory, which means that the next time you run the program the cache will be empty. file_cache stores the results on disk. We also considered using Redis, but writing to disk is easier to set up/manage.</li>
+</ul>
+</li>
+<li>
+<p>lru_cache doesn't support ignoring arguments that invalidate the cache.</p>
+<ul>
+<li>We'll use a custom <code dir="ltr">chat_logger</code> which stores the chats for visualization. It contains the current timestamp <code dir="ltr">chat_logger.expiration</code>, which will invalidate the cache if it's serialized.</li>
+<li>To counteract this we added ignored parameters, used like this: <code dir="ltr">file_cache(ignore_params=["chat_logger"])</code>. This removes <code dir="ltr">chat_logger</code> from the cache key construction and prevents bad invalidation due to the constantly changing <code dir="ltr">expiration</code>.</li>
+</ul>
+</li>
+</ol>
+<h2>Implementation<a href="#implementation" id="implementation" aria-label="Permalink for this section"></a></h2>
+<p>Our two main methods are <code dir="ltr">recursive_hash</code> and <code dir="ltr">file_cache</code>.</p>
+<h3>recursive_hash<a href="#recursive_hash" id="recursive_hash" aria-label="Permalink for this section"></a></h3>
+<p>We want to stably hash objects, and this is <a href="https://death.andgravity.com/stable-hashing" target="_blank" rel="noreferrer">not natively supported in python<span> (opens in a new tab)</span></a>.</p>
+
+<p>hashlib.md5 alone doesn't work for objects, giving us the error: <code dir="ltr">TypeError: object supporting the buffer API required</code>.
+We use recursive_hash, which works for arbitrary python objects.</p>
+
+<h3>file_cache<a href="#file_cache" id="file_cache" aria-label="Permalink for this section"></a></h3>
+<p>file_cache is a decorator that handles the caching logic for us.</p>
+
+<p>Without the cache, searching through the codebase using our LLM agent to get <code dir="ltr">top_results</code> takes 5 minutes - way too long if we're not actually testing it. Instead with file_cache, we just need to wait for deserialization of the pickled object - basically instantaneous for search results.</p>
+<h4>Wrapper<a href="#wrapper" id="wrapper" aria-label="Permalink for this section"></a></h4>
+<p>First we store our cache in <code dir="ltr">/tmp/file_cache</code>. This lets us remove the cache by simply deleting the directory (running <code dir="ltr">rm -rf /tmp/file_cache</code>).
+We can also selectively remove function calls using <code dir="ltr">rm -rf /tmp/file_cache/search_codebase*</code>.</p>
+
+<p>Then we can create a cache key.</p>
+<h4>Cache Key Creation / Miss Conditions<a href="#cache-key-creation--miss-conditions" id="cache-key-creation--miss-conditions" aria-label="Permalink for this section"></a></h4>
+<p>We have another problem - we want to miss our cache under two conditions:</p>
+<ol>
+<li>The arguments to the function change - handled by <code dir="ltr">recursive_hash</code></li>
+<li>The code changes</li>
+</ol>
+<p>To handle 2. we used <code dir="ltr">inspect.getsource(func)</code> to add the function's source code to the hash, correctly missing the cache when the the code changes.</p>
+
+
+<h4>Cache hits and misses<a href="#cache-hits-and-misses" id="cache-hits-and-misses" aria-label="Permalink for this section"></a></h4>
+<p>Finally we check cache key existence and write to the cache in the case of a cache miss.</p>
+
+<h2>Conclusion<a href="#conclusion" id="conclusion" aria-label="Permalink for this section"></a></h2>
+<p>We hope this code is useful to you. We've found it to be a massive time saver when debugging LLM calls.
+We'd love to hear your feedback and contributions at <a href="https://github.com/sweepai/sweep" target="_blank" rel="noreferrer">https://github.com/sweepai/sweep<span> (opens in a new tab)</span></a>!</p></main></article></div></div>]]>
+            </description>
+            <link>https://docs.sweep.dev/blogs/file-cache</link>
+            <guid isPermaLink="false">hacker-news-small-sites-39750077</guid>
+            <pubDate>Mon, 18 Mar 2024 21:12:11 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Inversion: Fast, Reliable Structured LLMs]]>
             </title>
             <description>
 <![CDATA[
-Score 74 | Comments 14 (<a href="https://news.ycombinator.com/item?id=39750061">thread link</a>) | @swyx
+Score 92 | Comments 21 (<a href="https://news.ycombinator.com/item?id=39750061">thread link</a>) | @swyx
 <br/>
 March 18, 2024 | https://rysana.com/inversion | <a href="https://web.archive.org/web/*/https://rysana.com/inversion">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section><div><div><div><div><p>Today we're excited to announce <strong>Inversion</strong> - our family of structured language models designed to solve the speed, reliability, and reasoning issues in traditional AI systems.</p><div dir="ltr" data-orientation="horizontal"><div data-state="active" data-orientation="horizontal" role="tabpanel" aria-labelledby="radix-:R7ffaufla:-trigger-speed" id="radix-:R7ffaufla:-content-speed" tabindex="0"><div><p><span>Inference speed in characters per second, 33rd/66th/99th percentile across 600 extraction &amp; reasoning tests.<!-- --> <span>(<!-- -->higher<!-- --> is better)</span></span></p></div></div></div><div><p>Our first generation models are state of the art in structured tasks such as extraction and function calling while running up to <strong>100× faster</strong>, with <strong>10× lower latency</strong>, outputting <strong>100% reliable structure</strong> with <strong>10,000× less overhead</strong> than the best alternatives, and boasting the deepest support for typed JSON output available anywhere.*</p>
@@ -85,7 +1124,7 @@ March 18, 2024 | https://rysana.com/inversion | <a href="https://web.archive.org
             </title>
             <description>
 <![CDATA[
-Score 106 | Comments 30 (<a href="https://news.ycombinator.com/item?id=39749943">thread link</a>) | @philzook
+Score 116 | Comments 34 (<a href="https://news.ycombinator.com/item?id=39749943">thread link</a>) | @philzook
 <br/>
 March 18, 2024 | https://www.philipzucker.com/compile_constraints/ | <a href="https://web.archive.org/web/*/https://www.philipzucker.com/compile_constraints/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div aria-label="Content">
@@ -1617,11 +2656,946 @@ constraint
         </item>
         <item>
             <title>
+<![CDATA[LaTeX3 Automatic Labels for Fun and No Profit]]>
+            </title>
+            <description>
+<![CDATA[
+Score 75 | Comments 79 (<a href="https://news.ycombinator.com/item?id=39748648">thread link</a>) | @miguelmurca
+<br/>
+March 18, 2024 | https://commutative.xyz/~miguelmurca/blog/x/autoref.html | <a href="https://web.archive.org/web/*/https://commutative.xyz/~miguelmurca/blog/x/autoref.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
+  
+  <p>I’m a PhD student in physics, which means I’ve spent the
+  better part of the last 10 years writing LaTeX. For those not in
+  the know, LaTeX is a 40-year old superset of a 46-year old
+  typesetting system – i.e., a macro based programming language to
+  produce print documents<sup id="fnref-1"><a href="#fn-1">1</a></sup>. Notably, it’s mostly
+  intended <em>not</em> as a programming language; its strongest
+  suit is arguably the way it beautifully typesets mathematics, and
+  its solution to express complex mathematical expressions. For
+  example,</p>
+  <div>
+    <pre><code><span>\sqrt</span><span>{</span><span>\frac</span><span>{</span>a+b<span>}{</span><span>\vert</span><span>{</span>c<span>}</span><span>\vert</span><span>}</span>
+</code></pre>
+  </div>
+  <p>refers to <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline">
+  <mrow>
+    <msqrt>
+      <mrow>
+        <mfrac>
+          <mrow>
+            <mi>
+              a
+            </mi>
+            <mo>
+              +
+            </mo>
+            <mi>
+              b
+            </mi>
+          </mrow>
+          <mrow>
+            <mi>
+              |
+            </mi>
+            <mrow>
+              <mi>
+                c
+              </mi>
+            </mrow>
+            <mi>
+              |
+            </mi>
+          </mrow>
+        </mfrac>
+      </mrow>
+    </msqrt>
+  </mrow></math>. Indeed, if you’ve ever needed to write a
+  mathematical expression into a computer, you’re likely to have
+  used either TeX or some form of pidgin TeX.<sup id="fnref-2"><a href="#fn-2">2</a></sup></p>
+  <p>But, (La)TeX really is Turing complete – it’s just extremely
+  convoluted. This makes (La)TeX a reasonably fun esoteric
+  programming language to play around with.<sup id="fnref-4"><a href="#fn-4">3</a></sup> On the
+  other hand, being able to wrangle (La)TeX’s macro system lets you
+  automate repetitive tasks, or generally extend (La)TeX’s
+  functionality, which end up being of practical use.<sup id="fnref-3"><a href="#fn-3">4</a></sup> This is
+  why there is also a community effort to improve programming
+  ("macro writing") in LaTeX.</p>
+  <p>LaTeX3 is a “new kernel for LaTeX [… based on] its own
+  consistent interface to all the functions needed to control
+  TeX."<sup><a href="https://mirrors.up.pt/pub/CTAN/macros/latex/contrib/l3kernel/expl3.pdf">[@expl3.pdf]</a></sup>
+  The “new” qualifier is arguable, seeing as it has been in
+  development since 1989, but, in short, we now have access to a
+  set of base macros in LaTeX which are more sophisticated and
+  behave more predictably. Unfortunately, however, due to Knuth’s
+  own <a href="https://en.wikipedia.org/wiki/Literate_programming">fondness of
+  literate programming</a> (the man invented the concept, after
+  all), and because of the nature of LaTeX’s output,<sup>[citation
+  needed]</sup> most information about LaTeX3’s functionality is
+  buried deep in long PDFs with interspersed prose and code and
+  accessible only via <code>texdoc &lt;designator you must
+  guess&gt;</code>.<sup id="fnref-5"><a href="#fn-5">5</a></sup> <sup id="fnref-6"><a href="#fn-6">6</a></sup> A notable (and welcome)
+  exception is <a href="https://www.alanshawn.com/latex3-tutorial/">this article by Alan
+  Xiang, which I recommend reading</a>. In any case, this post is
+  my attempt to make a small contribution to practical and
+  digestible LaTeX3 materials, so that you, too, can procrastinate
+  writing your document by writing very convoluted LaTeX
+  macros.</p>
+  <h2 id="problem-statement-and-goal">Problem statement and
+  goal</h2>
+  <p>In LaTeX, you may <code>\label{...}</code> sections,
+  equations, …, and later refer to their identifier with
+  <code>\ref{...}</code>. So, for example,</p>
+  <div>
+    <pre><code><span>\documentclass</span><span>{</span>article<span>}</span>
+<span>\begin</span><span>{</span>document<span>}</span>
+
+<span>\section</span><span>{</span>First section<span>}</span>
+<span>\label</span><span>{</span>sec:first-section<span>}</span>
+
+Some text here.
+
+This is actually section~<span>\ref</span><span>{</span>sec:first-section<span>}</span>.
+
+<span>\end</span><span>{</span>document<span>}</span>
+</code></pre>
+  </div>
+  <p>yields</p>
+  <pre><code>1 First section
+
+    Some text here.
+    This is actually section 1.
+</code></pre>
+  <p>As said, this also works for equations, and is most useful in
+  mathematical documents, where you want to reference equations in
+  the body of text. LaTeX2e provides the <code>equation</code>
+  environment, which automatically typesets a nice
+  <code>(eqno)</code> next to your equation, and which you can
+  label and reference: <sup id="fnref-7"><a href="#fn-7">7</a></sup></p>
+  <div>
+    <pre><code><span>\documentclass</span><span>{</span>article<span>}</span>
+<span>\let\implies\Longrightarrow</span> <span>% \implies == \Longrightarrow</span>
+<span>\begin</span><span>{</span>document<span>}</span>
+
+<span>\begin</span><span>{</span>equation<span>}</span> <span>\label</span><span>{</span>eq:a-implies-b<span>}</span>
+    A <span>\implies</span> B
+<span>\end</span><span>{</span>equation<span>}</span>
+<span>\begin</span><span>{</span>equation<span>}</span> <span>\label</span><span>{</span>eq:b-implies-c<span>}</span>
+    B <span>\implies</span> C
+<span>\end</span><span>{</span>equation<span>}</span>
+
+From eqs.~<span>$</span><span>(</span><span>\ref</span><span>{eq:a</span><span>-</span><span>implies</span><span>-</span><span>b}, </span><span>\ref</span><span>{eq:b</span><span>-</span><span>implies</span><span>-</span><span>c}</span><span>)</span><span>$</span>, we conclude that <span>$</span><span>A</span><span>$</span> implies
+<span>$</span><span>C</span><span>$</span>.
+
+<span>\end</span><span>{</span>document<span>}</span>
+</code></pre>
+  </div>
+  <p>yields something as</p>
+  <pre><code>            A ⇒ B       (1)
+            B ⇒ C       (2)
+
+From eqs. (1,2), we conclude that A implies C.
+</code></pre>
+  <p>However, labels must be unique throughout the document. And
+  so, when writing out a long document, it quickly becomes quite
+  upsetting to think up a good label for an equation you are
+  certain you will only reference in the next line of text.
+  Wouldn’t it be nice to have some <code>\AutoLabel</code> and
+  <code>\AutoRef</code> macros that would let you just</p>
+  <div>
+    <pre><code><span>\begin</span><span>{</span>equation<span>}</span> <span>\AutoLabel</span>
+    1 + 1 = 2
+<span>\end</span><span>{</span>equation<span>}</span>
+
+Equation~<span>\AutoRef</span><span>{}</span> can be proven with set theory.
+</code></pre>
+  </div>
+  <h2 id="first-steps">First steps</h2>
+  <p>The simplest approach to this problem is to have
+  <code>\AutoLabel</code> generate a different label every time
+  it’s called in a systematic way, and have <code>\AutoRef</code>
+  reference that label when it’s called.</p>
+  <div>
+    <pre><code><span>\documentclass</span><span>{</span>article<span>}</span>
+<span>\let\implies\Longrightarrow</span>
+
+<span>\ExplSyntaxOn</span>
+<span>\int</span><span>_</span>new:N <span>\g</span><span>_</span>autolabel<span>_</span>int
+<span>\NewDocumentCommand</span><span>{</span><span>\AutoLabel</span><span>}{}{</span>
+    <span>\int</span><span>_</span>gincr:N <span>\g</span><span>_</span>autolabel<span>_</span>int
+    <span>\exp</span><span>_</span>args:Ne <span>\label</span> <span>{</span>autolabelprefix- <span>\int</span><span>_</span>use:N <span>\g</span><span>_</span>autolabel<span>_</span>int<span>}</span>
+<span>}</span>
+<span>\NewDocumentCommand</span><span>{</span><span>\AutoRef</span><span>}{}{</span>
+    <span>\exp</span><span>_</span>args:Ne <span>\ref</span> <span>{</span>autolabelprefix-<span>\int</span><span>_</span>use:N <span>\g</span><span>_</span>autolabel<span>_</span>int<span>}</span>
+<span>}</span>
+<span>\ExplSyntaxOff</span>
+
+<span>\begin</span><span>{</span>document<span>}</span>
+
+<span>\begin</span><span>{</span>equation<span>}</span> <span>\AutoLabel</span>
+    A <span>\implies</span> B
+<span>\end</span><span>{</span>equation<span>}</span>
+
+I have just defined eq.~<span>\AutoRef</span><span>{}</span>.
+
+<span>\end</span><span>{</span>document<span>}</span>
+</code></pre>
+  </div>
+  <p>Let’s break this down line by line:</p>
+  
+  <p>Anything between <code>\ExplSyntaxOn</code> and
+  <code>\ExplSyntaxOff</code> obeys LaTeX3’s syntax rules, rather
+  than LaTeX2e’s rules. Indeed, (La)TeX allows you to (roughly
+  speaking) re-define syntax rules on the fly; in particular, the
+  “function” of each character as it is parsed. So, for example,
+  while <code>\</code> is usually a special character (indicating
+  that what follows is a control sequence), you can change its
+  value halfway through the document to function as a regular
+  character. A typical (ab)use of this mechanism in LaTeX2e was the
+  modification of the “character type” (the “character code”, or
+  “catcode")<sup id="fnref-8"><a href="#fn-8">8</a></sup> of <code>@</code> between special character
+  and regular letter to guard internal commands from the end-user.
+  This procedure was summarized with the <code>\makeatletter</code>
+  and <code>\makeatother</code> commands (to, respectively, set the
+  catcode of <code>@</code> to “regular letter” and “other
+  character"), and you’ll often find, in LaTeX2e code, code that
+  looks like:</p>
+  <div>
+    <pre><code><span>\makeatletter</span>
+<span>\newcommand</span><span>{</span><span>\@</span>internalcommand<span>}{</span>Do something<span>}</span>
+<span>\newcommand</span><span>{</span><span>\endusercommand</span><span>}{</span><span>\@</span>internalcommand<span>\ </span>and something else.<span>}</span>
+<span>\makeatother</span>
+</code></pre>
+  </div>
+  <p>Calling <code>\@internalcommand</code> after
+  <code>\makeatother</code> yields an error, because, after
+  <code>\makeatother</code> is called, LaTeX doesn’t know how to
+  interpret the character <code>@</code> anymore. This also
+  highlights the fact that the catcode switching happens as these
+  declarations are parsed, even though the expressions in the
+  declarations themselves are <em>not</em> evaluated at the time of
+  declaration. This finds expression in the following example, a
+  mistake I’ve incurred in more than once:</p>
+  <div>
+    <pre><code><span>\newcommand</span><span>{</span><span>\boom</span><span>}{</span><span>\makeatletter\@</span>destroytheworld<span>\makeatother</span><span>}</span>
+</code></pre>
+  </div>
+  <p>Calling <code>\boom</code> later in the document errors out,
+  since at the time of declaration, <code>\@</code> is parsed as
+  the command in the declaration, not
+  <code>\@destroytheworld</code>. At macro declaration time, the
+  parser sees <code>\makeatletter</code>, but only as a macro that
+  is part of the declaration – it doesn’t make sense to “run” the
+  definition at declaration time, after all. It thus parses the
+  rest of the declaration based on its current rules, which do
+  <em>not</em> expect <code>@</code> to be a regular character. So,
+  as far as the parser cares, <code>\boom</code> reads
+  <code>[macro: \makeatletter] [macro: \@] [letters:
+  destroytheworld] [macro: \makeatother]</code>. When
+  <code>\boom</code> is finally called, LaTeX complains about the
+  use of <code>\@</code>.</p>
+  <p>This is a reasonably long tangent to say that
+  <code>\ExplSyntaxOn</code> modifies catcodes, to favour better
+  and more consistent macro names, and to provide a nicer
+  “programming” environment. There are two notable effects: first,
+  within <code>expl3</code> rules, spaces are ignored. Really,
+  dealing with spaces within macro declarations is a true pain
+  point of LaTeX2e; not just spaces you type out, but also spaces
+  implied by new lines. Here’s an example; what do you expect the
+  differences to be between <code>\a</code>, <code>\b</code>,
+  <code>\c</code>, and <code>\d</code>?</p>
+  <div>
+    <pre><code><span>\newcommand</span><span>{</span><span>\a</span><span>}{</span>foobar<span>}</span>
+<span>\newcommand</span><span>{</span><span>\b</span><span>}{</span>
+    foobar
+<span>}</span>
+<span>\newcommand</span><span>{</span><span>\c</span><span>}{</span>
+    foo
+    bar<span>%</span>
+<span>}</span>
+<span>\newcommand</span><span>{</span><span>\d</span><span>}{</span>foo<span>%</span>
+    bar<span>}</span>
+</code></pre>
+  </div>
+  <p>I tested these out by calling <code>.\a..\b..\c..\d.</code>
+  within a LaTeX document; the periods are there to highlight
+  eventual spacing. The results are as follows:</p>
+  <pre><code>.foobar..␣foobar␣..␣foo␣bar..foobar.
+</code></pre>
+  <p>(I’ve highlighted spaces for you, with the <code>␣</code>
+  character.) Essentially, what you would expect happens in the
+  body of text – that a single newline becomes a space – is also
+  happening within the macro declaration, inserting spurious spaces
+  everywhere. These spaces can only be avoided by inserting comment
+  characters, <code>%</code>, before the end of the line, which the
+  parser interprets as an explicit instruction to ignore the
+  newline. This results in a mess of <code>%</code> everywhere in
+  macro declarations, since, at some point, macro writers start
+  putting a <code>%</code> at the end of every line where they
+  don’t <em>explicitly</em> want some space. While, in the example
+  given, the spaces are not too critical (although unwanted),
+  within complicated macro declarations spurious spaces will cause
+  some really nasty bugs and crashes. The situation is even worse
+  with double newlines, which get transformed into a
+  paragraph,<sup id="fnref-9"><a href="#fn-9">9</a></sup> and that will <em>really</em> mess up your
+  command’s parsing.</p>
+  <p>The other notable catcode switch is making <code>:</code> and
+  <code>_</code> “regular letters”. So, while in LaTeX2e, macro
+  names are generally composed of <code>a-zA-Z</code> (and,
+  eventually, <code>@</code>), in LaTeX3, macros names are expected
+  to be of the form (<code>texdoc expl3</code>, sec. 3.2.),</p>
+  <pre><code>\⟨module⟩_⟨description⟩:⟨arg-spec⟩
+</code></pre>
+  <p>where <code>module</code> would be a unique per-macro package
+  prefix, to avoid name collisions, and <code>description</code>
+  would be the actual name of the macro. <code>arg-spec</code> is a
+  bit more special, telling you what <em>kind</em> of argument the
+  macro expects, and, notably, if the command will expand it or
+  not. Think of it as only slightly more than type hints. Macro
+  expansion is a big topic – too big to cover here – but here’s an
+  illustrative example:</p>
+  <div>
+    <pre><code><span>\newcommand</span><span>{</span><span>\foobar</span><span>}{</span>A winner is you!<span>}</span>
+<span>\newcommand</span><span>{</span><span>\myname</span><span>}{</span>foobar<span>}</span>
+
+<span>\csname\myname\endcsname</span> <span>% The macro named `\myname`</span>
+                         <span>% (so, `\\myname`, if it were possible.)</span>
+
+<span>\expandafter\csname\myname\endcsname</span> <span>% \foobar</span>
+</code></pre>
+  </div>
+  <p>Read more about expansion <a href="https://www.overleaf.com/learn/latex/Articles/How_does_%5Cexpandafter_work%3A_The_meaning_of_expansion">
+  here</a>.</p>
+  <p>In <code>expl3</code>, the <code>arg-spec</code> bit of a
+  macro will tell you what the macro consumes, and if it will
+  expand what it consumes. The main ones to care about (though you
+  can find a complete list in <code>texdoc expl3</code>, chapter 3,
+  and throughout the main reference for programming in LaTeX3,
+  <code>texdoc interface3</code>) are:</p>
+  <ul>
+    <li><code>n</code> – a braced set of characters ("token
+    list"),</li>
+    <li><code>N</code> – a single character ("token"); a macro is a
+    single token,</li>
+    <li><code>c</code> – a macro <em>name</em>
+    (<code>foobar</code>, rather than <code>\foobar</code>); thus,
+    a token list,</li>
+    <li><code>V</code> – a variable, i.e., a macro containing a
+    value (read on),</li>
+    <li><code>v</code> – a variable’s <em>name</em>; like
+    <code>c</code>, but for <code>V</code>,</li>
+    <li><code>e</code> – a braced set of characters to be fully
+    expanded before consumption,</li>
+    <li><code>o</code> – a braced set of characters to be expanded
+    once before consumption,</li>
+    <li><code>T</code> and <code>F</code> – a braced set of
+    characters to be inserted in case some condition evaluates to
+    true or false, respectively.</li>
+  </ul>
+  <p>The notion of a “variable” also appears here, as LaTeX3 tries
+  to separate the notion of a macro that <em>does</em> something (a
+  function) from a macro that merely stores some value (a
+  variable). So, in LaTeX3 terms, <code>\foo</code> below would be
+  a variable, whereas <code>\baz</code> is a function:</p>
+  <div>
+    <pre><code><span>\newcommand</span><span>{</span><span>\foo</span><span>}{</span>winner<span>}</span>
+<span>\newcommand</span><span>{</span><span>\baz</span><span>}</span>[1]<span>{</span>A #1 is you!<span>}</span>
+
+<span>\baz</span><span>{</span><span>\foo</span><span>}</span>
+</code></pre>
+  </div>
+  <p>Though I should really say,</p>
+  <div>
+    <pre><code><span>\ExplSyntaxOn</span>
+<span>\cs</span><span>_</span>new:Nn <span>\baz</span>:N <span>{</span>
+    A #1 is you!
+<span>}</span>
+<span>\tl</span><span>_</span>new:Nn <span>\foo</span> <span>{</span>winner<span>}</span>
+<span>\baz</span>:N <span>\foo</span>
+<span>\ExplSyntaxOff</span>
+</code></pre>
+  </div>
+  <p>Even more correct would be<sup id="fnref-10"><a href="#fn-10">10</a></sup></p>
+  <div>
+    <pre><code><span>\ExplSyntaxOn</span>
+<span>\cs</span><span>_</span>new:Nn <span>\baz</span>:N <span>{</span>
+    A #1 is you!
+<span>}</span>
+<span>\cs</span><span>_</span>generate<span>_</span>variant:Nn <span>\baz</span>:N <span>{</span>V<span>}</span>
+<span>\tl</span><span>_</span>new:Nn <span>\foo</span> <span>{</span>winner<span>}</span>
+<span>\baz</span>:V <span>\foo</span>
+<span>\ExplSyntaxOff</span>
+</code></pre>
+  </div>
+  <p>And, finally, heck it, <code>texdoc expl3</code> specifies
+  that variables should be named as
+  <code>\⟨scope⟩_⟨module⟩_⟨description⟩_⟨type⟩</code>, so here’s
+  some good, honest to God, LaTeX3:</p>
+  <div>
+    <pre><code><span>\ExplSyntaxOn</span>
+<span>\cs</span><span>_</span>new:Nn <span>\custom</span><span>_</span>baz:N <span>{</span>
+    A #1 is you!
+<span>}</span>
+<span>\cs</span><span>_</span>generate<span>_</span>variant:Nn <span>\custom</span><span>_</span>baz:N <span>{</span>V<span>}</span>
+<span>\tl</span><span>_</span>new:Nn <span>\l</span><span>_</span>custom<span>_</span>foo<span>_</span>tl <span>{</span>winner<span>}</span>
+<span>\custom</span><span>_</span>baz:N <span>\l</span><span>_</span>custom<span>_</span>foo<span>_</span>tl
+<span>\ExplSyntaxOff</span>
+</code></pre>
+  </div>
+  <p>This is the price to pay for the magical expansion control
+  tools that LaTeX3 gives.</p>
+  <p>Finally, we move to the following line,</p>
+  <div>
+    <pre><code><span>\int</span><span>_</span>new:N <span>\g</span><span>_</span>autolabel<span>_</span>int
+</code></pre>
+  </div>
+  <p>Here, we’re declaring a new integer variable. As good LaTeX3
+  netizens, we use the correct variable naming scheme, and declare
+  the variable to be global with <code>g_</code> (labels will need
+  to be globally unique to the document, so this makes sense). We
+  can expect this variable to be initialized to 0; from page 168 of
+  <code>texdoc interface3</code>:</p>
+  <blockquote>
+    <p>The ⟨integer⟩ is initially equal to 0.</p>
+  </blockquote>
+  <p>The idea will be that we can generate infinite unique labels
+  by choosing a unique prefix, and suffixing it with an increasing
+  integer; <code>\g_autolabel_int</code> will hold this
+  integer.</p>
+  <p>Next line:</p>
+  <div>
+    <pre><code><span>\NewDocumentCommand</span><span>{</span><span>\AutoLabel</span><span>}{}{</span>
+    <span>\int</span><span>_</span>gincr:N <span>\g</span><span>_</span>autolabel<span>_</span>int
+    <span>\exp</span><span>_</span>args:Ne <span>\label</span> <span>{</span>autolabelprefix- <span>\int</span><span>_</span>use:N <span>\g</span><span>_</span>autolabel<span>_</span>int<span>}</span>
+<span>}</span>
+</code></pre>
+  </div>
+  <p>Here we declare a user-facing command, with
+  <code>\NewDocumentCommand</code> (LaTeX3’s version of
+  <code>\newcommand</code>, much nicer to use and about which you
+  can read with <code>texdoc xparse</code>). Thus, there is no need
+  to adhere to LaTeX3’s naming conventions. The declaration
+  furthermore specifies that it takes no arguments from the user,
+  and leaves in its place, when called, two instructions: a global
+  increment of the <code>\g_autolabel_int</code> variable, and
+  <code>\exp_args:Ne \label {autolabelprefix- \int_use:N
+  \g_autolabel_int}</code>. Here is what
+  <code>interface3.pdf</code> has to say about
+  <code>\exp_args:Ne</code>:</p>
+  <blockquote>
+    <p>This function absorbs two arguments (the ⟨function⟩ name and
+    the ⟨tokens⟩) and exhaustively expands the ⟨tokens⟩. The result
+    is inserted in braces into the input stream after reinsertion
+    of the ⟨function⟩. Thus the ⟨function⟩ may take more than one
+    argument: all others are left unchanged.</p>
+  </blockquote>
+  <p>Ideally, we would have some labelling function
+  <code>\label:n</code> with a variant <code>\label:e</code>, that
+  would expand whatever would be given to it before taking the
+  result as the actual label text. But, we don’t, since
+  <code>label</code> is a LaTeX2e command (<code>texdoc
+  latex2e</code>, chap. 7.1). So, we use <code>LaTeX3</code>’s
+  <code>\exp_args:Ne</code>, to leave the first token
+  (<code>\label</code>) alone while the braced tokens that follow
+  are not fully expanded. Only then is this token list passed as
+  argument to <code>\label</code>.</p>
+  <p>Inside the token list, we find <code>autolabelprefix-
+  \int_use:N \g_autolabel_int</code>: since <code>\int_use:N</code>
+  will “[recover] the content of an ⟨integer⟩ and [place] it
+  directly in the input stream”, we get, after full expansion, our
+  unique label, of the form</p>
+  <pre><code>autolabelprefix-⟨label number⟩
+</code></pre>
+  <p>Finally, we have the declaration of the command that
+  references this label:</p>
+  <div>
+    <pre><code><span>\NewDocumentCommand</span><span>{</span><span>\AutoRef</span><span>}{}{</span>
+    <span>\exp</span><span>_</span>args:Ne <span>\ref</span> <span>{</span>autolabelprefix-<span>\int</span><span>_</span>use:N <span>\g</span><span>_</span>autolabel<span>_</span>int<span>}</span>
+<span>}</span>
+</code></pre>
+  </div>
+  <p>It’s fairly similar to <code>\AutoLabel</code>, with the
+  exception that the relevant LaTeX2e function is now
+  <code>\ref</code>, rather than <code>\label</code>. Since we know
+  the form of the generated labels, we reconstruct the label at
+  referencing time, by once again using the
+  <code>\g_autolabel_int</code> variable and
+  <code>\exp_args:Ne</code>.</p>
+  <h2 id="multiple-labels">Multiple Labels</h2>
+  <p>The above solution works fine, but it quickly breaks down if
+  we wish to reference two equations after <em>both</em> their
+  declarations. To recover a previous example,</p>
+  <div>
+    <pre><code><span>% snip</span>
+<span>\begin</span><span>{</span>equation<span>}</span> <span>\AutoLabel</span>
+    A <span>\implies</span> B
+<span>\end</span><span>{</span>equation<span>}</span>
+<span>\begin</span><span>{</span>equation<span>}</span> <span>\AutoLabel</span>
+    B <span>\implies</span> C
+<span>\end</span><span>{</span>equation<span>}</span>
+
+Eqs.~<span>\AutoRef\ </span>and <span>\AutoRef\ </span>imply <span>$</span><span>A </span><span>\implies</span><span> C</span><span>$</span>.
+</code></pre>
+  </div>
+  <p>will not work, as the output will read</p>
+  <pre><code>Eqs. (2) and (2) imply A ⇒ C.
+</code></pre>
+  <p>We can deal with this quite simply, by counting the number of
+  labels and references separately:</p>
+  <div>
+    <pre><code><span>\ExplSyntaxOn</span>
+<span>\int</span><span>_</span>new:N <span>\g</span><span>_</span>autolabel<span>_</span>int
+<span>\int</span><span>_</span>new:N <span>\g</span><span>_</span>autoref<span>_</span>int
+<span>\tl</span><span>_</span>const:Nn <span>\c</span><span>_</span>autoprefix<span>_</span>tl <span>{</span>autolabelprefix-<span>}</span>
+
+<span>\NewDocumentCommand</span><span>{</span><span>\AutoLabel</span><span>}{}</span> <span>{</span>
+    <span>\int</span><span>_</span>gincr:N <span>\g</span><span>_</span>autolabel<span>_</span>int
+    <span>\exp</span><span>_</span>args:Ne <span>\label</span><span>{</span> <span>\tl</span><span>_</span>use:N <span>\c</span><span>_</span>autoprefix<span>_</span>tl <span>\int</span><span>_</span>use:N <span>\g</span><span>_</span>autolabel<span>_</span>int <span>}</span>
+<span>}</span>
+<span>\NewDocumentCommand</span><span>{</span><span>\AutoRef</span><span>}{}</span> <span>{</span>
+    <span>\int</span><span>_</span>gincr:N <span>\g</span><span>_</span>autoref<span>_</span>int
+    <span>\exp</span><span>_</span>args:Ne <span>\ref</span><span>{</span> <span>\tl</span><span>_</span>use:N <span>\c</span><span>_</span>autoprefix<span>_</span>tl <span>\int</span><span>_</span>use:N <span>\g</span><span>_</span>autoref<span>_</span>int<span>}</span>
+<span>}</span>
+<span>\ExplSyntaxOff</span>
+</code></pre>
+  </div>
+  <p>I’ve sneaked in <code>\c_autoprefix_tl</code> as a constant
+  token list holding the prefix, just because it looks that much
+  nicer than a repeated arbitrary constant string throughout the
+  source, and I’ve also done away with the scope for the sake of
+  readability. Otherwise everything is still quite similar to the
+  previous definition. Things start going awry when using, for
+  example, the <code>gather</code> environment from the
+  <code>amsmath</code> package:</p>
+  <div>
+    <pre><code><span>% snip</span>
+<span>\begin</span><span>{</span>gather<span>}</span> 
+    A <span>\implies</span> B <span>\AutoLabel</span> <span>\\</span>
+    B <span>\implies</span> C <span>\AutoLabel</span>
+<span>\end</span><span>{</span>gather<span>}</span>
+</code></pre>
+  </div>
+  <p>produces</p>
+  <pre><code>Eqs. ?? and ?? imply A ⇒ C.
+</code></pre>
+  <p>What’s going on? LaTeX3 does have some console debugging
+  capabilities, with commands such as <code>tl_show:N</code>, but
+  it’s easier, here, to just go with LaTeX’s version of
+  print-debugging: placing values directly in the text. We thus
+  modify the <code>\AutoLabel</code> definition to not only label
+  the equations, but also place the label’s name in the text
+  stream:</p>
+  <div>
+    <pre><code><span>% snip</span>
+<span>\NewDocumentCommand</span><span>{</span><span>\AutoLabel</span><span>}{}</span> <span>{</span>
+    <span>\int</span><span>_</span>gincr:N <span>\g</span><span>_</span>autolabel<span>_</span>int
+    <span>% 👇 new addition</span>
+    <span>{</span><span>\tl</span><span>_</span>use:N <span>\c</span><span>_</span>autoprefix<span>_</span>tl <span>\int</span><span>_</span>use:N <span>\g</span><span>_</span>autolabel<span>_</span>int<span>}</span>
+    <span>\exp</span><span>_</span>args:Ne <span>\label</span><span>{</span> <span>\tl</span><span>_</span>use:N <span>\c</span><span>_</span>autoprefix<span>_</span>tl <span>\int</span><span>_</span>use:N <span>\g</span><span>_</span>autolabel<span>_</span>int <span>}</span>
+<span>}</span>
+<span>% snip</span>
+</code></pre>
+  </div>
+  <p>Once again compiling, we find that the equations now read:</p>
+  <pre><code>    A ⇒ Bautolabelprefix−3   (1)
+    B ⇒ Cautolabelprefix−4   (2)
+</code></pre>
+  <p>Huh?! Where did labels 1 and 2 go? The problem seems to happen
+  only with <code>amsmath</code> environments, and so a little bit
+  of trolling its documentation (<code>texdoc amsmath</code>)
+  reveals the following paragraph:<sup id="fnref-11"><a href="#fn-11">11</a></sup></p>
+  <blockquote>
+    <p><code>ifmeasuring@</code> – All display environments get
+    typeset twice—once during a “measuring” phase and then again
+    during a “production” phase; <code>\ifmeasuring@</code> will be
+    used to determine which case we’re in, so we can take
+    appropriate action.</p>
+    <p><code>\newif\ifmeasuring@</code></p>
+  </blockquote>
+  <p>Uh oh. Our <code>\AutoLabel</code> function is getting called
+  twice: once in a box that <code>amsmath</code> uses to perform
+  measurements, and then discards, and then again when the actual
+  typesetting happens. To make matters worse, <code>amsmath</code>
+  is using a Plain TeX Boolean, <code>\ifmeasuring@</code>,
+  <em>and</em> the Boolean’s name has a <code>@</code> in it.
+  Here’s what <code>interface3.pdf</code> has to say on its
+  Booleans, and Plain TeX’s Booleans:</p>
+  <blockquote>
+    <p>TeXhackers note: The <code>bool</code> data type is not
+    implemented using the
+    <code>\iffalse</code>/<code>\iftrue</code> primitives, in
+    contrast to <code>\newif</code>, etc., in plain TeX, LaTeX2e
+    and so on. Programmers should not base use of <code>bool</code>
+    switches on any particular expectation of the
+    implementation.</p>
+  </blockquote>
+  <p>Plain TeX Booleans are very fickle, and likely to misbehave if
+  the Boolean test looks anything other than</p>
+  
+  <p>We might get away with giving some arguments to
+  <code>\a</code> or <code>\b</code>, but no more than that;
+  certainly, something like
+  <code>\ifbool\a\b\c\else\d\e\f\fi</code> is bound to cause you
+  trouble. So, our first step is moving the whole of
+  <code>\AutoLabel</code> into a single macro of its own:</p>
+  <div>
+    <pre><code><span>\ExplSyntaxOn</span>
+<span>\int</span><span>_</span>new:N <span>\g</span><span>_</span>autolabel<span>_</span>int
+<span>\int</span><span>_</span>new:N <span>\g</span><span>_</span>autoref<span>_</span>int
+<span>\tl</span><span>_</span>const:Nn <span>\c</span><span>_</span>autoprefix<span>_</span>tl <span>{</span>autolabelprefix-<span>}</span>
+
+<span>\cs</span><span>_</span>new:Nn <span>\autolabel</span>: <span>{</span>
+    <span>\int</span><span>_</span>gincr:N <span>\g</span><span>_</span>autolabel<span>_</span>int
+    <span>\exp</span><span>_</span>args:Ne <span>\label</span><span>{</span> <span>\tl</span><span>_</span>use:N <span>\c</span><span>_</span>autoprefix<span>_</span>tl <span>\int</span><span>_</span>use:N <span>\g</span><span>_</span>autolabel<span>_</span>int <span>}</span>
+<span>}</span>
+<span>\NewDocumentCommand</span><span>{</span><span>\AutoLabel</span><span>}{}{</span>
+    <span>\autolabel</span>:
+<span>}</span>
+<span>\NewDocumentCommand</span><span>{</span><span>\AutoRef</span><span>}{}{</span>
+    <span>\int</span><span>_</span>gincr:N <span>\g</span><span>_</span>autoref<span>_</span>int
+    <span>\exp</span><span>_</span>args:Ne <span>\ref</span><span>{</span> <span>\tl</span><span>_</span>use:N <span>\c</span><span>_</span>autoprefix<span>_</span>tl <span>\int</span><span>_</span>use:N <span>\g</span><span>_</span>autoref<span>_</span>int<span>}</span>
+<span>}</span>
+<span>\ExplSyntaxOff</span>
+</code></pre>
+  </div>
+  <p>Now, we need only to test <code>\ifmeasuring@</code> inside
+  <code>\AutoLabel</code>, and behave accordingly; i.e., if,
+  indeed, measuring, we don’t want to do anything at all. But,
+  recall that LaTeX3 and LaTeX2e’s relationship with <code>@</code>
+  is different, and LaTeX3 won’t correctly interpret
+  <code>\ifmeasuring@</code> at all (it’s not expecting macro names
+  to have <code>@</code>s in them). We may get around this by first
+  using a <code>c</code>-type argument, and an auxiliary
+  definition:<sup id="fnref-12"><a href="#fn-12">12</a></sup></p>
+  <div>
+    <pre><code><span>% snip</span>
+<span>\NewDocumentCommand</span><span>{</span><span>\AutoLabel</span><span>}{}{</span>
+    <span>\cs</span><span>_</span>set<span>_</span>eq:Nc <span>\amsmath</span><span>_</span>ifmeasuring <span>{</span>ifmeasuring@<span>}</span>
+    <span>\amsmath</span><span>_</span>ifmeasuring<span>\else\autolabel</span>:<span>\fi</span>
+<span>}</span>
+<span>% snip</span>
+</code></pre>
+  </div>
+  <p>We’re using the <code>Nc</code> variant of
+  <code>\cs_set_eq:NN</code>, about which
+  <code>interface3.pdf</code> tells us:</p>
+  <blockquote>
+    <p>Globally creates ⟨control sequence1⟩ and sets it to have the
+    same meaning as ⟨control sequence2⟩ or ⟨token⟩. The second
+    control sequence may subsequently be altered with- out
+    affecting the copy.</p>
+  </blockquote>
+  <p>Is this very kosher? Absolutely not. Is this the least cursed
+  LaTeX macro ever written? Not even close, and it works, to boot.
+  Run your compilation steps again, and you’ll find the document
+  now correctly reads</p>
+  <pre><code>        A ⇒ B               (1)
+        B ⇒ C               (2)
+
+Eqs. 1 and 2 imply A ⇒ C.
+</code></pre>
+  <h2 id="some-final-improvements">Some final improvements</h2>
+  <p>The last thing that’s missing is the ability to repeatedly
+  reference the same equation. As it stands, there is no way to
+  typeset something like</p>
+  <pre><code>Eqs. 1 and 2 imply A ⇒ C, but eq. 1 does not imply B ⇒ A.
+</code></pre>
+  <p>Let’s fix that. Specifically, let’s modify
+  <code>\AutoRef</code> to take in an optional argument. If the
+  argument is present, and equal to <code>n</code>, then that
+  command should reference the <code>n</code>th equation before it.
+  Thus, our previous example would correspond to something like</p>
+  <div>
+    <pre><code>Eqs.~<span>\AutoRef\ </span>and <span>\AutoRef</span> imply <span>$</span><span>A </span><span>\implies</span><span> C</span><span>$</span>, but <span>\AutoRef</span><span>[2]</span> does not imply <span>$</span><span>B </span><span>\implies</span><span> A</span><span>$</span>.
+</code></pre>
+  </div>
+  <p>I’ll once again give you the final answer, and then break down
+  any new elements:</p>
+  <div>
+    <pre><code><span>\ExplSyntaxOn</span>
+<span>\int</span><span>_</span>new:N <span>\g</span><span>_</span>autolabel<span>_</span>int
+<span>\int</span><span>_</span>new:N <span>\g</span><span>_</span>autoref<span>_</span>int
+<span>\tl</span><span>_</span>const:Nn <span>\c</span><span>_</span>autoprefix<span>_</span>tl <span>{</span>autolabelprefix-<span>}</span>
+
+<span>\cs</span><span>_</span>new:Nn <span>\autolabel</span>: <span>{</span>
+    <span>\int</span><span>_</span>gincr:N <span>\g</span><span>_</span>autolabel<span>_</span>int
+    <span>\exp</span><span>_</span>args:Ne <span>\label</span><span>{</span> <span>\c</span><span>_</span>autoprefix<span>_</span>tl <span>\int</span><span>_</span>use:N <span>\g</span><span>_</span>autolabel<span>_</span>int<span>}</span>
+<span>}</span>
+<span>\NewDocumentCommand</span><span>{</span><span>\AutoLabel</span><span>}{}{</span>
+    <span>\cs</span><span>_</span>set<span>_</span>eq:Nc<span>\amsmath</span><span>_</span>ifmeasuring<span>{</span>ifmeasuring@<span>}</span>
+    <span>\amsmath</span><span>_</span>ifmeasuring<span>\else\autolabel</span>:<span>\fi</span>
+<span>}</span>
+<span>\NewDocumentCommand</span><span>{</span><span>\AutoRef</span><span>}{</span>o<span>}{</span>
+    <span>\cs</span><span>_</span>set<span>_</span>eq:Nc<span>\amsmath</span><span>_</span>ifmeasuring<span>{</span>ifmeasuring@<span>}</span>
+    <span>\IfValueF</span><span>{</span>#1<span>}</span>
+        <span>{</span><span>\amsmath</span><span>_</span>ifmeasuring<span>\else\int</span><span>_</span>gincr:N <span>\g</span><span>_</span>autoref<span>_</span>int<span>\fi</span><span>}</span>
+    <span>\IfValueTF</span><span>{</span>#1<span>}</span>
+        <span>{</span><span>\int</span><span>_</span>set<span>_</span>eq:NN <span>\l</span><span>_</span>tmpa<span>_</span>int <span>\g</span><span>_</span>autolabel<span>_</span>int<span>}</span>
+        <span>{</span><span>\int</span><span>_</span>set<span>_</span>eq:NN <span>\l</span><span>_</span>tmpa<span>_</span>int <span>\g</span><span>_</span>autoref<span>_</span>int<span>}</span>
+    <span>\IfValueT</span><span>{</span>#1<span>}</span>
+        <span>{</span><span>\int</span><span>_</span>sub:Nn <span>\l</span><span>_</span>tmpa<span>_</span>int <span>{</span>#1 - 1<span>}}</span>
+    <span>\exp</span><span>_</span>args:Ne <span>\ref</span> <span>{</span><span>\tl</span><span>_</span>use:N <span>\c</span><span>_</span>autoprefix<span>_</span>tl <span>\int</span><span>_</span>use:N <span>\l</span><span>_</span>tmpa<span>_</span>int<span>}</span>
+<span>}</span>
+<span>\ExplSyntaxOff</span>
+</code></pre>
+  </div>
+  <p>First, note that I’ve also guarded the
+  <code>\g_autoref_int</code> counter against double incrementation
+  due to measuring – something we’d neglected to previously do, but
+  it’s plausible <code>\AutoRef</code> is called within an
+  <code>amsmath</code> environment. Otherwise, the main difference
+  to the previous definitions has to do with the inclusion of the
+  optional (<code>o</code>) argument in the declaration of
+  <code>\AutoRef</code>.When no value is given for these arguments,
+  they take a special flag value (usually denoted
+  <code>-NoValue-</code> in the documentation). <code>xparse</code>
+  provides the nice <code>IfValue(TF)</code> macros to deal with
+  the cases where, respectively, the argument takes some value, or
+  no value.</p>
+  <p>So, when we find that the user passed some optional value, we
+  calculate the corresponding “absolute label number”; this is
+  given by the current auto-labelling number, minus the number the
+  user gave minus one (in other words: if
+  <code>g_autolabel_int</code> is currently <code>2</code>,
+  implying <code>autoprefix-1</code> and <code>-2</code> were
+  already defined, and the user passes in <code>\AutoRef[2]</code>,
+  they are referencing <code>autoprefix-1</code>, and <code>1 =
+  2-(2-1)</code>).</p>
+  <p>If, on the other hand, the user did not pass in any value,
+  then they are referencing the most recent label; as before, we
+  increment <code>g_autoref_int</code>, and set
+  <code>\l_tmpa_int</code> to hold this number:<sup id="fnref-13"><a href="#fn-13">13</a></sup>
+  <sup id="fnref-14"><a href="#fn-14">14</a></sup></p>
+  <div>
+    <pre><code><span>\amsmath</span><span>_</span>ifmeasuring<span>\else\int</span><span>_</span>gincr:N <span>\g</span><span>_</span>autoref<span>_</span>int<span>\fi</span>
+<span>\int</span><span>_</span>set<span>_</span>eq:NN <span>\l</span><span>_</span>tmpa<span>_</span>int <span>\g</span><span>_</span>autoref<span>_</span>int
+</code></pre>
+  </div>
+  <p>Then, the final line correctly references the most recent
+  label:</p>
+  <div>
+    <pre><code><span>\exp</span><span>_</span>args:Ne <span>\ref</span> <span>{</span><span>\tl</span><span>_</span>use:N <span>\c</span><span>_</span>autoprefix<span>_</span>tl <span>\int</span><span>_</span>use:N <span>\l</span><span>_</span>tmpa<span>_</span>int<span>}</span>
+</code></pre>
+  </div>
+  <p>This <em>almost</em> works, except for the following edge
+  case: what do you expect the following code to produce?</p>
+  <div>
+    <pre><code><span>\begin</span><span>{</span>equation<span>}</span> <span>\AutoLabel</span>
+    A = A
+<span>\end</span><span>{</span>equation<span>}</span>
+
+<span>\AutoRef</span><span>[1]</span> constitutes a ``tautology''.
+
+<span>\begin</span><span>{</span>equation<span>}</span>
+    A = B
+<span>\end</span><span>{</span>equation<span>}</span>
+
+Eq.~<span>\AutoRef</span><span>{}</span> does not constitute a tautology.
+</code></pre>
+  </div>
+  <p>As it stands, the first call to <code>\AutoRef[1]</code>
+  correctly references the label of the first equation, but it does
+  <em>not</em> advance <code>\g_autoref_int</code>, because a value
+  is given. Therefore, when <code>\AutoRef</code> is called a
+  second time, in the second paragraph, it again references the
+  first equation. This is, however, the behaviour we might expect
+  in the following situation (which, with apologies, is more
+  synthetic):</p>
+  <div>
+    <pre><code><span>\begin</span><span>{</span>gather<span>}</span>
+    A <span>\AutoLabel</span> <span>\\</span>
+    B <span>\AutoLabel</span> <span>\\</span>
+    C <span>\AutoLabel</span>
+<span>\end</span><span>{</span>gather<span>}</span>
+
+Eq~<span>\AutoRef</span><span>[1]</span> and <span>\AutoRef</span><span>{}</span> and <span>\AutoRef</span><span>{}</span>.
+</code></pre>
+  </div>
+  <p>Indeed, here, we do <em>not</em> expect
+  <code>\AutoRef[1]</code> to advance
+  <code>\g_autoref_int</code>.</p>
+  <p>The bottom line is that, to get the intended behaviour,
+  calling <code>\AutoRef[1]</code> should be indifferent from
+  simply calling <code>\AutoRef</code>; but only in the case where
+  the two would produce the same result. This is not currently the
+  case. But!, LaTeX3 has us covered with some pretty comprehensive
+  arithmetic tools. The following modification to
+  <code>\AutoRef</code> is sufficient:</p>
+  <div>
+    <pre><code><span>% snip</span>
+<span>\NewDocumentCommand</span><span>{</span><span>\AutoRef</span><span>}{</span>o<span>}{</span>
+    <span>\cs</span><span>_</span>set<span>_</span>eq:Nc<span>\amsmath</span><span>_</span>ifmeasuring<span>{</span>ifmeasuring@<span>}</span>
+    <span>% 👇 main difference</span>
+    <span>\tl</span><span>_</span>set:Nn <span>\l</span><span>_</span>tmpb<span>_</span>tl <span>{</span>#1<span>}</span>
+    <span>\IfValueT</span><span>{</span>#1<span>}</span>
+        <span>{</span><span>\int</span><span>_</span>compare:nNnT <span>{</span>#1<span>}</span>=<span>{</span>1<span>}</span> <span>{</span>
+            <span>\int</span><span>_</span>compare:nNnT <span>{</span><span>\g</span><span>_</span>autoref<span>_</span>int<span>}</span>=<span>{</span><span>\g</span><span>_</span>autolabel<span>_</span>int - 1<span>}</span> 
+                <span>{</span><span>\tl</span><span>_</span>set:NV <span>\l</span><span>_</span>tmpb<span>_</span>tl <span>\c</span><span>_</span>novalue<span>_</span>tl<span>}}}</span>
+    <span>% 👆</span>
+    <span>% 👇 But notice also the use of \l_tmpb_tl below, now:</span>
+    <span>\exp</span><span>_</span>args:Ne <span>\IfValueF</span><span>{</span><span>\tl</span><span>_</span>use:N <span>\l</span><span>_</span>tmpb<span>_</span>tl<span>}</span>
+        <span>{</span><span>\amsmath</span><span>_</span>ifmeasuring<span>\else\int</span><span>_</span>gincr:N <span>\g</span><span>_</span>autoref<span>_</span>int<span>\fi</span><span>}</span>
+    <span>\exp</span><span>_</span>args:Ne <span>\IfValueTF</span><span>{</span><span>\tl</span><span>_</span>use:N <span>\l</span><span>_</span>tmpb<span>_</span>tl<span>}</span>
+        <span>{</span><span>\int</span><span>_</span>set<span>_</span>eq:NN <span>\l</span><span>_</span>tmpa<span>_</span>int <span>\g</span><span>_</span>autolabel<span>_</span>int<span>}</span>
+        <span>{</span><span>\int</span><span>_</span>set<span>_</span>eq:NN <span>\l</span><span>_</span>tmpa<span>_</span>int <span>\g</span><span>_</span>autoref<span>_</span>int<span>}</span>
+    <span>\exp</span><span>_</span>args:Ne <span>\IfValueT</span><span>{</span><span>\tl</span><span>_</span>use:N <span>\l</span><span>_</span>tmpb<span>_</span>tl<span>}</span>
+        <span>{</span><span>\exp</span><span>_</span>args:NNe <span>\int</span><span>_</span>sub:Nn <span>\l</span><span>_</span>tmpa<span>_</span>int <span>{</span><span>\tl</span><span>_</span>use <span>\l</span><span>_</span>tmpb<span>_</span>tl - 1<span>}}</span>
+    <span>\exp</span><span>_</span>args:Ne <span>\ref</span> <span>{</span><span>\tl</span><span>_</span>use:N <span>\c</span><span>_</span>autoprefix<span>_</span>tl <span>\int</span><span>_</span>use:N <span>\l</span><span>_</span>tmpa<span>_</span>int<span>}</span>
+<span>}</span>
+<span>% snip</span>
+</code></pre>
+  </div>
+  <p>The idea is not so different; but now, instead of addressing
+  the optional argument directly (<code>#1</code>), we start by
+  assigning it to <code>\l_tmpb_tl</code>. Then, if we find that
+  the user did pass in some value, but that this value is 1, and
+  would result in the same as not having provided any value at all,
+  we put the empty value into <code>\l_tmpb_tl</code>. The rest of
+  the command is therefore processed, in that case, as though the
+  user had not supplied a value.</p>
+  <p>Using <code>\l_tmpb_tl</code> instead of <code>#1</code>
+  requires some further care with <code>\exp_args:Ne</code> to make
+  sure the value of <code>\l_tmpb_tl</code> is expanded before it’s
+  tested, but nothing special.</p>
+  
+  <p>Thus, we have our final set of LaTeX3 macros:</p>
+  <div>
+    <pre><code><span>\ExplSyntaxOn</span>
+<span>\int</span><span>_</span>new:N <span>\g</span><span>_</span>autolabel<span>_</span>int
+<span>\int</span><span>_</span>new:N <span>\g</span><span>_</span>autoref<span>_</span>int
+<span>\tl</span><span>_</span>const:Nn <span>\c</span><span>_</span>autoprefix<span>_</span>tl <span>{</span>autolabelprefix-<span>}</span>
+
+<span>\cs</span><span>_</span>new:Nn <span>\autolabel</span>: <span>{</span>
+    <span>\int</span><span>_</span>gincr:N <span>\g</span><span>_</span>autolabel<span>_</span>int
+    <span>\exp</span><span>_</span>args:Ne <span>\label</span><span>{</span> <span>\c</span><span>_</span>autoprefix<span>_</span>tl <span>\int</span><span>_</span>use:N <span>\g</span><span>_</span>autolabel<span>_</span>int<span>}</span>
+<span>}</span>
+<span>\NewDocumentCommand</span><span>{</span><span>\AutoLabel</span><span>}{}{</span>
+    <span>\cs</span><span>_</span>set<span>_</span>eq:Nc<span>\amsmath</span><span>_</span>ifmeasuring<span>{</span>ifmeasuring@<span>}</span>
+    <span>\amsmath</span><span>_</span>ifmeasuring<span>\else\autolabel</span>:<span>\fi</span>
+<span>}</span>
+<span>\NewDocumentCommand</span><span>{</span><span>\AutoRef</span><span>}{</span>o<span>}{</span>
+    <span>\cs</span><span>_</span>set<span>_</span>eq:Nc<span>\amsmath</span><span>_</span>ifmeasuring<span>{</span>ifmeasuring@<span>}</span>
+    <span>\tl</span><span>_</span>set:Nn <span>\l</span><span>_</span>tmpb<span>_</span>tl <span>{</span>#1<span>}</span>
+    <span>\IfValueT</span><span>{</span>#1<span>}</span>
+        <span>{</span><span>\int</span><span>_</span>compare:nNnT <span>{</span>#1<span>}</span>=<span>{</span>1<span>}</span> <span>{</span>
+            <span>\int</span><span>_</span>compare:nNnT <span>{</span><span>\g</span><span>_</span>autoref<span>_</span>int<span>}</span>=<span>{</span><span>\g</span><span>_</span>autolabel<span>_</span>int - 1<span>}</span> 
+                <span>{</span><span>\tl</span><span>_</span>set:NV <span>\l</span><span>_</span>tmpb<span>_</span>tl <span>\c</span><span>_</span>novalue<span>_</span>tl<span>}}}</span>
+    <span>\exp</span><span>_</span>args:Ne <span>\IfValueF</span><span>{</span><span>\tl</span><span>_</span>use:N <span>\l</span><span>_</span>tmpb<span>_</span>tl<span>}</span>
+        <span>{</span><span>\amsmath</span><span>_</span>ifmeasuring<span>\else\int</span><span>_</span>gincr:N <span>\g</span><span>_</span>autoref<span>_</span>int<span>\fi</span><span>}</span>
+    <span>\exp</span><span>_</span>args:Ne <span>\IfValueTF</span><span>{</span><span>\tl</span><span>_</span>use:N <span>\l</span><span>_</span>tmpb<span>_</span>tl<span>}</span>
+        <span>{</span><span>\int</span><span>_</span>set<span>_</span>eq:NN <span>\l</span><span>_</span>tmpa<span>_</span>int <span>\g</span><span>_</span>autolabel<span>_</span>int<span>}</span>
+        <span>{</span><span>\int</span><span>_</span>set<span>_</span>eq:NN <span>\l</span><span>_</span>tmpa<span>_</span>int <span>\g</span><span>_</span>autoref<span>_</span>int<span>}</span>
+    <span>\exp</span><span>_</span>args:Ne <span>\IfValueT</span><span>{</span><span>\tl</span><span>_</span>use:N <span>\l</span><span>_</span>tmpb<span>_</span>tl<span>}</span>
+        <span>{</span><span>\exp</span><span>_</span>args:NNe <span>\int</span><span>_</span>sub:Nn <span>\l</span><span>_</span>tmpa<span>_</span>int <span>{</span><span>\tl</span><span>_</span>use <span>\l</span><span>_</span>tmpb<span>_</span>tl - 1<span>}}</span>
+    <span>\exp</span><span>_</span>args:Ne <span>\ref</span> <span>{</span><span>\tl</span><span>_</span>use:N <span>\c</span><span>_</span>autoprefix<span>_</span>tl <span>\int</span><span>_</span>use:N <span>\l</span><span>_</span>tmpa<span>_</span>int<span>}</span>
+<span>}</span>
+<span>\ExplSyntaxOff</span>
+</code></pre>
+  </div>
+  <p>While quite a modest contribution to the <a href="https://ctan.math.illinois.edu/">very hefty history of LaTeX
+  packages</a>, it nonetheless served as a basis for discussing
+  important points of LaTeX3 macro writing, such as syntax
+  differences, token list manipulation, controlled expansion,
+  variables and functions, Boolean tests, and LaTeX2e interfacing.
+  Not too shabby. Hopefully this post is also a good enough
+  introduction that you may now directly reference important
+  reference documents, such as <code>interface3.pdf</code>,
+  yourself.</p>
+  <p>Personally, I also find the macro itself quite useful in
+  practice, and it’s something I’ve been using in my scientific
+  writing. I am yet to find out if Physical Review will be upset by
+  it.</p>
+  <p>As a parting gift, and to point the interested user towards
+  property lists, here is an exercise for the reader: the
+  <code>revtex4-2</code> document class, mandated by Physical
+  Review, does not support the use of <code>\footnotetext</code>
+  and <code>\footnotenumber</code>. This means that any footnote
+  text really must be in the middle of the source of the body of
+  text. Can you write <code>\FootnoteLater</code> and
+  <code>\FootnoteNow</code> to rectify this?</p>
+  <hr>
+  <p><strong>A Post-Scriptum for HackerNews readers:</strong> I
+  like to submit these posts to HN, as I feel like the average HN
+  user fits the intended audience. But, 1. famously, HN can be
+  quite predictable in some of their responses (by what I expect
+  is, essentially, a meme effect), and 2. I’ve had some unexpected
+  experiences resulting from previously reaching FP in HN. So,
+  consider this a preemptive response to some points I expect to be
+  raised. If you’re coming in from HN and you see someone fail to
+  account for these answers, you’ll know they haven’t even read the
+  whole thing. So:</p>
+  <ol>
+    <li>It’s weird I even have to say this, but don’t stalk me and
+    email me at my personal address. This is genuinely something
+    that has happened, inexplicably. If you wish to contact me by
+    email, by all means do so to <code>miguelmurca+autoref [æt]
+    cumperativa.xyz</code>.</li>
+    <li>Again, strange that I would need to point this out, but do
+    not assume my nationality, or language. This post is in
+    English. If you wish to write me, please do so in English.</li>
+    <li>Yes, we are aware of <a href="https://github.com/typst/typst">typst</a>. I think it’s cool,
+    but C++ hasn’t replaced C, Rust hasn’t replaced C++, Typst is
+    unlikely to replace LaTeX. Likewise, many are aware of
+      <a href="https://www.luatex.org/">LuaTeX</a>, but, again, the
+      entrenching of a 40-odd year system is not to be
+      underestimated. I am rooting for <code>typst</code>, anyway,
+      and hope it finds its place. A good place to start would be
+      to provide a compilation toolchain from <code>typst</code> to
+      TeX, if they really want to replace TeX.
+    </li>
+    <li>There are, in fact, reasons why someone would not want to
+    just use your favourite form of Markdown plus pidgin TeX, not
+    least of all because not everyone is just taking notes, and
+    also because not everyone (dare I say, most people) who are
+    using LaTeX are of the computer science/technology subject.
+    Also, on a purely personal level, if you were taking your class
+    notes in Markdown+TeX, either the syllabus was too easy or you
+    were making it way harder for yourself.</li>
+    <li>Yes, LaTeX is ugly and antiquated. It <em>is</em> old. It’s
+    an evolving, niche, very precocious thing, and it suffers from
+    this. And, yet, it seems to have its place. But, if you just
+    look at it like an esoteric programming language, why should
+    this be a problem?</li>
+    <li>Even though I strived to be correct, it’s likely I’ve
+    incurred in some error. There are a lot of people who are
+    <em>really</em> good with LaTeX in HN, and I expect them to
+    point out any errors (for which I will be very grateful, and
+    will duly correct). But, at the end of the day, LaTeX is far
+    from my primary occupation, and I felt like the sort of
+    introduction that this text would be able to give to the
+    average programmer w.r.t. LaTeX would outweigh any eventual
+    minor error, easily corrected by consulting the official
+    references.</li>
+    <li>Yes, it’s <code>$YEAR</code> and we’re still producing
+    PDFs. Again, historical reasons plus the fact that most people
+    doing maths are not necessarily very interested in
+    computers.</li>
+    <li>99% of the time that you’re writing LaTeX, you need to know
+    literally nothing of what’s contained in this blog post.</li>
+    <li>(La)TeX does not have a grammar. Parsing TeX is Turing
+    complete. This does not mean that you could not write a grammar
+    for, roughly speaking, “much” of TeX, especially “many”
+    mathematical expressions. I suspect this is what quite a few
+    pidgin TeX-related programs do.</li>
+  </ol>
+  
+  <hr>
+  
+
+
+</div>]]>
+            </description>
+            <link>https://commutative.xyz/~miguelmurca/blog/x/autoref.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-39748648</guid>
+            <pubDate>Mon, 18 Mar 2024 19:14:09 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[RP2040 Boot Sequence]]>
             </title>
             <description>
 <![CDATA[
-Score 172 | Comments 45 (<a href="https://news.ycombinator.com/item?id=39746625">thread link</a>) | @vmoore
+Score 178 | Comments 52 (<a href="https://news.ycombinator.com/item?id=39746625">thread link</a>) | @vmoore
 <br/>
 March 18, 2024 | https://vanhunteradams.com/Pico/Bootloader/Boot_sequence.html | <a href="https://web.archive.org/web/*/https://vanhunteradams.com/Pico/Bootloader/Boot_sequence.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div>
@@ -1979,7 +3953,7 @@ bss_fill_test:
             </title>
             <description>
 <![CDATA[
-Score 142 | Comments 59 (<a href="https://news.ycombinator.com/item?id=39745923">thread link</a>) | @caranea
+Score 146 | Comments 60 (<a href="https://news.ycombinator.com/item?id=39745923">thread link</a>) | @caranea
 <br/>
 March 18, 2024 | https://programmingattack.com/articles/optimizing-the-article-life-from-a-thousand-to-a-milion-particles | <a href="https://web.archive.org/web/*/https://programmingattack.com/articles/optimizing-the-article-life-from-a-thousand-to-a-milion-particles">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p><img src="https://programmingattack.com/articles/1.webp" alt=""></p><h2 id="why-particle-life"><a href="#why-particle-life"><!--[-->Why Particle Life?<!--]--></a></h2><p><!--[-->For one of my programming classes this semester, my task was writing a program in Python. It was only an introductory course, so it didn’t have to be anything fancy. Whenever I get assignments like this one, my choice is simple: I enjoy tinkering around with cellular automata and particle simulations.<!--]--></p><p><!--[-->I have had an eye on Particle Life for quite a while now. The idea belongs to Jeffrey Ventrella, who called it "Clusters." As the name suggests, its simple rules result in the emergence of lifelike, cell-like structures interacting with one another. During my experiments, I was also amazed by the fact that applying the same rules on much larger scales gives us a resemblance to many different phenomena in nature, somewhat like electron clouds or cosmic structures. I, personally, found it mesmerizing, and I got completely absorbed by writing this program for the better part of a week, completely neglecting other things I needed to take care of.<!--]--></p><p><!--[-->But what do I even mean by emergence in the paragraph above?<!--]--></p><p><!--[-->Have you ever wondered how a flock of birds operates? How is it able to travel, forage, and respond to predators? An individual bird does not have a blueprint of the flock's final behavior and its part in it.<!--]--></p><p><!--[-->Instead, a singular bird operates based on simple rules guiding its behavior. For example, in boids, an algorithm simulating the flocking behavior of birds, an individual agent's interaction must adhere to (a simplified) set of rules:<!--]--></p><ol><!--[--><li><!--[-->Stay <strong><!--[-->separated<!--]--></strong> to avoid crowding local flockmates.<!--]--></li><li><!--[--><strong><!--[-->Align<!--]--></strong> with the average direction of your local flockmates.<!--]--></li><li><!--[-->Navigate towards the average position of your local flockmates to retain <strong><!--[-->cohesion<!--]--></strong>.<!--]--></li><!--]--></ol><p><!--[-->The complexity of the flock emerges from every agent in the system following these rules. Flock has distinct properties that arose from the behavior of its components, but there's no way for us to deduce these properties from the rules we applied to individual agents. This is why we can call a flock a complex system.<!--]--></p><p><!--[-->Human societies, the universe, climate, cities—all these are examples of complex systems. And the simulation we'll write is an example of it as well. You'll see for yourself how the structures we'll see on the screen are described nowhere in the code but emerge as a result of uncomplicated rules generated for every particle randomly each time we start the program.<!--]--></p><p><!--[-->There are multiple implementations of the algorithm available online. To contribute something new, I decided to focus on the optimization of the program. This is a deep-dive, several-piece series, but at the end, we'll render a million particles in real-time, which makes it completely worth the time spent on the project!<!--]--></p><h2 id="the-rules"><a href="#the-rules"><!--[-->The rules<!--]--></a></h2><p><!--[-->The first thing we need to specify is the number of classes of particles. We will denote these classes by their colors, and how particles interact with each other will depend on their respective colors. This force can be attractive or repulsive, depending on our color-attraction matrix. It doesn’t have to be symmetric: red particles can be attracted to green particles, but green particles can be repulsed by red ones.<!--]--></p><p><!--[-->To visualize this dependence, let’s see an example matrix with two classes of particles and forces ranging from -1.0 to 1.0:<!--]--></p>
@@ -2213,7 +4187,7 @@ March 18, 2024 | https://programmingattack.com/articles/optimizing-the-article-l
             </title>
             <description>
 <![CDATA[
-Score 147 | Comments 144 (<a href="https://news.ycombinator.com/item?id=39744878">thread link</a>) | @cassepipe
+Score 149 | Comments 152 (<a href="https://news.ycombinator.com/item?id=39744878">thread link</a>) | @cassepipe
 <br/>
 March 18, 2024 | https://www.devaboone.com/post/vitamin-d-part-2-shannon-s-story | <a href="https://web.archive.org/web/*/https://www.devaboone.com/post/vitamin-d-part-2-shannon-s-story">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-hook="post-description"><article><div><div><div><div data-rce-version="9.18.1"><div dir="ltr" data-id="content-viewer"><div data-query="container"><div><div data-breakout="normal"><div id="viewer-clbfl"><div><div data-hook="imageViewer" role="button" tabindex="0"><div id="new-image465296"><wow-image id="3e0600_cc86ea12bc4248faaa2a0e149d1a9ef4~mv2.jpg" data-image-info="{&quot;containerId&quot;:&quot;new-image465296&quot;,&quot;displayMode&quot;:&quot;fill&quot;,&quot;isLQIP&quot;:true,&quot;isSEOBot&quot;:false,&quot;lqipTransition&quot;:&quot;blur&quot;,&quot;imageData&quot;:{&quot;width&quot;:900,&quot;height&quot;:450,&quot;uri&quot;:&quot;3e0600_cc86ea12bc4248faaa2a0e149d1a9ef4~mv2.jpg&quot;,&quot;name&quot;:&quot;&quot;,&quot;displayMode&quot;:&quot;fill&quot;}}" data-bg-effect-name="" data-has-ssr-src="true" data-animate-blur=""><img src="https://static.wixstatic.com/media/3e0600_cc86ea12bc4248faaa2a0e149d1a9ef4~mv2.jpg/v1/fill/w_162,h_81,al_c,q_80,usm_0.66_1.00_0.01,blur_2,enc_auto/3e0600_cc86ea12bc4248faaa2a0e149d1a9ef4~mv2.jpg" alt="" data-pin-url="https://www.devaboone.com/post/vitamin-d-part-2-shannon-s-story" data-pin-media="https://static.wixstatic.com/media/3e0600_cc86ea12bc4248faaa2a0e149d1a9ef4~mv2.jpg/v1/fill/w_900,h_450,al_c,q_85/3e0600_cc86ea12bc4248faaa2a0e149d1a9ef4~mv2.jpg"></wow-image></div></div></div></div></div><p data-breakout="normal"><h3 id="viewer-7adfi"><span><span>How much Vitamin D should I take? This is still the looming question, and it’s time to address it. </span></span></h3></p><p id="viewer-9k73p"><span><span>First, though, imagine that someone in a public forum online asked me, “How much metoprolol (a common blood pressure medication) should I take?” It would be clear that I could not give a real answer. I could give a heavily qualified blanket statement that covered indications and common starting doses, and then recommended speaking with a doctor regarding a personalized dosage. I wouldn’t give a specific dose. But no one would expect me to.  Metoprolol is a medication, and medications are usually prescribed by a physician.</span></span></p><p id="viewer-7tpp4"><span><span>We think of vitamins and supplements differently. A few readers have made comments like this: “I understand that the evidence for Vitamin D in healthy adults doesn’t really show a benefit, but I take Vitamin D because it probably won’t hurt me, and it might help.” This is a common sentiment regarding supplements, but not a statement that most people would make about metoprolol, or any prescribed medication.  Medications are generally understood to be substances taken in response to a specific disease or condition, and we hope that research has shown that they work. Supplements are given a pass; we take them if they might help, even though they may not be needed. </span></span></p><p id="viewer-2fbtq"><span><span><span>But Vitamin D should be thought of as a medication</span></span><span>, despite being sold over-the-counter in the supplements aisle. </span></span></p><p id="viewer-5549c"><span><span>To illustrate this, let me introduce Shannon. </span></span></p><p id="viewer-518ch"><span><span>In the fall of 2018, Shannon R. was the special education director for a large Arizona school district. Normally energetic and expressive, the otherwise healthy 38-year-old began having an odd and disturbing symptom: difficulty speaking. Her husband and two boys would ask her questions, and though understanding the question, she was unable to formulate the words to respond. </span></span></p><p id="viewer-e7f4v"><span><span>Milder problems had started over the summer, when she felt more tired than usual. As the months passed, new symptoms appeared: palpitations, insomnia, anxiety, along with cognitive deficits – “like my brain wouldn’t function,” she recalled. Her heart rate, normally in the 60s, now often stayed in the 90s, even while in bed. She barely slept at night and lost nearly 50 pounds. By mid-semester, she was often unable to work. At around 1 AM one October morning, she was taken to the emergency room for a racing heart. When there, she had difficulty responding to the doctors’ and nurses’ questions. After a full workup, the doctors had no explanation, so they resorted to what doctors often reach for when confronted with mystery ailments: psychiatric illness. </span></span></p><p id="viewer-fu7id"><span><span>Shannon would be hospitalized several times for “catatonia,” a general symptom describing difficulty with speaking or moving that is caused by certain psychiatric conditions like depression and schizophrenia. Though she had never exhibited mental illness before, doctors assumed that Shannon had developed a severe psychiatric disorder. </span></span></p><p id="viewer-4pb27"><span><span>Shannon’s husband, as well as her new psychiatrist, doubted this diagnosis, and sought second and third opinions. By the time she contacted me four months later, they had consulted multiple specialists at three different hospitals around the state, but still did not have an explanation for her physical and mental decline. There was something that all of the doctors had noticed, though. Her blood calcium levels were often mildly to moderately elevated above normal, up to 11.1 mg/dl (normal for her age would be up to 10.2 mg/dl). The cause of this was unclear, but her doctors did not believe that this incidental finding was relevant to her current issues, and did not pursue it. </span><span><span>Shannon was not taking calcium supplements at all throughout this time, but her levels were still high.</span></span><span> When she emailed me in February 2019, she was desperate for answers and thought the calcium levels might be a clue. </span></span></p><p id="viewer-1miap"><span><span>My specialty is parathyroid disease, which is the most common cause of high calcium. Based on her parathyroid hormone tests, it did not appear that Shannon had parathyroid disease. But she had high calcium levels, and the rise in those levels correlated with the onset of her symptoms. High calcium levels might initially appear to be a good thing, since we need calcium for our bones. But they are not. High blood calcium levels usually indicate a serious illness.</span></span></p><div data-breakout="normal"><div id="viewer-ep36c"><div><div data-hook="imageViewer" role="button" tabindex="0"><div id="new-image465297"><wow-image id="3e0600_ab9b4f52fab24f4aaf3be163ee13d0ca~mv2.jpg" data-image-info="{&quot;containerId&quot;:&quot;new-image465297&quot;,&quot;displayMode&quot;:&quot;fill&quot;,&quot;isLQIP&quot;:true,&quot;isSEOBot&quot;:false,&quot;lqipTransition&quot;:&quot;blur&quot;,&quot;imageData&quot;:{&quot;width&quot;:900,&quot;height&quot;:434,&quot;uri&quot;:&quot;3e0600_ab9b4f52fab24f4aaf3be163ee13d0ca~mv2.jpg&quot;,&quot;name&quot;:&quot;&quot;,&quot;displayMode&quot;:&quot;fill&quot;}}" data-bg-effect-name="" data-has-ssr-src="true" data-animate-blur=""><img src="https://static.wixstatic.com/media/3e0600_ab9b4f52fab24f4aaf3be163ee13d0ca~mv2.jpg/v1/fill/w_162,h_78,al_c,q_80,usm_0.66_1.00_0.01,blur_2,enc_auto/3e0600_ab9b4f52fab24f4aaf3be163ee13d0ca~mv2.jpg" alt="" data-pin-url="https://www.devaboone.com/post/vitamin-d-part-2-shannon-s-story" data-pin-media="https://static.wixstatic.com/media/3e0600_ab9b4f52fab24f4aaf3be163ee13d0ca~mv2.jpg/v1/fill/w_900,h_434,al_c,q_85/3e0600_ab9b4f52fab24f4aaf3be163ee13d0ca~mv2.jpg"></wow-image></div></div></div></div></div><p id="viewer-5d4om"><span><span><span>Calcium is known for its role in bone health, but its role in the brain and nervous system is just as important. Calcium levels need to be within a small range; anything too high or too low can cause problems.  Image by </span></span><a target="_blank" href="https://www.bigstockphoto.com/search/?contributor=madrock24" rel="noopener" data-hook="WebLink"><span>madrock24</span></a><span> on </span><a target="_blank" href="http://bigstockphoto.com/" rel="noopener" data-hook="WebLink"><span><span>bigstockphoto.com</span></span></a></span></p><p id="viewer-115r5"><span><span>Most patients with high calcium develop fatigue and body aches, and just generally feel bad. They may develop insomnia and palpitations, a feeling like the heart is racing. Some have more severe neurologic symptoms like muscle weakness and problems with balance, and some have psychiatric symptoms like depression and anxiety. Untreated high calcium can also lead to kidney stones, kidney failure, cardiac arrhythmias, headaches, and gastrointestinal problems. Shannon had some of the classic symptoms, as well as what appeared to be more severe “psychiatric” symptoms. I suspected they were all related to her calcium levels. </span></span></p><p id="viewer-bac7q"><span><span>But why was her calcium high? The parathyroid glands exist to regulate calcium, and they do a very good job at it, keeping blood calcium within a tight range. Usually, a problem with calcium indicates a problem with the parathyroids. But over the last few years I have had more patients coming to me with high calcium related to something else: Vitamin D. </span></span></p><p id="viewer-6d1js"><span><span><span>Vitamin D is a steroid hormone</span></span><span>, in the same category as sex hormones like estrogen and testosterone, and glucocorticoids like the stress hormone cortisol. Steroid hormones are all made from cholesterol, and looking at their molecular structures, you can see the similarities. </span></span></p><div data-breakout="normal"><div id="viewer-6s0p9"><div><div data-hook="imageViewer" role="button" tabindex="0"><div id="new-image465298"><wow-image id="3e0600_1ef7e9201aae4b54be7b21f6f218627e~mv2.png" data-image-info="{&quot;containerId&quot;:&quot;new-image465298&quot;,&quot;displayMode&quot;:&quot;fill&quot;,&quot;isLQIP&quot;:true,&quot;isSEOBot&quot;:false,&quot;lqipTransition&quot;:&quot;blur&quot;,&quot;imageData&quot;:{&quot;width&quot;:1586,&quot;height&quot;:972,&quot;uri&quot;:&quot;3e0600_1ef7e9201aae4b54be7b21f6f218627e~mv2.png&quot;,&quot;name&quot;:&quot;&quot;,&quot;displayMode&quot;:&quot;fill&quot;}}" data-bg-effect-name="" data-has-ssr-src="true" data-animate-blur=""><img src="https://static.wixstatic.com/media/3e0600_1ef7e9201aae4b54be7b21f6f218627e~mv2.png/v1/fill/w_49,h_30,al_c,q_85,usm_0.66_1.00_0.01,blur_2,enc_auto/3e0600_1ef7e9201aae4b54be7b21f6f218627e~mv2.png" alt="" data-pin-url="https://www.devaboone.com/post/vitamin-d-part-2-shannon-s-story" data-pin-media="https://static.wixstatic.com/media/3e0600_1ef7e9201aae4b54be7b21f6f218627e~mv2.png/v1/fill/w_1586,h_972,al_c,q_90/3e0600_1ef7e9201aae4b54be7b21f6f218627e~mv2.png"></wow-image></div></div></div></div></div><p id="viewer-3upia"><span><span>Like the other steroid hormones, Vitamin D acts on multiple organs and only tiny amounts of the molecule are required to have substantial effects. Anyone who has gone through puberty understands the impressive physiologic changes brought about by relatively small shifts in hormone levels. Not surprisingly, most steroid hormones are considered medications that require a physician's order. Vitamin D is an exception. In the U.S., high dose Vitamin D can be purchased by anyone, without a prescription, in most drugstores and grocery stores. It is called a dietary supplement, which sounds safer than a medication, but this is misleading. Due to its role in calcium absorption, high dose Vitamin D can cause serious problems. </span></span></p><p id="viewer-21t00"><span><span>Eventually we worked out what happened with Shannon: In 2013 she was diagnosed with mild osteopenia, a thinning of the bones that can be a precursor to osteoporosis. Her Vitamin D was low at the time, so her physician started her on over-the-counter Vitamin D supplementation at 5000 international units (IUs) daily. Five years later, she was still on this dose, and her blood Vitamin D level had risen to 79 ng/ml. This level is within what many labs call the normal range, between 30 and 100 ng/ml, but levels above 70 are almost always a result of high dose supplementation, and I have seen toxicity with levels between 70 and 100 ng/ml. (A better “normal range” based on what I have seen would probably be between 30 and 60.) Vitamin D builds up over time, so the longer someone is on a high dose, the more likely she is to develop toxicity. Shannon’s calcium levels began rising in the fall of 2018, when her severe symptoms developed. </span></span></p><p id="viewer-c0tav"><span><span>Ironically, Shannon started to recover because she became too sick to worry about taking her vitamins, and stopped taking Vitamin D in October. It often takes many months for high Vitamin D levels to drop, and it took six months for Shannon’s level to fall into the 50s. As it fell, her calcium level gradually started to normalize, and her symptoms slowly resolved. By May, she was starting to feel like herself again. </span></span></p><p id="viewer-208hf"><span><span>I spoke with Shannon recently. All of the symptoms that characterized her frightening and rapid decline in health had resolved completely. Listening to this animated woman, it was difficult to imagine her unable to talk. The only lingering effects appeared to be a wariness of physicians and distrust of vitamins, both understandable. Shannon agrees that Vitamin D should be treated like a medication. “It’s a hormone!” she exclaimed. “If I had to take ‘Hormone D’, I would have questioned my doctor about why I needed it.” Shannon is now committed to educating others about Vitamin D. </span></span></p><p id="viewer-16oc8"><span><span>Of course, there is a selection bias in who comes to me. There are people out there doing just fine on 5000 units of Vitamin D daily. I only see the ones who develop high calcium levels. But I see enough of them to know that this is not an exceptionally rare occurrence. I have been to lectures in which physicians have claimed that Vitamin D toxicity almost never occurs. In my experience, this is false. I have seen many cases of Vitamin D toxicity in people who were taking the recommended dose from an over-the-counter bottle.</span></span></p><p id="viewer-8pgar"><span><span>Unfortunately, none of those patients were warned about the potential for Vitamin D to cause high calcium. They all believed that they were taking a supplement to improve health and that there was very little risk. Supplements don’t require prescriptions, and most do not have the warning labels that accompany medications. For Vitamin D, a steroid hormone, that may need to change. </span></span></p><p id="viewer-4ie1g"><span><span><span>So, how much Vitamin D should you take? </span></span></span></p><p id="viewer-9iecb"><span><span>Vitamin D should be approached like a medication that is used to treat low calcium levels and low levels of the hormone called Vitamin D. The dose depends on your calcium and current Vitamin D levels, and needs to be adjusted appropriately in response to those levels. For my patients, I can and do give very specific recommendations on Vitamin D doses. In future posts, I can go through how I decide that. I will not give any recommendation without first knowing Vitamin D and calcium levels. </span></span></p><p id="viewer-ecd8g"><span><span><span>Edited to add: This post should not be taken as a condemnation of Vitamin D supplements. Vitamin D deficiency is a problem that can and should be treated with supplementation. The message is simply that we should give over-the-counter Vitamin D supplements the same respect we give to a prescribed medication. There are risks and benefits to every medication. Some people need to be on high-dose Vitamin D. Whenever you are on a high dose of a medication, it helps to know the indications and the risks. </span></span></span></p><p id="viewer-7g07m"><span><span>Edited 8/25/20 to add: I have disabled comments because I do not have time to adequately address all of them. You can still contact me through the form if you want to reach out. </span></span></p><p id="viewer-7v25u"><span><a target="_blank" href="https://www.devaboone.com/post/vitamin-d-part-1-back-to-basics" rel="noopener" data-hook="WebLink"><span><span><span>Part 1</span></span></span></a><span><span> addresses the basic science of what Vitamin D does on a molecular level, reviewing studies in humans, mice, and cell cultures. </span></span></span></p><p id="viewer-1n2v"><span><a target="_blank" href="https://www.devaboone.com/post/vitamin-d-part-3-the-evidence" rel="noopener" data-hook="WebLink"><span><span><span>Part 3</span></span></span></a><span><span> reviews the major studies on Vitamin D. </span></span></span></p></div></div></div></div></div></div></div></article></div></div>]]>
@@ -2228,7 +4202,7 @@ March 18, 2024 | https://www.devaboone.com/post/vitamin-d-part-2-shannon-s-story
             </title>
             <description>
 <![CDATA[
-Score 91 | Comments 62 (<a href="https://news.ycombinator.com/item?id=39743398">thread link</a>) | @RetroTechie
+Score 91 | Comments 64 (<a href="https://news.ycombinator.com/item?id=39743398">thread link</a>) | @RetroTechie
 <br/>
 March 18, 2024 | https://www.powerchip.com/en-global/insights/press-releases/content/20240229 | <a href="https://web.archive.org/web/*/https://www.powerchip.com/en-global/insights/press-releases/content/20240229">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2270,7 +4244,7 @@ March 18, 2024 | https://www.powerchip.com/en-global/insights/press-releases/con
             </title>
             <description>
 <![CDATA[
-Score 260 | Comments 30 (<a href="https://news.ycombinator.com/item?id=39742916">thread link</a>) | @mattashii
+Score 268 | Comments 34 (<a href="https://news.ycombinator.com/item?id=39742916">thread link</a>) | @mattashii
 <br/>
 March 18, 2024 | https://www.pinaraf.info/2024/03/look-ma-i-wrote-a-new-jit-compiler-for-postgresql/ | <a href="https://web.archive.org/web/*/https://www.pinaraf.info/2024/03/look-ma-i-wrote-a-new-jit-compiler-for-postgresql/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="post-98">
@@ -2453,7 +4427,7 @@ March 18, 2024 | https://www.pinaraf.info/2024/03/look-ma-i-wrote-a-new-jit-comp
             </title>
             <description>
 <![CDATA[
-Score 550 | Comments 580 (<a href="https://news.ycombinator.com/item?id=39742578">thread link</a>) | @KingOfCoders
+Score 562 | Comments 610 (<a href="https://news.ycombinator.com/item?id=39742578">thread link</a>) | @KingOfCoders
 <br/>
 March 18, 2024 | https://www.amazingcto.com/cookie-banners-are-not-needed/ | <a href="https://web.archive.org/web/*/https://www.amazingcto.com/cookie-banners-are-not-needed/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p><em>I’m not a lawyer and this is not legal advice. Ask your data protection specialist.</em></p><p><img src="https://www.amazingcto.com/images/PaulGraham.png" alt="Paul Graham on Cookie Banners">
@@ -2490,7 +4464,7 @@ March 18, 2024 | https://www.amazingcto.com/cookie-banners-are-not-needed/ | <a 
             </title>
             <description>
 <![CDATA[
-Score 551 | Comments 134 (<a href="https://news.ycombinator.com/item?id=39742422">thread link</a>) | @MrBruh
+Score 555 | Comments 134 (<a href="https://news.ycombinator.com/item?id=39742422">thread link</a>) | @MrBruh
 <br/>
 March 18, 2024 | https://env.fail/posts/firewreck-1/ | <a href="https://web.archive.org/web/*/https://env.fail/posts/firewreck-1/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><article><div><p><strong>TLDR</strong>:</p>
@@ -2575,7 +4549,7 @@ March 18, 2024 | https://env.fail/posts/firewreck-1/ | <a href="https://web.arch
             </title>
             <description>
 <![CDATA[
-Score 230 | Comments 366 (<a href="https://news.ycombinator.com/item?id=39742188">thread link</a>) | @rkwz
+Score 241 | Comments 396 (<a href="https://news.ycombinator.com/item?id=39742188">thread link</a>) | @rkwz
 <br/>
 March 18, 2024 | https://www.sheshbabu.com/posts/thoughts-on-the-future-of-software-development/ | <a href="https://web.archive.org/web/*/https://www.sheshbabu.com/posts/thoughts-on-the-future-of-software-development/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>Large Language Models (LLMs) caused a huge stir in the creative circles when they were able to generate images, text and code. Initially the results were quite hilarious with <a href="https://twitter.com/weirddalle/status/1617240690290839553" target="_blank" rel="noopener">drawings of people with messed up hands</a>, hallucinating incorrect facts and code. But things are slowly <em>and steadily</em> getting better. Before the advent of these models, the main argument against automating these tasks was that machines can’t think creatively. Now this argument gets weaker by the day. Where do we go from here?</p>
@@ -2649,7 +4623,7 @@ March 18, 2024 | https://www.sheshbabu.com/posts/thoughts-on-the-future-of-softw
             </title>
             <description>
 <![CDATA[
-Score 102 | Comments 29 (<a href="https://news.ycombinator.com/item?id=39741600">thread link</a>) | @necubi
+Score 106 | Comments 30 (<a href="https://news.ycombinator.com/item?id=39741600">thread link</a>) | @necubi
 <br/>
 March 18, 2024 | https://www.arroyo.dev/blog/why-arrow-and-datafusion | <a href="https://web.archive.org/web/*/https://www.arroyo.dev/blog/why-arrow-and-datafusion">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article><p>Arroyo is coming up on its one-year anniversary as an open-source project, and
@@ -3172,7 +5146,7 @@ and collects its results. <a href="#user-content-fnref-6" data-footnote-backref=
             </title>
             <description>
 <![CDATA[
-Score 82 | Comments 159 (<a href="https://news.ycombinator.com/item?id=39738862">thread link</a>) | @schappim
+Score 85 | Comments 163 (<a href="https://news.ycombinator.com/item?id=39738862">thread link</a>) | @schappim
 <br/>
 March 17, 2024 | https://www.smh.com.au/technology/uber-to-pay-272-million-to-australian-taxi-operators-20240318-p5fd4p.html | <a href="https://web.archive.org/web/*/https://www.smh.com.au/technology/uber-to-pay-272-million-to-australian-taxi-operators-20240318-p5fd4p.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article><header></header><section></section><section data-testid="article-body-top"><div data-testid="article-body"><div><div data-testid="body-content"><p>Nicos Andrianakis’ 40-year-old taxi business was “all he knew” before ride-share giant Uber arrived in Melbourne in 2014.</p><p>The mass disruption of Ubers rolling out onto the city’s streets decimated the value of his three taxi licence plates – worth about $500,000 each.</p><p>“I lost my passion for work, I lost my [registered taxi licence] plates worth half a million dollars each, and I lost my income that provided food on the table,” he said.</p><figure data-testid="image"><div aria-label="enlarge image" role="button" tabindex="0"><picture><source media="(min-width: 1024px)" srcset="https://static.ffx.io/images/$zoom_0.238%2C$multiply_0.9788%2C$ratio_1.5%2C$width_756%2C$x_0%2C$y_0/t_crop_custom/q_86%2Cf_auto/f34f4ddfaacb3c70f48aa75f4c1407873910dd9f, https://static.ffx.io/images/$zoom_0.238%2C$multiply_1.9577%2C$ratio_1.5%2C$width_756%2C$x_0%2C$y_0/t_crop_custom/q_62%2Cf_auto/f34f4ddfaacb3c70f48aa75f4c1407873910dd9f 2x" height="494" width="740"><source media="(min-width: 768px)" srcset="https://static.ffx.io/images/$zoom_0.238%2C$multiply_1.0159%2C$ratio_1.5%2C$width_756%2C$x_0%2C$y_0/t_crop_custom/q_86%2Cf_auto/f34f4ddfaacb3c70f48aa75f4c1407873910dd9f, https://static.ffx.io/images/$zoom_0.238%2C$multiply_2.0317%2C$ratio_1.5%2C$width_756%2C$x_0%2C$y_0/t_crop_custom/q_62%2Cf_auto/f34f4ddfaacb3c70f48aa75f4c1407873910dd9f 2x" height="512" width="768"><img alt="Former taxi driver Nick Andrianakis, lead plaintiff in the class action against Uber, and Michael Donelly, class action principal lawyer at Maurice Blackburn Lawyers, outside the Supreme Court." src="https://static.ffx.io/images/$zoom_0.238%2C$multiply_0.7725%2C$ratio_1.5%2C$width_756%2C$x_0%2C$y_0/t_crop_custom/q_86%2Cf_auto/f34f4ddfaacb3c70f48aa75f4c1407873910dd9f" height="390" width="584" srcset="https://static.ffx.io/images/$zoom_0.238%2C$multiply_0.7725%2C$ratio_1.5%2C$width_756%2C$x_0%2C$y_0/t_crop_custom/q_86%2Cf_auto/f34f4ddfaacb3c70f48aa75f4c1407873910dd9f, https://static.ffx.io/images/$zoom_0.238%2C$multiply_1.545%2C$ratio_1.5%2C$width_756%2C$x_0%2C$y_0/t_crop_custom/q_62%2Cf_auto/f34f4ddfaacb3c70f48aa75f4c1407873910dd9f 2x"></picture></div><figcaption><p><span>Former taxi driver Nick Andrianakis, lead plaintiff in the class action against Uber, and Michael Donelly, class action principal lawyer at Maurice Blackburn Lawyers, outside the Supreme Court.</span><cite><span>Credit: </span>Paul Rovere</cite></p></figcaption></figure><p>After five years of pursuing a class action lawsuit against Uber on behalf of 8000 taxi operators, Andrianakis stood on the steps of the Supreme Court of Victoria on Monday morning following a historic settlement of $272 million – the fifth-largest class action settlement in Australia’s history.</p></div><div data-testid="body-content"><p>“Today I’m very pleased as this hasn’t been done before,” he said. “We suggested that Uber acted illegally and they needed to pay, and that they have today.”</p><p>On the cusp of a 10-week trial, the ride-share giant settled the lawsuit in a short court hearing.</p><p>The class action, brought by Maurice Blackburn Lawyers <a href="https://www.smh.com.au/link/follow-20170101-p51jkc">in 2019</a>, was filed on behalf of more than 8000 taxi and hire car owners and drivers who said they lost income when Uber entered the Australian market.</p><figure data-testid="image"><div aria-label="enlarge image" role="button" tabindex="0"><picture><source media="(min-width: 1024px)" srcset="https://static.ffx.io/images/$zoom_0.167%2C$multiply_0.9788%2C$ratio_1.5%2C$width_756%2C$x_0%2C$y_0/t_crop_custom/q_86%2Cf_auto/de21bc7476133ff38fc207ced147c5135f525147, https://static.ffx.io/images/$zoom_0.167%2C$multiply_1.9577%2C$ratio_1.5%2C$width_756%2C$x_0%2C$y_0/t_crop_custom/q_62%2Cf_auto/de21bc7476133ff38fc207ced147c5135f525147 2x" height="494" width="740"><source media="(min-width: 768px)" srcset="https://static.ffx.io/images/$zoom_0.167%2C$multiply_1.0159%2C$ratio_1.5%2C$width_756%2C$x_0%2C$y_0/t_crop_custom/q_86%2Cf_auto/de21bc7476133ff38fc207ced147c5135f525147, https://static.ffx.io/images/$zoom_0.167%2C$multiply_2.0317%2C$ratio_1.5%2C$width_756%2C$x_0%2C$y_0/t_crop_custom/q_62%2Cf_auto/de21bc7476133ff38fc207ced147c5135f525147 2x" height="512" width="768"><img alt="The class action was filed on behalf of more than 8000 taxi and hire car owners and drivers." loading="lazy" src="https://static.ffx.io/images/$zoom_0.167%2C$multiply_0.7725%2C$ratio_1.5%2C$width_756%2C$x_0%2C$y_0/t_crop_custom/q_86%2Cf_auto/de21bc7476133ff38fc207ced147c5135f525147" height="390" width="584" srcset="https://static.ffx.io/images/$zoom_0.167%2C$multiply_0.7725%2C$ratio_1.5%2C$width_756%2C$x_0%2C$y_0/t_crop_custom/q_86%2Cf_auto/de21bc7476133ff38fc207ced147c5135f525147, https://static.ffx.io/images/$zoom_0.167%2C$multiply_1.545%2C$ratio_1.5%2C$width_756%2C$x_0%2C$y_0/t_crop_custom/q_62%2Cf_auto/de21bc7476133ff38fc207ced147c5135f525147 2x"></picture></div><figcaption><p><span>The class action was filed on behalf of more than 8000 taxi and hire car owners and drivers.</span><cite><span>Credit: </span>Ryan Stuart</cite></p></figcaption></figure><p>Maurice Blackburn principal Michael Donelly said Uber “fought tooth and nail at every point along the way, every day, for the five years this has been on foot, trying at every turn to deny our group members any form of remedy or compensation for their losses”.</p></div></div></div></section><section data-testid="article-body-bottom"><div><div><div data-testid="body-content"><p>“But on the courtroom steps and after years of refusing to do the right thing by those we say they harmed, Uber has blinked, and thousands of everyday Australians joined together to stare down a global giant.”</p><p>When Maurice Blackburn launched the class action 2019, it outlined its key argument that Uber knew its operations in Australia were illegal because the company understood that its drivers were not properly licensed and did not have proper accreditation.</p><p>”Uber said that was innovation, and we said it was illegal – a conspiracy by unlawful means,” Donelly said on Monday.</p><p>“We also alleged that in conducting Uber X operations, Uber engaged in a variety [of] shocking conduct. We said that they misled regulators, geo-blocked authorities, and even went so far as to activate an electronic kill switch to disrupt a search warrant while in progress.” </p><figure data-testid="image"><div aria-label="enlarge image" role="button" tabindex="0"><picture><source media="(min-width: 1024px)" srcset="https://static.ffx.io/images/$zoom_0.146%2C$multiply_0.9788%2C$ratio_1.5%2C$width_756%2C$x_0%2C$y_0/t_crop_custom/q_86%2Cf_auto/3de5c11c5b1efcabd6d5db928f11320b19931439, https://static.ffx.io/images/$zoom_0.146%2C$multiply_1.9577%2C$ratio_1.5%2C$width_756%2C$x_0%2C$y_0/t_crop_custom/q_62%2Cf_auto/3de5c11c5b1efcabd6d5db928f11320b19931439 2x" height="494" width="740"><source media="(min-width: 768px)" srcset="https://static.ffx.io/images/$zoom_0.146%2C$multiply_1.0159%2C$ratio_1.5%2C$width_756%2C$x_0%2C$y_0/t_crop_custom/q_86%2Cf_auto/3de5c11c5b1efcabd6d5db928f11320b19931439, https://static.ffx.io/images/$zoom_0.146%2C$multiply_2.0317%2C$ratio_1.5%2C$width_756%2C$x_0%2C$y_0/t_crop_custom/q_62%2Cf_auto/3de5c11c5b1efcabd6d5db928f11320b19931439 2x" height="512" width="768"><img alt="Nick Andrianakis and Michael Donelly speak outside the Supreme Court of Victoria on Monday." loading="lazy" src="https://static.ffx.io/images/$zoom_0.146%2C$multiply_0.7725%2C$ratio_1.5%2C$width_756%2C$x_0%2C$y_0/t_crop_custom/q_86%2Cf_auto/3de5c11c5b1efcabd6d5db928f11320b19931439" height="390" width="584" srcset="https://static.ffx.io/images/$zoom_0.146%2C$multiply_0.7725%2C$ratio_1.5%2C$width_756%2C$x_0%2C$y_0/t_crop_custom/q_86%2Cf_auto/3de5c11c5b1efcabd6d5db928f11320b19931439, https://static.ffx.io/images/$zoom_0.146%2C$multiply_1.545%2C$ratio_1.5%2C$width_756%2C$x_0%2C$y_0/t_crop_custom/q_62%2Cf_auto/3de5c11c5b1efcabd6d5db928f11320b19931439 2x"></picture></div><figcaption><p><span>Nick Andrianakis and Michael Donelly speak outside the Supreme Court of Victoria on Monday.</span><cite><span>Credit: </span>Paul Rovere</cite></p></figcaption></figure></div><div data-testid="body-content"><p>How the $272 million would be split among the 8000 class action members would be determined via a formal process through the court, but the amount would not be divided equally, Donelly said.</p><p>“There are a variety of group members within that cohort range, from taxi licence owners like Nick Andrianakis all the way through to people who drove taxis part-time, two days a week in Queensland,” he said.</p><p>“It’s plain in those circumstances that dividing the settlement will not be done purely on an equal basis, because the claims have different amounts of loss.”</p><p>Donelly said his firm’s costs would likely be in the order of $30 million to $35 million, and that the rising legal costs of going to trial factored into the decision to settle.</p><p>“That level of uncertainty and that imposition of labour costs was the other side of the point that we sought to balance in achieving a record settlement,” he said.</p></div><div data-testid="body-content"><p>An Uber spokesperson said the regulatory environment had changed markedly since the company entered Australia.</p><p>“When Uber started more than a decade ago, ride-sharing regulations did not exist anywhere in the world, let alone Australia,” the spokesperson said. “Today is different, and Uber is now regulated in every state and territory across Australia, and governments recognise us as an important part of the nation’s transport mix.</p><p>“Since 2018, Uber has made significant contributions into various state-level taxi compensation schemes, and with today’s proposed settlement, we put these legacy issues firmly in our past.”</p><p>The spokesperson said that while Uber and the plaintiffs had reached an in-principle settlement, it would be inappropriate to comment on specifics until the agreement was finalised and the settlement had been disclosed to the court.</p></div><div data-testid="body-content"><p>Transport Workers’ Union national secretary Michael Kaine welcomed the news and said that when the gig economy arrived in Australia, the nation’s laws and courts couldn’t keep up because of a lack of regulation.</p><figure data-testid="image"><div aria-label="enlarge image" role="button" tabindex="0"><picture><source media="(min-width: 1024px)" srcset="https://static.ffx.io/images/$zoom_0.423%2C$multiply_0.9788%2C$ratio_1.5%2C$width_756%2C$x_125%2C$y_0/t_crop_custom/q_86%2Cf_auto/9561ddcee4aba6c8ffe8fdf94dbf07eef270d340, https://static.ffx.io/images/$zoom_0.423%2C$multiply_1.9577%2C$ratio_1.5%2C$width_756%2C$x_125%2C$y_0/t_crop_custom/q_62%2Cf_auto/9561ddcee4aba6c8ffe8fdf94dbf07eef270d340 2x" height="494" width="740"><source media="(min-width: 768px)" srcset="https://static.ffx.io/images/$zoom_0.423%2C$multiply_1.0159%2C$ratio_1.5%2C$width_756%2C$x_125%2C$y_0/t_crop_custom/q_86%2Cf_auto/9561ddcee4aba6c8ffe8fdf94dbf07eef270d340, https://static.ffx.io/images/$zoom_0.423%2C$multiply_2.0317%2C$ratio_1.5%2C$width_756%2C$x_125%2C$y_0/t_crop_custom/q_62%2Cf_auto/9561ddcee4aba6c8ffe8fdf94dbf07eef270d340 2x" height="512" width="768"><img alt=" " loading="lazy" src="https://static.ffx.io/images/$zoom_0.423%2C$multiply_0.7725%2C$ratio_1.5%2C$width_756%2C$x_125%2C$y_0/t_crop_custom/q_86%2Cf_auto/9561ddcee4aba6c8ffe8fdf94dbf07eef270d340" height="390" width="584" srcset="https://static.ffx.io/images/$zoom_0.423%2C$multiply_0.7725%2C$ratio_1.5%2C$width_756%2C$x_125%2C$y_0/t_crop_custom/q_86%2Cf_auto/9561ddcee4aba6c8ffe8fdf94dbf07eef270d340, https://static.ffx.io/images/$zoom_0.423%2C$multiply_1.545%2C$ratio_1.5%2C$width_756%2C$x_125%2C$y_0/t_crop_custom/q_62%2Cf_auto/9561ddcee4aba6c8ffe8fdf94dbf07eef270d340 2x"></picture></div><figcaption><p><cite><span>Credit: </span>Matt Golding</cite></p></figcaption></figure><p>”This is a significant outcome for the thousands of drivers who stood together, and Maurice Blackburn who stood alongside them over a five-year battle,” Kaine said.</p><p>“We know this decision won’t right past wrongs … But it’s now time to look to the future and how we can set standards to make the industry better for all participants.”</p><p>Uber drivers will have minimum standards, including conditions and pay rates, set up by the Fair Work Commission after amendments to the Fair Work Act passed in February. Uber has welcomed those changes, which will come into effect in August.</p></div><div data-testid="body-content"><p>At present, the US-based company is worth about $US157 billion ($240 billion). Late last year, <a href="https://www.smh.com.au/link/follow-20170101-p5enaw">Uber listed taxis on its app in Melbourne</a>, a partnership that in the past would have been unthinkable.</p><p>When Uber <a href="https://www.smh.com.au/link/follow-20170101-zqyby">launched in Australia</a> in 2014, taxi drivers went on strike and <a href="https://www.smh.com.au/link/follow-20170101-gjj8mg">took to the streets to protest</a>.</p><p>Another civil proceeding against Uber is going ahead to trial in coming weeks, the court heard – a case brought by Taxi Apps Pty Ltd.</p><p>Donelly said the key message that the class action settlement sent to Uber and other ride-sharing companies was “about the importance of the rule of law in this country and the importance of class actions”.</p><p>“While people may think that they have gotten away with things for periods of time, having a strong class-actions regime in this country, backed by talented lawyers, and courageous and passionate group members, means that people can never walk away from what they have done.” </p></div></div><div><section id="endOfArticle"></section><div><section aria-busy="true" aria-live="polite"><header><h2>Most Viewed in Technology</h2></header><p><span><span></span><span>Loading</span></span></p></section></div></div></div></section></article></div>]]>
@@ -3187,7 +5161,7 @@ March 17, 2024 | https://www.smh.com.au/technology/uber-to-pay-272-million-to-au
             </title>
             <description>
 <![CDATA[
-Score 63 | Comments 43 (<a href="https://news.ycombinator.com/item?id=39737810">thread link</a>) | @xrayarx
+Score 63 | Comments 44 (<a href="https://news.ycombinator.com/item?id=39737810">thread link</a>) | @xrayarx
 <br/>
 March 17, 2024 | https://beuke.org/terminal-latency/ | <a href="https://web.archive.org/web/*/https://beuke.org/terminal-latency/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div class"content"="">
@@ -3471,7 +5445,7 @@ sync_to_monitor no
             </title>
             <description>
 <![CDATA[
-Score 163 | Comments 67 (<a href="https://news.ycombinator.com/item?id=39736718">thread link</a>) | @skandium
+Score 164 | Comments 68 (<a href="https://news.ycombinator.com/item?id=39736718">thread link</a>) | @skandium
 <br/>
 March 17, 2024 | https://mlumiste.com/technical/compression-deep-learning/ | <a href="https://web.archive.org/web/*/https://mlumiste.com/technical/compression-deep-learning/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section itemprop="text">
@@ -3664,7 +5638,7 @@ March 17, 2024 | https://www.asomo.co/p/the-luddites-guide-to-defending-physical
             </title>
             <description>
 <![CDATA[
-Score 68 | Comments 38 (<a href="https://news.ycombinator.com/item?id=39735570">thread link</a>) | @ben_s
+Score 69 | Comments 41 (<a href="https://news.ycombinator.com/item?id=39735570">thread link</a>) | @ben_s
 <br/>
 March 17, 2024 | https://webup.org/blog/the-high-risk-refactoring/ | <a href="https://web.archive.org/web/*/https://webup.org/blog/the-high-risk-refactoring/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -3922,7 +5896,7 @@ March 17, 2024 | https://webup.org/blog/the-high-risk-refactoring/ | <a href="ht
             </title>
             <description>
 <![CDATA[
-Score 260 | Comments 36 (<a href="https://news.ycombinator.com/item?id=39732116">thread link</a>) | @pbamotra
+Score 261 | Comments 36 (<a href="https://news.ycombinator.com/item?id=39732116">thread link</a>) | @pbamotra
 <br/>
 March 16, 2024 | https://exclusivearchitecture.com/03-technical-articles-IC-00-table-of-contents.html | <a href="https://web.archive.org/web/*/https://exclusivearchitecture.com/03-technical-articles-IC-00-table-of-contents.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -3940,7 +5914,7 @@ March 16, 2024 | https://exclusivearchitecture.com/03-technical-articles-IC-00-t
             </title>
             <description>
 <![CDATA[
-Score 190 | Comments 122 (<a href="https://news.ycombinator.com/item?id=39731960">thread link</a>) | @todsacerdoti
+Score 191 | Comments 122 (<a href="https://news.ycombinator.com/item?id=39731960">thread link</a>) | @todsacerdoti
 <br/>
 March 16, 2024 | https://jwgoerlich.com/we-were-wizards-learning-perl/ | <a href="https://web.archive.org/web/*/https://jwgoerlich.com/we-were-wizards-learning-perl/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4200,7 +6174,7 @@ March 16, 2024 | https://application.garden/signup | <a href="https://web.archiv
             </title>
             <description>
 <![CDATA[
-Score 541 | Comments 516 (<a href="https://news.ycombinator.com/item?id=39728146">thread link</a>) | @ingve
+Score 545 | Comments 520 (<a href="https://news.ycombinator.com/item?id=39728146">thread link</a>) | @ingve
 <br/>
 March 16, 2024 | https://aplus.rs/2024/hackintosh-almost-dead/ | <a href="https://web.archive.org/web/*/https://aplus.rs/2024/hackintosh-almost-dead/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
