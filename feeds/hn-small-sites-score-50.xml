@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Tue, 26 Mar 2024 12:23:31 GMT</lastBuildDate>
+        <lastBuildDate>Tue, 26 Mar 2024 20:21:14 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-50.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Tue, 26 Mar 2024 12:23:31 GMT</pubDate>
+        <pubDate>Tue, 26 Mar 2024 20:21:14 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,632 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Flipping Pages: New Linux vulnerability in nf_tables and exploitation techniques]]>
+            </title>
+            <description>
+<![CDATA[
+Score 290 | Comments 87 (<a href="https://news.ycombinator.com/item?id=39828424">thread link</a>) | @Unroll0201
+<br/>
+March 26, 2024 | https://pwning.tech/nftables/ | <a href="https://web.archive.org/web/*/https://pwning.tech/nftables/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="site-main">
+<article>
+
+    <header>
+
+        
+
+        
+
+            <p>A tale about exploiting KernelCTF Mitigation, Debian, and Ubuntu instances with a double-free in nf_tables in the Linux kernel, using novel techniques like Dirty Pagedirectory. All without even having to recompile the exploit for different kernel targets once.</p>
+
+        
+
+
+    </header>
+
+    <section>
+        <p>This blogpost is the next instalment of my series of hands-on no-boilerplate vulnerability research blogposts, intended for time-travellers in the future who want to do Linux kernel vulnerability research. Specifically, I hope beginners will learn from my VR workflow and the seasoned researchers will learn from my techniques.</p><p>In this blogpost, I'm discussing a bug I found in nf_tables in the Linux kernel (<a href="https://www.cvedetails.com/cve/CVE-2024-1086/">CVE-2024-1086</a>) and its root cause analysis. Then, I show several novel techniques I used to drop a universal root shell on nearly all Linux kernels between at least v5.14 and v6.6.14 (unpriv userns required) without even recompiling the exploit. This is possible because of the data-only, KSMA ambience of the exploit. Among those targeted kernels are Ubuntu kernels, recent Debian kernels, and one of the most hardened Linux kernels out there (KernelCTF mitigation kernels). </p><p>Additionally, I'm providing the proof-of-concept source code (also available in the <a href="https://github.com/Notselwyn/CVE-2024-1086" rel="noreferrer">CVE-2024-1086 PoC repository</a> on Github). As a bonus, I wanted to challenge myself by making the exploit support fileless execution (which helps in CNO and avoids detections in pentests), and by not making any changes to the disk whatsoever (including setting /bin/sh to SUID 0 et cetera).</p><p>This blogpost aims to be a supplementary guide to the original&nbsp;<a href="https://yanglingxi1993.github.io/dirty_pagetable/dirty_pagetable.html">Dirty Pagetable blogpost</a>&nbsp;as well, considering there were not any blogposts covering the practical bits (e.g. TLB flushing for exploits) when I started writing this blogpost. Additionally, I hope the skb-related techniques will be embedded in remote network-based exploits (e.g. bugs in IPv4, if they still exist), and I hope that the Dirty Pagedirectory technique will be utilized for LPE exploits. Let's get to the good stuff!</p><figure><img src="https://pwning.tech/content/images/2024/03/-cover_better-4.svg" alt="" loading="lazy" width="3471" height="2297"><figcaption><span>Blogpost image cover: birdseye view of exploit including the vulnerability and some of the techniques for visual purposes.</span></figcaption></figure><h2 id="0-before-you-read">0. Before you read</h2><h3 id="01-how-to-read-this-blogpost">0.1. How to read this blogpost</h3><p>To the aspiring vulnerability researchers: I wrote this blogpost in a way that slightly represents a research paper in terms of the format, because the format happens to be exactly what I was looking for: it is easy to scan and cherrypick knowledge from even though it may be a big pill to swallow. Because research papers are considered hard to read by many people, I'd like to give steps on how I would read this blogpost to extract knowledge efficiently:</p><ol><li>Read the overview section (check if the content is even interesting to you)</li><li>Split-screen this blogpost (reading and looking up)</li><li>Skip to the bug section (try to understand how the bug works)</li><li>Skip to the proof of concept section (walk through the exploit)</li></ol><p>If things are not clear, utilize the background and/or techniques section. If you want to learn more about a specific topic, I have attached an external article for most sections.</p><h3 id="02-affected-kernel-versions">0.2. Affected kernel versions</h3><p>This section contains information about the affected kernel versions for this exploit, which is useful when looking up existing techniques for exploiting a bug. Based on these observations, it seems feasable that all versions from atleast (including) v5.14.21 to (including) v6.6.14 are exploitable, depending on the kconfig values (details below). This means that at the time of writing, the stable branches <code>linux-5.15.y</code>, <code>linux-6.1.y</code>, and <code>linux-6.6.y</code> are affected by this exploit, and perhaps <code>linux-6.7.1</code> as well. Fortunately for the users, a bugfix in the stable branches has been released in February 2024.</p><blockquote>Note that the same base config file was reused for most vanilla kernels, and that the mentioned versions are all vulnerable to the PoC bug. The base config was generated with <code>kernel-hardening-checker</code>. Additionally, if a version isn't affected by the bug, yet the exploitation techniques work, it will not be displayed in the table.</blockquote><p>For vanilla kernels, <code>CONFIG_INIT_ON_FREE_DEFAULT_ON</code> was toggled off in the config, which sets a page to null-bytes after free - which thwarts the skb part of for the exploit. This config value is toggled off in major distro's like KernelCTF, Ubuntu, and Debian, so I consider this an acceptable measure. However, <code>CONFIG_INIT_ON_ALLOC_DEFAULT_ON</code> remains toggled on, as this is part of the Ubuntu and Debian kernel config. Unfortunately, this causes <code>bad_page()</code> detection as an side-effect in versions starting from v6.4.0. When <code>CONFIG_INIT_ON_ALLOC_DEFAULT_ON</code> is toggled off, the exploit is working up to (including) v6.6.4. </p><p>The <strong>success rate </strong>for the exploit is <strong>99.4%</strong> (n=1000) - sometimes with drops to 93.0% (n=1000) - on Linux kernel v6.4.16, with the setup as below (and the kernelctf filesystem). I do not expect the success rate to deviate much across versions, although it might deviate per device workload. I consider an exploit working for a particular setup if it succeeds all attempts at trying it out (manual verification, so usually 1-2 tries). Because of the high success rate, it is pretty easy to filter out if the exploit works or not. Additionally, all fails have been investigated and hence have their reasons been included in the table, so false positives are unlikely.</p><p>All non-obsolete techniques (and the resulting PoC) are tested on setups:</p><figure><pre><code>| Kernel | Kernel Version | Distro    | Distro Version    | Working/Fail | CPU Platform      | CPU Cores | RAM Size | Fail Reason                                                                           | Test Status | Config URL                                                                                                                               |
+|--------|----------------|-----------|-------------------|--------------|-------------------|-----------|----------|---------------------------------------------------------------------------------------|-------------|------------------------------------------------------------------------------------------------------------------------------------------|
+| Linux  | v5.4.270       | n/a       | n/a               | fail         | QEMU x86_64       | 8         | 16GiB    | [CODE] pre-dated nft code (denies rule alloc)                                         | final       | https://raw.githubusercontent.com/Notselwyn/blogpost-files/main/nftables/test-kernel-configs/linux-vanilla-v5.4.270.config               |
+| Linux  | v5.10.209      | n/a       | n/a               | fail         | QEMU x86_64       | 8         | 16GiB    | [TCHNQ] BUG mm/slub.c:4118                                                            | final       | https://raw.githubusercontent.com/Notselwyn/blogpost-files/main/nftables/test-kernel-configs/linux-vanilla-v5.10.209.config              |
+| Linux  | v5.14.21       | n/a       | n/a               | working      | QEMU x86_64       | 8         | 16GiB    | n/a                                                                                   | final       | https://raw.githubusercontent.com/Notselwyn/blogpost-files/main/nftables/test-kernel-configs/linux-vanilla-v5.14.21.config               |
+| Linux  | v5.15.148      | n/a       | n/a               | working      | QEMU x86_64       | 8         | 16GiB    | n/a                                                                                   | final       | https://raw.githubusercontent.com/Notselwyn/blogpost-files/main/nftables/test-kernel-configs/linux-vanilla-v5.15.148.config              |
+| Linux  | v5.16.20       | n/a       | n/a               | working      | QEMU x86_64       | 8         | 16GiB    | n/a                                                                                   | final       | https://raw.githubusercontent.com/Notselwyn/blogpost-files/main/nftables/test-kernel-configs/linux-vanilla-v5.16.20.config               |
+| Linux  | v5.17.15       | n/a       | n/a               | working      | QEMU x86_64       | 8         | 16GiB    | n/a                                                                                   | final       | https://raw.githubusercontent.com/Notselwyn/blogpost-files/main/nftables/test-kernel-configs/linux-vanilla-v5.17.15.config               |
+| Linux  | v5.18.19       | n/a       | n/a               | working      | QEMU x86_64       | 8         | 16GiB    | n/a                                                                                   | final       | https://raw.githubusercontent.com/Notselwyn/blogpost-files/main/nftables/test-kernel-configs/linux-vanilla-v5.18.19.config               |
+| Linux  | v5.19.17       | n/a       | n/a               | working      | QEMU x86_64       | 8         | 16GiB    | n/a                                                                                   | final       | https://raw.githubusercontent.com/Notselwyn/blogpost-files/main/nftables/test-kernel-configs/linux-vanilla-v5.19.17.config               |
+| Linux  | v6.0.19        | n/a       | n/a               | working      | QEMU x86_64       | 8         | 16GiB    | n/a                                                                                   | final       | https://raw.githubusercontent.com/Notselwyn/blogpost-files/main/nftables/test-kernel-configs/linux-vanilla-v6.0.19.config                |
+| Linux  | v6.1.55        | KernelCTF | Mitigation v3     | working      | QEMU x86_64       | 8         | 16GiB    | n/a                                                                                   | final       | https://raw.githubusercontent.com/Notselwyn/blogpost-files/main/nftables/test-kernel-configs/linux-kernelctf-mitigationv3-v6.1.55.config |
+| Linux  | v6.1.69        | Debian    | Bookworm 6.1.0-17 | working      | QEMU x86_64       | 8         | 16GiB    | n/a                                                                                   | final       | https://raw.githubusercontent.com/Notselwyn/blogpost-files/main/nftables/test-kernel-configs/linux-debian-v6.1.0-17-amd64.config         |
+| Linux  | v6.1.69        | Debian    | Bookworm 6.1.0-17 | working      | AMD Ryzen 5 7640U | 6         | 32GiB    | n/a                                                                                   | final       | https://raw.githubusercontent.com/Notselwyn/blogpost-files/main/nftables/test-kernel-configs/linux-debian-v6.1.0-17-amd64.config         |
+| Linux  | v6.1.72        | KernelCTF | LTS               | working      | QEMU x86_64       | 8         | 16GiB    | n/a                                                                                   | final       | https://raw.githubusercontent.com/Notselwyn/blogpost-files/main/nftables/test-kernel-configs/linux-kernelctf-lts-v6.1.72.config          |
+| Linux  | v6.2.?         | Ubuntu    | Jammy v6.2.0-37   | working      | AMD Ryzen 5 7640U | 6         | 32GiB    | n/a                                                                                   | final       |                                                                                                                                          |
+| Linux  | v6.2.16        | n/a       | n/a               | working      | QEMU x86_64       | 8         | 16GiB    | n/a                                                                                   | final       | https://raw.githubusercontent.com/Notselwyn/blogpost-files/main/nftables/test-kernel-configs/linux-vanilla-v6.2.16.config                |
+| Linux  | v6.3.13        | n/a       | n/a               | working      | QEMU x86_64       | 8         | 16GiB    | n/a                                                                                   | final       | https://raw.githubusercontent.com/Notselwyn/blogpost-files/main/nftables/test-kernel-configs/linux-vanilla-v6.3.13.config                |
+| Linux  | v6.4.16        | n/a       | n/a               | fail         | QEMU x86_64       | 8         | 16GiB    | [TCHNQ] bad page: page-&gt;_mapcount != -1 (-513), bcs CONFIG_INIT_ON_ALLOC_DEFAULT_ON=y | final       | https://raw.githubusercontent.com/Notselwyn/blogpost-files/main/nftables/test-kernel-configs/linux-vanilla-v6.4.16.config                |
+| Linux  | v6.5.3         | Ubuntu    | Jammy v6.5.0-15   | fail         | QEMU x86_64       | 8         | 16GiB    | [TCHNQ] bad page: page-&gt;_mapcount != -1 (-513), bcs CONFIG_INIT_ON_ALLOC_DEFAULT_ON=y | final       | https://raw.githubusercontent.com/Notselwyn/blogpost-files/main/nftables/test-kernel-configs/linux-ubuntu-jammy-v6.5.0-15.config         |
+| Linux  | v6.5.13        | n/a       | n/a               | fail         | QEMU x86_64       | 8         | 16GiB    | [TCHNQ] bad page: page-&gt;_mapcount != -1 (-513), bcs CONFIG_INIT_ON_ALLOC_DEFAULT_ON=y | final       | https://raw.githubusercontent.com/Notselwyn/blogpost-files/main/nftables/test-kernel-configs/linux-vanilla-v6.5.13.config                |
+| Linux  | v6.6.14        | n/a       | n/a               | fail         | QEMU x86_64       | 8         | 16GiB    | [TCHNQ] bad page: page-&gt;_mapcount != -1 (-513), bcs CONFIG_INIT_ON_ALLOC_DEFAULT_ON=y | final       | https://raw.githubusercontent.com/Notselwyn/blogpost-files/main/nftables/test-kernel-configs/linux-vanilla-v6.6.14.config                |
+| Linux  | v6.7.1         | n/a       | n/a               | fail         | QEMU x86_64       | 8         | 16GiB    | [CODE] nft verdict value incorrect is altered by kernel                               | final       | https://raw.githubusercontent.com/Notselwyn/blogpost-files/main/nftables/test-kernel-configs/linux-vanilla-v6.7.1.config                 |</code></pre><figcaption><p><span>Table 0.2.1: An overview of the exploit test results per tested kernel versions and their setups.</span></p></figcaption></figure><h2 id="1-overview">1. Overview</h2><h3 id="11-abstract">1.1. Abstract</h3><p>In this blogpost I present several novel techniques I used to exploit a 0-day double-free bug in hardened Linux kernels (i.e. KernelCTF mitigation instances) with 93%-99% success rate. The underlying bug is input sanitization failure of netfilter verdicts. Hence, the requirements for the exploit are that nf_tables is enabled and unprivileged user namespaces are enabled. The exploit is data-only and performs an kernel-space mirroring attack (KSMA) from userland with the  novel Dirty Pagedirectory technique (pagetable confusion), where it is able to link any physical address (and its permissions) to virtual memory addresses by performing <em>just </em>read/writes to userland addresses.</p><h3 id="12-workflow">1.2. Workflow</h3><p>To trigger the bug leading to the double-free, I add a Netfilter rule to an unprivileged-user namespace. The Netfilter rule contains an expression which sets a malicious verdict value, which will make the internal nf_tables kernel code interpret <code>NF_DROP</code> at first, after which it will free the skb, and then return <code>NF_ACCEPT</code> so the packet handling continues, and it will double-free the skb. Then, I trigger this rule by allocating an 16-page IP packet (so that it gets allocated by the buddy-allocator and not the PCP-allocator or slab-allocator, and it shares a cache across CPUs) which has migratetype 0.</p><p>In order to delay the 2nd free (so I can avoid corruption by doing stuff), I abuse the IP fragmenation logic of an IP packet. This allows us to make an skb "wait" in an IP fragmentation queue without being freed for an arbitrary amount of seconds. In order to traverse this code path with corrupted packet metadata, I spoof IP source address 1.1.1.1 and destination address 255.255.255.255. However, this means we get to deal with Reverse Path Forwarding (RPF), so we need to disable it in our networking namespace (does not require root privileges).</p><p>To achieve unlimited R/W to any physical memory address (including kernel addresses), I present the Dirty Pagedirectory technique. This technique is - softly said - pagetable confusion, by allocating an PTE page and PMD page to the same physical page. </p><p>Unfortunately, these pagetable pages are <code>migratetype==0 order==0</code> pages allocated with <code>alloc_pages()</code>, and skb heads (the double-free'd objects) are allocated with kmalloc, which means the slab-allocator is used for page <code>order&lt;=1</code>, the PCP-allocator is used for <code>order&lt;=3</code>, and the buddy-allocator for <code>order&gt;=4</code>. To avoid hassle (explained in detail in the blogpost), we have to use <code>order&gt;=4</code> pages for the double-free. This also means we cannot directly use a double-free on buddy-allocator pages (<code>order&gt;=4</code>) to double allocate PTE/PMD pages (<code>order==0</code>), but I discovered methods to achieve this. </p><p>To double allocate PTE/PMD pages with the kmalloc-based double-free, I present 2 methods:</p><p><strong>The better page conversion technique (PCP draining)</strong><br>In this simpler, more stable, and faster method we take advantage of the fact that the PCP-allocator is simply a per-CPU freelist, which is refilled with pages from the buddy-allocator when it is drained. Hence, we can simply free <code>order==4</code> (16) pages to the buddy-allocator freelist, drain the PCP list, and refill the <code>order==0</code> PCP list with 64 pages from the buddy-allocator freelist, containing said 16 pages.</p><p><strong>The original page conversion technique (racecondition)</strong><br>This method relies on a race-condition and hence only works in virtualized environments such as QEMU VMs, where terminal IO causes a substantial delay in the VMs kernel. We take advantage of a WARN() message which causes ~50-300ms delay to trigger a race condition, to free an <code>order==4</code> buddy page to an <code>order==0</code> PCP freelist. As you may notice, this does not work on real hardware (as the delay is ~1ms) and is therefore replaced with the method above. Unfortunately, I used this technique for the original kernelctf exploit.</p><p>Between the double-free, I make sure the page refcounts never go to 0 since it would deny freeing the page (possibly as a double-free mitigation). Additionally, I spray skb objects into the <code>skbuff_head_cache</code> slabcache of the same CPU to avoid experimental freelist corruption detection in the kernelctf mitigation instance, and to increase stability in general. </p><p>When the double-free primitive is achieved, I will use a new technique called Dirty Pagedirectory to achieve unlimited read/write to any physical address. This requires double-allocating a page table entry (PTE) page and a page middle directory (PMD) page to the same address. When writing an arbitrary PTE value containing page permissions and page physical address to a page within the span of the PTE page, the PMD page will interpret said address when trying to dereference the PTE value's page within the PMD pages' span. This boils down to setting a PTE value to <code>0xDEADBEEF</code> entirely from userland, and then dereference that PTE value from userland again to access the page referenced to by <code>0xDEADBEEF</code> using the flags (including but not limited to permissions) set in <code>0xDEADBEEF</code>.</p><p>In order to utilize this unlimited R/W primitive, we need to flush the TLB. After reading several impractical research papers I came up with my own complex flushing algorithm to flush TLBs in Linux from userland: calling fork() and munmap()'ing the flushed VMA. In order to avoid crashes when the child exits the program, I make the child thread go to sleep indefinitely.</p><p>I utilize this unlimited physical memory access to bruteforce physical KASLR (which is accelerated because the physical kernel base is aligned with <code>CONFIG_PHYSICAL_START</code> (a.k.a. <code>0x100'0000</code> / 16MiB) or - when defined - <code>CONFIG_PHYSICAL_ALIGN</code> (a.k.a. <code>0x20'0000</code> / 2MiB) and leak the physical kernel base address by checking 2MiB worth of pages on a machine with 8GiB memory (assuming 16MiB alignment), which even fits into the area of a single overwritten PTE page. To detect the kernel, I used the <a href="https://github.com/notselwyn/get-sig" rel="noreferrer">get-sig</a> scripts which generate a highly precise fingerprint of files, like recent Linux kernels across compilers, and slapped that into my exploit. </p><p>In order to find <code>modprobe_path</code>, I do a fairly simplistic <code>"/sbin/modprobe" + "\x00" * ...</code> memory scan across 80MiB beyond the detected kernel base to get access to <code>modprobe_path</code>. To verify that the "real" <code>modprobe_path</code> variable was found instead of a false-positive, I overwrite <code>modprobe_path</code> and check if <code>/proc/sys/kernel/modprobe</code> (read-only user interface for <code>modprobe_path</code>) reflects this change. If <code>CONFIG_STATIC_USERMODEHELPER</code> is enabled, it will just check for <code>"/sbin/usermode-helper"</code>.</p><p>In order to drop a root shell (including an namespace escape) I overwrite <code>modprobe_path</code> or <code>"/sbin/usermode-helper"</code> to the exploits' memfd file descriptor containing the privesc script, such as <code>/proc/&lt;pid&gt;/fd/&lt;fd&gt;</code>. This fileless approach allows the exploit to be ran on an entire read-only filesystem (it being bootstrapped using perl). The PID has to be bruteforced if the exploit is running in a namespace - because the exploit only knows the namespace PID - but is luckily incredibly fast since we don't need to flush the TLB as we aren't changing the physical address of the PTE. This will essentially be writing the string to a userland address and executing a file.</p><p>In the privesc script, we will execute a <code>/bin/sh</code> process (as root) and hook the exploits' file descriptors (<code>/dev/&lt;pid&gt;/fd/&lt;fd&gt;</code>) to the shells' file descriptors, allowing us to achieve a namespace escape. The advantage of this method is that it's very versatile, as it works on local terminals and reverse shells, all without depending on filesystems and other forms of isolation. </p><h2 id="2-background-info">2. Background info</h2><h3 id="21-nftables">2.1. nf_tables</h3><p>One of the in-tree Linux kernel modules is <code>nf_tables</code>. In recent versions of <code>iptables</code> - which is one of the most popular firewall tools out there - the <code>nf_tables</code> kernel module is the backend. <code>iptables</code> itself is part of the <code>ufw</code> backend. In order to decide which packets will pass the firewall, nftables uses a state machine with user-issued rules. </p><h4 id="211-netfilter-hierarchy">2.1.1. Netfilter Hierarchy</h4><p>These rules come in the following orders (i.e. one table contains many chains, one chain contains many rules, one rule contains many expressions):</p><ul><li>Tables (which protocol)</li><li>Chains (which trigger)</li><li>Rules (state machine functions)</li><li>Expressions (state machine instructions)</li></ul><figure><img src="https://pwning.tech/content/images/2024/02/nf_tables-4.svg" alt="" loading="lazy" width="703" height="423"><figcaption><span>Illustration 2.1.1.1: Nftables hierarchy overview of tables, chains, rules and expressions.</span></figcaption></figure><p>This allows users to program complex firewall rules, because nftables has many atomic expressions which can be chained together in rules to filter packets. Additionally, it allows chains to be ran at different times in the packet processing code (i.e. before routing and after routing) which can be selected when creating a chain using flags like <code>NF_INET_LOCAL_IN</code> and <code>NF_INET_POST_ROUTING</code>. Due to this extremely customizable nature, nftables is known to be incredibly insecure. Hence, many vulnerabilities have been reported and have been fixed already. </p><p>To learn more about nftables, I recommend this blogpost by @pqlqpql which goes into the deepest trenches of nftables: <a href="https://blog.dbouman.nl/2022/04/02/How-The-Tables-Have-Turned-CVE-2022-1015-1016/">"How The Tables Have Turned: An analysis of two new Linux vulnerabilities in nf_tables."</a></p><h4 id="212-netfilter-verdicts">2.1.2. Netfilter Verdicts</h4><p>More relevant to the blogpost are Netfilter verdicts. A verdict is a decision by a Netfilter ruleset about a certain packet trying to pass the firewall. For example, it may be a drop or an accept. If the rule decides to drop the packet, Netfilter will stop processing the packet. On the contrary, if the rule decides to accept the packet, Netfilter will continue processing the packet until the packet passes all rules. At the time of writing, all the verdicts are:</p><ul><li>NF_DROP: Drop the packet, stop processing it.</li><li>NF_ACCEPT: Accept the packet, continue processing it.</li><li>NF_STOLEN: Stop processing, the hook needs to free it.</li><li>NF_QUEUE: Let userland application process it.</li><li>NF_REPEAT: Call the hook again.</li><li>NF_STOP (deprecated): Accept the packet, stop processing it in Netfilter.</li></ul><h3 id="22-skbuff-skb">2.2. sk_buff (skb)</h3><p>To describe network data (including IP packets, ethernet frames, WiFi frames, etc.) the Linux kernel uses the sk_buff structure and commonly calls them skb's as shorthand. To represent a packet, the kernel uses 2 objects which are important to us: the <code>sk_buff</code> object itself which contains kernel meta-data for skb handling, and the <code>sk_buff-&gt;head</code> object which contains the actual packet content like the IP header and the IP packets' body.</p><figure><img src="https://pwning.tech/content/images/2024/02/sk_buff_struct-4.svg" alt="" loading="lazy" width="931" height="602"><figcaption><span>Illustration 2.2.1: Overview of the sk_buff structure's data buffer and its length field.</span></figcaption></figure><p>In order to use values from the IP header (since IP packets are parsed in the kernel afterall), the kernel does type punning with IP header struct and the <code>sk_buff-&gt;head</code> object using <code>ip_hdr()</code>. This pattern gets applied across the kernel since it allows for quick header parsing. As a matter of fact, the type punning trick is also used to parse ELF headers when executing a binary.</p><p>To learn more, check this excelent Linux kernel documentation page: <a href="https://docs.kernel.org/networking/skbuff.html">"struct sk_buff - The Linux Kernel."</a></p><h3 id="23-ip-packet-fragmentation">2.3. IP packet fragmentation</h3><p>One of the features of IPv4 is packet fragmentation. This allows packets to be transmitted using multiple IP fragments. Fragments are just regular IP packets, except that they do not contain the full packet size specified in its IP header and it having the <code>IP_MF</code> flag set in the header. </p><p>The general calculation for the IP packet length in an IP fragments' header is <code>iph-&gt;len = sizeof(struct ip_header) * frags_n + total_body_length</code>. In the Linux kernel, all fragments for a single IP packet are stored into the same red-black tree (called an IP frag queue) until all fragments have been received. In order to filter out which fragment belongs at which offset when reassembling, the IP fragment offset is required: <code>iph-&gt;offset = body_offset &gt;&gt; 3</code>, whereby <code>body_offset</code> is the offset in the final IP body, and thus excluding any IP header lengths which may be used when calculating <code>iph-&gt;len</code>. As you may notice, fragment data has to be aligned with 8 bytes because the specs specify that the upper 3 bits of the offset field are used for flags (i.e. <code>IP_MF</code> and <code>IP_DF</code>). If we want to transmit 64 bytes of data across 2 fragments whose size are respectively 8 bytes and 56 bytes, we should format it like the code below. The kernel would then reassemble the IP packet as 'A' * 64.</p><figure><pre><code>iph1-&gt;len = sizeof(struct ip_header)*2 + 64;
+iph1-&gt;offset = ntohs(0 | IP_MF); // set MORE FRAGMENTS flag 
+memset(iph1_body, 'A', 8); 
+transmit(iph1, iph1_body, 8); 
+
+iph2-&gt;len = sizeof(struct ip_header)*2 + 64; 
+iph2-&gt;offset = ntohs(8 &gt;&gt; 3); // don't set IP_MF since this is the last packet 
+memset(iph2_body, 'A', 56); 
+transmit(iph2, iph2_body, 56);</code></pre><figcaption><p><span>Codeblock 2.3.1: C psuedocode describing the IP header format of IP fragments.</span></p></figcaption></figure><p>To learn more about packet fragmentation, check this blogpost by PacketPushers: <a href="https://packetpushers.net/ip-fragmentation-in-detail/" rel="noreferrer">"IP Fragmentation in Detail."</a></p><h3 id="24-page-allocation">2.4. Page allocation</h3><p>There are 3 major ways to allocate pages in the Linux kernel: using the slab-allocator, the buddy-allocator and the per-cpu page (PCP) allocator. In short: the buddy-allocator is invoked with <code>alloc_pages()</code>, can be used for any page order (0-&gt;10), and allocates pages from a global pool of pages across CPUs. The PCP-allocator is also invoked with <code>alloc_pages()</code>, and can be used to allocate pages with order 0-&gt;3 from a per-CPU pool of pages. Additionally, there's the slab-allocator, which is invoked with <code>kmalloc()</code> and can allocate pages with order 0-&gt;1 (including smaller allocations) from specialized per-CPU freelists/caches.</p><p>The PCP-allocator exists because the buddy-allocator locks access when a CPU is allocating a page from the global pool, and hence blocks another CPU when it wants to allocate a page. The PCP-allocator prevents this by having a smaller per-CPU pool of pages which are allocated in bulk by the buddy-allocator in the background. This way, the chance of page allocation blockage is smaller.</p><figure><img src="https://pwning.tech/content/images/2024/02/pageallocatorbailywick.svg" alt="" loading="lazy" width="753" height="306"><figcaption><span>Illustration 2.4.1: Overview of available page allocators per order.</span></figcaption></figure><figure><img src="https://pwning.tech/content/images/2024/02/pageallocations-3.svg" alt="" loading="lazy" width="701" height="823"><figcaption><span>Illustration 2.4.2: Activity diagram of the page allocation process, starting from kmalloc().</span></figcaption></figure><p>To learn more about the buddy-allocator and the PCP-allocator, check the Page Allocation section of this extensive analysis: <a href="https://gitlab.com/gitlab-com/gl-infra/scalability/-/issues/2387#user-content-page-allocator">"Reference: Analyzing Linux kernel memory management anomalies."</a></p><h3 id="25-physical-memory">2.5. Physical memory</h3><h4 id="251-physical-to-virtual-memory-mappings">2.5.1. Physical-to-virtual memory mappings</h4><p>One of the most fundamental elements of the kernel is memory management. When we are talking about memory, we could be talking about 2 types of memory: physical memory and virtual memory. Physical memory is what the RAM chips use, and virtual memory is how programs (including the kernel) running on the CPU interact with the physical memory. Of course when we use gdb to debug a binary, all addresses we use are virtual - since gdb and the underlying program is such a program as well. </p><p>Essentially, virtual memory is built on top of physical memory. The advantage of this model is that the virtual address range is larger than the physical address range - since empty virtual memory pages can be unmapped - which is good for ASLR efficiency among other things. Additionally, we can map 1 physical page to many virtual pages, or let there be an illusion that there are 128TiB addresses whilst in practice most of these are not backed by an actual page. </p><p>This means that we can work with 128TiB virtual memory ranges per process on a system with only 4GiB of physical memory. In theory, we could even map a single physical page of 4096 <code>\x41</code> bytes to all 128TiB worth of userland virtual pages. When a program wants to write a <code>\x42</code> byte to a virtual page, we perform copy-on-write (COW) and create a 2nd physical page and map that page to just the virtual page that the program wrote to. </p><figure><img src="https://pwning.tech/content/images/2024/02/phys_virt_mem-1.svg" alt="" loading="lazy" width="783" height="283"><figcaption><span>Illustration 2.5.1.1: Mappings between virtual and physical memory pages. </span></figcaption></figure><p>In order to translate virtual memory addresses to physical memory addresses, the CPU utilizes pagetables. So when our userland program tries to read (virtual memory) address <code>0xDEADBEEF</code>, the CPU will essentially do <code>mov rax, [0xDEADBEEF]</code>. However, in order to actually read the value from the RAM chips, the CPU needs to convert the virtual memory address <code>0xDEADBEEF</code> to an physical memory address. </p><p>This translation is oblivious to the kernel and our userland program when it is trying to access a virtual memory address. To perform this translation, the CPU performs a lookup in the Translation Lookaside Buffer (TLB) - which exists in the MMU - which caches the virtual-to-physical address translations. If the virtual <code>0xDEADBEEF</code> address (or more specifically, the virtual <code>0xDEADB000</code> page) has been recently accessed, the TLB does not have to traverse the pagetables (the next section), and will have the physical address beloning to the virtual address in cache. Otherwise, if the address is not in the TLB cache, the TLB needs to traverse the pagetables to get the physical address. This will be covered in the next subsection.</p><p>To learn more about physical memory, check this excellent <a href="https://read.seas.harvard.edu/cs161/2023/doc/memory-layout/" rel="noreferrer">memory layout page from a Harvards Operating Systems course</a>.</p><h4 id="252-pagetables">2.5.2. Pagetables</h4><p>When the TLB gets requested a physical address for a virtual address which is not in its cache, it performs a "pagewalk" to acquire the physical address of a virtual address. A pagewalk means traversing the pagetables, which are a few nested arrays, with the physical addresses in the bottom arrays.<strong><em> </em></strong></p><blockquote>Note that the diagram below uses pagetable indices of 9 bits (because <code>2**9 = 512</code> pagetable values fit into a single page). Additionally, we are using 4-level pagetables here, but the kernel also supports 5-level, 3-level, et cetera.</blockquote><figure><img src="https://pwning.tech/content/images/2024/03/pagetables_with_bits-1.webp" alt="" loading="lazy" width="2000" height="745" srcset="https://pwning.tech/content/images/size/w600/2024/03/pagetables_with_bits-1.webp 600w, https://pwning.tech/content/images/size/w1000/2024/03/pagetables_with_bits-1.webp 1000w, https://pwning.tech/content/images/size/w1600/2024/03/pagetables_with_bits-1.webp 1600w, https://pwning.tech/content/images/size/w2400/2024/03/pagetables_with_bits-1.webp 2400w" sizes="(min-width: 720px) 720px"><figcaption><span>Illustration 2.5.2.1: An example of virtual address to physical address translation.</span></figcaption></figure><blockquote>This model of nested arrays is used because it saves a lot of memory. Instead of allocating a huge array for 128TiB of virtual addresses, it instead divides it into several smaller arrays with each layer having a smaller bailiwick. This means that tables responsible for an unallocated area will not be allocated. </blockquote><p>Traversing the pagetables is a very inexpensive process since it are essentially 4-5 array dereferences. The indices for these dereferences are - get ready to have your mind blown - embedded in the virtual address. This means that a virtual address is not an address, but pagetable indices with a prefixed canonical. This elegant approach allows for O(1) physical address retrieval, since array dereferences are O(1) and the bit shifting to recover for the index is O(1) as well. Unfortunately, pagetables would need to be traversed very often which would make even these array dereferences slow. Hence, the TLB is implemented.</p><p>In terms of practicality, the TLB needs to find the pagetables in physical memory to pagewalk them. The address for the root of the userland pagetable hierarchy (PGD) of <strong>the running process</strong> is stored in the privileged <code>CR3</code> register in the corresponding CPU core. 'Privileged' means that the register can only be accessed from kernelspace, as userland accesses will lead to a permission error. When the kernel scheduler makes the CPU switch to another process context, the kernel will set the <code>CR3</code> register to <code>virt_to_phys(current-&gt;mm-&gt;pgd)</code>.</p><p>To learn more about how the MMU finds the location of the pagetable hierarchy when the CPU needs to do a TLB lookup with cache miss, check the <a href="https://en.wikipedia.org/wiki/Control_register" rel="noreferrer">Wikipedia page on control registers</a>. </p><h3 id="26-tlb-flushing">2.6. TLB Flushing</h3><p>TLB Flushing is the practice of, well, flushing the TLB. The translation lookaside buffer (TLB) caches translations between virtual addresses and physical addresses. This practice delivers a huge performance increase as the CPU doesn't have to traverse the pagetables anymore and can instead <em>lookaside</em> to the TLB. </p><p>When an virtual addresses' pagetable hierarchy changes in kernelspace, it needs to be updated in the TLB as well. This is invoked manually from the kernel by doing function calls in the same functions where the pagetables are changed. These functions "flush" the TLB, which empties the translation cache (possibly only for a certain address range) of the TLB. Then, the next the virtual address is accessed, the TLB will save the translation to the TLB cache. </p><p>However, sometimes we change the pagetables (and their virtual addresses) in exploits at times where that's not expected. An example of this is using a UAF write bug to overwrite a PTE. At that time, the TLB flushing functions in the kernel are not called, since we are not using the functions to change the page tables, which do invoke said functions. Hence, we need to flush the TLB indirectly from userland. Otherwise, the TLB would contain outdated cache entries. In the techniques section of this blogpost I present my own method of doing this. </p><p>To learn more about the TLB, check the Wikipedia article: <a href="https://en.wikipedia.org/wiki/Translation_lookaside_buffer">"Translation lookaside buffer - Wikipedia." </a></p><h3 id="27-dirty-pagetable">2.7. Dirty Pagetable</h3><p>Dirty Pagetable is a novel technique presented by N. Wu, which boils down to overwriting PTEs in order to perform an KSMA attack. Their research paper presents 2 scenarios to overwrite PTEs: a double-free bug and an UAF-write bug. Both scenarios are supplemented with a practical example. The original paper is definitely worth a read considering I learned a lot from it. </p><figure><img src="https://pwning.tech/content/images/2024/02/dirtypagetable-3.svg" alt="" loading="lazy" width="713" height="513"><figcaption><span>Illustration 2.7.1: An high-level overview of the Dirty Pagetable technique.</span></figcaption></figure><p>However, there are a few critical topics out-of-scope in the original paper, which I try to include in this blogpost. An example of those topics is how pagetables work, TLB flushing, proof-of-concept code, the workings of physical KASLR, and the format of PTE values. Additionally, I present a variation on this technique (Dirty Pagedirectory) in this blogpost.</p><p>To learn more, check the original research paper by N. Wu: <a href="https://yanglingxi1993.github.io/dirty_pagetable/dirty_pagetable.html">"Dirty Pagetable: A Novel Exploitation Technique To Rule Linux Kernel."</a></p><h3 id="28-overwriting-modprobepath">2.8. Overwriting modprobe_path</h3><p>One of the more classical privilege escalation techniques is overwriting the <code>modprobe_path</code> variable in the kernel. The value of the variable is set to <code>CONFIG_MODPROBE_PATH</code> at compile-time, and is padded to <code>KMOD_PATH_LEN</code> bytes with nullbytes. Usually <code>CONFIG_MODPROBE_PATH</code> is set to "/sbin/modprobe" as that is the usual filepath for the modprobe binary. </p><p>The variable is used when a user is trying execute a binary with an unknown magic bytes header. For instance, the magic bytes of an ELF binary are <code>FE45 4C46</code> (a.k.a. ".ELF"). When executing the binary, the kernel will look for registered binary handlers which match said magic bytes. In the case of ELF, the ELF binfmt handler is selected. However when a registered binfmt is not recognized, modprobe will be invoked using the path stored in <code>modprobe_path</code> and it will <a href="https://elixir.bootlin.com/linux/latest/source/fs/exec.c#L1754">query for a kernel module</a> with the name <code>binfmt-%04x</code>, where <code>%04x</code> is the hex representation of the first 2 bytes in the file.</p><figure><img src="https://pwning.tech/content/images/2024/02/modprobe_path-4.svg" alt="" loading="lazy" width="923" height="748"><figcaption><span>Illustration 2.8.1: Analysis of the modprobe_path privilege escalation technique.</span></figcaption></figure><p>To exploit this, we can overwrite the value of <code>modprobe_path</code> with a string of the path of a privilege escalation script (which gives /bin/sh root SUID for instance), and then invoke modprobe by trying to execute a file with an invalid format such as <code>ffff ffff</code>. The kernel will then run <code>/tmp/privesc_script.sh -q -- binfmt-ffff</code> as root, which allows us to run any code as root. This saves us the hassle of having to run kernel functions ourselves, and instead allows easy privesc by overwriting a string.</p><p>Somewhere along the line, the <code>CONFIG_STATIC_USERMODEHELPER_PATH</code> mitigation was introduced, which makes overwriting <code>modprobe_path</code> useless. The mitigation works by setting every executed binary's path to a busybox-like binary, which behaves differently based on the argv[0] filename passed. Hence, if we overwrite <code>modprobe_path</code>, only this argv[0] value would differ, which the busybox-like binary does not recognize and hence would not execute.</p><p>The exploit presented in this exploit works both with and without <code>CONFIG_STATIC_USERMODEHELPER_PATH</code>, because we can simply overwrite the read-only <code>"/sbin/usermode-helper"</code> string in kernel memory.</p><p>To learn more about the modprobe_path technique, check this useful page on Github by user Smallkirby: <a href="https://github.com/smallkirby/kernelpwn/blob/master/technique/modprobe_path.md">"modprobe_path.md · smallkirby/kernelpwn."</a></p><h3 id="29-kernelctf">2.9. KernelCTF</h3><p>KernelCTF is a program ran by Google with the intent of disclosing new exploitation techniques for (hardened) Linux kernels. It's also a great way to get an ethical bounty for any vulnerabilities you may have in the Linux kernel, as the bounties range from $21.337 anywhere up to $111.337 and even more, all depending on the scope of the vulnerability and if there are any novel techniques.</p><p>The major outlines are that there are 3 machine categories: LTS (long-term stable kernel hardened with existing mitigations), mitigation (kernel hardened with experimental mitigations on top of existing mitigations), and COS (container optimized OS). Each machine can be hacked once per version, and the researcher who hacked the machine first gets the reward. This means that if researcher A hacked LTS version 6.1.63, then researcher A and researcher B can still hack mitigation version 6.1.63. After the next version is released on the KernelCTF platform (typically after 2 weeks), both researcher A and researcher B can hack LTS version 6.1.65 again. However, the bug reported by researcher A for version 6.1.63 will most likely be fixed now, and would be treated like a duplicate anyways if it were to be exploited again.</p><p>In order to "hack" the KernelCTF machine, the researcher needs to read the <code>/flag</code> file in the root (jail host) namespace, which is only readable by the root user. As you may expect, this may require both a namespace sandbox (<code>nsjail</code>) escape as well as an privilege escalation to the root user. At the end of the day, this does not matter as long as the flag is captured.</p><p>To debug the environment, check the <code>local_runner.sh</code> script which the KernelCTF team provides. Note the <code>--root</code> flag, which allows you to run a root shell from outside of the jail.</p><p>To learn more about the KernelCTF program, check this page: <a href="https://google.github.io/security-research/kernelctf/rules.html">"KernelCTF rules | security-research."</a></p><h2 id="3-the-bug">3. The bug</h2><h3 id="31-finding-the-bug">3.1. Finding the bug</h3><p>It all started when I wanted to implement firewall bypasses into my ORB rootkit  <a href="https://github.com/Notselwyn/netkit" rel="noreferrer">Netkit</a>. I wanted to rely on the kernel API (exported functions) for any actions, as it would have the same compatibility as regular kernel modules. Hopefully, this would mean that the rootkit kernel module could be used across architectures and kernel versions, without having to change the source code.</p><p>This led me into the rabbit hole called Netfilter. Before this research, I had no practical experience with Netfilter, so I had to do a lot of research on my own. Gladfully, there is plenty of documentation available from both the kernel developers and the infosec community. After reading myself into the subsystem, I read a bunch of source code from the top down related to nf_tables rules and expressions.</p><p>While reading nf_tables code - whose state machine is very interesting from a software development point of view - I noticed the <code>nf_hook_slow()</code> function. This function loops over all rules in a chain and stops evaluation (returns the function) immediately when <code>NF_DROP</code> is issued. </p><p>In the <code>NF_DROP</code> handling, it frees the packet and it allows a user to set the return value using <code>NF_GET_DROPERR()</code>. With this knowledge I made the function return <code>NF_ACCEPT</code> using the drop error when handling <code>NF_DROP</code>. A bunch of kernel panics and code path analyses later, I found a double-free primitive.</p><figure><pre><code>// looping over existing rules when skb triggers chain
+int nf_hook_slow(struct sk_buff *skb, struct nf_hook_state *state,
+		 const struct nf_hook_entries *e, unsigned int s)
+{
+	unsigned int verdict;
+	int ret;
+
+	// loop over every rule
+	for (; s &lt; e-&gt;num_hook_entries; s++) {
+		// acquire rule's verdict
+		verdict = nf_hook_entry_hookfn(&amp;e-&gt;hooks[s], skb, state);
+
+		switch (verdict &amp; NF_VERDICT_MASK) {
+		case NF_ACCEPT:
+			break;  // go to next rule
+		case NF_DROP:
+			kfree_skb_reason(skb, SKB_DROP_REASON_NETFILTER_DROP);
+
+			// check if the verdict contains a drop err
+			ret = NF_DROP_GETERR(verdict);
+			if (ret == 0)
+				ret = -EPERM;
+
+			// immediately return (do not evaluate other rules)
+			return ret;
+
+		// [snip] alternative verdict cases
+		default:
+			WARN_ON_ONCE(1);
+			return 0;
+		}
+	}
+
+	return 1;
+}</code></pre><figcaption><p><span>Codeblock 3.1.1: The </span><code spellcheck="false"><span>nf_hook_slow()</span></code><span> kernel function written in C, which iterates over nftables rules.</span></p></figcaption></figure><h3 id="32-root-cause-analysis">3.2. Root cause analysis</h3><p>The root cause of the bug is quite simplistic in nature, as it is an input sanitization bug. The impact of this is a stable double-free primitive. </p><p>The important details of the dataflow analysis are that when creating a verdict <strong>object </strong>for a netfilter hook, the kernel allowed positive drop errors. This meant an attacking user could cause the scenario below, where <code>nf_hook_slow()</code> would free an skb object when <code>NF_DROP</code> is returned from a hook/rule, and then return <code>NF_ACCEPT</code> as if every hook/rule in the chain returned <code>NF_ACCEPT</code>. This causes the caller of <code>nf_hook_slow()</code> to misinterpret the situation, and continue parsing the packet and eventually double-free it.</p><figure><pre><code>// userland API (netlink-based) handler for initializing the verdict 
+static int nft_verdict_init(const struct nft_ctx *ctx, struct nft_data *data,
+			    struct nft_data_desc *desc, const struct nlattr *nla)
+{
+	u8 genmask = nft_genmask_next(ctx-&gt;net);
+	struct nlattr *tb[NFTA_VERDICT_MAX + 1];
+	struct nft_chain *chain;
+	int err;
+
+	// [snip] initialize memory
+
+	// malicious user: data-&gt;verdict.code = 0xffff0000
+	switch (data-&gt;verdict.code) {
+	default:
+		// data-&gt;verdict.code &amp; NF_VERDICT_MASK == 0x0 (NF_DROP)
+		switch (data-&gt;verdict.code &amp; NF_VERDICT_MASK) {
+		case NF_ACCEPT:
+		case NF_DROP:
+		case NF_QUEUE:
+			break;  // happy-flow
+		default:
+			return -EINVAL;
+		}
+		fallthrough;
+	case NFT_CONTINUE:
+	case NFT_BREAK:
+	case NFT_RETURN:
+		break;  // happy-flow
+	case NFT_JUMP:
+	case NFT_GOTO:
+		// [snip] handle cases
+		break;
+	}
+
+	// successfully set the verdict value to 0xffff0000
+	desc-&gt;len = sizeof(data-&gt;verdict);
+
+	return 0;
+}</code></pre><figcaption><p><span>Codeblock 3.2.1: The </span><code spellcheck="false"><span>nft_verdict_init()</span></code><span> kernel function written in C, which constructs an netfilter verdict object.</span></p></figcaption></figure><figure><pre><code>// looping over existing rules when skb triggers chain
+int nf_hook_slow(struct sk_buff *skb, struct nf_hook_state *state,
+         const struct nf_hook_entries *e, unsigned int s)
+{
+    unsigned int verdict;
+    int ret;
+
+    for (; s &lt; e-&gt;num_hook_entries; s++) {
+        // malicious rule: verdict = 0xffff0000
+        verdict = nf_hook_entry_hookfn(&amp;e-&gt;hooks[s], skb, state);  
+
+        // 0xffff0000 &amp; NF_VERDICT_MASK == 0x0 (NF_DROP)
+        switch (verdict &amp; NF_VERDICT_MASK) {  
+        case NF_ACCEPT:
+            break;
+        case NF_DROP:
+            // first free of double-free
+            kfree_skb_reason(skb,
+                     SKB_DROP_REASON_NETFILTER_DROP);  
+            
+            // NF_DROP_GETERR(0xffff0000) == 1 (NF_ACCEPT)
+            ret = NF_DROP_GETERR(verdict);  
+            if (ret == 0)
+                ret = -EPERM;
+            
+            // return NF_ACCEPT (continue packet handling)
+            return ret;  
+
+        // [snip] alternative verdict cases
+        default:
+            WARN_ON_ONCE(1);
+            return 0;
+        }
+    }
+
+    return 1;
+}</code></pre><figcaption><p><span>Codeblock 3.2.2: The </span><code spellcheck="false"><span>nf_hook_slow()</span></code><span> kernel function written in C, which iterates over nftables rules.</span></p></figcaption></figure><figure><pre><code>static inline int NF_HOOK(uint8_t pf, unsigned int hook, struct net *net, struct sock *sk, 
+	struct sk_buff *skb, struct net_device *in, struct net_device *out, 
+	int (*okfn)(struct net *, struct sock *, struct sk_buff *))
+{
+	// results in nf_hook_slow() call
+	int ret = nf_hook(pf, hook, net, sk, skb, in, out, okfn);
+
+	// if skb passes rules, handle skb, and double-free it
+	if (ret == NF_ACCEPT)
+		ret = okfn(net, sk, skb);
+
+	return ret;
+}</code></pre><figcaption><p><span>Codeblock 3.2.3: The </span><code spellcheck="false"><span>NF_HOOK()</span></code><span> kernel function written in C, which calls a callback function on success.</span></p></figcaption></figure><h3 id="33-bug-impact-exploitation">3.3. Bug impact &amp; exploitation</h3><p>As said in the subsection above, this bug leaves us with a very powerful double-free primitive when the correct code paths are hit. The double-free impacts both <code>struct sk_buff</code> objects in the <code>skbuff_head_cache</code> slab cache, as well as a dynamically-sized <code>sk_buff-&gt;head</code> object ranging from <code>kmalloc-256</code> up to order 4 pages directly from the buddy-allocator (65536 bytes) with ipv4 packets (perhaps even more with ipv6 jumbo packets?).</p><p>The <code>sk_buff-&gt;head</code> object is allocated through a kmalloc-like interface (<code>kmalloc_reserve()</code>) in <code>__alloc_skb()</code>. This allows us to allocate objects of a dynamic size. Hence, we can allocate slab objects from size 256 to full-on pages of 65536 bytes from the buddy allocator. An functional overview of this can be found in the page allocaction subsection of the background info section.</p><p>The size of the sk_buff-&gt;head object is directly influenced by the size of the network packet, as this object contains the packet content. Hence, if we send a packet with e.g. 40KiB data, the kernel would allocate an order 4 page directly from the buddy-allocator.</p><p>When you try to reproduce the bug yourselves, the kernel may panic, even when all mitigations are disabled. This is because certain fields of the skb - such as pointers - get corrupted when the skb is freed. As such, we should try to avoid usage of these fields. Fortunately, I found a way to bypass all usage which could lead to a panic or usual errors and get a highly reliable double-free primitive. I'm highlighting this in the respective subsection within the proof-of-concept section.</p><h3 id="34-bug-fixes">3.4. Bug fixes</h3><p>When I reported the bug to the kernel developers, I proposed my own bug fix which regretfully had to introduce a specific breaking change in the middle of the netfilter stack. </p><p>Thankfully, one of the maintainers of the subsystem came up with their own elegant fix. Their fix sanitizes verdicts from userland input in the netfilter API itself, before the malicious verdict is even added. The specific fix makes the kernel disallow drop errors entirely for userland input. The maintainer mentions however that if this behaviour is needed in the future, only drop errors with <code>n &lt;= 0</code> should be allowed to prevent bugs like these. This is because positive drop errors like <code>1</code> will overlap as <code>NF_ACCEPT</code>. </p><p>Additionally, the vulnerability was assigned <a href="https://nvd.nist.gov/vuln/detail/CVE-2024-1086">CVE-2024-1086</a> (this was before the Linux kernel became an CNA and ruined the meaning of CVEs).</p><figure><pre><code>A use-after-free vulnerability in the Linux kernel's netfilter: nf_tables component can be exploited to achieve local privilege escalation.
+
+The nft_verdict_init() function allows positive values as drop error within the hook verdict, and hence the nf_hook_slow() function can cause a double free vulnerability when NF_DROP is issued with a drop error which resembles NF_ACCEPT.
+
+We recommend upgrading past commit f342de4e2f33e0e39165d8639387aa6c19dff660.</code></pre><figcaption><p><span>Codeblock 3.4.1: The description of CVE-2024-1086.</span></p></figcaption></figure><figure><pre><code>--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@ -10988,16 +10988,10 @@ static int nft_verdict_init(const struct nft_ctx *ctx, struct nft_data *data,
+ 	data-&gt;verdict.code = ntohl(nla_get_be32(tb[NFTA_VERDICT_CODE]));
+ 
+ 	switch (data-&gt;verdict.code) {
+-	default:
+-		switch (data-&gt;verdict.code &amp; NF_VERDICT_MASK) {
+-		case NF_ACCEPT:
+-		case NF_DROP:
+-		case NF_QUEUE:
+-			break;
+-		default:
+-			return -EINVAL;
+-		}
+-		fallthrough;
++	case NF_ACCEPT:
++	case NF_DROP:
++	case NF_QUEUE:
++		break;
+ 	case NFT_CONTINUE:
+ 	case NFT_BREAK:
+ 	case NFT_RETURN:
+@@ -11032,6 +11026,8 @@ static int nft_verdict_init(const struct nft_ctx *ctx, struct nft_data *data,
+ 
+ 		data-&gt;verdict.chain = chain;
+ 		break;
++	default:
++		return -EINVAL;
+ 	}
+ 
+ 	desc-&gt;len = sizeof(data-&gt;verdict);
+-- </code></pre><figcaption><p><span>Codeblock 3.4.2: C code diff of the </span><code spellcheck="false"><span>nft_verdict_init()</span></code><span> kernel function being patched against the bug.</span></p></figcaption></figure><p>You can learn more about their fix on the kernel lore website: <a href="https://lore.kernel.org/all/20240120215012.129529-1-fw@strlen.de" rel="noreferrer">"[PATCH nf] netfilter: nf_tables: reject QUEUE/DROP verdict parameters."</a></p><h2 id="4-techniques">4. Techniques</h2><h3 id="41-page-refcount-juggling">4.1. Page refcount juggling</h3><p>The first technique required for the exploit is juggling page refcounts. When we attempt to double-free a page in the kernel using the dedicated API functions, the kernel will check the refcount of the page:</p><figure><pre><code>void __free_pages(struct page *page, unsigned int order)
+{
+	/* get PageHead before we drop reference */
+	int head = PageHead(page);
+
+	if (put_page_testzero(page))
+		free_the_page(page, order);
+	else if (!head)
+		while (order-- &gt; 0)
+			free_the_page(page + (1 &lt;&lt; order), order);
+}</code></pre><figcaption><p><span>Codeblock 4.1.1: C code of the </span><code spellcheck="false"><span>__free_pages()</span></code><span> kernel function with …</span></p></figcaption></figure></section></article></div></div>
+<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://pwning.tech/nftables/">https://pwning.tech/nftables/</a></em></p>]]>
+            </description>
+            <link>https://pwning.tech/nftables/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-39828424</guid>
+            <pubDate>Tue, 26 Mar 2024 14:35:33 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Pinnacle – a modern tribute to the 1986 classic, The Sentinel]]>
+            </title>
+            <description>
+<![CDATA[
+Score 54 | Comments 20 (<a href="https://news.ycombinator.com/item?id=39827972">thread link</a>) | @sandebert
+<br/>
+March 26, 2024 | https://viperfish.com.au/games/pinnacle.html | <a href="https://web.archive.org/web/*/https://viperfish.com.au/games/pinnacle.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="tm-main">
+
+
+<div tm-header-transparent="light" uk-sticky="overflow-flip: true; end: 100%;" uk-scrollspy="target: [uk-scrollspy-class]; cls: uk-animation-slide-left-medium; delay: false;" uk-height-viewport="offset-top: true; offset-bottom: 20;">
+<video src="https://viperfish.com.au/images/template/video/7ad4ef08-97d5-44cf-981b-c447e9564fd4.mp4" loop="" autoplay="" muted="" playsinline="" uk-cover=""></video>
+
+<div>
+<div>
+<div>
+<div>
+
+<h3 uk-scrollspy-class=""> A modern tribute to the 1986 classic, The Sentinel. </h3><div uk-scrollspy-class=""><p>Originally built by Geoff Crammond and published on 8-bit home computers in the late 1980's.</p>
+<p>Pinnacle captures the ambience and mood of the original game while taking advantage of modern processing power.</p></div>
+
+</div></div>
+</div>
+</div>
+</div>
+<div uk-scrollspy="target: [uk-scrollspy-class]; cls: uk-animation-slide-bottom-small; delay: 200;">
+<div>
+<div>
+<div>
+<div uk-scrollspy-class=""><p>As a teenager in the late 80s, I was profoundly influenced by The&nbsp;Sentinel and played it obsessively on my Commodore&nbsp;64. 37 years later, I'm thrilled to present Pinnacle,&nbsp;a modern tribute to the original game. A reimagining that is faster paced and makes use of modern features like&nbsp;global illumination,&nbsp;volumetric fog and shadows while staying true to the game's original concepts.</p>
+<p>I sincerely hope that players enjoy this as much as I enjoyed the original.</p></div>
+</div></div>
+</div>
+</div>
+
+<div uk-scrollspy="target: [uk-scrollspy-class]; cls: uk-animation-scale-up; delay: false;">
+<div>
+<div>
+<div>
+<h2 uk-scrollspy-class=""> Immersive gameplay in a surreal world </h2><p>Pinnacle is a game of energy, entropy and in many ways the cycle of life itself. Harness the energy around you, use it wisely, conserve it. Like the tangible world around us, energy is perpetual. It is never destroyed, it just changes form.</p>
+</div></div><div uk-grid="">
+<div>
+<div>
+<div uk-scrollspy-class="">
+<picture>
+<source type="image/webp" srcset="https://viperfish.com.au/templates/yootheme/cache/9e/trees-9edef491.webp 768w, https://viperfish.com.au/templates/yootheme/cache/ec/trees-ec51072c.webp 920w, https://viperfish.com.au/templates/yootheme/cache/54/trees-543ef9ac.webp 1024w, https://viperfish.com.au/templates/yootheme/cache/9f/trees-9fd9e854.webp 1366w, https://viperfish.com.au/templates/yootheme/cache/e2/trees-e2f4abfc.webp 1600w, https://viperfish.com.au/templates/yootheme/cache/bf/trees-bf2747f5.webp 1799w" sizes="(min-width: 920px) 920px">
+<img src="https://viperfish.com.au/templates/yootheme/cache/b9/trees-b9c89586.png" width="920" height="518" alt="" loading="lazy">
+</picture>
+</div>
+</div>
+</div>
+<div>
+<div>
+<h3 uk-scrollspy-class=""> Absorb energy from the landscape </h3><p>Trees serve as the&nbsp;basic unit of energy.&nbsp;Absorb them from the scenery when you're able to do so. You can only assimilate objects&nbsp;if the square upon which they rest is visible to you.</p>
+</div>
+</div></div><div uk-grid="">
+<div>
+<div>
+<div uk-scrollspy-class="">
+<picture>
+<source type="image/webp" srcset="https://viperfish.com.au/templates/yootheme/cache/26/boulders-269d7391.webp 768w, https://viperfish.com.au/templates/yootheme/cache/7a/boulders-7a7e7aca.webp 920w, https://viperfish.com.au/templates/yootheme/cache/57/boulders-575c8e55.webp 1024w, https://viperfish.com.au/templates/yootheme/cache/9c/boulders-9cbb9fad.webp 1366w, https://viperfish.com.au/templates/yootheme/cache/e1/boulders-e196dc05.webp 1600w, https://viperfish.com.au/templates/yootheme/cache/78/boulders-789f5b44.webp 1799w" sizes="(min-width: 920px) 920px">
+<img src="https://viperfish.com.au/templates/yootheme/cache/20/boulders-205153e5.png" width="920" height="518" alt="" loading="lazy">
+</picture>
+</div>
+</div>
+</div>
+<div>
+<div>
+<h3 uk-scrollspy-class=""> Gain altitude </h3><p><span>Stack boulders, place a "synthoid" on top and teleport your consciousness into this new vessel. Reabsorb the shell and any boulders you left behind. Boulders&nbsp;are worth 2 energy units, a synthoid, 3.</span></p>
+</div>
+</div></div><div uk-grid="">
+<div>
+<div>
+<div uk-scrollspy-class="">
+<picture>
+<source type="image/webp" srcset="https://viperfish.com.au/templates/yootheme/cache/34/introuble-341f3dc9.webp 768w, https://viperfish.com.au/templates/yootheme/cache/ed/introuble-ed7f1f54.webp 920w, https://viperfish.com.au/templates/yootheme/cache/f2/introuble-f20c860b.webp 1024w, https://viperfish.com.au/templates/yootheme/cache/39/introuble-39eb97f3.webp 1366w, https://viperfish.com.au/templates/yootheme/cache/44/introuble-44c6d45b.webp 1600w, https://viperfish.com.au/templates/yootheme/cache/34/introuble-341b2469.webp 1799w" sizes="(min-width: 920px) 920px">
+<img src="https://viperfish.com.au/templates/yootheme/cache/24/introuble-2428efb5.png" width="920" height="518" alt="" loading="lazy">
+</picture>
+</div>
+</div>
+</div>
+<div>
+<div>
+<h3 uk-scrollspy-class=""> Elude&nbsp;the Sentinel's watchful eye </h3><p>When you find yourself caught in the Sentinel's gaze,&nbsp;it will leach away your life-force, scattering it across the terrain in the&nbsp;form of newborn trees. Move before it drains and kills you. Alternatively, hyperspace to a random location at the cost of 3 energy units and leaving your old vessel and any boulders behind.</p>
+</div>
+</div></div><div uk-grid="">
+<div>
+<div>
+<div uk-scrollspy-class="">
+<picture>
+<source type="image/webp" srcset="https://viperfish.com.au/templates/yootheme/cache/94/absorb-9452d23c.webp 768w, https://viperfish.com.au/templates/yootheme/cache/6f/absorb-6f44bcd4.webp 920w, https://viperfish.com.au/templates/yootheme/cache/f3/absorb-f3055168.webp 1024w, https://viperfish.com.au/templates/yootheme/cache/38/absorb-38e24090.webp 1366w, https://viperfish.com.au/templates/yootheme/cache/45/absorb-45cf0338.webp 1600w, https://viperfish.com.au/templates/yootheme/cache/2c/absorb-2cdf8143.webp 1799w" sizes="(min-width: 920px) 920px">
+<img src="https://viperfish.com.au/templates/yootheme/cache/99/absorb-9936b6e5.png" width="920" height="518" alt="" loading="lazy">
+</picture>
+</div>
+</div>
+</div>
+<div>
+<div>
+<h3 uk-scrollspy-class=""> Take the throne </h3><div uk-scrollspy-class=""><p>When you have absorbed enough energy and gained enough altitude, absorb the Sentinel, claim its throne on the pinnacle and advance to the next world that awaits.</p>
+</div>
+</div>
+</div></div><div uk-grid="">
+<div>
+<div>
+<div uk-scrollspy-class="">
+<picture>
+<source type="image/webp" srcset="https://viperfish.com.au/templates/yootheme/cache/2a/sentries-2a8d1598.webp 768w, https://viperfish.com.au/templates/yootheme/cache/40/sentries-4027750a.webp 920w, https://viperfish.com.au/templates/yootheme/cache/d7/sentries-d73e8ade.webp 1024w, https://viperfish.com.au/templates/yootheme/cache/1c/sentries-1cd99b26.webp 1366w, https://viperfish.com.au/templates/yootheme/cache/61/sentries-61f4d88e.webp 1600w, https://viperfish.com.au/templates/yootheme/cache/fb/sentries-fbc7cfa1.webp 1799w" sizes="(min-width: 920px) 920px">
+<img src="https://viperfish.com.au/templates/yootheme/cache/bf/sentries-bf54dc2e.png" width="920" height="518" alt="" loading="lazy">
+</picture>
+</div>
+</div>
+</div>
+<div>
+<div>
+<h3 uk-scrollspy-class=""> The Sentinel&nbsp;is not alone </h3><p>As your voyage takes you into more challenging worlds, you'll have to grapple with additional sentries. Equally formidable as the Sentinel, they rotate in the reverse direction. Maintain a watchful eye on them and strategise your approach accordingly.</p>
+</div>
+</div></div>
+</div>
+</div>
+<div uk-scrollspy="target: [uk-scrollspy-class]; cls: uk-animation-scale-up; delay: 600;">
+<div>
+<div>
+<div>
+<p uk-scrollspy-class="">
+<iframe src="https://www.youtube.com/embed/IWYP2Itnh9w?disablekb=1" allow="autoplay" allowfullscreen="" uk-responsive="" width="1280" height="720"></iframe>
+</p>
+</div></div>
+</div>
+</div>
+<div id="download" uk-scrollspy="target: [uk-scrollspy-class]; cls: uk-animation-slide-bottom-small; delay: 100;" uk-height-viewport="offset-top: true;">
+<div>
+<div>
+<div uk-grid="">
+<div>
+<div uk-scrollspy-class=""><p>Pinnacle is provided as is, completely free of charge, without any warranty or guarantee. Download the appropriate version for your operating system.</p>
+</div><p>Pinnacle (Version Beta 1.0)</p>
+
+<div id="page#1" uk-scrollspy-class=""><div><div id="windows-modal" uk-modal="">
+<div>
+
+<div>
+<div>
+
+<p>Windows Defender will probably block Pinnacle from running as it's not from a verified publisher.</p></div>
+<p>If you experience this, you can click 'More info' then 'Run anyway'. The file is perfectly safe and doesn't track any information or install anything to your system.</p><p>Pinnacle is a fun side project I provide free of charge. For this reason I don't pay Microsoft and Apple hundreds of dollars in yearly fees to join their developer programs. Unfortunately, this means end users can't install free software without being nagged.</p>
+</div>
+</div></div>
+</div></div><div id="page#2" uk-scrollspy-class=""><div><div id="macos-modal" uk-modal="">
+<div>
+
+<div>
+<div>
+
+<p>Mac Gatekeeper may initially block Pinnacle from running as it's not from the App Store.</p></div>
+<p>If you experience this, right-click (or CTRL+click) on the .app file, select Open, you get the contextual menu to open up the app anyway. It should open normally after this.</p>
+<p>Pinnacle is a fun side project I provide free of charge. For this reason I don't pay Microsoft and Apple hundreds of dollars in yearly fees to join their developer programs. Unfortunately, this means end users can't install free software without being nagged.</p>
+</div>
+</div></div>
+</div></div>
+</div>
+<div>
+<div>
+<div uk-sticky="end: !.js-sticky; media: @m;">
+<h4 uk-scrollspy-class=""> System Requirements </h4>
+<ul uk-scrollspy-class="">
+<li>
+<div uk-grid="">  <div>
+<p>Windows 10, Linux 64bit or MacOS 10.13</p> </div>
+</div>
+</li>
+<li>
+<div uk-grid="">  <div>
+<p><span>Intel Core 2 Duo E8400 / AMD Athlon II X2 250</span></p> </div>
+</div>
+</li>
+<li>
+
+</li>
+<li>
+<div uk-grid="">  <div>
+<p>NVIDIA GeForce&nbsp;Series 8 or&nbsp;AMD Radeon HD 7000 series</p> </div>
+</div>
+</li>
+<li>
+
+</li>
+<li>
+
+</li>
+</ul><hr uk-scrollspy-class="">
+<h4 uk-scrollspy-class=""> Made with Godot Engine </h4>
+<div uk-scrollspy-class="">
+<a href="https://godotengine.org/" target="_blank"><picture>
+<source type="image/webp" srcset="https://viperfish.com.au/templates/yootheme/cache/5b/godot_logo_large_color_dark-5b195580.webp 280w, https://viperfish.com.au/templates/yootheme/cache/f6/godot_logo_large_color_dark-f63ea061.webp 560w" sizes="(min-width: 280px) 280px">
+<img src="https://viperfish.com.au/templates/yootheme/cache/90/godot_logo_large_color_dark-90865347.png" width="280" height="113" alt="Made with Godot Engine." loading="eager">
+</picture></a>
+</div>
+</div>
+</div>
+</div></div>
+</div>
+</div>
+</div>
+<div uk-scrollspy="target: [uk-scrollspy-class]; cls: uk-animation-slide-top-small; delay: 200;">
+<div>
+<div>
+<div>
+<p>Originally released in 1986 by Geoff Crammond, The Sentinel, also known as The Sentry in the United States, was a pioneer in 3D graphics for home computers. It quickly became one of the highest rated games on the&nbsp;BBC Micro, ZX Spectrum and Commodore 64.</p><div uk-scrollspy-class=""><p>In the annals of video game history, certain titles stand out for their innovative gameplay, groundbreaking graphics, or compelling narratives. Among these is the 1986 game "The Sentinel", published as "The Senty" in the USA.</p>
+<p>Developed by Geoff Crammond, a British game designer renowned for his work on the Grand Prix series, The Sentinel pushed the boundaries of what was possible on home computers at the time, offering a unique blend of strategy, atmosphere and tension that captivated players and critics alike.</p>
+<p>For its time, The Sentinel was a revolutionary game. It was one of the first games to use solid 3D polygon graphics on home computers, a significant leap forward in an era when most games were text based, using 2D sprites.</p>
+<p>Geoff developed a technique where rather than rendering a complete view in real time - impossible on&nbsp;8-bit hardware - the camera would rotate a number of degrees at set intervals. The edge portion of the screen would be rendered as it came into view.</p>
+<p>This mechanic was built into the game play and for the first time on home computers allowed for a truly immersive 3D gaming experience.</p></div>
+
+</div></div>
+</div>
+</div>
+
+<div>
+<div>
+<div>
+<div>
+<h3> Disclaimer </h3><p>Pinnacle is an independent fan creation and is provided free of charge and without warranty. Viperfish Media and John Pitchers have no association or affiliation with the original developers, publishers, or any other entities holding rights to the original work. This application shall not be disseminated via any channels that seek to gain profit from it.</p>
+</div></div>
+</div>
+</div>
+<div>
+<div>
+<div><div uk-grid="">
+<div>
+<h2> Download Pinnacle </h2><p>Available for free for Windows, Mac and Linux.<br>
+<span>  </span></p>
+</div>
+</div></div>
+</div>
+</div>
+</div></div>]]>
+            </description>
+            <link>https://viperfish.com.au/games/pinnacle.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-39827972</guid>
+            <pubDate>Tue, 26 Mar 2024 14:05:02 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Packet-editing games in Golang (2021)]]>
+            </title>
+            <description>
+<![CDATA[
+Score 75 | Comments 6 (<a href="https://news.ycombinator.com/item?id=39824611">thread link</a>) | @jszymborski
+<br/>
+March 25, 2024 | https://remyhax.xyz/posts/golang-packet-editing/ | <a href="https://web.archive.org/web/*/https://remyhax.xyz/posts/golang-packet-editing/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><figure><img src="https://remyhax.xyz/image/feature-packetediting.jpg"></figure><p>It’s easy to set up an IDS or other infrastructure to drop packets that match rules. There are many tools for real-time inspection of connections that can handle higher level protocols like HTTP or TLS. This article aims to go a bit lower and address how to <em>edit</em> packets in flight. We’ll be looking at it through the lens of editing packets for a game using Golang.</p><p>Some basic guidelines / personal policy:</p><ul><li><strong>This is not a guide of how to cheat at online games and should not be used as such.</strong></li><li>There are plenty of old multiplayer games that have been lost to the tides of time with copyright’s long expired that are perfect for learning how they work.</li><li>Examples as shown are editing packets Server –&gt; Client. Any changes to client state could be done much easier using <a href="https://www.cheatengine.org/">Cheat Engine</a> etc…</li><li>No modified/forged packets are sent from Client –&gt; Server in any examples. There is a very obvious reason for this.</li><li><strong>Cheating ruins games for others and yourself.</strong></li></ul><p>With that out of the way, let’s get started:</p><p>If you’re interested in more projects like this, give me a follow on Twitter <a href="https://twitter.com/_mattata">@_mattata</a>. I’m always working on something fun.</p><p>You should generally be familiar with Wireshark, general networking, and Go.</p><p>For ease of use and a controlled environment, I usually start by downloading a Ubuntu Desktop ISO and spin up a Virtual machine in VirtualBox.</p><p>I’ll add a USB filter to expose a Wireless USB to the VM
+<img src="https://remyhax.xyz/packetediting/usb.PNG" alt="USB Filter)"></p><p>Then I’ll use the “Create Hotspot” function to create a wireless AP hosted through the VM
+<img src="https://remyhax.xyz/packetediting/hotspot.PNG" alt="Hotspot)"></p><p>You could of course also do this with a custom DHCP setup with IP Forwarding and maybe even a selective VPN. I’m lazy, so I do this because it takes 3 clicks and I’m done. The main idea is to be able to route traffic through the VM. However you want to accomplish that is up to you.</p><p>Here is a simple example that will route packets from TCP source port 9999 into nfqueue 0. The Go code will trigger a callback when a packet enters the queue which allows us to modify the data using the gopacket library. Once we are done with the packet, we can issue a verdict to allow the modified packet out of the queue and continue on to it’s destination.</p><p>In this case, we’re looking for packets containing “magic string” which we will replace with “modified value”</p><div><pre><code data-lang="go"><span>package</span> <span>main</span>
+
+<span>import</span> (
+	<span>"bytes"</span>
+	<span>"encoding/hex"</span>
+	<span>"fmt"</span>
+	<span>"io/ioutil"</span>
+	<span>"log"</span>
+	<span>"os"</span>
+	<span>"os/exec"</span>
+	<span>"os/signal"</span>
+	<span>"strings"</span>
+	<span>"syscall"</span>
+
+	<span>"github.com/chifflier/nfqueue-go/nfqueue"</span>
+
+	<span>"github.com/sergi/go-diff/diffmatchpatch"</span>
+
+	<span>"github.com/google/gopacket"</span>
+	<span>"github.com/google/gopacket/layers"</span>
+)
+
+<span>func</span> <span>realCallback</span>(<span>payload</span> <span>*</span><span>nfqueue</span>.<span>Payload</span>) <span>int</span> {
+	<span>// Decode a packet
+</span><span></span>	<span>packet</span> <span>:=</span> <span>gopacket</span>.<span>NewPacket</span>(<span>payload</span>.<span>Data</span>, <span>layers</span>.<span>LayerTypeIPv4</span>, <span>gopacket</span>.<span>Default</span>)
+	<span>// Get the TCP layer from this packet
+</span><span></span>	<span>if</span> <span>tcpLayer</span> <span>:=</span> <span>packet</span>.<span>Layer</span>(<span>layers</span>.<span>LayerTypeTCP</span>); <span>tcpLayer</span> <span>!=</span> <span>nil</span> {
+		<span>// Get actual TCP data from this layer
+</span><span></span>		<span>tcp</span>, <span>_</span> <span>:=</span> <span>tcpLayer</span>.(<span>*</span><span>layers</span>.<span>TCP</span>)
+		<span>fmt</span>.<span>Printf</span>(<span>"From src port %d to dst port %d\n"</span>, <span>tcp</span>.<span>SrcPort</span>, <span>tcp</span>.<span>DstPort</span>)
+	}
+	<span>//Log Initial State
+</span><span></span>	<span>fmt</span>.<span>Printf</span>(<span>"  id: %d\n"</span>, <span>payload</span>.<span>Id</span>)
+	<span>fmt</span>.<span>Println</span>(<span>hex</span>.<span>Dump</span>(<span>payload</span>.<span>Data</span>))
+	<span>if</span> <span>app</span> <span>:=</span> <span>packet</span>.<span>ApplicationLayer</span>(); <span>app</span> <span>!=</span> <span>nil</span> {
+		<span>if</span> <span>strings</span>.<span>Contains</span>(string(<span>app</span>.<span>Payload</span>()), <span>"magic string"</span>) {
+			<span>// modify payload of application layer
+</span><span></span>			<span>*</span><span>packet</span>.<span>ApplicationLayer</span>().(<span>*</span><span>gopacket</span>.<span>Payload</span>) = <span>bytes</span>.<span>ReplaceAll</span>(<span>app</span>.<span>Payload</span>(), []byte(<span>"magic string"</span>), []byte(<span>"modified value"</span>))
+			<span>// if its tcp we need to tell it which network layer is being used
+</span><span></span>			<span>// to be able to handle multiple protocols we can add a if clause around this
+</span><span></span>			<span>packet</span>.<span>TransportLayer</span>().(<span>*</span><span>layers</span>.<span>TCP</span>).<span>SetNetworkLayerForChecksum</span>(<span>packet</span>.<span>NetworkLayer</span>())
+
+			<span>buffer</span> <span>:=</span> <span>gopacket</span>.<span>NewSerializeBuffer</span>()
+			<span>options</span> <span>:=</span> <span>gopacket</span>.<span>SerializeOptions</span>{
+				<span>ComputeChecksums</span>: <span>true</span>,
+				<span>FixLengths</span>:       <span>true</span>,
+			}
+
+			<span>// Serialize Packet to get raw bytes
+</span><span></span>			<span>if</span> <span>err</span> <span>:=</span> <span>gopacket</span>.<span>SerializePacket</span>(<span>buffer</span>, <span>options</span>, <span>packet</span>); <span>err</span> <span>!=</span> <span>nil</span> {
+				<span>log</span>.<span>Fatalln</span>(<span>err</span>)
+			}
+
+			<span>packetBytes</span> <span>:=</span> <span>buffer</span>.<span>Bytes</span>()
+			
+			<span>//Pretty color diff on the hexdump
+</span><span></span>			<span>dmp</span> <span>:=</span> <span>diffmatchpatch</span>.<span>New</span>()
+			<span>diffs</span> <span>:=</span> <span>dmp</span>.<span>DiffMain</span>(<span>hex</span>.<span>Dump</span>(<span>payload</span>.<span>Data</span>), <span>hex</span>.<span>Dump</span>(<span>packetBytes</span>), <span>true</span>)
+			<span>fmt</span>.<span>Println</span>(<span>dmp</span>.<span>DiffPrettyText</span>(<span>diffs</span>))
+			<span>//Set the packet verdict as modified
+</span><span></span>			<span>payload</span>.<span>SetVerdictModified</span>(<span>nfqueue</span>.<span>NF_ACCEPT</span>, <span>packetBytes</span>)
+			<span>return</span> <span>0</span>
+		}
+	}
+	<span>fmt</span>.<span>Println</span>(<span>"-- "</span>)
+	<span>payload</span>.<span>SetVerdict</span>(<span>nfqueue</span>.<span>NF_ACCEPT</span>)
+	<span>return</span> <span>0</span>
+}
+
+<span>func</span> <span>main</span>() {
+	<span>//Create go nfqueue
+</span><span></span>	<span>q</span> <span>:=</span> new(<span>nfqueue</span>.<span>Queue</span>)
+	<span>//Set callback for queue
+</span><span></span>	<span>q</span>.<span>SetCallback</span>(<span>realCallback</span>)
+	<span>//Initialize queue
+</span><span></span>	<span>q</span>.<span>Init</span>()
+	<span>//Generic reset for bind
+</span><span></span>	<span>q</span>.<span>Unbind</span>(<span>syscall</span>.<span>AF_INET</span>)
+	<span>q</span>.<span>Bind</span>(<span>syscall</span>.<span>AF_INET</span>)
+	<span>//Create nfqueue "0"
+</span><span></span>	<span>q</span>.<span>CreateQueue</span>(<span>0</span>)
+
+	<span>//Set iptables rule to route packets from sourc eport 9999 to queue number 0
+</span><span></span>	<span>cmd</span> <span>:=</span> <span>exec</span>.<span>Command</span>(<span>"iptables"</span>, <span>"-t"</span>, <span>"raw"</span>, <span>"-A"</span>, <span>"PREROUTING"</span>, <span>"-p"</span>, <span>"tcp"</span>, <span>"--source-port"</span>, <span>"9999"</span>, <span>"-j"</span>, <span>"NFQUEUE"</span>, <span>"--queue-num"</span>, <span>"0"</span>)
+	<span>stdout</span>, <span>err</span> <span>:=</span> <span>cmd</span>.<span>Output</span>()
+
+	<span>if</span> <span>err</span> <span>!=</span> <span>nil</span> {
+		<span>fmt</span>.<span>Println</span>(<span>err</span>.<span>Error</span>())
+		<span>return</span>
+	} <span>else</span> {
+		<span>fmt</span>.<span>Println</span>(string(<span>stdout</span>))
+	}
+
+	<span>//Listener for CNTRL+C
+</span><span></span>	<span>c</span> <span>:=</span> make(<span>chan</span> <span>os</span>.<span>Signal</span>, <span>1</span>)
+	<span>signal</span>.<span>Notify</span>(<span>c</span>, <span>os</span>.<span>Interrupt</span>)
+	<span>log</span>.<span>SetOutput</span>(<span>ioutil</span>.<span>Discard</span>)
+	<span>go</span> <span>func</span>() {
+		<span>for</span> <span>sig</span> <span>:=</span> <span>range</span> <span>c</span> {
+			<span>// sig is a ^C, handle it
+</span><span></span>			<span>_</span> = <span>sig</span>
+			<span>q</span>.<span>StopLoop</span>()
+		}
+	}()
+
+	<span>// XXX Drop privileges here
+</span><span></span>
+	<span>q</span>.<span>Loop</span>()
+	<span>q</span>.<span>DestroyQueue</span>()
+	<span>q</span>.<span>Close</span>()
+
+	<span>//Remove iptables rules that route packets into nfqueue
+</span><span></span>	<span>unroute</span> <span>:=</span> <span>exec</span>.<span>Command</span>(<span>"iptables"</span>, <span>"-F"</span>, <span>"-t"</span>, <span>"raw"</span>)
+	<span>stdoutUnroute</span>, <span>err</span> <span>:=</span> <span>unroute</span>.<span>Output</span>()
+
+	<span>if</span> <span>err</span> <span>!=</span> <span>nil</span> {
+		<span>fmt</span>.<span>Println</span>(<span>err</span>.<span>Error</span>())
+		<span>return</span>
+	} <span>else</span> {
+		<span>fmt</span>.<span>Println</span>(string(<span>stdoutUnroute</span>))
+	}
+
+	<span>os</span>.<span>Exit</span>(<span>0</span>)
+}</code></pre></div><p>So let’s see it in action eh? You’ll need libnetfilter-queue-dev installed in order to compile.</p><p>Outside of the VM, open a netcat listener on port 9999</p><p><code>nc -vvv -l 192.168.8.154 9999</code></p><p>Now, from inside the VM open a terminal and connect to the netcat listener outside the VM:</p><p><code>nc -vvv 192.168.8.154</code></p><p>We’ll type the string “hello” and see that it goes through without issue.</p><p>Then we’ll type the string “magic string” and note that is is modified in flight.</p><p><img src="https://remyhax.xyz/packetediting/basic.PNG" alt="Basic"></p><p>The packet was modified because it had a source port of 9999, was routed into nfqueue 0, and contained the string “magic string”, so we replaced it before allowing it to continue to it’s destination.</p><p>Games have text too! But it’s typically embedded in a custom protocol.</p><p><img src="https://remyhax.xyz/packetediting/chatbox.jpg" alt="Chatbox"></p><pre><code>00000070  00 0a 7c d9 e7 00 06 00  37 02 7b 00 12 46 61 74  |..|.....7.{..Fat|
+00000080  68 65 72 20 41 65 72 65  63 6b 00 00 e7 00 03 a3  |her Aereck......|
+00000090  00 2d 57 65 6c 63 6f 6d  65 20 74 6f 20 74 68 65  |.-Welcome to the|
+000000a0  20 63 68 75 72 63 68 20  6f 66 20 68 6f 6c 79 20  | church of holy |
+000000b0  53 61 72 61 64 6f 6d 69  6e 2e 00 00 e7 00 05 a0  |Saradomin.......
+</code></pre><p>Let’s see if we can replace the characters name “Father Aereck” with “Remy”</p><div><pre><code data-lang="go"><span>// modify payload of application layer
+</span><span></span><span>*</span><span>packet</span>.<span>ApplicationLayer</span>().(<span>*</span><span>gopacket</span>.<span>Payload</span>) = <span>bytes</span>.<span>ReplaceAll</span>(<span>app</span>.<span>Payload</span>(), []byte(<span>"Father Aereck"</span>), []byte(<span>"REMY"</span>))</code></pre></div><p><img src="https://remyhax.xyz/packetediting/connectionlost.jpg" alt="Connection lost"></p><p>We can see that the bytes were replaced, but the game client glitched out. What happened?</p><p>The client reset because the custom protocol used for it couldn’t be parsed correctly! Even outside of editing packets, most protocols will have error handling for situations like this. Packet errors <strong>absolutely do</strong> occur in the real world.</p><p><strong>But why wasn’t the protocol parsed correctly? All we did was change some text!</strong></p><p>Incorrect! We changed the text <strong>and the length of the text</strong>. Unless you’re dealing with a text based protocol, you’ll usually encounter something called <a href="https://en.wikipedia.org/wiki/Type%E2%80%93length%E2%80%93value">TLV</a> in binary protocols.</p><p>We’re dealing with a binary protocol now, not a text based protocol like a simple netcat pipe.</p><p>The type and length are fixed in size (typically 1-4 bytes), and the value field is of variable size. These fields are used as follows:</p><ul><li>Type</li><li><ul><li>A binary code, often simply alphanumeric, which indicates the kind of field that this part of the message represents;</li></ul></li><li>Length</li><li><ul><li>The size of the value field (typically in bytes);</li></ul></li><li>Value</li><li><ul><li>Variable-sized series of bytes which contains data for this part of the message.</li></ul></li></ul><p><em>For a crash course on the subject of reverse engineering protocols, I recommend watching <a href="https://www.youtube.com/watch?v=FKbVNXnR10A">PancakesCon 2 - netspooky - Reverse Engineering &amp; ASCII Art For Beginners</a></em></p><h2 id="attempt-2">Attempt 2</h2><p>This time, we’re going to replace the text, but we’re going to pad the replaced text so that it matches the same length of the original value using spaces</p><div><pre><code data-lang="go"><span>//OLD
+</span><span>//bytes.ReplaceAll(app.Payload(), []byte("Father Aereck"), []byte("REMY"))
+</span><span>//New
+</span><span></span><span>bytes</span>.<span>ReplaceAll</span>(<span>app</span>.<span>Payload</span>(), []byte(<span>"Father Aereck"</span>), []byte(<span>"REMY         "</span>))</code></pre></div><p><img src="https://remyhax.xyz/packetediting/remy.jpg" alt="success"></p><p>Success! We can rewrite the text of an NPC.</p><p>Start looking into where the <em>Length</em> (L) value is defined in the protocol so that you don’t need to arbitrarily pad the <em>Value</em> (V). Once you know the format of the L and V, you might start playing with different <em>Types</em> (T).</p><p>From there, you’re well on your way to understanding how things work behind the scenes.</p><p>This will of course require staring at hex output, but there are tools that make it much easier. A method called “differential analysis” can be used to narrow down specific pieces of a protocol so that they are easier to understand.</p><p>A useful tool for this is <a href="https://github.com/netspooky/pdiff">pDiff</a> which is demoed in the PancakesCon youtube video linked above.</p><p>You can also use a WebAssembly implementation in-browser that I wrote here: <a href="https://remyhax.xyz/tools/pdiffwasm/">https://remyhax.xyz/tools/pdiffwasm/</a></p><p>The setup I use with a hosted Wifi AP allows packet editing for anything with WiFi support which keeps it versatile. iPhone, Android, Playstation, XBOX, Nintendo, etc…</p><p>The examples above explicitly modify packets destined for the client. You probably aren’t allowed to (and shouldn’t!) modify packets destined to the server.</p><p>Again, and I cannot be any more explicit about this:</p><ul><li>Cheating ruins games for everyone. Don’t do it.</li><li><a href="https://archive.org/">Archive.org</a> has tons of old games you can <em>self host</em> to poke around.</li><li>Don’t mess with servers you don’t own or manage.</li></ul><p>That being said, dissecting and playing with protocols is extremely fun.</p><p>Dissect the protocol because it’s fun.</p><p>Play the games because they’re fun.</p><p>Don’t mix those two.</p><p>-remy</p></div></div>]]>
+            </description>
+            <link>https://remyhax.xyz/posts/golang-packet-editing/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-39824611</guid>
+            <pubDate>Tue, 26 Mar 2024 05:52:12 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Speeding up Azure development by not using Terraform]]>
             </title>
             <description>
 <![CDATA[
-Score 70 | Comments 80 (<a href="https://news.ycombinator.com/item?id=39820432">thread link</a>) | @elisselockhart
+Score 71 | Comments 82 (<a href="https://news.ycombinator.com/item?id=39820432">thread link</a>) | @elisselockhart
 <br/>
 March 25, 2024 | https://nitric.io/blog/terraform-comparison-demo | <a href="https://web.archive.org/web/*/https://nitric.io/blog/terraform-comparison-demo">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article><div><p>We recently built a basic e-commerce site to demonstrate how to deploy to Microsoft Azure. We compared what the process looked like using Nitric vs. Terraform for the infrastructure.</p><p>The video below shows how we built and deployed the application. Here, we'll walk through the specifics of the infrastructure and application code when building with Nitric and then with Terraform.</p><p><iframe src="https://www.youtube-nocookie.com/embed/_n8S0IYxmSM?si=soCg6ur6HPyWIG4I" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"></iframe></p><p>The application code is kept relatively simple as we are mainly focused on the infrastructure code differences. This project will have two services, one for handling user submitted orders, and one for generating invoices for those orders. There will be a topic which binds these two services together and a bucket which will store the generated orders.</p><p>To get this running in Azure we will need to create the following resources:</p><ul><li>Resource Group - for logical grouping</li><li>2 Container Apps</li><li>Container Registry - to store the container images</li><li>Container App Environment - to run the container apps</li><li>EventGrid Topic</li><li>EventGrid Subscription</li><li>Storage Account - to configure the storage container</li><li>Storage Container</li><li>IAM rules - to implement least-privilege</li></ul><p><img src="https://nitric.io/images/blog/terraform-comparison-demo/azure-example.svg" width="1000px" alt="Diagram describing the architecture of the application"></p><p>For an application built using traditional Infrastructure as Code (IaC) tooling like Terraform, each of these resources needs to be individually defined, configured, and bound to the application code. Using a more Infastructure <em>from</em> Code approach like Nitric, the resources are defined in your application code. We will first take a look at writing and deploying this application with Nitric, and then compare this with the same application written in HCL.</p><h2 id="building-with-nitric">Building with Nitric</h2><p>To start, ensure you have the <a href="https://nitric.io/docs/installation" target="_blank" rel="noreferrer">Nitric CLI</a> installed. We can then create our Nitric project using the following command.</p><pre><code><span>nitric new bookstore </span><span>"official/TypeScript - Starter"</span>
@@ -624,7 +1245,7 @@ March 25, 2024 | https://nitric.io/blog/terraform-comparison-demo | <a href="htt
             </title>
             <description>
 <![CDATA[
-Score 63 | Comments 61 (<a href="https://news.ycombinator.com/item?id=39820269">thread link</a>) | @disadvantage
+Score 64 | Comments 61 (<a href="https://news.ycombinator.com/item?id=39820269">thread link</a>) | @disadvantage
 <br/>
 March 25, 2024 | https://www.oliviaking.com/inclusive-sans | <a href="https://web.archive.org/web/*/https://www.oliviaking.com/inclusive-sans">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-block-type="2" data-border-radii="{&quot;topLeft&quot;:{&quot;unit&quot;:&quot;px&quot;,&quot;value&quot;:0.0},&quot;topRight&quot;:{&quot;unit&quot;:&quot;px&quot;,&quot;value&quot;:0.0},&quot;bottomLeft&quot;:{&quot;unit&quot;:&quot;px&quot;,&quot;value&quot;:0.0},&quot;bottomRight&quot;:{&quot;unit&quot;:&quot;px&quot;,&quot;value&quot;:0.0}}" id="block-5751185ca34d09d986a6"><div>
@@ -665,11 +1286,26 @@ March 25, 2024 | https://www.oliviaking.com/inclusive-sans | <a href="https://we
         </item>
         <item>
             <title>
+<![CDATA[Scripts should be written using the project main language]]>
+            </title>
+            <description>
+<![CDATA[
+Score 52 | Comments 53 (<a href="https://news.ycombinator.com/item?id=39820011">thread link</a>) | @freitzzz
+<br/>
+March 25, 2024 | https://joaomagfreitas.link/scripts-should-be-written-using-the-project-main-language/ | <a href="https://web.archive.org/web/*/https://joaomagfreitas.link/scripts-should-be-written-using-the-project-main-language/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>This is an <a>hot-take</a> I’ve been feeling for a long time.</p><p>Almost all projects I’ve worked on have scripts we wrote to automate a <strong>repetitive process</strong>. Consecutively, the majority of the scripts became obsolete and unmaintainable after some weeks because we either didn’t need them anymore or they have become too <strong>complex</strong> to be looked at. Afterward, these scripts are either refactored or they stay forever in the <em>scripts graveyard</em>.</p><figure><img src="https://raw.githubusercontent.com/freitzzz/cinderela/master/blog/general/clipart/tombstone-128.png" alt="A clipart styled tombstone labeled with RIP"><figcaption><p>Never forget to pay your respects for all the scripts we left to rot 🫡 (<a href="https://clipart-library.com/clipart/rTjKGajec.htm">Source</a>)</p></figcaption></figure><p>I think one of the major reasons that led to this outcome is that we wrote the scripts in <code>Bash</code> or <code>Python</code>. Don’t get me wrong, I’m a big fan of the two, but I feel like teams can <strong>win</strong> more if they write scripts using the <strong>main</strong> language their project is developed with. From the start, <em>time</em> and <em>effort</em> required to write them is reduced since:</p><ul><li>The learning curve is <strong>minimal</strong> since you already know the corners of the language</li><li>Internal language APIs can be leveraged, which drastically changes the <strong>mental model</strong> to write the script (for the better)</li><li>Scripts feel more <strong>natural</strong> and eventually <strong>maintainability</strong> increases. Team members are <strong>familiarized</strong> with the language!</li><li>Development machines <strong>compatibility</strong> increases. Windows users can finally run all scripts. 🤭</li></ul><p>The downside of going in this direction is the main language <strong>runtime</strong> support. Not every language is multi-paradigm or was designed to support scripting. For example, writing scripts on <code>JVM</code> languages would require additional effort to build a <strong>toolchain</strong> that compiles and runs files on the fly, with a short start time. But if you work on a web frontend project (<code>JavaScript</code>), the power is in your hands.</p><p>At the end of the day, it is up to teams to talk and establish an <strong>agreement</strong> on which language fits best their needs and <strong>standardize</strong> their scripting language. If they can use the main language, awesome. If they can’t, a higher-level scripting language with native support (e.g., <code>Python</code>) should be adopted, since it provides the means to increase maintainability in the long run.</p></div></div>]]>
+            </description>
+            <link>https://joaomagfreitas.link/scripts-should-be-written-using-the-project-main-language/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-39820011</guid>
+            <pubDate>Mon, 25 Mar 2024 18:56:14 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Two open source projects with great architecture documentation]]>
             </title>
             <description>
 <![CDATA[
-Score 288 | Comments 29 (<a href="https://news.ycombinator.com/item?id=39819409">thread link</a>) | @johnjago
+Score 335 | Comments 34 (<a href="https://news.ycombinator.com/item?id=39819409">thread link</a>) | @johnjago
 <br/>
 March 25, 2024 | https://johnjago.com/great-docs/ | <a href="https://web.archive.org/web/*/https://johnjago.com/great-docs/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -761,7 +1397,7 @@ March 25, 2024 | https://johnjago.com/great-docs/ | <a href="https://web.archive
             </title>
             <description>
 <![CDATA[
-Score 53 | Comments 26 (<a href="https://news.ycombinator.com/item?id=39818535">thread link</a>) | @oalders
+Score 57 | Comments 26 (<a href="https://news.ycombinator.com/item?id=39818535">thread link</a>) | @oalders
 <br/>
 March 25, 2024 | https://peateasea.de/hotel-hotspot-hijinks/ | <a href="https://web.archive.org/web/*/https://peateasea.de/hotel-hotspot-hijinks/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1101,11 +1737,59 @@ day<sup id="fnref:perl-saves-the-day" role="doc-noteref"><a href="#fn:perl-saves
         </item>
         <item>
             <title>
+<![CDATA[How do MRI Headphones work? (2022)]]>
+            </title>
+            <description>
+<![CDATA[
+Score 61 | Comments 73 (<a href="https://news.ycombinator.com/item?id=39816152">thread link</a>) | @kbf
+<br/>
+March 25, 2024 | https://tomlingham.com/articles/how-do-mri-headphones-work/ | <a href="https://web.archive.org/web/*/https://tomlingham.com/articles/how-do-mri-headphones-work/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>I was getting an MRI the other day (much to the surprise of my fiancée I do in
+fact have a brain — and a remarkably uninteresting one at that) and I started
+thinking about the headphones that I was wearing</p>
+<p>For those that haven't been for an MRI before, they are pretty uncomfortable
+affairs that can take maybe an hour. To help pass the time they have you wear
+headphones so that you can at least enjoy music that you can barely hear over
+the thumping of the machine.</p>
+<p>The only headphone tech that I was aware of or that I'd ever really considered
+was the typical diaphragm and magnet drivers "driven" by electrical signals
+traveling down a stranded copper wire. But, hang on... wait. I'm in an MRI. I'm
+not allowed to have any metals or magnetic materials on me. So, why would these
+headphones be OK?</p>
+<p>Was it the same principal as a microwave? In that
+<a href="https://www.youtube.com/watch?v=OyTmJX_TC84">metals don't really have the effect you imagine</a>
+they'd have? Surely not — MRIs use magnetic resonance (I mean, it's in the name)
+not radiation like an X-Ray or CT and certainly not microwave radiation.</p>
+<p>I started considering all the different materials that could possibly achieve a
+similar result. Maybe something conductive but non-magnetic with silver or gold?
+I mean, after all my gold dental crown was fine to be in the machine (though it
+did create a noticeable artifact — a little black hole of nothing where that
+tooth would be). Was it something mechanical? I couldn't think of anything that
+would achieve that same result except the old can-and-string telephones that
+we'd create as children did come to mind (but the headphones weren't taut?).</p>
+<p>But then at the end of the MRI I noticed that the "cable" of the headphones was
+kind of "thick". Akin to a rubber hose. It turns out that it's much much simpler
+than any of what I was thinking.</p>
+<p>Instead of magnetic drivers that would otherwise pose a problem with use near or
+inside of an MRI, there is no wire and there is no driver. The headphones are
+nothing but a cup with a tube extending from them that leads from the headphones
+away from the MRI machine into another room where the drivers are located. The
+sound is transported along the tube via air — a very simple solution. Though
+this also explains why they sound absolutely terrible.</p>
+<p>Please enjoy this artists rendition of the design:</p>
+<p><img src="https://tomlingham.com/images/mri-headphones-sketch.png" alt="MRI Headphones vs. Traditional"></p></div></div>]]>
+            </description>
+            <link>https://tomlingham.com/articles/how-do-mri-headphones-work/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-39816152</guid>
+            <pubDate>Mon, 25 Mar 2024 13:39:06 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Bump Allocation: Up or Down?]]>
             </title>
             <description>
 <![CDATA[
-Score 94 | Comments 18 (<a href="https://news.ycombinator.com/item?id=39815429">thread link</a>) | @celeritascelery
+Score 99 | Comments 19 (<a href="https://news.ycombinator.com/item?id=39815429">thread link</a>) | @celeritascelery
 <br/>
 March 25, 2024 | https://coredumped.dev/2024/03/25/bump-allocation-up-or-down/ | <a href="https://web.archive.org/web/*/https://coredumped.dev/2024/03/25/bump-allocation-up-or-down/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1314,11 +1998,212 @@ March 25, 2024 | https://coredumped.dev/2024/03/25/bump-allocation-up-or-down/ |
         </item>
         <item>
             <title>
+<![CDATA[Thoughts on Vision Pro]]>
+            </title>
+            <description>
+<![CDATA[
+Score 56 | Comments 78 (<a href="https://news.ycombinator.com/item?id=39815391">thread link</a>) | @AndrewHart
+<br/>
+March 25, 2024 | https://andrewhart.me/vision-pro/ | <a href="https://web.archive.org/web/*/https://andrewhart.me/vision-pro/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+  <div>
+    <div>
+
+      
+
+      
+
+      <div>
+        <p>A month ago, I flew from London to NYC, paid $3500 for a Vision Pro headset at Apple Fifth Avenue, and flew back home. I’ve been using it every day since — here’s what I think.</p>
+
+<p>My background, for context:</p>
+<ul>
+  <li>I’ve been working in AR <a href="https://x.com/AndrewHartAR/status/886916872683343872?s=20">for many years</a>.</li>
+  <li>I built the largest open-source projects for both of Apple’s AR frameworks — ARKit and RealityKit.</li>
+  <li>I pioneered AR Navigation, which you can try out in Apple and Google Maps.</li>
+  <li>I run an AR startup called <a href="https://hyperar.com/">Hyper</a>, where we’ve built breakthrough AR technology for precise indoor location.</li>
+  <li>I’m not knowledgeable on AR/VR hardware.</li>
+  <li>I own a PSVR, Oculus Go, Quest 1 and 2 — and now, a Vision Pro.</li>
+</ul>
+
+<p>I’m going to assume some familiarity with Vision Pro and focus on a few key areas. I’d recommend <a href="https://www.wired.com/review/apple-vision-pro/">Wired</a> or <a href="https://www.theverge.com/24054862/apple-vision-pro-review-vr-ar-headset-features-price">The Verge</a> reviews for an introduction.</p>
+
+<p>I typically use Vision Pro for working via the Mac Virtual Screen feature, and watching TV/movies.</p>
+
+<p><img src="https://andrewhart.me/assets/img/vision-pro/sb.jpg" alt="Vision Pro"></p>
+
+<h2 id="passthrough">Passthrough</h2>
+<p>Passthrough is impressive compared to everything else I’ve tried, but still feels like viewing the world through a noisy camera feed. I was surprised — many of the initial impressions from last year described it as life-like, almost impossible to tell from reality.</p>
+
+<p><a href="https://daringfireball.net/2023/06/first_impressions_of_vision_pro_and_visionos">John Gruber</a>:</p>
+<blockquote>
+  <p>The pass-through video experience is so seamless, so natural, so much like just looking through glasses, not looking at a screen inside a headset</p>
+</blockquote>
+
+<p>It’s not, and this is misleading. Here’s an example of passthrough compared to real life:</p>
+
+<div>
+  
+  <p><img src="https://andrewhart.me/assets/img/vision-pro/quality-1.jpg" alt="">
+  </p>
+  <p><img src="https://andrewhart.me/assets/img/vision-pro/quality-2.jpg" alt="">
+  </p>
+</div>
+
+
+
+
+<ul>
+  <li>Passthrough quality will be a year-on-year improvement, it’s not quite there yet.</li>
+  <li>Apple have done a remarkable job of minimising distortion, compared to Meta who have been shipping passthrough for about 4 years but <a href="https://x.com/rafamolone/status/1758079480780771544?s=20">still have challenges</a>.</li>
+  <li>Some typical camera behaviours remain — flickering lights, lens flare, exposure issues, motion blur.</li>
+</ul>
+
+<h2 id="immersion">Immersion</h2>
+<ul>
+  <li>The screen resolution is stunning. The rendered virtual content looks real, you can’t see any pixels. Ironically, the virtual content looks closer to real life than the passthrough camera feed.</li>
+</ul>
+
+<h3 id="environments">Environments</h3>
+<ul>
+  <li>Environments are impressive, but could be more interesting. Quest has you in cozy home environments with a warm fire, or on a space station with an immersive window.</li>
+  <li>There are some more fun environments, but they’re hidden away in different places. Keynote has a boardroom, and Steve Jobs Theatre. Disney+ has New York City and Tatooine. Apple TV app has a cinema environment, plus it can blast the video out to a giant cinema screen over your system environment.</li>
+  <li>Will Apple open up environments in some way? I’d pay $$ for an environment pack.</li>
+  <li>The environments are also a bit fiddly to change right now.</li>
+</ul>
+
+<p><img src="https://andrewhart.me/assets/img/vision-pro/moon.gif" alt="Moon environment"></p>
+
+<h3 id="comfort">Comfort</h3>
+<ul>
+  <li>A number of factors make Vision Pro less comfortable to use: limited field-of-view (tunnel vision), passthrough quality, motion blur and weight. When I take it off, I feel some relief to be back in the real world.</li>
+  <li>But using without the <a href="https://support.apple.com/en-gb/guide/apple-vision-pro/tan9e3152900/visionos">Light Seal</a> is a massive improvement. You’re closer to the screen, so it reduces the tunnel vision and expands the effective field-of-view. And rather than a black edge, you have a frame, with outside visibility.
+</li>
+</ul>
+
+<div>
+  
+  <p><img src="https://andrewhart.me/assets/img/vision-pro/fs-1.jpg" alt="">
+  </p>
+  <p><img src="https://andrewhart.me/assets/img/vision-pro/fs-2.jpg" alt="">
+  </p>
+</div>
+
+
+<p>Of course, it’s not designed for this — the aluminium frame is just resting right on your nose. <strong>I really want someone to make an accessory to solve this</strong>.</p>
+
+<h2 id="inputs">Inputs</h2>
+<p>Look-and-tap feels very natural and quick to pick up. It’s Apple’s next interaction model.</p>
+
+<div><p><img src="https://andrewhart.me/assets/img/vision-pro/sj.jpg" alt="Steve Jobs Revolutionary User Interfaces slide"></p></div>
+
+<p>But it’s not perfect.</p>
+<ul>
+  <li>After using it for any length of time, I realised that my eyes move onto the next thing before I’ve tapped. Moving my eyes over to every button and staring at it until I’ve completed a tap, feels like a chore that’s slowing me down.</li>
+  <li>There’s also anxiety because everything you look at is immediately selected, and one accidental tap could be destructive.</li>
+  <li>I was downloading Star Wars for my flight back to London. The only way to check progress over slow hotel wifi was to look at the progress circle, which is also the cancel button. I was aware that every time I checked progress, I was one finger-spasm away from cancelling the whole download.</li>
+</ul>
+
+<div><p><img src="https://andrewhart.me/assets/img/vision-pro/download.jpg" alt="Easy to mistakenly cancel download"></p></div>
+
+<ul>
+  <li>Virtual keyboard is very challenging for air-typing on. It turns out you really need a surface to rest your hands, and physical feedback when you tap.</li>
+  <li>When you think about it, even iPhone keyboard has the feedback of touching a physical surface as you tap each key.</li>
+  <li>You can also peck at each individual key by looking and tapping — this is as cumbersome as it sounds.</li>
+  <li>The most practical solution is to use a physical keyboard, via Mac Virtual Screen or connecting one directly, but this is a bandaid solution. It reminds me of <a href="https://cdn.macstories.net/002/20761_MC533_AV1.jpeg">the keyboard solution for iPad 1</a>. Hopefully Apple have a much better answer to this for v2.</li>
+</ul>
+
+<h2 id="visionos">visionOS</h2>
+<p>The biggest innovation with Vision Pro is visionOS. <em>visionOS provides native app frameworks, so developers can build apps for it.</em> That sounds ridiculously obvious, and yet its something Meta <a href="https://twitter.com/AndrewHartAR/status/1659538128724545536">have failed to offer for years</a>.</p>
+
+<p>Every app on Quest has to reinvent how buttons work, how a scroll view works, how far away from the user the content should be etc.. and every app works differently. On visionOS, all of this is handled by Apple, and every app looks and feels the same.</p>
+
+<p>The apps can also co-exist alongside each other, in your own space. Quest and PSVR are consoles, by comparison. You tap a title, it launches a fully immersive Unity app with a custom UX. You click a home button, back to your list of titles.</p>
+
+<p>On visionOS, apps can’t freeze up the system — if there is a crash, passthrough and environments will always keep rendering without missing a frame, so you never feel nauseous from that. It doesn’t flash white in your face when you launch a new app, like often happens on Quest. Small details that matter.</p>
+
+<p>
+<iframe src="https://www.youtube.com/embed/t5m16QBF-I8?rel=0" width="730" height="411" title="visionOS demo" frameborder="0" allowfullscreen=""></iframe>
+</p>
+
+<p>But it’s still early days for visionOS. It really feels like a perfect v1 OS, with the foundations set and tonnes of opportunity for improvement. Window management in particular needs a lot of work:</p>
+<ul>
+  <li>Windows by default all just open in front of you, which quickly turns into a stack, that you have to manually move each window out the window to get to the ones behind it.</li>
+  <li>If I want to keep some of my apps open but out sight, I just drag them off to my left and leave them over there to pile up. It gets messy.</li>
+  <li>There’s no way to ‘hide’ or ‘minimise’ an app. If I tap close on Disney+, my download continues in the background. If I tap close on Apple Music, my music stops playing. 🫠  So this needs some work.</li>
+</ul>
+
+<p><img src="https://andrewhart.me/assets/img/vision-pro/overlap.jpg" alt="Overlapping windows"></p>
+
+<h2 id="content">Content</h2>
+<ul>
+  <li><a href="https://twitter.com/dvdaltizer/status/1677360272527302662">There was a rumour last year</a>  that Apple was shooting all Apple TV+ shows using special cameras, for immersion in Vision Pro. Sadly not. <em>For All Mankind</em> isn’t even available in 3D.</li>
+  <li>
+    <p>The only immersive content currently available so far is a handful of short one-off videos. They are all incredible, much higher res I’ve seen in any immersive video – but you can get through everything in less than an hour.</p>
+  </li>
+  <li>
+    <p>Spatial photos/videos are also an amazing experience, even just watching the videos from a month ago give me a blast of nostalgia.</p>
+  </li>
+  <li>
+    <p>There aren’t that many apps available yet, it’s a lot like the early iPhone days in that sense.</p>
+  </li>
+  <li>The first-run experiences on PSVR and Quest give a great intro to the system. Vision Pro is just the necessary boring setup steps. I was hoping for something more exciting, similar to <a href="https://www.youtube.com/watch?v=5DSXz9xst5k">the experience I had</a> when I bought my first Mac.</li>
+</ul>
+
+<h2 id="sharing-and-giving-demos">Sharing and giving demos</h2>
+<p>Every device is calibrated to the owner, with a custom Light Seal etc.. so one of the first questions I had is, can I demo and share this with other people? Yes, but it’s early days and these features need some work.</p>
+
+<h3 id="sharing-screenshots">Sharing screenshots</h3>
+
+<ul>
+  <li>Vision Pro renders high-res visuals where you look, and blurs everywhere else to boost the frame rate. This is all fine, but when you take a screenshot, it includes the blur, so people who haven’t used it before are confused and think it really is that low res (check my screenshot above demonstrating the cancel button for an example). Apple should make it render the full frame for screenshots.</li>
+  <li>Watching Apple TV+ shows on a giant screen reflecting in the ripples of the water under Mount Hood, is stunning. I live in the phones-at-concerts generation, so my immediate reaction is to screenshot and share how amazing it looks. But for copyright reasons, if you try and screenshot most content, it blacks it out, which is a shame. I always forget, so I have tonnes of screenshots like this.</li>
+</ul>
+
+<p><img src="https://andrewhart.me/assets/img/vision-pro/jw.jpg" alt="A blacked-out screenshot of a movie"></p>
+
+<h3 id="guest-mode">Guest Mode</h3>
+
+<ul>
+  <li>Apple provides two options for guest mode - full access, or just the currently open apps.</li>
+  <li>Full access means <em>full access</em>, including your photos, email, notes etc. 💀</li>
+  <li>Limited access means you have to set everything up perfectly each time, and if they accidentally close out of something, they’re doomed. But surely, they can easily reset Guest Mode, right? Eh, no.</li>
+  <li>If your guest lifts the headset off their head, they’re kicked out of guest mode, and have to hand it back to you. They have to go through the 2 minute setup process every time. A few tweaks and this whole system could be a lot better (“remember me for later”?)</li>
+  <li>And to be honest, I also don’t mind my guest having access to 90% of the system, just protect some of my apps and we’re good.</li>
+  <li>One great feature of demo mode is Mac mirroring, which projects the view from the headset onto your Mac. This is great for quickly giving demos to a small group. The caveat: they now can’t try out watching TV shows and see the Mount Hood ripple effect. Or any of the immersive videos, which would otherwise make for a great demo. It blacks out the video, both on the Mac mirroring and inside the headset. The guest will be staring at black for a while, thinking it’s just atmospheric. So my tip right now is: always go for the trailers, they’re not copyright protected and still help to demo the TV/movies features.</li>
+</ul>
+
+<h2 id="conclusion">Conclusion</h2>
+
+<p><img src="https://andrewhart.me/assets/img/vision-pro/home.jpg" alt="visionOS"></p>
+
+<p>I love a v1 product. v1 should demonstrate some value and a vision, but still be a little rough, with plenty of things people can point at and criticise (such as some upstart tech person with a new blog, for example 👀).</p>
+
+<p>Vision Pro is a perfect v1. There are some things to improve, and some hardware teething problems too (<a href="https://discussions.apple.com/thread/255461254?sortBy=best&amp;page=1">my right speaker is overheating</a>). I’m using it 1-2 hours every day, and my feedback is all in the direction of “if <em>x</em> were better, I’d find it even more valuable”, which is a positive signal. I’m super excited to see what comes next.</p>
+
+      </div>
+
+      
+
+      
+
+      
+
+    </div>
+  </div>
+</div></div>]]>
+            </description>
+            <link>https://andrewhart.me/vision-pro/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-39815391</guid>
+            <pubDate>Mon, 25 Mar 2024 12:21:05 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Friends don't let friends export to CSV]]>
             </title>
             <description>
 <![CDATA[
-Score 180 | Comments 325 (<a href="https://news.ycombinator.com/item?id=39814334">thread link</a>) | @lervag
+Score 229 | Comments 403 (<a href="https://news.ycombinator.com/item?id=39814334">thread link</a>) | @lervag
 <br/>
 March 25, 2024 | https://kaveland.no/friends-dont-let-friends-export-to-csv.html | <a href="https://web.archive.org/web/*/https://kaveland.no/friends-dont-let-friends-export-to-csv.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1533,7 +2418,7 @@ efficient to work with.</p>
             </title>
             <description>
 <![CDATA[
-Score 87 | Comments 23 (<a href="https://news.ycombinator.com/item?id=39814271">thread link</a>) | @ingve
+Score 92 | Comments 24 (<a href="https://news.ycombinator.com/item?id=39814271">thread link</a>) | @ingve
 <br/>
 March 25, 2024 | https://www.c64os.com/post/hiddenfiles | <a href="https://web.archive.org/web/*/https://www.c64os.com/post/hiddenfiles">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2371,7 +3256,7 @@ done     rts
             </title>
             <description>
 <![CDATA[
-Score 89 | Comments 12 (<a href="https://news.ycombinator.com/item?id=39813588">thread link</a>) | @undefined_void
+Score 89 | Comments 13 (<a href="https://news.ycombinator.com/item?id=39813588">thread link</a>) | @undefined_void
 <br/>
 March 25, 2024 | https://divy.work/turbocall.html | <a href="https://web.archive.org/web/*/https://divy.work/turbocall.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
@@ -2519,7 +3404,7 @@ like Hermes, Quickjs.</p>
             </title>
             <description>
 <![CDATA[
-Score 407 | Comments 404 (<a href="https://news.ycombinator.com/item?id=39812969">thread link</a>) | @thunderbong
+Score 413 | Comments 433 (<a href="https://news.ycombinator.com/item?id=39812969">thread link</a>) | @thunderbong
 <br/>
 March 24, 2024 | https://notgull.net/why-not-threads/ | <a href="https://web.archive.org/web/*/https://notgull.net/why-not-threads/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2960,7 +3845,7 @@ We should be using semantic reasons.</p>
             </title>
             <description>
 <![CDATA[
-Score 99 | Comments 74 (<a href="https://news.ycombinator.com/item?id=39812124">thread link</a>) | @djha-skin
+Score 100 | Comments 74 (<a href="https://news.ycombinator.com/item?id=39812124">thread link</a>) | @djha-skin
 <br/>
 March 24, 2024 | https://blog.djhaskin.com/blog/mutt-on-windows-without-wsl/ | <a href="https://web.archive.org/web/*/https://blog.djhaskin.com/blog/mutt-on-windows-without-wsl/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div itemprop="articleBody">
@@ -3081,7 +3966,7 @@ set envelope_from=yes
             </title>
             <description>
 <![CDATA[
-Score 53 | Comments 19 (<a href="https://news.ycombinator.com/item?id=39811291">thread link</a>) | @rcarmo
+Score 55 | Comments 19 (<a href="https://news.ycombinator.com/item?id=39811291">thread link</a>) | @rcarmo
 <br/>
 March 24, 2024 | https://mccormick.cx/news/entries/moving-back-to-london-2023-review | <a href="https://web.archive.org/web/*/https://mccormick.cx/news/entries/moving-back-to-london-2023-review">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -3158,7 +4043,7 @@ March 24, 2024 | https://mccormick.cx/news/entries/moving-back-to-london-2023-re
             </title>
             <description>
 <![CDATA[
-Score 68 | Comments 145 (<a href="https://news.ycombinator.com/item?id=39808967">thread link</a>) | @dbingham
+Score 69 | Comments 149 (<a href="https://news.ycombinator.com/item?id=39808967">thread link</a>) | @dbingham
 <br/>
 March 24, 2024 | https://www.theroadgoeson.com/why-isnt-preprint-review-being-adopted | <a href="https://web.archive.org/web/*/https://www.theroadgoeson.com/why-isnt-preprint-review-being-adopted">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section>
@@ -3416,7 +4301,7 @@ current attempts, this one removes the most barriers to adoption.</li>
             </title>
             <description>
 <![CDATA[
-Score 162 | Comments 105 (<a href="https://news.ycombinator.com/item?id=39808616">thread link</a>) | @layer8
+Score 164 | Comments 105 (<a href="https://news.ycombinator.com/item?id=39808616">thread link</a>) | @layer8
 <br/>
 March 24, 2024 | https://www.atnnn.com/p/operator-larrow/ | <a href="https://web.archive.org/web/*/https://www.atnnn.com/p/operator-larrow/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content">
@@ -3468,7 +4353,7 @@ March 24, 2024 | https://www.atnnn.com/p/operator-larrow/ | <a href="https://web
             </title>
             <description>
 <![CDATA[
-Score 173 | Comments 259 (<a href="https://news.ycombinator.com/item?id=39808357">thread link</a>) | @firstSpeaker
+Score 176 | Comments 267 (<a href="https://news.ycombinator.com/item?id=39808357">thread link</a>) | @firstSpeaker
 <br/>
 March 24, 2024 | https://unravelweb.dev/2024/02/12/the-u-u-conundrum/ | <a href="https://web.archive.org/web/*/https://unravelweb.dev/2024/02/12/the-u-u-conundrum/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="post-1020">
@@ -3547,7 +4432,7 @@ March 24, 2024 | https://unravelweb.dev/2024/02/12/the-u-u-conundrum/ | <a href=
             </title>
             <description>
 <![CDATA[
-Score 104 | Comments 51 (<a href="https://news.ycombinator.com/item?id=39807914">thread link</a>) | @przem8k
+Score 105 | Comments 51 (<a href="https://news.ycombinator.com/item?id=39807914">thread link</a>) | @przem8k
 <br/>
 March 24, 2024 | https://newsletter.pnote.eu/p/be-more-lucky | <a href="https://web.archive.org/web/*/https://newsletter.pnote.eu/p/be-more-lucky">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><article><div><div><div dir="auto"><p>What if luck was a skill?</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F91884328-aa97-4102-8aff-900f3810dc17_1456x832.jpeg" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F91884328-aa97-4102-8aff-900f3810dc17_1456x832.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F91884328-aa97-4102-8aff-900f3810dc17_1456x832.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F91884328-aa97-4102-8aff-900f3810dc17_1456x832.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F91884328-aa97-4102-8aff-900f3810dc17_1456x832.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F91884328-aa97-4102-8aff-900f3810dc17_1456x832.jpeg" width="1456" height="832" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/91884328-aa97-4102-8aff-900f3810dc17_1456x832.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:832,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:212236,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/jpeg&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:true,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F91884328-aa97-4102-8aff-900f3810dc17_1456x832.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F91884328-aa97-4102-8aff-900f3810dc17_1456x832.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F91884328-aa97-4102-8aff-900f3810dc17_1456x832.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F91884328-aa97-4102-8aff-900f3810dc17_1456x832.jpeg 1456w" sizes="100vw" fetchpriority="high"></picture></div></a></figure></div><p>The proposition sounds absurd, and yet we all know people who seem to be good at being lucky. They don’t try that hard and nice things just keep coming: they meet the right people at the right time, narrowly catch all trains and never get pooped on by birds.</p><p>If we’re are not superstitious, then what could explain the patterns of good (or ill fortune) some of us experience?</p><p><span>Richard Wieseman (University of Hertfordshire) </span><a href="http://richardwiseman.com/resources/The_Luck_Factor.pdf" rel="">describes</a><span> an experiment in which people first self-identify as lucky or unlucky; and then start working on a simple task: counting the photographs in a newspaper.</span></p><p>The pictures are easy enough to count: there are 43 of them.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F5353c6c4-c082-48b6-ba2a-f3d0ef9ba3cd_1456x832.jpeg" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F5353c6c4-c082-48b6-ba2a-f3d0ef9ba3cd_1456x832.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F5353c6c4-c082-48b6-ba2a-f3d0ef9ba3cd_1456x832.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F5353c6c4-c082-48b6-ba2a-f3d0ef9ba3cd_1456x832.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F5353c6c4-c082-48b6-ba2a-f3d0ef9ba3cd_1456x832.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F5353c6c4-c082-48b6-ba2a-f3d0ef9ba3cd_1456x832.jpeg" width="1456" height="832" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/5353c6c4-c082-48b6-ba2a-f3d0ef9ba3cd_1456x832.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:832,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:431045,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/jpeg&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F5353c6c4-c082-48b6-ba2a-f3d0ef9ba3cd_1456x832.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F5353c6c4-c082-48b6-ba2a-f3d0ef9ba3cd_1456x832.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F5353c6c4-c082-48b6-ba2a-f3d0ef9ba3cd_1456x832.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F5353c6c4-c082-48b6-ba2a-f3d0ef9ba3cd_1456x832.jpeg 1456w" sizes="100vw"></picture></div></a></figure></div><p><span>But the newspaper also contains something else: within one of the columns, there’s a piece of text that reads: </span><em>Stop counting, tell the experimenter you have seen this and win $250.</em></p><p>Guess which group tends to find the hidden message more often?</p><p><span>Why did the “unlucky” people miss the hidden message? According to Wieseman, people miss chance opportunities when they’re </span><em>too focused on looking for something else</em><span>.</span></p><blockquote><p><em>They go to parties intent on finding their perfect partner and so miss opportunities to make good friends. They look through newspapers determined to find certain type of job advertisements and as a result miss other types of jobs.</em><span> </span></p></blockquote><p>Meanwhile, lucky people tend to be more relaxed and have a softer focus, which helps them to notice the little opportunities gleaning on the periphery of their vision. (Literally or figuratively.)</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8891a16c-fa96-495a-8e10-c94389647909_1426x958.jpeg" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8891a16c-fa96-495a-8e10-c94389647909_1426x958.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8891a16c-fa96-495a-8e10-c94389647909_1426x958.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8891a16c-fa96-495a-8e10-c94389647909_1426x958.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8891a16c-fa96-495a-8e10-c94389647909_1426x958.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8891a16c-fa96-495a-8e10-c94389647909_1426x958.jpeg" width="1426" height="958" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/8891a16c-fa96-495a-8e10-c94389647909_1426x958.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:958,&quot;width&quot;:1426,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:158106,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/jpeg&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8891a16c-fa96-495a-8e10-c94389647909_1426x958.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8891a16c-fa96-495a-8e10-c94389647909_1426x958.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8891a16c-fa96-495a-8e10-c94389647909_1426x958.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8891a16c-fa96-495a-8e10-c94389647909_1426x958.jpeg 1456w" sizes="100vw" loading="lazy"></picture></div></a><figcaption><strong>Tim Minchin</strong><span>: Advice! Metaphor! Look at me go</span></figcaption></figure></div><p><span>Reading about this I had a strange sense of dejà vu, and then remembered </span><a href="https://www.youtube.com/watch?v=yoEezZD71sc&amp;t=211s" rel="">this bit</a><span> from the magnificent Tim Minchin: </span></p><blockquote><p><em><span>The next worthy pursuit will probably appear in your </span><strong>periphery</strong><span>. Which is why you should be careful of long-term dreams: if you focus too far in front of you, you won’t see the shiny thing out the corner of your eye.</span></em></p></blockquote><p>Here’s a comedian and a psychology professor saying the same thing about good fortune 💫.</p><p>I’d love to see more ideas (and projects and products) that aim to increase the surface area of serendipity in our lives. There may be a startup idea along the lines of “Headspace but for luck”. How would such an app look like?</p><ul><li><p><span>📖 Wieseman wrote an </span><a href="https://www.goodreads.com/book/show/100158.The_Luck_Factor?ac=1&amp;from_search=true&amp;qid=G4keXllTYW&amp;rank=1" rel="">entire book</a><span> on this</span></p></li><li><p><span>📝 Source </span><a href="http://richardwiseman.com/resources/The_Luck_Factor.pdf" rel="">description</a><span> of the newspaper picture experiment</span></p></li><li><p><span>🎨 </span><a href="https://www.rnz.co.nz/news/the-wireless/373065/the-pencilsword-on-a-plate" rel="">On a plate</a><span>. Luck and openness to opportunities are only part of the story. Behind every success there’s a lot of support and resources that tend to be unequally distributed.</span></p></li></ul><ul><li><p><span>🗺️ My </span><a href="https://pnote.eu/projects/invaders/" rel="">map of space invaders</a><span> in Paris and beyond now supports deep links, so that you can share a link to a specific location and zoom level on the map.</span></p></li><li><p><span>🤖 </span><strong>Inflection AI gets aquihired</strong><span> (</span><em>eaten alive</em><span> as playfully </span><a href="https://techcrunch.com/2024/03/19/after-raising-1-3b-inflection-got-eaten-alive-by-its-biggest-investor-microsoft/" rel="">described</a><span> by Techcrunch) by Microsoft, which appoints Mustafa Suleyman (co-founder of DeepMind) to lead their new AI unit, Microsoft AI</span></p></li></ul><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4234d4bc-968a-4a47-90f6-80f846da4617_3894x2189.jpeg" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4234d4bc-968a-4a47-90f6-80f846da4617_3894x2189.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4234d4bc-968a-4a47-90f6-80f846da4617_3894x2189.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4234d4bc-968a-4a47-90f6-80f846da4617_3894x2189.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4234d4bc-968a-4a47-90f6-80f846da4617_3894x2189.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4234d4bc-968a-4a47-90f6-80f846da4617_3894x2189.jpeg" width="1456" height="818" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/4234d4bc-968a-4a47-90f6-80f846da4617_3894x2189.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:818,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:3071910,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/jpeg&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4234d4bc-968a-4a47-90f6-80f846da4617_3894x2189.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4234d4bc-968a-4a47-90f6-80f846da4617_3894x2189.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4234d4bc-968a-4a47-90f6-80f846da4617_3894x2189.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4234d4bc-968a-4a47-90f6-80f846da4617_3894x2189.jpeg 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p>The spring has come to Paris and the sun is shining over the parc of Buttes Chaumont. Springtime is a great season to think of new projects and get enthusiastic about life :).</p><p><span>Good luck 🍀,</span><br><span> – Przemek</span></p></div></div></div></article></div></div></div>]]>
@@ -3897,7 +4782,7 @@ By considering reactive programs as a collection of pure (reactive-only) reactor
             </title>
             <description>
 <![CDATA[
-Score 161 | Comments 31 (<a href="https://news.ycombinator.com/item?id=39805269">thread link</a>) | @signa11
+Score 162 | Comments 31 (<a href="https://news.ycombinator.com/item?id=39805269">thread link</a>) | @signa11
 <br/>
 March 23, 2024 | https://austinsnerdythings.com/2021/10/15/creating-an-autopilot-in-x-plane-using-python-part-1/ | <a href="https://web.archive.org/web/*/https://austinsnerdythings.com/2021/10/15/creating-an-autopilot-in-x-plane-using-python-part-1/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -3951,7 +4836,7 @@ March 23, 2024 | https://austinsnerdythings.com/2021/10/15/creating-an-autopilot
 <li>Navigate directly to a lat/lon point</li>
 </ul>
 <p>See you at the next post! Next post – <a href="https://austinsnerdythings.com/2021/10/19/coding-a-wing-leveler-autopilot-in-x-plane-with-python/" target="_blank" rel="noreferrer noopener">Coding a wing leveler autopilot in X-Plane with Python</a></p>
-<p><span></span> <span>Post Views:</span> <span>16,890</span>
+<p><span></span> <span>Post Views:</span> <span>17,284</span>
 </p>
 </div>
 </div></div>]]>
@@ -4185,7 +5070,7 @@ March 23, 2024 | https://praveshkoirala.com/2024/03/07/solving-the-nerd-sniping-
             </title>
             <description>
 <![CDATA[
-Score 125 | Comments 71 (<a href="https://news.ycombinator.com/item?id=39804004">thread link</a>) | @dmarto
+Score 132 | Comments 71 (<a href="https://news.ycombinator.com/item?id=39804004">thread link</a>) | @dmarto
 <br/>
 March 23, 2024 | https://devnonsense.com/posts/tcp-connection-timeout-mystery/ | <a href="https://web.archive.org/web/*/https://devnonsense.com/posts/tcp-connection-timeout-mystery/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content"><p>For over a year, I’ve been investigating a strange issue with the internet in my apartment.
@@ -4210,7 +5095,7 @@ Is there something special about Bunny CDN that could interact badly with the ca
             </title>
             <description>
 <![CDATA[
-Score 369 | Comments 150 (<a href="https://news.ycombinator.com/item?id=39803508">thread link</a>) | @dzdt
+Score 370 | Comments 151 (<a href="https://news.ycombinator.com/item?id=39803508">thread link</a>) | @dzdt
 <br/>
 March 23, 2024 | https://tlacuilolli.com/2024/03/21/new-aztec-codices-the-codices-of-san-andres-tetepilco/ | <a href="https://web.archive.org/web/*/https://tlacuilolli.com/2024/03/21/new-aztec-codices-the-codices-of-san-andres-tetepilco/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4261,7 +5146,7 @@ March 23, 2024 | https://tlacuilolli.com/2024/03/21/new-aztec-codices-the-codice
             </title>
             <description>
 <![CDATA[
-Score 115 | Comments 70 (<a href="https://news.ycombinator.com/item?id=39803287">thread link</a>) | @gchamonlive
+Score 117 | Comments 70 (<a href="https://news.ycombinator.com/item?id=39803287">thread link</a>) | @gchamonlive
 <br/>
 March 23, 2024 | https://xd1.dev/2024/03/hyprland-crash-course | <a href="https://web.archive.org/web/*/https://xd1.dev/2024/03/hyprland-crash-course">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -4459,7 +5344,8 @@ pressed the toggle key.</p>
     # ...
 }
 
-device:logitech-mx-keys {
+device {
+    name = logitech-mx-keys
     kb_layout = us
     kb_variant = intl
 }
@@ -4530,7 +5416,7 @@ Just <strong>don't</strong> remove it from <code>OpenSSH Keys</code> tab as it w
             </title>
             <description>
 <![CDATA[
-Score 84 | Comments 108 (<a href="https://news.ycombinator.com/item?id=39801234">thread link</a>) | @j-wang
+Score 84 | Comments 109 (<a href="https://news.ycombinator.com/item?id=39801234">thread link</a>) | @j-wang
 <br/>
 March 23, 2024 | https://weightythoughts.com/p/cuda-is-still-a-giant-moat-for-nvidia | <a href="https://web.archive.org/web/*/https://weightythoughts.com/p/cuda-is-still-a-giant-moat-for-nvidia">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><article><div><div><div dir="auto"><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7c7f5c59-7f46-4b6d-ad1b-63543b876454.heic" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7c7f5c59-7f46-4b6d-ad1b-63543b876454.heic 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7c7f5c59-7f46-4b6d-ad1b-63543b876454.heic 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7c7f5c59-7f46-4b6d-ad1b-63543b876454.heic 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7c7f5c59-7f46-4b6d-ad1b-63543b876454.heic 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7c7f5c59-7f46-4b6d-ad1b-63543b876454.heic" width="840" height="600" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/7c7f5c59-7f46-4b6d-ad1b-63543b876454.heic&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:600,&quot;width&quot;:840,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:78629,&quot;alt&quot;:&quot;NVIDIA CUDA represented as a fortress with a moat surrounding it.&quot;,&quot;title&quot;:null,&quot;type&quot;:&quot;image/heic&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:true,&quot;internalRedirect&quot;:null}" alt="NVIDIA CUDA represented as a fortress with a moat surrounding it." title="NVIDIA CUDA represented as a fortress with a moat surrounding it." srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7c7f5c59-7f46-4b6d-ad1b-63543b876454.heic 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7c7f5c59-7f46-4b6d-ad1b-63543b876454.heic 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7c7f5c59-7f46-4b6d-ad1b-63543b876454.heic 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7c7f5c59-7f46-4b6d-ad1b-63543b876454.heic 1456w" sizes="100vw" fetchpriority="high"></picture></div></a></figure></div><p><span>In a way, this is a post-</span><strong><a href="https://www.nvidia.com/gtc/" rel="">GTC</a></strong><span> update. However, </span><strong><a href="https://www.fabricatedknowledge.com/p/jensens-world-compressing-reality-be4?utm_campaign=email-post&amp;r=4de3d&amp;utm_source=substack&amp;utm_medium=email" rel="">there are already great overviews of the event</a></strong><span>. Here, I’ll explain more about why I’ve been a somewhat lonely voice (until recently) about why other players like </span><strong><a href="https://weightythoughts.com/p/fear-and-loathing-in-7nm" rel="">SMIC/Huawei/etc</a></strong><span> improving on their hardware still doesn’t displace NVIDIA at all.</span></p><p>That view mainly relates to CUDA’s ecosystem and NVIDIA’s proprietary interconnects.</p><p><span>CUDA remains as dominant as ever, and while the announcements about </span><strong><a href="https://nvidianews.nvidia.com/news/nvidia-blackwell-platform-arrives-to-power-a-new-era-of-computing" rel="">Blackwell</a></strong><span> are interesting, it’s a big incremental step forward rather than something truly groundbreaking. The much more compelling announcement related to how much more NVIDIA is creating a lead in interconnects for large-scale computing (NVLink especially).</span></p><p>I’ll get into a deeper post about interconnects, which is quite involved, but I think I should finally more fully explain my views on CUDA. Instead of a pure technical explanation, let me tell a story to make it more visceral.</p><p><span>I once took a graduate class at UC Berkeley on high-performance and parallel computing. The students were mainly PhDs in computer science, computer engineering, and statistics (machine learning). I was a weirdo taking it during my MBA—nothing in the rules </span><em>technically</em><span> said I couldn’t fulfill my electives with this and PhD seminars in computer science and statistics. This was before I got my own Master’s degree in computer science.</span></p><p>Anyway, we went through the concepts and techniques involved in parallel computing, in terms of memory architecture, deep dives in matrix multiplication (which is fundamental to most modern computing, including current AI), locality, SIMD/CPU vectorization, lock/etc primitives. These were quite theoretical, but we also discussed and implemented specific technologies including OpenMP, OpenCL/GL, and the like.</p><p>All of them were a pain in the ass.</p><p>Then, still fairly early in the term, a former PhD student of the professor who now worked at NVIDIA came in to guest lecture on GPUs and CUDA.</p><p>It’s really difficult to explain to non-programmers—or even programmers who don’t deal with massive compute problems—just how night-and-day the difference is between CUDA and its alternatives.</p><p>Some of it has extremely nice primitives for standard math and atomic memory operations, while also offering easy explicit memory allocation… and a ton of other stuff that for most of my audience is completely meaningless. I’ll just say it gives you super pleasant tools.</p><p><span>But beyond that, because NVIDIA controls CUDA </span><em>and</em><span> their GPUs, they control the entire stack. Software, firmware, and hardware. This is the same thing that gives Apple a killer advantage on their platforms. NVIDIA has the same thing, and even aside from programmer productivity/ease (which, as we’ve learned over the years, is itself huge), stuff in CUDA just magically works much better. Behind the scenes, CUDA performs significant optimizations.</span></p><p>Additionally, as new GPUs come out, as they inevitably do, CUDA continues to be forward and backward-compatible (depending on the features you use), and you continue to reap the benefits of even better hardware and firmware that NVIDIA continues to pump out.</p><p>One of the primary arguments about why the hardware is what matters in the AI compute war is that it’s easy to see why that is a “hard” barrier. If you can’t make the hardware, well, you’re just out of luck.</p><p><span>However, if that were the case, we shouldn’t be seeing such tepid adoption (if it exists at all) of AMD in AI workloads. AMD is worse, sure, but it’s not </span><em>that</em><span> far behind, and if you’re stuck with massive waitlists and impossible-to-get NVIDIA GPUs, why wouldn’t you do AMD?</span></p><p>The answer is CUDA.</p><p><span>AMD has its own “drop-in” replacement for CUDA called </span><strong><a href="https://www.amd.com/en/products/software/rocm.html" rel="">ROCm</a></strong><span>, which for the longest time didn’t even support floating-point operations (meaning, for non-technical folks, decimals). It has a lot of the same primitives, it just sucks.</span></p><p>Even if you were an ambitious PhD in computer science who is also an outstanding programmer who somehow wants to write a new AI-related library in OpenCL or Vulcan or whatever, you still wouldn’t get the performance you could with CUDA (at least not without a massive amount of extra low-level programming effort).</p><p>In reality, although I know this is strange to non-PhD/technical/academic readers, most PhDs in computer science, engineering, and statistics actually kind of suck at programming, unless their specialty is programming languages. They aren’t motivated by trying to do fancy stuff with writing code. Additionally, they have enough headaches and time pressure, why would they deliberately choose to make life harder on themselves?</p><p>This is why a lot of bleeding-edge, prototype machine learning algorithms are written in and only available in R (which can make one internally scream, but I’ve been forced to get extremely familiar with it), which offers no performance benefits at all. But for stuff that is meant to run on “real” workloads to try to demonstrate cutting-edge performance on massive datasets, that’s in the CUDA ecosystem.</p><p>One can liken it to Adobe/Microsoft/AutoCAD software being used extensively in educational institutions, and that makes them also very sticky in industry (which in turn reinforces why schools use them). Of course, it’s even more painful to switch from CUDA in this case.</p><p>Tensorflow and PyTorch nowadays support platforms apart from CUDA and (in turn) NVIDIA GPUs. However, for the longest time, they didn’t—or, at least, they didn’t if you wanted to finish your workloads anytime this century and not run them on CPUs.</p><p>Now that these fundamental tools support other platforms may sound like it’s countering my argument, but it’s more to illustrate that years of tools, low-level libraries, and the like assumed that everyone was using NVIDIA GPUs.</p><p><span>There were PhD blog posts/guides during the great GPU shortage in 2020-2022 about buying used RTX 2090s for poor graduate students. </span><strong><a href="https://timdettmers.com/2023/01/30/which-gpu-for-deep-learning/comment-page-1/" rel="">Today, more updated guides still exclusively talk about NVIDIA GPUs</a></strong><span>.</span></p><p><span>I’ve heard arguments about how China has infinite money and resources to throw at conquering AI (… which is an assertion that is also debatable, especially now), they can just port everything to a new platform like </span><strong><a href="https://github.com/opencv/opencv/wiki/Huawei-CANN-Backend" rel="">Huawei’s CANN</a></strong><span>.</span></p><p><span>Aside from the hand-wavy nature of the rather insane proposal (which I think is mainly “simple” only to hardware people) to just “port everything,” that still doesn’t solve the problem. The </span><em><strong><a href="https://weightythoughts.com/p/compute-is-overrated-as-ais-bottleneck" rel="">leading edge</a></strong></em><strong><a href="https://weightythoughts.com/p/compute-is-overrated-as-ais-bottleneck" rel=""> of AI software and models, which is </a></strong><em><strong><a href="https://weightythoughts.com/p/compute-is-overrated-as-ais-bottleneck" rel="">really</a></strong></em><strong><a href="https://weightythoughts.com/p/compute-is-overrated-as-ais-bottleneck" rel=""> what’s driving the AI revolution, not hardware/compute</a></strong><span>, is still within the CUDA ecosystem.</span></p><p><span>If you’re ok with always lagging, sure, that’s ok, but if AI’s frontier moves as fast as everyone seems to think it will (which I do too), it’ll be similar to Moore’s Law pre-2010. Being generations behind constantly is a </span><em>bad thing</em><span> in that case and not the key to any kind of technological innovation, let alone leadership.</span></p><p><strong><a href="https://en.wikipedia.org/wiki/Chip_War:_The_Fight_for_the_World%27s_Most_Critical_Technology" rel="">Chip War</a></strong><span> has a great section on how the Soviet Union tried a “just copy/steal” strategy in semiconductors and fell hopelessly behind because of it. It’s a great theoretical idea to just copy/steal and fast-follow, but semiconductors, AI, and other “harder technologies” require building human and intellectual capital that will get better with time. From there, you need to have the prior generation to keep up with ever-increasing complexity and difficulty as these things get more advanced.</span></p><p><span>The idea that NVIDIA is dominant isn’t exactly a controversial take </span><strong><a href="https://www.businessinsider.com/nvidia-ceo-taylor-swift-nod-shows-aware-of-tech-reputation-2024-3" rel="">immediately after a GTC that has been likened to a Taylor Swift concert</a></strong><span>.</span></p><p><span>However, the </span><em>reasons</em><span> continue to be the same, and I think are worth emphasizing. Will CUDA one day lose its advantage? Will Huawei’s CANN or various open-source projects like Vulcan be able to take away its sheer dominance in the AI field, and thus degrade NVIDIA’s absolute stranglehold on AI compute?</span></p><p>Maybe. But I still haven’t seen a distinctive shift. The reasons aren’t in numbers or simplistic top-down thought experiments about how NVIDIA can lose its leadership.</p><p>The reasons for NVIDIA’s dominance are years and billions of dollars in investment in the CUDA ecosystem, evangelism, and education of the community that builds AI. Even if it were fading, it would take quite a while for the impacts of such a heavy, long-term strategy to go away.</p><p>As it stands, NVIDIA is only retrenching its strength within the space. And the reason (apart from interconnects—which, as said, I promise a piece at some point) is CUDA and its ecosystem.</p></div></div></div></article></div></div></div>]]>
@@ -4545,7 +5431,7 @@ March 23, 2024 | https://weightythoughts.com/p/cuda-is-still-a-giant-moat-for-nv
             </title>
             <description>
 <![CDATA[
-Score 233 | Comments 75 (<a href="https://news.ycombinator.com/item?id=39800678">thread link</a>) | @cyanbane
+Score 254 | Comments 77 (<a href="https://news.ycombinator.com/item?id=39800678">thread link</a>) | @cyanbane
 <br/>
 March 23, 2024 | https://visdeurbel.nl/en/the-fish-doorbell/ | <a href="https://web.archive.org/web/*/https://visdeurbel.nl/en/the-fish-doorbell/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4581,7 +5467,7 @@ March 23, 2024 | https://visdeurbel.nl/en/the-fish-doorbell/ | <a href="https://
             </title>
             <description>
 <![CDATA[
-Score 60 | Comments 18 (<a href="https://news.ycombinator.com/item?id=39800542">thread link</a>) | @GrokNet
+Score 64 | Comments 18 (<a href="https://news.ycombinator.com/item?id=39800542">thread link</a>) | @GrokNet
 <br/>
 March 23, 2024 | https://zetier.com/news/jtag-chain-diagram-to-dump-nor/ | <a href="https://web.archive.org/web/*/https://zetier.com/news/jtag-chain-diagram-to-dump-nor/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section>
@@ -5427,7 +6313,7 @@ March 23, 2024 | https://chinabooksreview.com/2023/10/19/a-spark-extinguished/ |
             </title>
             <description>
 <![CDATA[
-Score 74 | Comments 14 (<a href="https://news.ycombinator.com/item?id=39798225">thread link</a>) | @countrymile
+Score 79 | Comments 16 (<a href="https://news.ycombinator.com/item?id=39798225">thread link</a>) | @countrymile
 <br/>
 March 23, 2024 | https://philwip.com/2024/03/22/pcb-repair-speed-buggy-buggy-boy/ | <a href="https://web.archive.org/web/*/https://philwip.com/2024/03/22/pcb-repair-speed-buggy-buggy-boy/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
