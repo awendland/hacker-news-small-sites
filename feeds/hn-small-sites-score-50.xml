@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Sun, 14 Apr 2024 09:51:25 GMT</lastBuildDate>
+        <lastBuildDate>Sun, 14 Apr 2024 14:09:35 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-50.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Sun, 14 Apr 2024 09:51:25 GMT</pubDate>
+        <pubDate>Sun, 14 Apr 2024 14:09:35 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,265 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Careful with That Lock, Eugene]]>
+            </title>
+            <description>
+<![CDATA[
+Score 53 | Comments 14 (<a href="https://news.ycombinator.com/item?id=40025148">thread link</a>) | @alflervag
+<br/>
+April 13, 2024 | https://kaveland.no/careful-with-that-lock-eugene.html | <a href="https://web.archive.org/web/*/https://kaveland.no/careful-with-that-lock-eugene.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+    <p>It is rewarding to work on software that people care about and use all around
+the clock. This constant usage means we can't simply take the system offline for
+maintenance without upsetting users. Therefore, techniques that allow us to
+update the software seamlessly without downtime or compromising service
+quality are incredibly valuable.</p>
+<p>Most projects I've worked on use a relational database for persistence, and have
+some sort of migration tool like flyway or liquibase to make changes to the
+database schema. This post is about a particular kind of migration situation
+that, in my experience, most developers who work on such projects will encounter
+at some point in their career. They will want to apply a simple, and seemingly
+innocent migration, like adding a column to a table and it'll cause some number
+of requests to fail, or maybe even a small outage. There are some tricks we can
+use here to reduce risk and automatically detect some patterns that cause this
+problem.</p>
+<h2>Scenario 1</h2>
+<p>We'll use postgres to describe the setup and scenario, with the following simple
+schema:</p>
+<div><pre><span></span><code><span>CREATE</span><span> </span><span>TABLE</span><span> </span><span>documents</span><span>(</span><span>id</span><span> </span><span>serial</span><span> </span><span>PRIMARY</span><span> </span><span>KEY</span><span>,</span><span> </span><span>document</span><span> </span><span>text</span><span>);</span>
+</code></pre></div>
+
+<p>This scenario has 2 transactions in it:</p>
+<ul>
+<li><code>A</code> is a transaction that wants to complete 2 statements, one fast and one
+  slow, both modifications to the database.</li>
+<li><code>B</code> is a transaction that only wants to read a single document.</li>
+</ul>
+<p>I will start these in different <code>psql</code> shells and we'll take a look at what
+happens.</p>
+<h3><code>A</code> adds a column to <code>documents</code></h3>
+<div><pre><span></span><code><span>postgres</span><span>=#</span><span> </span><span>BEGIN</span><span>;</span>
+<span>BEGIN</span>
+<span>postgres</span><span>=*#</span><span> </span><span>ALTER</span><span> </span><span>TABLE</span><span> </span><span>documents</span><span> </span><span>ADD</span><span> </span><span>COLUMN</span><span> </span><span>is_indexed</span><span> </span><span>bool</span><span>;</span>
+<span>ALTER</span><span> </span><span>TABLE</span>
+</code></pre></div>
+
+<p><code>A</code> is now holding an <code>AccessExclusiveLock</code> on <code>documents</code>, and all subsequent
+transactions that attempt to do anything with that table must wait:</p>
+<div><pre><span></span><code><span>postgres</span><span>=#</span><span> </span><span>SELECT</span><span> </span><span>l</span><span>.</span><span>relation</span><span>::</span><span>regclass</span><span> </span><span>AS</span><span> </span><span>object_name</span><span>,</span><span> </span><span>l</span><span>.</span><span>mode</span><span>,</span><span> </span><span>locktype</span><span>,</span><span> </span><span>granted</span>
+<span>FROM</span><span> </span><span>pg_locks</span><span> </span><span>l</span>
+<span>JOIN</span><span> </span><span>pg_class</span><span> </span><span>c</span><span> </span><span>ON</span><span> </span><span>c</span><span>.</span><span>oid</span><span> </span><span>=</span><span> </span><span>l</span><span>.</span><span>relation</span>
+<span>JOIN</span><span> </span><span>pg_namespace</span><span> </span><span>n</span><span> </span><span>ON</span><span> </span><span>n</span><span>.</span><span>oid</span><span> </span><span>=</span><span> </span><span>c</span><span>.</span><span>relnamespace</span>
+<span>AND</span><span> </span><span>n</span><span>.</span><span>nspname</span><span> </span><span>!=</span><span> </span><span>'pg_catalog'</span><span>;</span>
+<span> </span><span>object_name</span><span> </span><span>|</span><span>        </span><span>mode</span><span>         </span><span>|</span><span> </span><span>locktype</span><span> </span><span>|</span><span> </span><span>granted</span>
+<span>-------------+---------------------+----------+---------</span>
+<span> </span><span>documents</span><span>   </span><span>|</span><span> </span><span>AccessExclusiveLock</span><span> </span><span>|</span><span> </span><span>relation</span><span> </span><span>|</span><span> </span><span>t</span>
+<span>(</span><span>1</span><span> </span><span>row</span><span>)</span>
+</code></pre></div>
+
+<h3><code>A</code> starts a slow statement</h3>
+<p>Let's say, then that <code>A</code> starts a slow statement, like filling in all the
+missing values for the new column (suppose that <code>documents</code> is a big table):</p>
+<div><pre><span></span><code><span>postgres</span><span>=*#</span><span> </span><span>UPDATE</span><span> </span><span>documents</span><span> </span><span>SET</span><span> </span><span>is_indexed</span><span> </span><span>=</span><span> </span><span>true</span><span>;</span>
+</code></pre></div>
+
+<h3><code>B</code> attempts to read a single document</h3>
+<div><pre><span></span><code><span>postgres</span><span>=#</span><span> </span><span>BEGIN</span><span>;</span>
+<span>BEGIN</span>
+<span>postgres</span><span>=*#</span><span> </span><span>SELECT</span><span> </span><span>document</span><span> </span><span>FROM</span><span> </span><span>documents</span><span> </span><span>WHERE</span><span> </span><span>id</span><span> </span><span>=</span><span> </span><span>3</span><span>;</span>
+</code></pre></div>
+
+<p><code>B</code> is now blocked and must wait for <code>A</code> to finish:</p>
+<div><pre><span></span><code><span>#</span><span> </span><span>SELECT</span><span> </span><span>l</span><span>.</span><span>relation</span><span>::</span><span>regclass</span><span> </span><span>AS</span><span> </span><span>object_name</span><span>,</span><span> </span><span>l</span><span>.</span><span>mode</span><span>,</span><span> </span><span>locktype</span><span>,</span><span> </span><span>granted</span>
+<span>FROM</span><span> </span><span>pg_locks</span><span> </span><span>l</span>
+<span>JOIN</span><span> </span><span>pg_class</span><span> </span><span>c</span><span> </span><span>ON</span><span> </span><span>c</span><span>.</span><span>oid</span><span> </span><span>=</span><span> </span><span>l</span><span>.</span><span>relation</span>
+<span>JOIN</span><span> </span><span>pg_namespace</span><span> </span><span>n</span><span> </span><span>ON</span><span> </span><span>n</span><span>.</span><span>oid</span><span> </span><span>=</span><span> </span><span>c</span><span>.</span><span>relnamespace</span>
+<span>AND</span><span> </span><span>n</span><span>.</span><span>nspname</span><span> </span><span>!=</span><span> </span><span>'pg_catalog'</span><span>;</span>
+<span>  </span><span>object_name</span><span>   </span><span>|</span><span>        </span><span>mode</span><span>         </span><span>|</span><span> </span><span>locktype</span><span> </span><span>|</span><span> </span><span>granted</span>
+<span>----------------+---------------------+----------+---------</span>
+<span> </span><span>documents_pkey</span><span> </span><span>|</span><span> </span><span>RowExclusiveLock</span><span>    </span><span>|</span><span> </span><span>relation</span><span> </span><span>|</span><span> </span><span>t</span>
+<span> </span><span>documents</span><span>      </span><span>|</span><span> </span><span>RowExclusiveLock</span><span>    </span><span>|</span><span> </span><span>relation</span><span> </span><span>|</span><span> </span><span>t</span>
+<span> </span><span>documents</span><span>      </span><span>|</span><span> </span><span>AccessExclusiveLock</span><span> </span><span>|</span><span> </span><span>relation</span><span> </span><span>|</span><span> </span><span>t</span>
+<span> </span><span>documents</span><span>      </span><span>|</span><span> </span><span>AccessShareLock</span><span>     </span><span>|</span><span> </span><span>relation</span><span> </span><span>|</span><span> </span><span>f</span>
+<span>(</span><span>4</span><span> </span><span>rows</span><span>)</span>
+</code></pre></div>
+
+<p>Once <code>A</code> commits successfully, <code>B</code> immediately executes. In this scenario, if
+<code>B</code> is a very frequent transaction type and <code>A</code> is very slow, this can seem like
+a partial outage that can impact users on the live system.</p>
+<p>This scenario is essentially identical to one in which there's a single
+migration statement that requires an <code>AccessExclusiveLock</code> <em>and</em> performs a
+table rewrite, such as adding a <code>NOT NULL</code> column with a <code>DEFAULT</code> value.</p>
+<p>But at least if <code>A</code> is fast, nothing bad can happen, right? Well...</p>
+<h2>Scenario 2</h2>
+<p>This scenario has 3 transactions in it:</p>
+<ul>
+<li><code>A</code> is a slow transaction. It reads <code>documents</code> and puts all the documents
+  somewhere, possibly a search engine or something. The search engine is having
+  a particularly bad day today or perhaps <code>A</code> is just reading more data than it
+  should.</li>
+<li><code>B</code> is our migration. It wants to add a column to <code>documents</code>, so that the job
+  that runs <code>A</code> can see which documents that have already been sent to the
+  search engine.</li>
+<li><code>C</code> represents one of many fast transactions, needle-in-the-haystack kind of
+  transactions. For example users that have clicked a link from the search
+  engine and want to retrieve the entire document to read it, instead of the
+  summary from the search engine.</li>
+</ul>
+<p>There's a particular interleaving of these that could cause a lot of <code>C</code>
+transactions to block, leading to time outs or hanging web pages and frustrated
+users.</p>
+<h3><code>A</code> reads <code>documents</code></h3>
+<div><pre><span></span><code><span>postgres</span><span>=*#</span><span> </span><span>SELECT</span><span> </span><span>document</span><span> </span><span>FROM</span><span> </span><span>documents</span><span>;</span>
+<span>  </span><span>document</span>
+<span>-------------</span>
+<span> </span><span>Imagine</span>
+<span> </span><span>a</span>
+<span> </span><span>bunch</span>
+<span> </span><span>of</span>
+<span> </span><span>interesting</span>
+<span> </span><span>documents</span>
+<span>(</span><span>6</span><span> </span><span>rows</span><span>)</span>
+</code></pre></div>
+
+<p>At this point, A starts doing a bunch of indexing into a search engine, and it's
+going to take a long time.</p>
+<h3><code>B</code> attempts to take an <code>AccessExclusiveLock</code></h3>
+<div><pre><span></span><code><span>postgres</span><span>=#</span><span> </span><span>BEGIN</span><span>;</span>
+<span>BEGIN</span>
+<span>postgres</span><span>=*#</span><span> </span><span>ALTER</span><span> </span><span>TABLE</span><span> </span><span>documents</span><span> </span><span>ADD</span><span> </span><span>COLUMN</span><span> </span><span>is_indexed</span><span> </span><span>boolean</span><span>;</span>
+</code></pre></div>
+
+<p>This transaction is blocked because <code>A</code> has some locks that are in conflict with
+the <code>AccessExclusiveLock</code> on <code>documents</code> that <code>B</code> is trying to take. We can
+check <code>pg_locks</code> to see what the status is right now:</p>
+<div><pre><span></span><code><span>postgres</span><span>=#</span><span> </span><span>SELECT</span><span> </span><span>l</span><span>.</span><span>relation</span><span>::</span><span>regclass</span><span> </span><span>AS</span><span> </span><span>object_name</span><span>,</span><span> </span><span>l</span><span>.</span><span>mode</span><span>,</span><span> </span><span>locktype</span><span>,</span><span> </span><span>granted</span>
+<span>FROM</span><span> </span><span>pg_locks</span><span> </span><span>l</span>
+<span>JOIN</span><span> </span><span>pg_class</span><span> </span><span>c</span><span> </span><span>ON</span><span> </span><span>c</span><span>.</span><span>oid</span><span> </span><span>=</span><span> </span><span>l</span><span>.</span><span>relation</span>
+<span>JOIN</span><span> </span><span>pg_namespace</span><span> </span><span>n</span><span> </span><span>ON</span><span> </span><span>n</span><span>.</span><span>oid</span><span> </span><span>=</span><span> </span><span>c</span><span>.</span><span>relnamespace</span>
+<span>AND</span><span> </span><span>n</span><span>.</span><span>nspname</span><span> </span><span>!=</span><span> </span><span>'pg_catalog'</span><span>;</span>
+<span>  </span><span>object_name</span><span>   </span><span>|</span><span>        </span><span>mode</span><span>         </span><span>|</span><span> </span><span>locktype</span><span> </span><span>|</span><span> </span><span>granted</span>
+<span>----------------+---------------------+----------+---------</span>
+<span> </span><span>documents_pkey</span><span> </span><span>|</span><span> </span><span>AccessShareLock</span><span>     </span><span>|</span><span> </span><span>relation</span><span> </span><span>|</span><span> </span><span>t</span>
+<span> </span><span>documents</span><span>      </span><span>|</span><span> </span><span>AccessShareLock</span><span>     </span><span>|</span><span> </span><span>relation</span><span> </span><span>|</span><span> </span><span>t</span>
+<span> </span><span>documents</span><span>      </span><span>|</span><span> </span><span>AccessExclusiveLock</span><span> </span><span>|</span><span> </span><span>relation</span><span> </span><span>|</span><span> </span><span>f</span>
+</code></pre></div>
+
+<p>The two <code>AccessShareLock</code>s are held by <code>A</code>, which is slow and <code>B</code> is waiting for
+the <code>AccessExclusiveLock</code>.</p>
+<h3><code>C</code> attempts to read one row from <code>documents</code></h3>
+<div><pre><span></span><code><span>postgres</span><span>=#</span><span> </span><span>BEGIN</span><span>;</span>
+<span>BEGIN</span>
+<span>postgres</span><span>=*#</span><span> </span><span>SELECT</span><span> </span><span>document</span><span> </span><span>FROM</span><span> </span><span>documents</span><span> </span><span>where</span><span> </span><span>id</span><span> </span><span>=</span><span> </span><span>3</span><span>;</span>
+</code></pre></div>
+
+<p><code>C</code> is now blocked, waiting to acquire an <code>AccessShareLock</code>:</p>
+<div><pre><span></span><code><span>postgres</span><span>=#</span><span> </span><span>SELECT</span><span> </span><span>l</span><span>.</span><span>relation</span><span>::</span><span>regclass</span><span> </span><span>AS</span><span> </span><span>object_name</span><span>,</span><span> </span><span>l</span><span>.</span><span>mode</span><span>,</span><span> </span><span>locktype</span><span>,</span><span> </span><span>granted</span>
+<span>FROM</span><span> </span><span>pg_locks</span><span> </span><span>l</span>
+<span>JOIN</span><span> </span><span>pg_class</span><span> </span><span>c</span><span> </span><span>ON</span><span> </span><span>c</span><span>.</span><span>oid</span><span> </span><span>=</span><span> </span><span>l</span><span>.</span><span>relation</span>
+<span>JOIN</span><span> </span><span>pg_namespace</span><span> </span><span>n</span><span> </span><span>ON</span><span> </span><span>n</span><span>.</span><span>oid</span><span> </span><span>=</span><span> </span><span>c</span><span>.</span><span>relnamespace</span>
+<span>AND</span><span> </span><span>n</span><span>.</span><span>nspname</span><span> </span><span>!=</span><span> </span><span>'pg_catalog'</span><span>;</span>
+<span>  </span><span>object_name</span><span>   </span><span>|</span><span>        </span><span>mode</span><span>         </span><span>|</span><span> </span><span>locktype</span><span> </span><span>|</span><span> </span><span>granted</span>
+<span>----------------+---------------------+----------+---------</span>
+<span> </span><span>documents_pkey</span><span> </span><span>|</span><span> </span><span>AccessShareLock</span><span>     </span><span>|</span><span> </span><span>relation</span><span> </span><span>|</span><span> </span><span>t</span>
+<span> </span><span>documents</span><span>      </span><span>|</span><span> </span><span>AccessShareLock</span><span>     </span><span>|</span><span> </span><span>relation</span><span> </span><span>|</span><span> </span><span>t</span>
+<span> </span><span>documents</span><span>      </span><span>|</span><span> </span><span>AccessExclusiveLock</span><span> </span><span>|</span><span> </span><span>relation</span><span> </span><span>|</span><span> </span><span>f</span>
+<span> </span><span>documents</span><span>      </span><span>|</span><span> </span><span>AccessShareLock</span><span>     </span><span>|</span><span> </span><span>relation</span><span> </span><span>|</span><span> </span><span>f</span>
+<span>(</span><span>4</span><span> </span><span>rows</span><span>)</span>
+</code></pre></div>
+
+<p>At this point, <code>B</code> can't proceed because of <code>A</code> and <code>C</code> can't proceed because of
+<code>B</code>. If <code>B</code> aborts and rolls back, all instances of <code>C</code> will be able to
+proceed. If <code>A</code> is fast enough, it might be that nobody notices anything, if
+it's also true that <code>B</code> is fast. If <code>A</code> is slow enough, some people might
+start getting alerts and start an investigation before <code>A</code> commits.</p>
+<h2>Mitigations</h2>
+<p>Scenario 1 would be resolved if we made <code>A</code> from that scenario into 2
+migrations; the <code>SELECT document FROM documents WHERE id = 3</code> transaction does
+not conflict with the locks that <code>UPDATE documents SET is_indexed = true</code> takes.</p>
+<p>For the common example of wanting to add a <code>NOT NULL</code>-column, we can add the
+column without the <code>NOT NULL</code> constraint, but with the default value in a
+migration. This is pretty much instant. Then we can issue a second migration to
+populate the value (it's safer still if we can do this in small batches to avoid
+long-running transactions), then a third migration to add the <code>NOT NULL</code>
+constraint.</p>
+<p>Scenario 2 needs a different strategy. Maybe we can design the job so we can
+solve the problem by adding a new <code>documents_index_status</code> table that has a
+foreign key to <code>documents</code>?</p>
+<p>Once you know these patterns, it's easy to test how possible mitigations would
+work out by practicing with concurrent sessions and see what works and what
+blocks. What would be very nice however, would be to have some tooling that told
+you that you were about to do something potentially dangerous.</p>
+<h2>Detection in CI/CD</h2>
+<p>Recently I learned from a colleague that flyway has a very cool
+<a href="https://javadoc.io/doc/org.flywaydb/flyway-core/latest/org/flywaydb/core/api/callback/Callback.html">callback</a>
+feature that will let you run queries in the same transaction as your
+migrations, and I'm realizing that there is a <em>lot of</em> potential to build nice
+tooling with this feature. I have taken a stab at detecting migrations that take
+<code>AccessExclusiveLock</code>s on tables that aren't new. I do this in three steps.</p>
+<h3>Snapshot <code>pg_class</code> before migration</h3>
+<p>When flyway gives my callback the <code>BEFORE_EACH_MIGRATE</code> event, I take a snapshot
+of <code>pg_class</code> to temporarily store which relations that existed before the
+migration ran:</p>
+<div><pre><span></span><code><span>CREATE</span><span> </span><span>TABLE</span><span> </span><span>pg_class_before_migrate</span><span> </span><span>as</span><span> </span><span>SELECT</span><span> </span><span>*</span><span> </span><span>FROM</span><span> </span><span>pg_class</span><span>;</span>
+</code></pre></div>
+
+<p>The reason we do this is that we don't want to yell wolf when migrations create
+new tables or indexes, since the locks only matter if other transactions try to
+use the relations concurrently with the migration.</p>
+<h3>Find relation level <code>AccessExclusiveLock</code>s</h3>
+<p>On the <code>AFTER_EACH_MIGRATE</code> event, I retrieve all relation level locks that my
+transaction has taken on database objects that existed <em>before</em> the migration
+ran. If the migration has issued a <code>SET ROLE</code> we may need to change role back to
+the one that created the <code>pg_class_before_migrate</code>-table.</p>
+<div><pre><span></span><code><span>SELECT</span><span> </span><span>n</span><span>.</span><span>nspname</span><span>::</span><span>text</span><span> </span><span>AS</span><span> </span><span>schema_name</span><span>,</span><span> </span><span>l</span><span>.</span><span>relation</span><span>::</span><span>regclass</span><span>::</span><span>text</span><span> </span><span>AS</span><span> </span><span>object_name</span>
+<span>FROM</span><span> </span><span>pg_locks</span><span> </span><span>l</span>
+<span>  </span><span>JOIN</span><span> </span><span>public</span><span>.</span><span>pg_class_before_migrate</span><span> </span><span>c</span><span> </span><span>ON</span><span> </span><span>c</span><span>.</span><span>oid</span><span> </span><span>=</span><span> </span><span>l</span><span>.</span><span>relation</span>
+<span>  </span><span>JOIN</span><span> </span><span>pg_namespace</span><span> </span><span>n</span><span> </span><span>ON</span><span> </span><span>n</span><span>.</span><span>oid</span><span> </span><span>=</span><span> </span><span>c</span><span>.</span><span>relnamespace</span>
+<span>WHERE</span><span> </span><span>l</span><span>.</span><span>locktype</span><span> </span><span>=</span><span> </span><span>'relation'</span>
+<span>  </span><span>AND</span><span> </span><span>l</span><span>.</span><span>mode</span><span> </span><span>=</span><span> </span><span>'AccessExclusiveLock'</span>
+<span>  </span><span>AND</span><span> </span><span>l</span><span>.</span><span>pid</span><span> </span><span>=</span><span> </span><span>pg_backend_pid</span><span>();</span><span> </span><span>-- Locks held by current transaction</span>
+</code></pre></div>
+
+<h3>Clean up</h3>
+<p>We probably shouldn't leave that snapshot of <code>pg_class</code> hanging around forever:</p>
+<div><pre><span></span><code><span>DROP</span><span> </span><span>TABLE</span><span> </span><span>pg_class_before_migrate</span><span>;</span>
+</code></pre></div>
+
+<p>At this point, you can choose to have the CI/CD comment on the pull request that
+the migration will lock <code>documents</code> and therefore you should check what types of
+transactions that may try to use that table concurrently with the
+migration. Possibly have some LLM generate a helpful text about what could go
+wrong with the migration script? Maybe match the locks against a list of
+tables that are acceptable to lock, or a list of tables that are known to be
+dangerous to lock?</p>
+<h2>Future work</h2>
+<p>Note that there are lots of corner cases still here, I'm very enthusiastic about
+lots of ideas in this space and definitely want to write and share some more
+code once I know more about what's possible.</p>
+<p>Taking a snapshot of <code>pg_class</code> potentially also gives us another few things we
+can detect. If we can run these migrations against something like an anonymized
+copy of the production database, we may be able to issue <code>ANALYZE</code> before and
+after the migration to detect some table rewrites -- such an operation <em>should</em>
+change the relationship between <code>reltuples</code> and <code>relpages</code> in <code>pg_class</code>, by
+increasing the size of the tuples. That might also allow us to flag migrations
+that rewrite large tables. We can also snapshot other tables from
+<code>information_schema</code>, or tables like <code>pg_attribute</code> to build a pretty good data
+structure describing the effect of the migration in terms of both schema and
+content.</p>
+  </div></div>]]>
+            </description>
+            <link>https://kaveland.no/careful-with-that-lock-eugene.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-40025148</guid>
+            <pubDate>Sat, 13 Apr 2024 18:50:50 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Self-Hosted Is Awesome]]>
             </title>
             <description>
 <![CDATA[
-Score 66 | Comments 47 (<a href="https://news.ycombinator.com/item?id=40022152">thread link</a>) | @thunderbong
+Score 67 | Comments 47 (<a href="https://news.ycombinator.com/item?id=40022152">thread link</a>) | @thunderbong
 <br/>
 April 13, 2024 | https://pixeljets.com/blog/self-hosted-is-awesome/ | <a href="https://web.archive.org/web/*/https://pixeljets.com/blog/self-hosted-is-awesome/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section>
@@ -81,7 +335,7 @@ April 12, 2024 | https://hereket.com/tiny/des-algorithm/ | <a href="https://web.
             </title>
             <description>
 <![CDATA[
-Score 101 | Comments 22 (<a href="https://news.ycombinator.com/item?id=40017176">thread link</a>) | @oleg_tarasov
+Score 103 | Comments 24 (<a href="https://news.ycombinator.com/item?id=40017176">thread link</a>) | @oleg_tarasov
 <br/>
 April 12, 2024 | https://olegtarasov.me/opentherm-thermostat-esphome/ | <a href="https://web.archive.org/web/*/https://olegtarasov.me/opentherm-thermostat-esphome/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -255,7 +509,7 @@ April 12, 2024 | https://blog.daveallie.com/ulid-primary-keys | <a href="https:/
             </title>
             <description>
 <![CDATA[
-Score 221 | Comments 31 (<a href="https://news.ycombinator.com/item?id=40015953">thread link</a>) | @EamonLeonard
+Score 247 | Comments 36 (<a href="https://news.ycombinator.com/item?id=40015953">thread link</a>) | @EamonLeonard
 <br/>
 April 12, 2024 | https://harper.blog/2024/04/12/i-accidentally-built-a-meme-search-engine/ | <a href="https://web.archive.org/web/*/https://harper.blog/2024/04/12/i-accidentally-built-a-meme-search-engine/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><article><div><h2 id="or-how-to-learn-about-clipsiglip-and-vector-encoding-images">Or: how to learn about clip/siglip and vector encoding images</h2><p><em>tl;dr</em>: I built a meme search engine using siglip/CLIP and vector encoding images. It was fun and I learned a lot.</p><p>I have been building a lot of applied AI tools for a while. One of the components that always seemed the most magical has always been vector embeddings. <a href="https://en.wikipedia.org/wiki/Word2vec" target="_blank">Word2Vec</a> and the like have straight blown my mind. It is like magic.</p><p>I saw a <a href="https://news.ycombinator.com/item?id=39392582" target="_blank">simple app on hacker news</a> that was <a href="https://mood-amber.vercel.app/" target="_blank">super impressive</a>. Someone crawled a bunch of Tumblr images and used <a href="https://arxiv.org/abs/2303.15343" target="_blank">siglip</a> to get the embeddings and then made a simple “click the image and see similar images” app. It was like magic. I had no idea how to achieve this, but it seemed accessible.</p><p>I decided to use my sudden motivation as an opportunity to learn how “all this works.”</p><h2 id="wut">wut</h2><p>If you have never ran into vector embeddings, clip/siglip, vector databases, and the like - never fear.</p><p>Before I saw the hack on hn I really didn’t think much about vector embeddings, multi modal embeddings or vector datastores. I had used faiss (facebooks simple vector store), and Pinecone ($$) for some hacks, but didn’t really dig in. Just got it to work and then was like “yep. Tests pass.”</p><p>I still barely know what vectors are. Lol. Before I dug in and built this, I really didn’t understand how I would use it outside of RAG or another LLM process.</p><p>I learn by building. It helps if the results are really intriguing, and in this case kind of magical.</p><h3 id="wtf-terms">WTF terms</h3><p>I had a few friends read this over before publishing and a couple were like “wtf is X?” Here is a short list of terms that were largely new to me:</p><ul><li><strong>Vector Embeddings</strong> - Vector embeddings convert your text of images into numerical representations, allowing you to find similar pics and search your library effectively.</li><li><strong>Vector Database</strong> - A vector database is a way to store and search through encoded items, enabling you to find similar items.</li><li><strong>Word2Vec</strong> - Word2Vec is a groundbreaking technique that converts words into numerical vectors, enabling you to perform tasks like finding similar words and exploring relationships between them.</li><li><strong>CLIP</strong> - CLIP is OpenAI’s model that encodes images and text into numerical vectors.</li><li><strong>OpenCLIP</strong> - OpenCLIP is an open-source implementation of OpenAI’s CLIP model, allowing anyone to use and build upon this powerful image and text encoding technology without the need for special access or permissions.</li><li><strong>FAISS</strong> - FAISS is an efficient library for managing and searching through large collections of image vectors, making it fast and easy to find the images you’re looking for.</li><li><strong>ChromaDB</strong> - ChromaDB is a database that stores and retrieves your image and text vectors, quickly returning similar results for your searches.</li></ul><h2 id="keep-it-simple-harper">Keep it simple, harper.</h2><p>This is a pretty straight forward hack. I am just fucking around so I wasn’t super interested in making it scalable. I did have an interest in making it replicable. I wanted to make something that <strong>you</strong> could run without a lot of work.</p><p>One of my goals was to make sure everything runs locally to my laptop. We have these fancy Mac GPUs - let’s heat them up.</p><p>The first step was building out a simple crawler that would crawl a directory of images. I use Apple Photos, so I didn’t have a directory full of my photos laying around. I did, however, have a giant bucket of memes from my precious and very secret meme chat group (don’t tell anyone). I exported the chat, moved the images to a directory and BAM - I had my test image set.</p><h3 id="the-crawler">The Crawler</h3><p>I created the world’s worst crawler. Well. I should be honest: Claude created the world’s worst crawler with my instructions.</p><p>It is a bit complicated but here are the steps:</p><ol><li>It gets the file list of the target directory</li><li>It stores the list in a msgpack file</li><li>I reference the msgpack file and then iterate through every image and store it in a sqlite db. Grabing some metadata about the file<ul><li>hash</li><li>filesize</li><li>location</li></ul></li><li>I iterate through that sqlite db and then use CLIP to get the vector encoding of every image.</li><li>Then I store those vectors back in the sqlite db</li><li>Then I iterate through the sqlite db and insert the vectors and image path into chroma vector db</li><li>Then we are done</li></ol><p>This is a lot of wasted work. You could iterate through the images, grab the embeddings and slam it into chroma (I chose chroma cuz it is easy, free, and no infra).</p><p>I have built it this way because:</p><ul><li>After the memes, I crawled 140k images and wanted it to be resilient to crashing.</li><li>I needed it to be able to resume building out the databases in case it crashed, power went out, etc</li><li>I really like loops</li></ul><p>Regardless of the extra complexity, it worked flawlessly. I have crawled over 200k images without a blip.</p><h3 id="an-embedding-system">An embedding system</h3><p>Encoding the images was fun.</p><p>I started with siglip and created a <a href="https://github.com/harperreed/imbedding" target="_blank">simple web service</a> where we could upload the image and get the vectors back. This ran on one of our GPU boxes at the studio and worked well. It wasn’t fast, but it was way faster than running <a href="https://github.com/mlfoundations/open_clip" target="_blank">open clip</a> locally.</p><p>I still wanted to run it locally. I remembered that the <a href="https://github.com/ml-explore/" target="_blank">ml-explore</a> repo from apple had some neat examples that could help. And BAM they had a <a href="https://github.com/ml-explore/mlx-examples/tree/main/clip" target="_blank">clip implementation</a> that was fast af. Even using the larger model, it was faster than the 4090. Wildstyle.</p><p>I just needed to make it easy to use in my script.</p><h3 id="mlx_clip">MLX_CLIP</h3><p>Claude and I were able to coerce the example script from apple into a fun lil python class that you can use locally on any of your machines. It will download the models if they don’t exist, convert them, and then use them in flight with your script.</p><p>You can check it out here: <a href="https://github.com/harperreed/mlx_clip" target="_blank">https://github.com/harperreed/mlx_clip</a></p><p>I am pretty chuffed with how well it turned out. I know most people know this, but the apple silicon is fast af.</p><p>It turned out to be rather simple to use:</p><div><pre tabindex="0"><code data-lang="python"><span><span><span>import</span> mlx_clip
@@ -272,7 +526,7 @@ April 12, 2024 | https://harper.blog/2024/04/12/i-accidentally-built-a-meme-sear
 </span></span><span><span>text_embeddings <span>=</span> clip<span>.</span>text_encoder(<span>"a photo of a cat"</span>)
 </span></span><span><span><span># Print the text embeddings to the console.</span>
 </span></span><span><span>print(text_embeddings)
-</span></span></code></pre></div><p>I would love to get this to work with siglip, as I prefer that model (it is way better than CLIP). However, this is a POC more than a product I want to maintain. If anyone has any hints on how to get it working with siglip - <a href="https://harper.blog/cdn-cgi/l/email-protection#f991988b899c8bb994969d9c8a8dd79a9694">hmu</a>. I don’t want to reinvent open clip - which should theoretically run well on apple silicon, and is very good.</p><h3 id="now-what">Now what</h3><p>Now that we had all the image vectors slammed into the vector datastore we could get started with the interface. I used the built in query functionality of chromadb to show similar images.</p><p>Grab the vectors of the image you are starting with. Query those vectors with chromadb. Chromed returns a list of image ids that are similar in declining similarity.</p><p>I then wrapped it all up in a tailwind/flask app.
+</span></span></code></pre></div><p>I would love to get this to work with siglip, as I prefer that model (it is way better than CLIP). However, this is a POC more than a product I want to maintain. If anyone has any hints on how to get it working with siglip - <a href="https://harper.blog/cdn-cgi/l/email-protection#076f6675776275476a68636274732964686a">hmu</a>. I don’t want to reinvent open clip - which should theoretically run well on apple silicon, and is very good.</p><h3 id="now-what">Now what</h3><p>Now that we had all the image vectors slammed into the vector datastore we could get started with the interface. I used the built in query functionality of chromadb to show similar images.</p><p>Grab the vectors of the image you are starting with. Query those vectors with chromadb. Chromed returns a list of image ids that are similar in declining similarity.</p><p>I then wrapped it all up in a tailwind/flask app.
 This was incredible.</p><p>I can’t imagine the amount of work we would have done in 2015 to build this. I spent maybe 10 hours total on this and it was trivial.</p><p>The results are akin to magic.</p><h3 id="memes-concept-search">Memes concept search</h3><p>Now remember, I used memes as my initial set of images. I had 12000 memes to search through.</p><p>Start with this:</p><figure role="group" aria-describedby="caption-So true"><img title="" loading="lazy" decoding="async" src="https://harper.blog/images/posts/vector-memes-bowie.png" alt="" width="" height=""><figcaption id="caption-So true">So true</figcaption></figure><p>Encode it, pass it to chroma to return similar results.</p><p>And then similar images that return are like this:
 <img title="" loading="lazy" decoding="async" src="https://harper.blog/images/posts/vector-memes-bowie-results.png" alt="" width="" height=""></p><p>Another example:
 <img title="" loading="lazy" decoding="async" src="https://harper.blog/images/posts/vector-memes-star-trek.png" alt="" width="" height=""></p><p>Gives you results like:
@@ -288,7 +542,7 @@ This was incredible.</p><p>I can’t imagine the amount of work we would have do
 <img title="" loading="lazy" decoding="async" src="https://harper.blog/images/posts/vector-memes-chicago.png" alt="" width="" height=""></p><p>Or emotions. I am apparently surprising so I have a lot of surprised photos.
 <img title="" loading="lazy" decoding="async" src="https://harper.blog/images/posts/vector-memes-surprised.png" alt="" width="" height=""></p><p>Also niche things like low riders. (These are from Shibuya!)
 <img title="" loading="lazy" decoding="async" src="https://harper.blog/images/posts/vector-memes-low-riders.png" alt="" width="" height=""></p><p>And you can use it to find things that are not easy to find or search for. Like bokeh.
-<img title="" loading="lazy" decoding="async" src="https://harper.blog/images/posts/vector-memes-bokeh.png" alt="" width="" height=""></p><p>It’s wonderful, because I can click through and find great images I had forgotten about. Like this great photo of Baratunde that I took in 2017:</p><p><img title="" loading="lazy" decoding="async" src="https://harper.blog/images/posts/vector-memes-baratunde.png" alt="" width="" height=""></p><h3 id="this-will-be-everywhere">This will be everywhere</h3><p>I imagine that we will see this tech rolled into all the various photo apps shortly. Google Photos probably already does this, but they have googled it so much that nobody notices.</p><p>This is too good to not roll into whatever photo app you use. If I had any large scale product that used photos or images, I would immediately set up a pipeline to start encoding the images to see what kind of weird features this unlocks.</p><h2 id="you-can-use-this-for-the-low-price-of-free">YOU CAN USE THIS FOR THE LOW PRICE OF FREE</h2><p>I put the source here: <a href="https://github.com/harperreed/photo-similarity-search" target="_blank">harperreed/photo-similarity-search</a>.</p><p>Please check it out.</p><p>It is pretty straight forward to get going. It is a bit hacky. lol.</p><p>I would use conda or something similar to keep things clean. The interface is simple tailwind. The web is flask. The code is python. I am your host, harper reed.</p><h2 id="my-challenge-for-you">My challenge for you!</h2><p>Please build an app that I can use to catalog my photo library in a nice way. I don’t want to upload to another destination. I want to have a simple Mac app that I can point to my photo library and say “crawl this.” I imagine a lot of neat stuff could be added:</p><ul><li>Llava/Moondream auto captioning</li><li>Keywords / Tags</li><li>Vector similarity</li><li>etc</li></ul><p>It should run locally. Be a native app. Be simple, and effective. Maybe plug into Lightroom, capture one, or apple photos.</p><p>I want this. Build it. Let’s discover all the amazing photos we have taken through the magic of AI.</p><p>My hacking buddy Ivan was around while I was building this. He immediately saw the magic of what a person could discover by using this on their photo library. He wanted to use it immediately.</p><p>His photo catalog is on an external hard drive - but he had his Lightroom preview file locally. He wrote a quick script to extract the thumbnails and metadata from the preview file and save it to an external disk.</p><p>We then ran the image vector crawler and BAM - he could see similar images and what not. Worked perfectly.</p><h4 id="recover-your-lightroom-photos-or-at-least-the-thumbnails">Recover your Lightroom photos. Or at least the thumbnails.</h4><p>Ivan’s simple script to extract the images from the preview file is really awesome. If you have ever lost your real photo library (corrupt harddrive, or whatever) and you still have the lrpreview file - this script can help you extract at least the lower res version.</p><p>A super handy script to keep around.</p><p>You can check it out here: <a href="https://github.com/ibips/lrprev-extract" target="_blank">LR Preview JPEG Extractor</a>.</p><h2 id="thanks-for-reading">Thanks for reading.</h2><p>As always, <a href="https://harper.blog/cdn-cgi/l/email-protection#81e9e0f3f1e4f3c1eceee5e4f2f5afe2eeec">hmu</a> and let’s hang out. I am thinking a lot about AI, Ecommerce, photos, hifi, hacking and other shit.</p><p>If you are in Chicago come hang out.</p></div></article></div></div></div>]]>
+<img title="" loading="lazy" decoding="async" src="https://harper.blog/images/posts/vector-memes-bokeh.png" alt="" width="" height=""></p><p>It’s wonderful, because I can click through and find great images I had forgotten about. Like this great photo of Baratunde that I took in 2017:</p><p><img title="" loading="lazy" decoding="async" src="https://harper.blog/images/posts/vector-memes-baratunde.png" alt="" width="" height=""></p><h3 id="this-will-be-everywhere">This will be everywhere</h3><p>I imagine that we will see this tech rolled into all the various photo apps shortly. Google Photos probably already does this, but they have googled it so much that nobody notices.</p><p>This is too good to not roll into whatever photo app you use. If I had any large scale product that used photos or images, I would immediately set up a pipeline to start encoding the images to see what kind of weird features this unlocks.</p><h2 id="you-can-use-this-for-the-low-price-of-free">YOU CAN USE THIS FOR THE LOW PRICE OF FREE</h2><p>I put the source here: <a href="https://github.com/harperreed/photo-similarity-search" target="_blank">harperreed/photo-similarity-search</a>.</p><p>Please check it out.</p><p>It is pretty straight forward to get going. It is a bit hacky. lol.</p><p>I would use conda or something similar to keep things clean. The interface is simple tailwind. The web is flask. The code is python. I am your host, harper reed.</p><h2 id="my-challenge-for-you">My challenge for you!</h2><p>Please build an app that I can use to catalog my photo library in a nice way. I don’t want to upload to another destination. I want to have a simple Mac app that I can point to my photo library and say “crawl this.” I imagine a lot of neat stuff could be added:</p><ul><li>Llava/Moondream auto captioning</li><li>Keywords / Tags</li><li>Vector similarity</li><li>etc</li></ul><p>It should run locally. Be a native app. Be simple, and effective. Maybe plug into Lightroom, capture one, or apple photos.</p><p>I want this. Build it. Let’s discover all the amazing photos we have taken through the magic of AI.</p><p>My hacking buddy Ivan was around while I was building this. He immediately saw the magic of what a person could discover by using this on their photo library. He wanted to use it immediately.</p><p>His photo catalog is on an external hard drive - but he had his Lightroom preview file locally. He wrote a quick script to extract the thumbnails and metadata from the preview file and save it to an external disk.</p><p>We then ran the image vector crawler and BAM - he could see similar images and what not. Worked perfectly.</p><h4 id="recover-your-lightroom-photos-or-at-least-the-thumbnails">Recover your Lightroom photos. Or at least the thumbnails.</h4><p>Ivan’s simple script to extract the images from the preview file is really awesome. If you have ever lost your real photo library (corrupt harddrive, or whatever) and you still have the lrpreview file - this script can help you extract at least the lower res version.</p><p>A super handy script to keep around.</p><p>You can check it out here: <a href="https://github.com/ibips/lrprev-extract" target="_blank">LR Preview JPEG Extractor</a>.</p><h2 id="thanks-for-reading">Thanks for reading.</h2><p>As always, <a href="https://harper.blog/cdn-cgi/l/email-protection#a4ccc5d6d4c1d6e4c9cbc0c1d7d08ac7cbc9">hmu</a> and let’s hang out. I am thinking a lot about AI, Ecommerce, photos, hifi, hacking and other shit.</p><p>If you are in Chicago come hang out.</p></div></article></div></div></div>]]>
             </description>
             <link>https://harper.blog/2024/04/12/i-accidentally-built-a-meme-search-engine/</link>
             <guid isPermaLink="false">hacker-news-small-sites-40015953</guid>
@@ -300,7 +554,7 @@ This was incredible.</p><p>I can’t imagine the amount of work we would have do
             </title>
             <description>
 <![CDATA[
-Score 173 | Comments 141 (<a href="https://news.ycombinator.com/item?id=40015612">thread link</a>) | @alexzeitler
+Score 173 | Comments 144 (<a href="https://news.ycombinator.com/item?id=40015612">thread link</a>) | @alexzeitler
 <br/>
 April 12, 2024 | https://blog.gypsydave5.com/posts/2024/4/12/htmx-and-the-rule-of-least-power/ | <a href="https://web.archive.org/web/*/https://blog.gypsydave5.com/posts/2024/4/12/htmx-and-the-rule-of-least-power/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -400,7 +654,7 @@ April 12, 2024 | https://blog.gypsydave5.com/posts/2024/4/12/htmx-and-the-rule-o
             </title>
             <description>
 <![CDATA[
-Score 356 | Comments 136 (<a href="https://news.ycombinator.com/item?id=40015185">thread link</a>) | @lordofmoria
+Score 408 | Comments 148 (<a href="https://news.ycombinator.com/item?id=40015185">thread link</a>) | @lordofmoria
 <br/>
 April 12, 2024 | https://kenkantzer.com/lessons-after-a-half-billion-gpt-tokens/ | <a href="https://web.archive.org/web/*/https://kenkantzer.com/lessons-after-a-half-billion-gpt-tokens/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -502,7 +756,7 @@ end</code></pre>
             </title>
             <description>
 <![CDATA[
-Score 390 | Comments 79 (<a href="https://news.ycombinator.com/item?id=40014937">thread link</a>) | @back7co
+Score 391 | Comments 79 (<a href="https://news.ycombinator.com/item?id=40014937">thread link</a>) | @back7co
 <br/>
 April 12, 2024 | https://www.doscher.com/recovery-kit-version-2/ | <a href="https://web.archive.org/web/*/https://www.doscher.com/recovery-kit-version-2/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section>
@@ -573,7 +827,7 @@ Digital files are for paid members only- signing up is very reasonable with memb
             </title>
             <description>
 <![CDATA[
-Score 54 | Comments 6 (<a href="https://news.ycombinator.com/item?id=40014708">thread link</a>) | @owulveryck
+Score 56 | Comments 6 (<a href="https://news.ycombinator.com/item?id=40014708">thread link</a>) | @owulveryck
 <br/>
 April 12, 2024 | https://blog.owulveryck.info/2024/04/09/data-as-a-product-and-data-contract-an-evolutionary-approach-to-data-maturity.html | <a href="https://web.archive.org/web/*/https://blog.owulveryck.info/2024/04/09/data-as-a-product-and-data-contract-an-evolutionary-approach-to-data-maturity.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content">
@@ -708,11 +962,138 @@ Throughout this process, remembering to consider data as a product is crucial. D
         </item>
         <item>
             <title>
+<![CDATA[Finding and fixing standard misconceptions about program behavior]]>
+            </title>
+            <description>
+<![CDATA[
+Score 51 | Comments 13 (<a href="https://news.ycombinator.com/item?id=40014486">thread link</a>) | @vector_spaces
+<br/>
+April 12, 2024 | https://blog.brownplt.org/2024/04/12/behavior-misconceptions.html | <a href="https://web.archive.org/web/*/https://blog.brownplt.org/2024/04/12/behavior-misconceptions.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content">
+<div id="graymatter">
+
+
+<div id="posts">
+  <div id="posts-content">
+    
+    
+
+
+    
+        
+        
+        	<p><em>
+          		Posted on 12 April 2024.</em></p><p>A large number of modern languages — from Java and C# to Python and JavaScript to Racket and OCaml — share a common semantic core:</p>
+
+<ul>
+  <li>variables are lexically scoped</li>
+  <li>scope can be nested</li>
+  <li>evaluation is eager</li>
+  <li>evaluation is sequential (per “thread”)</li>
+  <li>variables are mutable, but first-<em>order</em></li>
+  <li>structures (e.g., vectors/arrays and objects) are mutable, and first-<em>class</em></li>
+  <li>functions can be higher-order, and close over lexical bindings</li>
+  <li>memory is managed automatically (e.g., garbage collection)</li>
+</ul>
+
+<p>We call this the <em>Standard Model of Languages</em> (SMoL).</p>
+
+<p>SMoL potentially has huge pedagogic benefit:</p>
+
+<ul>
+  <li>
+    <p>If students master SMoL, they have a good handle on the core of several of these languages.</p>
+  </li>
+  <li>
+    <p>Students may find it easier to port their knowledge between languages: instead of being lost in a sea of different syntax, they can find familiar signposts in the common semantic features. This may also make it easier to learn new languages.</p>
+  </li>
+  <li>
+    <p>The <em>differences</em> between the languages are thrown into sharper contrast.</p>
+  </li>
+  <li>
+    <p>Students can see that, by going beyond syntax, there are several big semantic ideas that underlie all these languages, many of which we consider “best practices” in programming language design.</p>
+  </li>
+</ul>
+
+<p>We have therefore spent the past four years working on the pedagogy of SMoL:</p>
+
+<ul>
+  <li>
+    <p>Finding errors in the understanding of SMoL program behavior.</p>
+  </li>
+  <li>
+    <p>Finding the (mis)conceptions behind these errors.</p>
+  </li>
+  <li>
+    <p>Collating these into clean instruments that are easy to deploy.</p>
+  </li>
+  <li>
+    <p>Building a <em>tutor</em> to help students correct these misconceptions.</p>
+  </li>
+  <li>
+    <p>Validating all of the above.</p>
+  </li>
+</ul>
+
+<p>We are now ready to present a checkpoint of this effort. We have distilled the essence of this work into a tool:</p>
+
+<p><a href="https://smol-tutor.xyz/">The SMoL Tutor</a></p>
+
+<p>It identifies and tries to fix student misconceptions. The Tutor assumes users have a baseline of programming knowledge typically found after 1–2 courses: variables, assignments, structured values (like vectors/arrays), functions, and higher-order functions (<code>lambda</code>s). Unlike most tutors, instead of <em>teaching</em> these concepts, it investigates how well the user actually <em>understands</em> them. Wherever the user makes a mistake, the tutor uses an educational device called a <em>refutation text</em> to help them understand where they went wrong and to correct their conception. The Tutor lets the user switch between multiple syntaxes, both so they can work with whichever they find most comfortable (so that syntactic unfamiliarity or discomfort does not itself become a source of errors), and so they can see the semantic unity beneath these languages.</p>
+
+<p>Along the way, to better classify student responses, we invent a concept called the <em>misinterpreter</em>. A misinterpreter is an intentionally incorrect interpreter. Concretely, for each misconception, we create a corresponding misinterpreter: one that has the same semantics as SMoL <em>except</em> on that one feature, where it implements the misconception instead of the correct concept. By making misconceptions executable, we can mechanically check whether student responses correspond to a misconception.</p>
+
+<p>There are many interesting lessons here:</p>
+
+<ul>
+  <li>
+    <p>Many of the problematic programs are likely to be startlingly simple to experts.</p>
+  </li>
+  <li>
+    <p>The combination of state, aliasing, and functions is complicated for students. (Yet most <em>introductory</em> courses plunge students into this maelstrom of topics without a second thought or care.)</p>
+  </li>
+  <li>
+    <p>Misinterpreters are an interesting concept in their own right, and are likely to have value independent of the above use.</p>
+  </li>
+</ul>
+
+<p>In addition, we have not directly studied the following claims but believe they are well warranted based on observations from this work and from experience teaching and discussing programming languages:</p>
+
+<ul>
+  <li>
+    <p>In SMoL languages, local and top-level bindings behave the same as the binding induced by a function call. However, students often do not realize that these have a uniform semantics. In part this may be caused by our focus on the “call by” terminology, which focuses on calls (and makes them seem special). We believe it would be an improvement to replace these with “bind by”.</p>
+  </li>
+  <li>
+    <p>We also believe that the terms “call-by-value” and “call-by-reference” are so hopelessly muddled at this point (between students, instructors, blogs, the Web…) that finding better terminology overall would be helpful.</p>
+  </li>
+  <li>
+    <p>The way we informally talk about programming concepts (like “pass a variable”), and the syntactic choices our languages make (like <code>return x</code>), are almost certainly also sources of confusion. The former can naturally lead students to believe variables are being aliased, and the latter can lead them to believe the <em>variable</em>, rather than its <em>value</em>, is being returned.</p>
+  </li>
+</ul>
+
+<p>For more details about the work, see <a href="https://cs.brown.edu/~sk/Publications/Papers/Published/lk-smol-tutor/">the paper</a>. The paper is based on an old version of the Tutor, where all programs were presented in parenthetical syntax. The Tutor now supports multiple syntaxes, so you don’t have to worry about being constrained by that. Indeed, it’s being used right now in a course that uses Scala 3.</p>
+
+<p>Most of all, the <a href="https://smol-tutor.xyz/">SMoL Tutor</a> is free to use! We welcome and encourage instructors of programming courses to consider using it — you may be surprised by the mistakes your students make on these seemingly very simple programs. But we also welcome learners of all stripes to give it a try!</p>
+
+  </div>
+</div>
+
+
+
+</div>
+</div></div>]]>
+            </description>
+            <link>https://blog.brownplt.org/2024/04/12/behavior-misconceptions.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-40014486</guid>
+            <pubDate>Fri, 12 Apr 2024 16:09:28 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[I Lost Faith in Kagi]]>
             </title>
             <description>
 <![CDATA[
-Score 652 | Comments 587 (<a href="https://news.ycombinator.com/item?id=40011314">thread link</a>) | @Tomte
+Score 658 | Comments 591 (<a href="https://news.ycombinator.com/item?id=40011314">thread link</a>) | @Tomte
 <br/>
 April 12, 2024 | https://d-shoot.net/kagi.html | <a href="https://web.archive.org/web/*/https://d-shoot.net/kagi.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
@@ -800,7 +1181,7 @@ April 12, 2024 | https://spacetelescopelive.org/webb?obsId=01HTJT20C0STKNZ01KQYG
             </title>
             <description>
 <![CDATA[
-Score 82 | Comments 53 (<a href="https://news.ycombinator.com/item?id=40009743">thread link</a>) | @signa11
+Score 83 | Comments 53 (<a href="https://news.ycombinator.com/item?id=40009743">thread link</a>) | @signa11
 <br/>
 April 11, 2024 | https://www.greptime.com/blogs/2024-04-09-rust-protobuf-performance | <a href="https://web.archive.org/web/*/https://www.greptime.com/blogs/2024-04-09-rust-protobuf-performance">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-v-fe5c02a4=""><div data-v-fe5c02a4=""><div><h2 id="background" tabindex="-1">Background <a href="#background" aria-label="Permalink to &quot;Background&quot;">​</a></h2><p>When optimizing the write performance of GreptimeDB v0.7, we discovered through flame graphs that the CPU time spent parsing Prometheus write requests accounted for about 12% of the total. In comparison, the CPU time spent on protocol parsing by VictoriaMetrics, which is implemented in Go, is only around 5%. This forced us to start considering optimizing the overhead of the protocol conversion layer.</p><p>To simplify the discussion, all the test code is stored in the GitHub repository <a href="https://github.com/v0y4g3r/prom-write-request-bench" target="_blank" rel="noreferrer">https://github.com/v0y4g3r/prom-write-request-bench</a>.</p><div><p><span>bash</span></p><pre><code><span><span>git</span><span> </span><span>clone</span><span> </span><span>https://github.com/v0y4g3r/prom-write-request-bench</span><span> </span></span>
@@ -1019,7 +1400,7 @@ April 11, 2024 | https://www.augment.ink/threads-on-mastodon/ | <a href="https:/
             </title>
             <description>
 <![CDATA[
-Score 52 | Comments 24 (<a href="https://news.ycombinator.com/item?id=40008934">thread link</a>) | @nithinbekal
+Score 52 | Comments 25 (<a href="https://news.ycombinator.com/item?id=40008934">thread link</a>) | @nithinbekal
 <br/>
 April 11, 2024 | https://nithinbekal.com/posts/abstract-methods-notimplementederror-ruby/ | <a href="https://web.archive.org/web/*/https://nithinbekal.com/posts/abstract-methods-notimplementederror-ruby/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1394,7 +1775,7 @@ to replace <code>NotImplementedError</code>.</em></p>
             </title>
             <description>
 <![CDATA[
-Score 227 | Comments 19 (<a href="https://news.ycombinator.com/item?id=40008841">thread link</a>) | @Arteiii
+Score 228 | Comments 20 (<a href="https://news.ycombinator.com/item?id=40008841">thread link</a>) | @Arteiii
 <br/>
 April 11, 2024 | https://www.polarsparc.com/xhtml/Containers-1.html | <a href="https://web.archive.org/web/*/https://www.polarsparc.com/xhtml/Containers-1.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
@@ -3935,7 +4316,7 @@ We are planning to explore these connections, along with generalisations in a fo
             </title>
             <description>
 <![CDATA[
-Score 53 | Comments 15 (<a href="https://news.ycombinator.com/item?id=40008030">thread link</a>) | @maltalex
+Score 54 | Comments 15 (<a href="https://news.ycombinator.com/item?id=40008030">thread link</a>) | @maltalex
 <br/>
 April 11, 2024 | https://computernewb.com/vncresolver/ | <a href="https://web.archive.org/web/*/https://computernewb.com/vncresolver/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -3957,7 +4338,7 @@ April 11, 2024 | https://computernewb.com/vncresolver/ | <a href="https://web.ar
             </title>
             <description>
 <![CDATA[
-Score 142 | Comments 101 (<a href="https://news.ycombinator.com/item?id=40006697">thread link</a>) | @Lammy
+Score 142 | Comments 102 (<a href="https://news.ycombinator.com/item?id=40006697">thread link</a>) | @Lammy
 <br/>
 April 11, 2024 | http://insectoid.budwin.net/dos/descent/descent.html | <a href="https://web.archive.org/web/*/http://insectoid.budwin.net/dos/descent/descent.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="rdescm">
@@ -4077,7 +4458,7 @@ April 11, 2024 | https://www.benlandautaylor.com/p/the-ddos-attack-of-academic-b
             </title>
             <description>
 <![CDATA[
-Score 865 | Comments 128 (<a href="https://news.ycombinator.com/item?id=40003710">thread link</a>) | @00702
+Score 868 | Comments 129 (<a href="https://news.ycombinator.com/item?id=40003710">thread link</a>) | @00702
 <br/>
 April 11, 2024 | https://paulbupejr.com/developing-the-optigap-sensor-system/ | <a href="https://web.archive.org/web/*/https://paulbupejr.com/developing-the-optigap-sensor-system/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="post-890">
@@ -4212,7 +4593,7 @@ April 11, 2024 | https://realtime.org/data/nyc-rat-sightings | <a href="https://
             </title>
             <description>
 <![CDATA[
-Score 73 | Comments 76 (<a href="https://news.ycombinator.com/item?id=40001889">thread link</a>) | @lifefeed
+Score 74 | Comments 77 (<a href="https://news.ycombinator.com/item?id=40001889">thread link</a>) | @lifefeed
 <br/>
 April 11, 2024 | https://landedstar.com/blog/posts/stack-overflow-is-documentation/ | <a href="https://web.archive.org/web/*/https://landedstar.com/blog/posts/stack-overflow-is-documentation/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div>
@@ -4710,7 +5091,7 @@ April 11, 2024 | https://www.optometryadvisor.com/home/meetings/aaopt-2021/socia
             </title>
             <description>
 <![CDATA[
-Score 68 | Comments 33 (<a href="https://news.ycombinator.com/item?id=39999159">thread link</a>) | @andrea76
+Score 70 | Comments 33 (<a href="https://news.ycombinator.com/item?id=39999159">thread link</a>) | @andrea76
 <br/>
 April 11, 2024 | https://gekk.info/articles/dosapps.html | <a href="https://web.archive.org/web/*/https://gekk.info/articles/dosapps.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><tr><td>
@@ -5051,7 +5432,7 @@ April 11, 2024 | https://gekk.info/articles/dosapps.html | <a href="https://web.
             </title>
             <description>
 <![CDATA[
-Score 658 | Comments 367 (<a href="https://news.ycombinator.com/item?id=39998849">thread link</a>) | @hongsy
+Score 661 | Comments 367 (<a href="https://news.ycombinator.com/item?id=39998849">thread link</a>) | @hongsy
 <br/>
 April 10, 2024 | https://suno.com/song/da6d4a83-1001-4694-8c28-648a6e8bad0a/ | <a href="https://web.archive.org/web/*/https://suno.com/song/da6d4a83-1001-4694-8c28-648a6e8bad0a/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-theme="dark"><div data-theme="dark"><p data-theme="dark">Sad girl piano ballad; jazz-trained female singer-songwriter</p></div><p data-theme="dark">Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
