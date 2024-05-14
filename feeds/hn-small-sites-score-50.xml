@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Tue, 14 May 2024 12:23:51 GMT</lastBuildDate>
+        <lastBuildDate>Tue, 14 May 2024 16:22:41 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-50.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Tue, 14 May 2024 12:23:51 GMT</pubDate>
+        <pubDate>Tue, 14 May 2024 16:22:41 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,857 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Blazingly fast linked lists]]>
+            </title>
+            <description>
+<![CDATA[
+Score 94 | Comments 22 (<a href="https://news.ycombinator.com/item?id=40355227">thread link</a>) | @dmitry_dygalo
+<br/>
+May 14, 2024 | https://dygalo.dev/blog/blazingly-fast-linked-lists/ | <a href="https://web.archive.org/web/*/https://dygalo.dev/blog/blazingly-fast-linked-lists/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+            
+  <figure>
+    <img src="https://dygalo.dev/blog/2048px-Rusty_chain_in_fishing_boat.jpg">
+    
+      <figcaption>© Tomas Castelazo, www.tomascastelazo.com / Wikimedia Commons / CC BY-SA 4.0</figcaption>
+    
+  </figure>
+
+<p>Linked lists are <a href="https://rust-unofficial.github.io/too-many-lists/" target="_blank">taught</a> as fundamental data structures in programming courses, but they are more commonly encountered in tech interviews than in real-world projects.</p>
+<p>In this post, I'll demonstrate a practical use case where a linked list significantly outperforms <code>Vec</code>. 
+We will build a simple data validation library that shows the exact error location within invalid input, showcasing how a linked list can be used in graph traversals.</p>
+<p>Starting with a naive approach, we’ll progressively implement various optimizations and observe their impact on performance. </p>
+<p>Readers are expected to have a basic understanding of Rust, common data structures, and the concept of memory allocations (stack vs. heap).</p>
+<blockquote>
+<p>To follow along with the implementation steps and explore the code, check out the accompanying <a href="https://github.com/Stranger6667/article-linked-lists" target="_blank">repository</a></p>
+</blockquote>
+<h2 id="validation-api">Validation API</h2>
+<p>Our library is fairly minimal, and follows <a href="https://json-schema.org/specification#specification-documents" target="_blank">JSON Schema</a> semantics:</p>
+<pre data-lang="rust"><code data-lang="rust"><span>use </span><span>serde_json::json;
+</span><span>
+</span><span>fn </span><span>main</span><span>() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+</span><span>    jsonschema::validate(
+</span><span>      </span><span>// JSON instance to validate
+</span><span>      &amp;json!({
+</span><span>          "</span><span>name</span><span>": "</span><span>John</span><span>",
+</span><span>          "</span><span>location</span><span>": {
+</span><span>               "</span><span>country</span><span>": </span><span>404
+</span><span>          }
+</span><span>      }),
+</span><span>      </span><span>// JSON schema
+</span><span>      &amp;json!({
+</span><span>          "</span><span>properties</span><span>": {
+</span><span>              "</span><span>name</span><span>": {
+</span><span>                  "</span><span>type</span><span>": "</span><span>string</span><span>"
+</span><span>              },
+</span><span>              "</span><span>location</span><span>": {
+</span><span>                  "</span><span>properties</span><span>": {
+</span><span>                      "</span><span>country</span><span>": {
+</span><span>                          "</span><span>type</span><span>": "</span><span>string</span><span>"
+</span><span>                      }
+</span><span>                  }
+</span><span>              }
+</span><span>          }
+</span><span>      }),
+</span><span>    ).</span><span>expect_err</span><span>("</span><span>Should fail</span><span>");
+</span><span>    Ok(())
+</span><span>}
+</span></code></pre>
+<p>In this example, <code>404</code> is not a string and this code should result in an error like this:</p>
+<pre><code><span>404 is not of type ‘string’ at /location/country
+</span><span> |                             |               |
+</span><span> |                              ---------------
+</span><span> |                                     |
+</span><span> |                                     Location within the JSON instance
+</span><span> |
+</span><span>  Failing value
+</span></code></pre>
+<blockquote>
+<p>This library and optimization ideas are derived from my <a href="https://github.com/Stranger6667/jsonschema-rs" target="_blank">jsonschema</a> crate</p>
+</blockquote>
+<p>The validation process boils down to graph traversal. The input instance is traversed based on rules defined in the schema. At any traversal step, we should know the current location within the JSON instance to potentially report a meaningful error.</p>
+
+  <p><img src="https://dygalo.dev/blog/validation-process.png"></p><p>Our primary goal is to implement location tracking while minimizing its impact on the library's performance.</p>
+<p>Without diving too deep into the <code>Validator</code> and <code>Node</code> implementations, let's see a simplified version of the validation process without location tracking:</p>
+<pre data-lang="rust"><code data-lang="rust"><span>type </span><span>ValidationResult = Result&lt;(), ValidationError&gt;;
+</span><span>
+</span><span>fn </span><span>validate</span><span>(</span><span>instance</span><span>: &amp;Value, </span><span>schema</span><span>: &amp;Value) -&gt; ValidationResult {
+</span><span>    Validator::new(schema)
+</span><span>        .</span><span>expect</span><span>("</span><span>Invalid schema</span><span>")
+</span><span>        .</span><span>validate</span><span>(instance)
+</span><span>}
+</span><span>
+</span><span>struct </span><span>ValidationError {
+</span><span>    </span><span>message</span><span>: String,
+</span><span>}
+</span><span>
+</span><span>impl </span><span>Validator {
+</span><span>    </span><span>/// Validate JSON instance against this validator.
+</span><span>    </span><span>fn </span><span>validate</span><span>(&amp;</span><span>self</span><span>, </span><span>instance</span><span>: &amp;Value) -&gt; ValidationResult {
+</span><span>        </span><span>self</span><span>.node.</span><span>validate</span><span>(instance)
+</span><span>    }
+</span><span>}
+</span><span>
+</span><span>trait </span><span>Node {
+</span><span>    </span><span>fn </span><span>validate</span><span>(&amp;</span><span>self</span><span>, </span><span>instance</span><span>: &amp;Value) -&gt; ValidationResult;
+</span><span>}
+</span><span>
+</span><span>impl </span><span>Node </span><span>for </span><span>Properties {
+</span><span>    </span><span>fn </span><span>validate</span><span>(&amp;</span><span>self</span><span>, </span><span>instance</span><span>: &amp;Value) -&gt; ValidationResult {
+</span><span>        </span><span>if let </span><span>Value::Object(object) = instance {
+</span><span>            </span><span>// Iterate over properties and validate them if they are present.
+</span><span>            </span><span>for </span><span>(key, value) in &amp;</span><span>self</span><span>.properties {
+</span><span>                </span><span>if let </span><span>Some(instance) = object.</span><span>get</span><span>(key) {
+</span><span>                    </span><span>// Delegate validation to the child validator.
+</span><span>                    value.</span><span>validate</span><span>(instance)?;
+</span><span>                }
+</span><span>            }
+</span><span>        }
+</span><span>        Ok(())
+</span><span>    }
+</span><span>}
+</span><span>
+</span><span>impl </span><span>Node </span><span>for </span><span>Type {
+</span><span>    </span><span>fn </span><span>validate</span><span>(&amp;</span><span>self</span><span>, </span><span>instance</span><span>: &amp;Value) -&gt; ValidationResult {
+</span><span>        </span><span>// ... 
+</span><span>    }
+</span><span>}
+</span></code></pre>
+<p>The <code>validate</code> function creates a new <code>Validator</code> instance (that is also a graph) from the provided schema and then calls its <code>validate</code> method with the JSON instance.
+The <code>Node</code> trait defines the <code>validate</code> method that each validation rule must implement.</p>
+<p>While this version provides error messages without location tracking, it serves as an upper bound for subsequent optimizations within the <code>validate</code> function.</p>
+<h2 id="benchmark-setup">Benchmark setup</h2>
+<p>To ensure the optimizations are relevant to the library's typical usage scenarios, we select inputs from different groups - valid and invalid instances of varying sizes. </p>
+<p>The <a href="https://github.com/Stranger6667/article-linked-lists/blob/main/benches/data.json#L2" target="_blank">schema</a> contains 10 levels of nesting and is deliberately restricted to only the <code>properties</code> and <code>type</code> keywords, which are sufficient to demonstrate the overhead of path-tracking behavior while simplifying benchmarking and keeping our focus on performance rather than JSON Schema semantics. It's worth noting that the path-tracking behavior will remain largely the same for other keywords as well.</p>
+<pre data-lang="json"><code data-lang="json"><span>{
+</span><span>    "</span><span>properties</span><span>":{
+</span><span>        "</span><span>another</span><span>":{
+</span><span>            "</span><span>type</span><span>":"</span><span>string</span><span>"
+</span><span>        },
+</span><span>        "</span><span>inner</span><span>":{
+</span><span>            "</span><span>properties</span><span>":{
+</span><span>                "</span><span>another</span><span>":{
+</span><span>                    "</span><span>type</span><span>":"</span><span>string</span><span>"
+</span><span>                },
+</span><span>                "</span><span>inner</span><span>":{
+</span><span>                    "</span><span>properties</span><span>":{
+</span><span>                        </span><span>// And so on for up to 10 levels
+</span><span>                    }
+</span><span>                }
+</span><span>            }
+</span><span>        }
+</span><span>    }
+</span><span>}
+</span></code></pre>
+<p>The instances have 0, 5, or 10 levels of nesting, following the schema's structure. Valid instances have a string value for the "another" property at the deepest level, while invalid instances have an integer.</p>
+<pre data-lang="json"><code data-lang="json"><span>// Valid - 5 levels
+</span><span>{
+</span><span>    "</span><span>inner</span><span>":{
+</span><span>        "</span><span>inner</span><span>":{
+</span><span>            "</span><span>inner</span><span>":{
+</span><span>                "</span><span>inner</span><span>":{
+</span><span>                    "</span><span>another</span><span>":"</span><span>hello</span><span>"
+</span><span>                }
+</span><span>            }
+</span><span>        }
+</span><span>    }
+</span><span>}
+</span><span>// Invalid - 5 levels
+</span><span>{
+</span><span>    "</span><span>inner</span><span>":{
+</span><span>        "</span><span>inner</span><span>":{
+</span><span>            "</span><span>inner</span><span>":{
+</span><span>                "</span><span>inner</span><span>":{
+</span><span>                    "</span><span>another</span><span>":</span><span>1
+</span><span>                }
+</span><span>            }
+</span><span>        }
+</span><span>    }
+</span><span>}
+</span></code></pre>
+<p>To focus on the performance of the validation process itself, the schema is hardcoded in <code>Validator::new</code>, and <code>Validator</code> is built once and then reused.</p>
+<p>Let’s measure performance with <a href="https://bheisler.github.io/criterion.rs/book/criterion_rs.html" target="_blank">criterion</a> by running the following validation routine:</p>
+<pre data-lang="rust"><code data-lang="rust"><span>const </span><span>NUMBER_OF_ITERATIONS</span><span>: </span><span>usize </span><span>= </span><span>10000</span><span>;
+</span><span>
+</span><span>fn </span><span>benchmarks</span><span>(</span><span>c</span><span>: &amp;</span><span>mut</span><span> Criterion) {
+</span><span>    </span><span>// snip ... 
+</span><span>    </span><span>for</span><span> instance in &amp;benchmark.instances {
+</span><span>        c.</span><span>bench_with_input</span><span>(
+</span><span>            BenchmarkId::new(instance.kind, &amp;instance.name),
+</span><span>            &amp;instance.value,
+</span><span>            |</span><span>b</span><span>: &amp;</span><span>mut</span><span> Bencher, </span><span>value</span><span>| {
+</span><span>                b.</span><span>iter</span><span>(|| {
+</span><span>                    </span><span>for </span><span>_ in </span><span>0</span><span>..</span><span>NUMBER_OF_ITERATIONS </span><span>{
+</span><span>                        </span><span>let </span><span>_ = validator.</span><span>validate</span><span>(value);
+</span><span>                    }
+</span><span>                });
+</span><span>            },
+</span><span>        );
+</span><span>    }
+</span><span>}
+</span></code></pre>
+<table>
+  <thead>
+    <tr>
+      <th rowspan="2">Commit</th>
+      <th colspan="3">Valid</th>
+      <th colspan="3">Invalid</th>
+    </tr>
+    <tr>
+      <th>0</th>
+      <th>5</th>
+      <th>10</th>
+      <th>0</th>
+      <th>5</th>
+      <th>10</th>
+    </tr>
+  </thead>
+  <tbody>
+<tr>
+  <td><a href="https://github.com/Stranger6667/article-linked-lists/commit/a030dcb18448555efa1a8f63f8b5ccebef7d2f59" target="_blank">a030dcb</a></td>
+  <td>36.3 µs</td>
+  <td>553.8 µs</td>
+  <td>1.11 ms</td>
+  <td>475.2 µs</td>
+  <td>914.8 µs</td>
+  <td>1.48 ms</td>
+</tr>
+  </tbody>
+</table>
+<blockquote>
+<p>The numbers in these microbenchmarks are not absolute and may vary depending on the hardware and the environment. Generally, the observed changes could be explained by stack traces in flame graphs, but you always need to check the benchmarks yourself.</p>
+</blockquote>
+<h2 id="naive-approach">Naive approach</h2>
+<p>Let's start from collecting traversed path segments in a vector adding a new segment each time validation goes one level deeper:</p>
+<pre data-lang="rust"><code data-lang="rust"><span>fn </span><span>validate</span><span>(&amp;</span><span>self</span><span>, </span><span>instance</span><span>: &amp;Value) -&gt; ValidationResult {
+</span><span>    </span><span>// Start with an empty vector
+</span><span>    </span><span>self</span><span>.node.</span><span>validate</span><span>(instance, vec![])
+</span><span>}
+</span><span>
+</span><span>trait </span><span>Node {
+</span><span>    </span><span>// Add `path` parameter to track the current location in the JSON instance
+</span><span>    </span><span>fn </span><span>validate</span><span>(&amp;</span><span>self</span><span>, </span><span>instance</span><span>: &amp;Value, </span><span>path</span><span>: Vec&lt;&amp;</span><span>str</span><span>&gt;) -&gt; ValidationResult;
+</span><span>}
+</span><span>
+</span><span>impl </span><span>Node </span><span>for </span><span>Properties {
+</span><span>    </span><span>fn </span><span>validate</span><span>(&amp;</span><span>self</span><span>, </span><span>instance</span><span>: &amp;Value, </span><span>path</span><span>: Vec&lt;&amp;</span><span>str</span><span>&gt;) -&gt; ValidationResult {
+</span><span>        </span><span>if let </span><span>Value::Object(object) = instance {
+</span><span>            </span><span>for </span><span>(key, value) in &amp;</span><span>self</span><span>.properties {
+</span><span>                </span><span>if let </span><span>Some((key, instance)) = object.</span><span>get_key_value</span><span>(key) {
+</span><span>                    </span><span>// Create a new path and pass it to the child node
+</span><span>                    </span><span>let mut</span><span> path = path.</span><span>clone</span><span>();
+</span><span>                    path.</span><span>push</span><span>(key);
+</span><span>                    value.</span><span>validate</span><span>(instance, path)?;
+</span><span>                }
+</span><span>            }
+</span><span>        }
+</span><span>        Ok(())
+</span><span>    }
+</span><span>}
+</span><span>
+</span><span>impl </span><span>Node </span><span>for </span><span>Type {
+</span><span>    </span><span>fn </span><span>validate</span><span>(&amp;</span><span>self</span><span>, </span><span>instance</span><span>: &amp;Value, </span><span>path</span><span>: Vec&lt;&amp;</span><span>str</span><span>&gt;) -&gt; ValidationResult {
+</span><span>        </span><span>match </span><span>(</span><span>self</span><span>, instance) {
+</span><span>            </span><span>// ... Compare `instance` type with expected type
+</span><span>            _ =&gt; Err(ValidationError::new(
+</span><span>                format!("</span><span>{instance}</span><span> is not of type '</span><span>{self}</span><span>'</span><span>"),
+</span><span>                </span><span>// Convert path to an iterator
+</span><span>                path.</span><span>into_iter</span><span>(),
+</span><span>            )),
+</span><span>        }
+</span><span>    }
+</span><span>}
+</span></code></pre>
+<p>The <code>ValidationError</code> struct now stores this path:</p>
+<pre data-lang="rust"><code data-lang="rust"><span>struct </span><span>ValidationError {
+</span><span>    </span><span>message</span><span>: String,
+</span><span>    </span><span>/// Error location within the input instance.
+</span><span>    </span><span>location</span><span>: Vec&lt;String&gt;,
+</span><span>}
+</span><span>
+</span><span>impl </span><span>ValidationError {
+</span><span>    </span><span>/// Create new validation error.
+</span><span>    </span><span>fn </span><span>new</span><span>(
+</span><span>        </span><span>message</span><span>: impl Into&lt;String&gt;,
+</span><span>        </span><span>// Accept an iterator and convert it to `Vec&lt;String&gt;`
+</span><span>        </span><span>location</span><span>: impl Iterator&lt;Item = impl Into&lt;String&gt;&gt;,
+</span><span>    ) -&gt; </span><span>Self </span><span>{
+</span><span>        </span><span>Self </span><span>{
+</span><span>            message: message.</span><span>into</span><span>(),
+</span><span>            location: location.</span><span>map</span><span>(Into::into).</span><span>collect</span><span>(),
+</span><span>        }
+</span><span>    }
+</span><span>}
+</span></code></pre>
+<p>If you've been writing Rust for a while, you'll likely recognize the <code>clone()</code> call as a common "solution" to lifetime and mutability issues. While it is acceptable in certain situations, depending on your performance and maintainability constraints, it often signals an opportunity for optimization. Cloning a <code>Vec</code> can be costly, especially in performance-critical code.</p>
+<table>
+  <thead>
+    <tr>
+      <th rowspan="2">Commit</th>
+      <th colspan="3">Valid</th>
+      <th colspan="3">Invalid</th>
+    </tr>
+    <tr>
+      <th>0</th>
+      <th>5</th>
+      <th>10</th>
+      <th>0</th>
+      <th>5</th>
+      <th>10</th>
+    </tr>
+  </thead>
+  <tbody>
+<tr>
+  <td><a href="https://github.com/Stranger6667/article-linked-lists/commit/9ef7b4c56c8ca2ba3dcd15681daff6951aa64c2c" target="_blank">9ef7b4c</a></td>
+  <td>40.9 µs<br>(<strong>+12%</strong>)</td>
+  <td>2.61 ms<br>(<strong>+369.4%</strong>)</td>
+  <td>6.69 ms<br>(<strong>+499.6%</strong>)</td>
+  <td>961.2 µs<br>(<strong>+100.8%</strong>)</td>
+  <td>4.11 ms<br>(<strong>+346.8%</strong>)</td>
+  <td>9.07 ms<br>(<strong>+502.7%</strong>)</td>
+</tr>
+  </tbody>
+</table>
+<p>This feature makes validation up to 6 times slower! </p>
+<blockquote>
+<p>You may note that <code>path</code> is only used when one of the validators returns an error. Can we leverage this observation for optimizations?</p>
+</blockquote>
+<p>Let’s visualize the slowest "valid" benchmark using <code>cargo flamegraph</code> to understand what is going on. As expected, the memory reallocations show up in the flame graph:</p>
+<pre data-lang="shell"><code data-lang="shell"><span>cargo flamegraph --bench jsonschema -o naive-10.svg -- --bench "^valid/10 levels"
+</span></code></pre>
+
+  <p><img src="https://dygalo.dev/blog/naive-valid-10.png"></p><blockquote>
+<p>Flame graphs are amazing for visualizing stack traces, see more details <a href="https://github.com/flamegraph-rs/flamegraph" target="_blank">here</a> </p>
+</blockquote>
+<h2 id="idea-1-cheaper-clones">Idea 1: Cheaper clones</h2>
+<p>There are a couple of ways to deal with clones. First, let's try a different data structure that offers cheaper clones. The <a href="https://docs.rs/imbl/latest/imbl/" target="_blank">imbl</a> crate provides the <code>Vector</code> type, which is based on the <a href="https://infoscience.epfl.ch/record/213452/files/rrbvector.pdf">Relaxed-Radix-Balanced tree</a>.</p>
+<p>RRB trees are a type of immutable data structure that allows for efficient structural sharing. This concept allows most memory to be shared among multiple mostly identical data structures, and extra memory is only allocated when modifications occur, thus requiring memory only to record the difference. With most operations being O(log n), <code>Vector </code> offers decent performance in many scenarios.</p>
+<pre data-lang="rust"><code data-lang="rust"><span>use </span><span>imbl::Vector;
+</span><span>
+</span><span>fn </span><span>validate</span><span>(&amp;</span><span>self</span><span>, </span><span>instance</span><span>: &amp;Value) -&gt; ValidationResult {
+</span><span>    </span><span>self</span><span>.node.</span><span>validate</span><span>(instance, Vector::new())
+</span><span>}
+</span><span>
+</span><span>trait </span><span>Node {
+</span><span>    </span><span>// Replace `Vec` with `imbl::Vector`
+</span><span>    </span><span>fn </span><span>validate</span><span>(&amp;</span><span>self</span><span>, </span><span>instance</span><span>: &amp;Value, </span><span>path</span><span>: Vector&lt;&amp;</span><span>str</span><span>&gt;) -&gt; ValidationResult;
+</span><span>}
+</span><span>
+</span><span>impl </span><span>Node </span><span>for </span><span>Properties {
+</span><span>    </span><span>fn </span><span>validate</span><span>(&amp;</span><span>self</span><span>, </span><span>instance</span><span>: &amp;Value, </span><span>path</span><span>: Vector&lt;&amp;</span><span>str</span><span>&gt;) -&gt; ValidationResult 
+</span><span>        </span><span>// ...
+</span><span>                    </span><span>let mut</span><span> path = path.</span><span>clone</span><span>();
+</span><span>                    </span><span>// Use `push_back` instead of `push`
+</span><span>                    path.</span><span>push_back</span><span>(key);
+</span><span>                    value.</span><span>validate</span><span>(instance, path)?;
+</span><span>        </span><span>// ...
+</span><span>    }
+</span><span>}
+</span><span>
+</span><span>impl </span><span>Node </span><span>for </span><span>Type {
+</span><span>    </span><span>fn </span><span>validate</span><span>(&amp;</span><span>self</span><span>, </span><span>instance</span><span>: &amp;Value, </span><span>path</span><span>: Vector&lt;&amp;</span><span>str</span><span>&gt;) -&gt; ValidationResult 
+</span><span>        </span><span>// ...
+</span><span>    }
+</span><span>}
+</span></code></pre>
+<table>
+  <thead>
+    <tr>
+      <th rowspan="2">Commit</th>
+      <th colspan="3">Valid</th>
+      <th colspan="3">Invalid</th>
+    </tr>
+    <tr>
+      <th>0</th>
+      <th>5</th>
+      <th>10</th>
+      <th>0</th>
+      <th>5</th>
+      <th>10</th>
+    </tr>
+  </thead>
+  <tbody>
+<tr>
+  <td><a href="https://github.com/Stranger6667/article-linked-lists/commit/77adb2c34ef95b978e90429c80bad59a422caa39" target="_blank">77adb2c</a></td>
+  <td>47.1 µs<br>(<strong>+13.6%</strong>)</td>
+  <td>2.25 ms<br>(<strong>-15.6%</strong>)</td>
+  <td>6.49 ms<br>(<strong>-3.7%</strong>)</td>
+  <td>904.3 µs<br>(<strong>-6.6%</strong>)</td>
+  <td>4.09 ms<br>(<strong>-1.2%</strong>)</td>
+  <td>9.77 ms<br>(<strong>+6.7%</strong>)</td>
+</tr>
+  </tbody>
+</table>
+<p>Interesting! In some cases, <code>Vector</code> outperforms the naive approach, while in others, it introduces slight overhead.  While <code>Vector</code> can be faster for certain data &amp; usage patterns due to structural sharing, it may introduce overhead for other patterns because of its more complex internal structure.</p>
+<blockquote>
+<p>In some scenarios, where modifications occur way less often than clones, you can consider using Arc as explained in this <a href="https://www.youtube.com/watch?v=A4cKi7PTJSs">video</a> . You may also try the <a href="https://docs.rs/rpds/latest/rpds/" target="_blank">rpds</a> crate which provides similar data structures with structural sharing.</p>
+</blockquote>
+<h2 id="idea-2-reuse-allocations">Idea 2: Reuse allocations</h2>
+<p>However, you may note that we don't have to clone the data - what if we mutate the same vector, pushing and popping segments as we traverse?</p>
+<pre data-lang="rust"><code data-lang="rust"><span>trait </span><span>Node {
+</span><span>    </span><span>fn </span><span>validate</span><span>&lt;</span><span>'a</span><span>&gt;(
+</span><span>        &amp;</span><span>self</span><span>,
+</span><span>        </span><span>instance</span><span>: &amp;</span><span>'a</span><span> Value,
+</span><span>        </span><span>path</span><span>: &amp;</span><span>mut </span><span>Vec&lt;&amp;</span><span>'a str</span><span>&gt;,
+</span><span>    ) -&gt; ValidationResult;
+</span><span>}
+</span><span>
+</span><span>impl </span><span>Node </span><span>for </span><span>Properties {
+</span><span>    </span><span>fn </span><span>validate</span><span>&lt;</span><span>'a</span><span>&gt;(
+</span><span>        &amp;</span><span>self</span><span>,
+</span><span>        </span><span>instance</span><span>: &amp;</span><span>'a</span><span> Value,
+</span><span>        </span><span>path</span><span>: &amp;</span><span>mut </span><span>Vec&lt;&amp;</span><span>'a str</span><span>&gt;,
+</span><span>    ) -&gt; ValidationResult {
+</span><span>        </span><span>// ...
+</span><span>                    path.</span><span>push</span><span>(key);
+</span><span>                    value.</span><span>validate</span><span>(instance, path)?;
+</span><span>                    path.</span><span>pop</span><span>();
+</span><span>        </span><span>// ...
+</span><span>    }
+</span><span>}
+</span><span>
+</span><span>impl </span><span>Node </span><span>for </span><span>Type {
+</span><span>    </span><span>fn </span><span>validate</span><span>&lt;</span><span>'a</span><span>&gt;(
+</span><span>        &amp;</span><span>self</span><span>,
+</span><span>        </span><span>instance</span><span>: &amp;</span><span>'a</span><span> Value,
+</span><span>        </span><span>path</span><span>: &amp;</span><span>mut </span><span>Vec&lt;&amp;</span><span>'a str</span><span>&gt;,
+</span><span>    ) -&gt; ValidationResult {
+</span><span>        </span><span>match </span><span>(</span><span>self</span><span>, instance) {
+</span><span>            </span><span>// ... Compare `instance` type with expected type
+</span><span>            _ =&gt; Err(ValidationError::new(
+</span><span>                format!("</span><span>{instance}</span><span> is not of type '</span><span>{self}</span><span>'</span><span>"),
+</span><span>                path.</span><span>iter</span><span>().</span><span>copied</span><span>(),
+</span><span>            )),
+</span><span>        }
+</span><span>    }
+</span></code></pre>
+<p>The lifetime annotations (<code>'a</code>) are needed here because the path parameter is a mutable reference to a <code>Vec</code> that contains references to the <code>instance</code> parameter. The lifetime <code>'a</code> ensures that the references in <code>path</code> do not outlive the <code>instance</code> they refer to.</p>
+<table>
+  <thead>
+    <tr>
+      <th rowspan="2">Commit</th>
+      <th colspan="3">Valid</th>
+      <th colspan="3">Invalid</th>
+    </tr>
+    <tr>
+      <th>0</th>
+      <th>5</th>
+      <th>10</th>
+      <th>0</th>
+      <th>5</th>
+      <th>10</th>
+    </tr>
+  </thead>
+  <tbody>
+<tr>
+  <td><a href="https://github.com/Stranger6667/article-linked-lists/commit/7c9473689bf24b90c8e0c45f700ad985b536a73e" target="_blank">7c94736</a></td>
+  <td>40.2 µs<br>(<strong>-13.1%</strong>)</td>
+  <td>1.24 ms<br>(<strong>-46.0%</strong>)</td>
+  <td>2.46 ms<br>(<strong>-62.3%</strong>)</td>
+  <td>951.7 µs<br>(<strong>+3.0%</strong>)</td>
+  <td>2.39 ms<br>(<strong>-42.2%</strong>)</td>
+  <td>4.16 ms<br>(<strong>-58.7%</strong>)</td>
+</tr>
+  </tbody>
+</table>
+<p>Indeed, using <code>&amp;mut Vec</code> can significantly improve performance compared to the naive approach, by reusing a single heap allocation instead of creating multiple clones. However, this approach requires more bookkeeping and somewhat more lifetime annotations, which can increase code complexity.</p>
+<h2 id="idea-3-linked-list">Idea 3: Linked list</h2>
+<p>However, is it even necessary to allocate heap memory for a vector during traversal? Consider this: for each traversed node in the input value, there's a corresponding <code>validate</code> function call with its own stack frame. As a result, path segments can be stored in these stack frames, eliminating the need for heap allocations completely.</p>
+
+  <p><img src="https://dygalo.dev/blog/function-call-frames.png"></p><blockquote>
+<p>Taking a step back and looking from a different angle can uncover ideas that may not be apparent at a lower level.</p>
+</blockquote>
+<p>By storing all segments on the stack, when an error happens, the previous segments can be traced back. This approach involves connecting each segment to form a path and collecting them when necessary. This sounds like a linked list:</p>
+<pre data-lang="rust"><code data-lang="rust"><span>/// A node in a linked list representing a JSON pointer.
+</span><span>struct </span><span>JsonPointerNode&lt;</span><span>'a</span><span>, </span><span>'b</span><span>&gt; {
+</span><span>    </span><span>segment</span><span>: Option&lt;&amp;</span><span>'a str</span><span>&gt;,
+</span><span>    </span><span>parent</span><span>: Option&lt;&amp;</span><span>'b </span><span>JsonPointerNode&lt;</span><span>'a</span><span>, </span><span>'b</span><span>&gt;&gt;,
+</span><span>}
+</span><span>impl</span><span>&lt;</span><span>'a</span><span>, </span><span>'b</span><span>&gt; JsonPointerNode&lt;</span><span>'a</span><span>, </span><span>'b</span><span>&gt; {
+</span><span>    </span><span>/// Create a root node of a JSON pointer.
+</span><span>    </span><span>const fn </span><span>new</span><span>() -&gt; </span><span>Self </span><span>{
+</span><span>        JsonPointerNode {
+</span><span>            segment: None,
+</span><span>            parent: None,
+</span><span>        }
+</span><span>    }
+</span><span>    </span><span>/// Push a new segment to the JSON pointer.
+</span><span>    </span><span>fn </span><span>push</span><span>(&amp;</span><span>'a </span><span>self</span><span>, </span><span>segment</span><span>: &amp;</span><span>'a str</span><span>) -&gt; JsonPointerNode&lt;</span><span>'a</span><span>, </span><span>'b</span><span>&gt; {
+</span><span>        JsonPointerNode {
+</span><span>            segment: Some(segment),
+</span><span>            parent: Some(</span><span>self</span><span>),
+</span><span>        }
+</span><span>    }
+</span><span>    </span><span>/// Convert the JSON pointer node to a vector of path segments.
+</span><span>   </span><span>fn </span><span>to_vec</span><span>(&amp;</span><span>'a </span><span>self</span><span>) -&gt; Vec&lt;&amp;</span><span>'a str</span><span>&gt; {
+</span><span>        </span><span>// Callect the segments from the head to the tail
+</span><span>        </span><span>let mut</span><span> buffer = Vec::new();
+</span><span>        </span><span>let mut</span><span> head = </span><span>self</span><span>;
+</span><span>        </span><span>if let </span><span>Some(segment) = &amp;head.segment {
+</span><span>            buffer.</span><span>push</span><span>(*segment);
+</span><span>        }
+</span><span>        </span><span>while let </span><span>Some(next) = head.parent {
+</span><span>            head = next;
+</span><span>            </span><span>if let </span><span>Some(segment) = &amp;head.segment {
+</span><span>                buffer.</span><span>push</span><span>(*segment);
+</span><span>            }
+</span><span>        }
+</span><span>        </span><span>// Reverse the buffer to get the segments in the correct order
+</span><span>        buffer.</span><span>reverse</span><span>();
+</span><span>        buffer
+</span><span>    }
+</span><span>}
+</span></code></pre>
+<p>Now we can replace <code>&amp;mut Vec</code>:</p>
+<pre data-lang="rust"><code data-lang="rust"><span>fn </span><span>validate</span><span>(&amp;</span><span>self</span><span>, </span><span>instance</span><span>: &amp;Value) -&gt; ValidationResult {
+</span><span>    </span><span>self</span><span>.node.</span><span>validate</span><span>(instance, JsonPointerNode::new())
+</span><span>}
+</span><span>
+</span><span>trait </span><span>Node {
+</span><span>    </span><span>fn </span><span>validate</span><span>&lt;</span><span>'a</span><span>&gt;(
+</span><span>        &amp;</span><span>self</span><span>,
+</span><span>        </span><span>instance</span><span>: &amp;</span><span>'a</span><span> Value,
+</span><span>        </span><span>path</span><span>: JsonPointerNode&lt;</span><span>'a</span><span>, '_&gt;,
+</span><span>    ) -&gt; ValidationResult;
+</span><span>}
+</span><span>
+</span><span>impl </span><span>Node </span><span>for </span><span>Properties {
+</span><span>    </span><span>fn </span><span>validate</span><span>&lt;</span><span>'a</span><span>&gt;(
+</span><span>        &amp;</span><span>self</span><span>,
+</span><span>        </span><span>instance</span><span>: &amp;</span><span>'a</span><span> Value,
+</span><span>        </span><span>path</span><span>: JsonPointerNode&lt;</span><span>'a</span><span>, '_&gt;,
+</span><span>    ) -&gt; ValidationResult {
+</span><span>        </span><span>// ...
+</span><span>                    value.</span><span>validate</span><span>(instance, path.</span><span>push</span><span>(key.</span><span>as_str</span><span>()))?;
+</span><span>        </span><span>// ...
+</span><span>}
+</span><span>
+</span><span>impl </span><span>Node </span><span>for </span><span>Type {
+</span><span>    </span><span>fn </span><span>validate</span><span>&lt;</span><span>'a</span><span>&gt;(
+</span><span>        &amp;</span><span>self</span><span>,
+</span><span>        </span><span>instance</span><span>: &amp;</span><span>'a</span><span> Value,
+</span><span>        </span><span>path</span><span>: JsonPointerNode&lt;</span><span>'a</span><span>, '_&gt;,
+</span><span>    ) -&gt; ValidationResult {
+</span><span>        </span><span>match </span><span>(</span><span>self</span><span>, instance) {
+</span><span>            </span><span>// ... Compare `instance` type with expected type
+</span><span>            _ =&gt; Err(ValidationError::new(
+</span><span>                format!("</span><span>{instance}</span><span> is not of type '</span><span>{self}</span><span>'</span><span>"),
+</span><span>                path.</span><span>to_vec</span><span>().</span><span>into_iter</span><span>(),
+</span><span>            )),
+</span><span>        }
+</span><span>    }
+</span><span>}
+</span></code></pre>
+<p>No heap allocations during traversal! Does it help?</p>
+<table>
+  <thead>
+    <tr>
+      <th rowspan="2">Commit</th>
+      <th colspan="3">Valid</th>
+      <th colspan="3">Invalid</th>
+    </tr>
+    <tr>
+      <th>0</th>
+      <th>5</th>
+      <th>10</th>
+      <th>0</th>
+      <th>5</th>
+      <th>10</th>
+    </tr>
+  </thead>
+  <tbody>
+<tr>
+  <td><a href="https://github.com/Stranger6667/article-linked-lists/commit/91ec92c757d3948a2a032a55d035e6fadc63fdcf" target="_blank">91ec92c</a></td>
+  <td>35.0 µs<br>(<strong>-14.8%</strong>)</td>
+  <td>663.5 µs<br>(<strong>-46.4%</strong>)</td>
+  <td>1.32 ms<br>(<strong>-46.6%</strong>)</td>
+  <td>958.9 µs<br>(<strong>+1.8%</strong>)</td>
+  <td>2.54 ms<br>(<strong>+5.1%</strong>)</td>
+  <td>4.58 ms<br>(<strong>+9.9%</strong>)</td>
+</tr>
+  </tbody>
+</table>
+<p>Woah! That is significantly better for valid inputs! Invalid ones are roughly the same, however, we have not optimized the linked list implementation yet.</p>
+<p>In our case, we are leveraging the fact, that the path is only needed when an error occurs. This allows us to avoid the overhead of maintaining the path during the entire traversal process and heap allocate only when necessary.</p>
+<blockquote>
+<p>Note that linked lists have worse cache locality compared to vectors, which can lead to slower performance in some scenarios.</p>
+</blockquote>
+<h2 id="idea-4-precise-memory-allocation">Idea 4: Precise memory allocation</h2>
+<p>Let's find out why the linked list implementation is not as performant for invalid inputs by looking at <code>JsonPointerNode</code> first:</p>
+
+  <p><img src="https://dygalo.dev/blog/linked-list-invalid-10.png"></p><p>Apparently, the problem is in memory reallocations inside <code>JsonPointerNode::to_vec</code>. We can avoid them by allocating the exact amount of memory needed. This will require an extra linked list traversal to calculate the capacity, but the performance gain from avoiding reallocations outweighs the cost of the extra traversal:</p>
+<pre data-lang="rust"><code data-lang="rust"><span>impl</span><span>&lt;</span><span>'a</span><span>, </span><span>'b</span><span>&gt; JsonPointerNode&lt;</span><span>'a</span><span>, </span><span>'b</span><span>&gt; {
+</span><span>    </span><span>pub</span><span>(</span><span>crate</span><span>) </span><span>fn </span><span>to_vec</span><span>(&amp;</span><span>'a </span><span>self</span><span>) -&gt; Vec&lt;&amp;</span><span>'a str</span><span>&gt; {
+</span><span>        </span><span>// Walk the linked list to calculate the capacity
+</span><span>        </span><span>let mut</span><span> capacity = </span><span>0</span><span>;
+</span><span>        </span><span>let mut</span><span> head = </span><span>self</span><span>;
+</span><span>        </span><span>while let </span><span>Some(next) = head.parent {
+</span><span>            head = next;
+</span><span>            capacity += </span><span>1</span><span>;
+</span><span>        }
+</span><span>        </span><span>// Callect the segments from the head to the tail
+</span><span>        </span><span>let mut</span><span> buffer = Vec::with_capacity(capacity);
+</span><span>        </span><span>let mut</span><span> head = </span><span>self</span><span>;
+</span><span>        </span><span>if let </span><span>Some(segment) = &amp;head.segment {
+</span><span>            buffer.</span><span>push</span><span>(*segment);
+</span><span>        }
+</span><span>        </span><span>while let </span><span>Some(next) = head.parent {
+</span><span>            head = next;
+</span><span>            </span><span>if let </span><span>Some(segment) = &amp;head.segment {
+</span><span>                buffer.</span><span>push</span><span>(*segment);
+</span><span>            }
+</span><span>        }
+</span><span>        </span><span>// Reverse the buffer to get the segments in the correct order
+</span><span>        buffer.</span><span>reverse</span><span>();
+</span><span>        buffer
+</span><span>    }
+</span><span>}
+</span></code></pre>
+<table>
+  <thead>
+    <tr>
+      <th rowspan="2">Commit</th>
+      <th colspan="3">Valid</th>
+      <th colspan="3">Invalid</th>
+    </tr>
+    <tr>
+      <th>0</th>
+      <th>5</th>
+      <th>10</th>
+      <th>0</th>
+      <th>5</th>
+      <th>10</th>
+    </tr>
+  </thead>
+  <tbody>
+<tr>
+  <td><a href="https://github.com/Stranger6667/article-linked-lists/commit/10ae4f100935c757bb7707defcf122c179aee2dc" target="_blank">10ae4f1</a></td>
+  <td>39.1 µs<br>(<strong>+11.2%</strong>)</td>
+  <td>667.9 µs<br>(<strong>+0.5%</strong>)</td>
+  <td>1.30 ms<br>(<strong>-1.7%</strong>)</td>
+  <td>899.7 µs<br>(<strong>-7.5%</strong>)</td>
+  <td>1.96 ms<br>(<strong>-23.3%</strong>)</td>
+  <td>3.49 ms<br>(<strong>-24.3%</strong>)</td>
+</tr>
+  </tbody>
+</table>
+<p>Great! Precise memory allocation improves performance for invalid inputs, bringing it closer to the performance of valid ones.
+Allocate exactly as needed, whenever possible, to avoid the overhead of memory reallocations.</p>
+<h2 id="idea-5-avoid-temporary-vec">Idea 5: Avoid temporary <code>Vec</code></h2>
+<p>At this point, the most significant slowdown is for invalid cases. If we take a closer look at the <code>ValidationError</code> implementation we’ll see the <code>collect</code> call, which means that first, we build <code>Vec&lt;&amp;str&gt;</code> in <code>JsonPointerNode::to_vec</code> and then almost immediately build <code>Vec&lt;String&gt;</code> from it, which means allocating <code>Vec</code> twice. Why don’t we just build <code>Vec&lt;String&gt;</code> in the first place:</p>
+<pre data-lang="rust"><code data-lang="rust"><span>impl </span><span>ValidationError {
+</span><span>    </span><span>fn </span><span>new</span><span>(</span><span>message</span><span>: impl Into&lt;String&gt;, </span><span>location</span><span>: Vec&lt;String&gt;) -&gt; </span><span>Self </span><span>{
+</span><span>        </span><span>Self </span><span>{
+</span><span>            message: message.</span><span>into</span><span>(),
+</span><span>            location,
+</span><span>        }
+</span><span>    }
+</span><span>}
+</span><span>
+</span><span>impl </span><span>Node </span><span>for </span><span>Type {
+</span><span>    </span><span>fn </span><span>validate</span><span>&lt;</span><span>'a</span><span>&gt;(
+</span><span>        &amp;</span><span>self</span><span>,
+</span><span>        </span><span>instance</span><span>: &amp;</span><span>'a</span><span> Value,
+</span><span>        </span><span>path</span><span>: JsonPointerNode&lt;</span><span>'a</span><span>, '_&gt;,
+</span><span>    ) -&gt; ValidationResult {
+</span><span>        </span><span>match </span><span>(</span><span>self</span><span>, instance) {
+</span><span>            </span><span>// ... Compare `instance` type with expected type
+</span><span>            _ =&gt; Err(ValidationError::new(
+</span><span>                format!("</span><span>{instance}</span><span> is not of type '</span><span>{self}</span><span>'</span><span>"),
+</span><span>                path.</span><span>to_vec</span><span>(),
+</span><span>            )),
+</span><span>        }
+</span><span>    }
+</span><span>}
+</span><span>
+</span><span>impl</span><span>&lt;</span><span>'a</span><span>, </span><span>'b</span><span>&gt; JsonPointerNode&lt;</span><span>'a</span><span>, </span><span>'b</span><span>&gt; {
+</span><span>    </span><span>pub</span><span>(</span><span>crate</span><span>) </span><span>fn </span><span>to_vec</span><span>(&amp;</span><span>self</span><span>) -&gt; Vec&lt;String&gt; {
+</span><span>        </span><span>// ...
+</span><span>        </span><span>if let </span><span>Some(segment) = &amp;head.segment {
+</span><span>            buffer.</span><span>push</span><span>((*segment).</span><span>to_string</span><span>());
+</span><span>        }
+</span><span>        </span><span>while let </span><span>Some(next) = head.parent {
+</span><span>            head = next;
+</span><span>            </span><span>if let </span><span>Some(segment) = &amp;head.segment {
+</span><span>                buffer.</span><span>push</span><span>((*segment).</span><span>to_string</span><span>());
+</span><span>            }
+</span><span>        }
+</span><span>        </span><span>// ...
+</span><span>    }
+</span><span>}
+</span></code></pre>
+<p>This optimization leads to a visible performance improvement for invalid cases:</p>
+<table>
+  <thead>
+    <tr>
+      <th rowspan="2">Commit</th>
+      <th colspan="3">Valid</th>
+      <th colspan="3">Invalid</th>
+    </tr>
+    <tr>
+      <th>0</th>
+      <th>5</th>
+      <th>10</th>
+      <th>0</th>
+      <th>5</th>
+      <th>10</th>
+    </tr>
+  </thead>
+  <tbody>
+<tr>
+  <td><a href="https://github.com/Stranger6667/article-linked-lists/commit/d3d2182e00aba996134475b90e87d565dfe47ac3" target="_blank">d3d2182</a></td>
+  <td>39.7 µs<br>(<strong>-0.2%</strong>)</td>
+  <td>652.3 µs<br>(<strong>-2.7%</strong>)</td>
+  <td>1.35 ms<br>(<strong>+2.2%</strong>)</td>
+  <td>765.1 µs<br>(<strong>-14.2%</strong>)</td>
+  <td>1.83 ms<br>(<strong>-6.9%</strong>)</td>
+  <td>3.33 ms<br>(<strong>-5.9%</strong>)</td>
+</tr>
+  </tbody>
+</table>
+<h2 id="idea-6-struct-size-optimization">Idea 6: Struct size optimization</h2>
+<p>Sometimes it is worth trying to reduce struct sizes, especially when the struct is passed by value frequently. 
+Smaller structs lead to less memory usage and faster function calls, as less data needs to be copied on the stack.</p>
+<p>If we were to track not only keys in JSON objects but also indexes in arrays, we would need to use an enum like this:</p>
+<pre data-lang="rust"><code data-lang="rust"><span>enum </span><span>Segment&lt;'a&gt; {
+</span><span>    </span><span>/// Property name within a JSON object.
+</span><span>    Property(&amp;</span><span>'a str</span><span>),
+</span><span>    </span><span>/// Index within a JSON array.
+</span><span>    Index(</span><span>usize</span><span>),
+</span><span>}
+</span><span>
+</span><span>struct </span><span>JsonPointerNode&lt;</span><span>'a</span><span>, </span><span>'b</span><span>&gt; {
+</span><span>    </span><span>segment</span><span>: Option&lt;Segment&lt;</span><span>'a</span><span>&gt;&gt;,
+</span><span>    </span><span>parent</span><span>: Option&lt;&amp;</span><span>'b </span><span>JsonPointerNode&lt;</span><span>'a</span><span>, </span><span>'b</span><span>&gt;&gt;,
+</span><span>}
+</span></code></pre>
+<p>Then, the <code>JsonPointerNode</code> struct would occupy 32 bytes:</p>
+<pre data-lang="rust"><code data-lang="rust"><span>assert_eq!(std::mem::size_of::&lt;JsonPointerNode&gt;(), </span><span>32</span><span>);
+</span></code></pre>
+<p>However, by avoiding <code>Option</code> in the <code>segment</code> field, we can reduce its size to 24 bytes. The idea is to put some cheap value in the root node and never read it:</p>
+<pre data-lang="rust"><code data-lang="rust"><span>struct </span><span>JsonPointerNode&lt;</span><span>'a</span><span>, </span><span>'b</span><span>&gt; {
+</span><span>    </span><span>segment</span><span>: Segment&lt;</span><span>'a</span><span>&gt;,
+</span><span>    </span><span>parent</span><span>: Option&lt;&amp;</span><span>'b </span><span>JsonPointerNode&lt;</span><span>'a</span><span>, </span><span>'b</span><span>&gt;&gt;,
+</span><span>}
+</span><span>impl</span><span>&lt;</span><span>'a</span><span>, </span><span>'b</span><span>&gt; JsonPointerNode&lt;</span><span>'a</span><span>, </span><span>'b</span><span>&gt; {
+</span><span>    </span><span>/// Create a root node of a JSON pointer.
+</span><span>    </span><span>const fn </span><span>new</span><span>() -&gt; </span><span>Self </span><span>{
+</span><span>        JsonPointerNode {
+</span><span>            </span><span>// The value does not matter, it will never be used
+</span><span>            segment: Segment::Index(</span><span>0</span><span>),
+</span><span>            parent: None,
+</span><span>        }
+</span><span>    }
+</span><span>   </span><span>fn </span><span>push</span><span>(&amp;</span><span>'a </span><span>self</span><span>, </span><span>segment</span><span>: Segment&lt;</span><span>'a</span><span>&gt;) -&gt; JsonPointerNode&lt;</span><span>'a</span><span>, </span><span>'b</span><span>&gt; {
+</span><span>        JsonPointerNode {
+</span><span>            segment,
+</span><span>            parent: Some(</span><span>self</span><span>),
+</span><span>        }
+</span><span>    }
+</span><span>    </span><span>/// Convert the JSON pointer node to a vector of path segments.
+</span><span>    </span><span>pub</span><span>(</span><span>crate</span><span>) </span><span>fn </span><span>to_vec</span><span>(&amp;</span><span>self</span><span>) -&gt; Vec&lt;String&gt; {
+</span><span>        </span><span>// ...
+</span><span>        </span><span>if</span><span> head.parent.</span><span>is_some</span><span>() {
+</span><span>            buffer.</span><span>push</span><span>(head.segment.</span><span>to_string</span><span>())
+</span><span>        }
+</span><span>        </span><span>while let </span><span>Some(next) = head.parent {
+</span><span>            head = next;
+</span><span>            </span><span>if</span><span> head.parent.</span><span>is_some</span><span>() {
+</span><span>                buffer.</span><span>push</span><span>(head.segment.</span><span>to_string</span><span>());
+</span><span>            }
+</span><span>        }
+</span><span>        </span><span>// ...
+</span><span>    }
+</span><span>}
+</span></code></pre>
+<p>This technique is directly used in the <a href="https://github.com/Stranger6667/jsonschema-rs" target="_blank">jsonschema</a> crate to reduce the size of the <code>JsonPointerNode</code> struct, but not used here for simplicity.</p>
+<h2 id="more-ideas-that-didn-t-make-it">More ideas that didn't make it</h2>
+<p>I think that we can also gain a bit more performance by avoiding the <code>reverse</code> call in <code>JsonPointerNode::to_vec</code>, as it moves the data around. One way to achieve this is by assigning segments starting from the back of a vector filled with default values. However, the extra bookeeping needed for writing in the reverse order could outweigh the gains, so it's important to profile and benchmark any changes to ensure they provide measurable benefits for your use case.</p>
+<p>Another idea is to store references to path segments inside <code>ValidationError</code> instead of cloning the strings:</p>
+<pre data-lang="rust"><code data-lang="rust"><span>struct </span><span>ValidationError&lt;</span><span>'a</span><span>&gt; {
+</span><span>    </span><span>message</span><span>: String,
+</span><span>    </span><span>location</span><span>: Vec&lt;&amp;</span><span>'a str</span><span>&gt;,
+</span><span>}
+</span></code></pre>
+<p>This way, we can avoid cloning the path segments and instead store references to them. This could lead to performance improvements, especially when dealing with long paths or large numbers of errors. However, this approach would make <code>ValidationError</code> less flexible, as it would be tied to the lifetime of the input JSON data.</p>
+<h2 id="bonus-idea-maybe-you-don-t-need-a-linked-list">Bonus idea: Maybe you don't need a linked list?</h2>
+<p>This idea was suggested by <a href="https://github.com/kobzol" target="_blank">@Kobzol</a>, who noted that the error path could be collected lazily from the call stack in the error propagation path. I've implemented the idea based on the suggestion and the original code snippet:</p>
+<pre data-lang="rust"><code data-lang="rust"><span>impl </span><span>ValidationError {
+</span><span>    </span><span>pub</span><span>(</span><span>crate</span><span>) </span><span>fn </span><span>push_segment</span><span>(&amp;</span><span>mut </span><span>self</span><span>, </span><span>segment</span><span>: String) {
+</span><span>        </span><span>self</span><span>.location.</span><span>push</span><span>(segment);
+</span><span>    }
+</span><span>    </span><span>pub</span><span>(</span><span>crate</span><span>) </span><span>fn </span><span>finish</span><span>(</span><span>mut </span><span>self</span><span>) -&gt; ValidationError {
+</span><span>        </span><span>self</span><span>.location.</span><span>reverse</span><span>();
+</span><span>        </span><span>self
+</span><span>    }
+</span><span>}
+</span><span>fn </span><span>validate</span><span>(&amp;</span><span>self</span><span>, </span><span>instance</span><span>: &amp;Value) -&gt; ValidationResult {
+</span><span>    </span><span>if let </span><span>Err(error) = </span><span>self</span><span>.node.</span><span>validate</span><span>(instance, </span><span>0</span><span>) {
+</span><span>        </span><span>// Reverse the path segments in the `finish` method
+</span><span>        Err(error.</span><span>finish</span><span>())
+</span><span>    } </span><span>else </span><span>{
+</span><span>        Ok(())
+</span><span>    }
+</span><span>}
+</span><span>
+</span><span>impl </span><span>Node </span><span>for </span><span>Properties {
+</span><span>    </span><span>fn </span><span>validate</span><span>(&amp;</span><span>self</span><span>, </span><span>instance</span><span>: &amp;Value, </span><span>level</span><span>: </span><span>u32</span><span>) -&gt; ValidationResult {
+</span><span>        </span><span>// ... 
+</span><span>            </span><span>for </span><span>(key, value) in &amp;</span><span>self</span><span>.properties {
+</span><span>                </span><span>if let </span><span>Some(instance) = object.</span><span>get</span><span>(key) {
+</span><span>                    </span><span>if let </span><span>Err(</span><span>mut</span><span> error) = value.</span><span>validate</span><span>(instance, level + </span><span>1</span><span>) {
+</span><span>                        error.</span><span>push_segment</span><span>(key.</span><span>to_string</span><span>());
+</span><span>                        </span><span>return </span><span>Err(error);
+</span><span>        </span><span>// ...
+</span><span>    }
+</span><span>}
+</span><span>
+</span><span>impl </span><span>Node </span><span>for </span><span>Type {
+</span><span>    </span><span>fn </span><span>validate</span><span>(&amp;</span><span>self</span><span>, </span><span>instance</span><span>: &amp;</span><span>'a</span><span> Value, </span><span>level</span><span>: </span><span>u32</span><span>) -&gt; ValidationResult {
+</span><span>        </span><span>// ...
+</span><span>            _ =&gt; Err(ValidationError::new(
+</span><span>                format!("</span><span>{instance}</span><span> is not of type '</span><span>{self}</span><span>'</span><span>"),
+</span><span>                Vec::with_capacity(level as </span><span>usize</span><span>)
+</span><span>        </span><span>// ...
+</span><span>    }
+</span><span>}
+</span></code></pre>
+<p>However, I was not able to get a stable improvement in benchmarks yet :(</p>
+<blockquote>
+<p>Small improvement may come from the fact that we no longer use the <code>?</code> operator as it involves the <code>From/Into</code> conversion, but we only have a single error type and don't need to convert it. This is the reason why <code>serde</code> has its own <code>tri!</code> <a href="https://github.com/serde-rs/serde/blob/3202a6858a2802b5aba2fa5cf3ec8f203408db74/serde/src/lib.rs#L287" target="_blank">macro</a> that is used instead of <code>?</code>;</p>
+</blockquote>
+<h2 id="conclusion">Conclusion</h2>
+<p>In the end, we achieved ~4.5x / ~2.2x improvements from the naive implementation for valid / invalid scenarios. Overall this feature adds 18% / 95% on top of the path-less version!</p>
+
+  <p><img src="https://dygalo.dev/blog/performance-comparison.png"></p><p>Some optimizations in this article may not seem immediately beneficial, especially if you already know where the bottlenecks are. However, exploring simpler optimizations can sometimes reveal unexpected opportunities for improvement. Even if an optimization doesn't directly pay off or even makes your code slower in some cases, it may open up new possibilities for further optimizations.</p>
+<p><strong>Takeaways</strong>:</p>
+<ol>
+<li>A naive approach could be good enough</li>
+<li>Try alternative data structures such as immutable <code>Vector</code></li>
+<li>Consider simpler stdlib variations like <code>Arc</code></li>
+<li>Look at the problem at different scales</li>
+<li>Search for a data structure that fits your problem</li>
+<li>Allocate exactly as needed and when necessary</li>
+<li>Reduce the size of values you pass around a lot</li>
+</ol>
+<p>If you have any more ideas to improve this use case or have any suggestions, please let me know!</p>
+<p>In the next article, I will dive into HTML trees and why you should try to build your own data structure for it.</p>
+<p>Thank you for your attention!</p>
+<p>Dmitry</p>
+
+        </div></div>]]>
+            </description>
+            <link>https://dygalo.dev/blog/blazingly-fast-linked-lists/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-40355227</guid>
+            <pubDate>Tue, 14 May 2024 13:51:26 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Using ARG in a Dockerfile – beware the gotcha]]>
             </title>
             <description>
 <![CDATA[
-Score 109 | Comments 52 (<a href="https://news.ycombinator.com/item?id=40352426">thread link</a>) | @todsacerdoti
+Score 117 | Comments 69 (<a href="https://news.ycombinator.com/item?id=40352426">thread link</a>) | @todsacerdoti
 <br/>
 May 14, 2024 | https://qmacro.org/blog/posts/2024/05/13/using-arg-in-a-dockerfile-beware-the-gotcha/ | <a href="https://web.archive.org/web/*/https://qmacro.org/blog/posts/2024/05/13/using-arg-in-a-dockerfile-beware-the-gotcha/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>Today I learned about the subtleties of <a href="https://docs.docker.com/build/guide/build-args/">build arguments</a> in Dockerfile definitions, specifically how the <code>ARG</code> instruction relates to - and is affected by - the <code>FROM</code> instruction. It's not entirely like a constant or a variable, in the way that I had thought.</p><h2>The problem with empty ARG values</h2><p>I spent more than a coffee's worth of time trying to understand why my custom builds of a CAP Node.js container image weren't of the CAP version I was specifying, either implicitly with the default value I'd declared in the <code>ARG</code> instruction in the Dockerfile, or even explicitly with the <code>--build-arg</code> option on the command line.</p><p>To illustrate the problem, here's a vastly simplified version of the Dockerfile I was building with:</p><pre><code><p><span><span>ARG</span> DEBVER=<span>"10"</span></span><br><span><span>ARG</span> CAPVER=<span>"7.8"</span></span><br><span><span>FROM</span> debian:<span>${DEBVER}</span></span></p><p><span><span>RUN</span> printf <span>"DEB=${DEBVER}\nCAP=${CAPVER}\n"</span> &gt; /tmp/log</span></p></code></pre><p>The first variable declared with <code>ARG</code> here is <code>DEBVER</code> and represents a fairly common use case of allowing for different versions of a base image, illustrated here in being able to start from different versions of the Debian distribution, where the default version is to be 10.</p><p>The second variable <code>CAPVER</code> was something similar that I was using later in the build instructions (i.e. further on in the Dockerfile), to specify the particular version of CAP that I wanted to install. The actual instruction in my Dockerfile looked like this: <code>RUN npm install -g @sap/cds-dk@{CAPVER}</code>.</p><p>After building the image based on this simplified Dockerfile, without specifying any values explicitly with <code>--build-arg</code>, like this:</p><pre><code><span>;</span> <span>docker</span> build <span>-t</span> argtest <span>.</span></code></pre><p>I could successfully confirm that the version of Debian in containers created from this image was 10:</p><pre><code><span>;</span> <span>docker</span> run <span>--rm</span> argtest <span>grep</span> VERSION_ID /etc/os-release<br><span>VERSION_ID</span><span>=</span><span>"10"</span></code></pre><p>But what of the content of <code>/tmp/log</code>?</p><pre><code><span>;</span> <span>docker</span> run <span>--rm</span> argtest <span>cat</span> /tmp/log<br><span>DEB</span><span>=</span><br><span>CAP</span><span>=</span></code></pre><p>Hmm.</p><p>How about when I use <code>--build-arg</code> options?</p><pre><code><span>;</span> <span>docker</span> build <span>\</span><br>  --build-arg<span>=</span><span>"DEBVER=11"</span> <span>\</span><br>  --build-arg<span>=</span><span>"CAPVER=7.9"</span> <span>\</span><br>  <span>-t</span> argtest <span>.</span></code></pre><p>The build completes successfully, and I can see that containers now are Debian 11 based:</p><pre><code><span>;</span> <span>docker</span> run <span>--rm</span> argtest <span>grep</span> VERSION_ID /etc/os-release<br><span>VERSION_ID</span><span>=</span><span>"11"</span></code></pre><p>but the problem with the empty values for <code>DEBVER</code> and <code>CAPVER</code> in <code>/tmp/log</code> remains.</p><p>Not only is the value for <code>CAPVER</code> empty when we reference it in the <code>RUN</code> instruction, but also, and this is the most mysterious thing thus far, while <code>DEBVER</code> was certainly recognised and set to 11 for the Debian distribution in the <code>FROM</code> instruction, it's empty when we reference it later in the <code>RUN</code> instruction.</p><h2>The subtleties of how ARG relates to FROM</h2><p>The cause is the rather subtle relationship between <code>ARG</code> and <code>FROM</code>, the explanation for which is brief and a little hidden in the main <a href="https://docs.docker.com/reference/dockerfile/">Dockerfile reference</a>. I certainly missed it when I went straight to the <a href="https://docs.docker.com/reference/dockerfile/#arg">reference for <code>ARG</code></a>, as it's not mentioned, and only explained at the end of the <a href="https://docs.docker.com/reference/dockerfile/#from">reference for <code>FROM</code></a> which is earlier on the page.</p><p>The key section is here: <a href="https://docs.docker.com/reference/dockerfile/#understand-how-arg-and-from-interact">Understand how ARG and FROM react</a>, and includes this line:</p><blockquote><p>"<em>An <code>ARG</code> declared before a <code>FROM</code> is outside of a build stage, so it can't be used in any instruction after a <code>FROM</code>.</em>"</p></blockquote><p>In other words, variables declared with <code>ARG</code> look like variables in, say, a shell script, variables which are also often declared at the start, and then used throughout the script.</p><p>But they're not.</p><h2>The solution</h2><p>What must be done to the Dockerfile above is to modify it so it looks like this:</p><pre><code><p><span><span>ARG</span> DEBVER=<span>"10"</span></span><br><span><span>FROM</span> debian:<span>${DEBVER}</span></span><br><span><span>ARG</span> DEBVER</span><br><span><span>ARG</span> CAPVER=<span>"7.8"</span></span></p><p><span><span>RUN</span> printf <span>"DEB=${DEBVER}\nCAP=${CAPVER}\n"</span> &gt; /tmp/log</span></p></code></pre><p>Moving the <code>ARG</code> instruction for <code>CAPVER</code> so that it comes after the <code>FROM</code> instruction gives it life and validity.</p><p>And the <code>ARG</code> instruction for <code>DEBVER</code> must stay where it is (as it's referenced in the <code>FROM</code> instruction details of course) but if it needs to be referred to after the <code>FROM</code> instruction it must be referenced again - hence the <code>ARG DEBVER</code> line.</p><p>From a container image built using this new version of the Dockerfile, with no <code>--build-arg</code> options specified, we can see that the values for <code>DEBVER</code> and <code>CAPVER</code> are available after the <code>FROM</code> instruction:</p><pre><code><span>;</span> <span>docker</span> run <span>--rm</span> argtest <span>cat</span> /tmp/log<br><span>DEB</span><span>=</span><span>10</span><br><span>CAP</span><span>=</span><span>7.8</span></code></pre><p>And this works of course if we set values for build arguments on the command line too, testing a container built using the same <code>docker build --build-arg ...</code> invocation as before:</p><pre><code><span>;</span> <span>docker</span> run <span>--rm</span> argtest <span>cat</span> /tmp/log<br><span>DEB</span><span>=</span><span>11</span><br><span>CAP</span><span>=</span><span>7.9</span></code></pre><p>and</p><pre><code><span>;</span> <span>docker</span> run <span>--rm</span> argtest <span>grep</span> VERSION_ID /etc/os-release<br><span>VERSION_ID</span><span>=</span><span>"11"</span></code></pre><h2>Wrapping up</h2><p>Perhaps I should have read the entire reference document for all the Dockerfile instructions first. Then I would have at least read about this relationship, and I may also have remembered it too. But for those of you like me who jump directly to consult the reference documentation on the thing they're trying to use, perhaps this will help.</p><p>Happy building!</p></div></div>]]>
@@ -39,7 +885,7 @@ May 14, 2024 | https://qmacro.org/blog/posts/2024/05/13/using-arg-in-a-dockerfil
             </title>
             <description>
 <![CDATA[
-Score 94 | Comments 14 (<a href="https://news.ycombinator.com/item?id=40350954">thread link</a>) | @apoorva26
+Score 115 | Comments 18 (<a href="https://news.ycombinator.com/item?id=40350954">thread link</a>) | @apoorva26
 <br/>
 May 13, 2024 | https://www.apoorva-srinivasan.com/plms/ | <a href="https://web.archive.org/web/*/https://www.apoorva-srinivasan.com/plms/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -82,7 +928,7 @@ May 13, 2024 | https://www.apoorva-srinivasan.com/plms/ | <a href="https://web.a
             </title>
             <description>
 <![CDATA[
-Score 62 | Comments 4 (<a href="https://news.ycombinator.com/item?id=40346148">thread link</a>) | @gelstudios
+Score 62 | Comments 5 (<a href="https://news.ycombinator.com/item?id=40346148">thread link</a>) | @gelstudios
 <br/>
 May 13, 2024 | https://www.fornaxis.org/forge/ | <a href="https://web.archive.org/web/*/https://www.fornaxis.org/forge/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content">
@@ -152,7 +998,7 @@ In addition, an interactive shell can be used to compose a program one line at a
             </title>
             <description>
 <![CDATA[
-Score 142 | Comments 33 (<a href="https://news.ycombinator.com/item?id=40345654">thread link</a>) | @smusamashah
+Score 155 | Comments 38 (<a href="https://news.ycombinator.com/item?id=40345654">thread link</a>) | @smusamashah
 <br/>
 May 13, 2024 | https://chaphlagical.icu/Deblur-GS/ | <a href="https://web.archive.org/web/*/https://chaphlagical.icu/Deblur-GS/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -185,11 +1031,26 @@ May 13, 2024 | https://chaphlagical.icu/Deblur-GS/ | <a href="https://web.archiv
         </item>
         <item>
             <title>
+<![CDATA[Fifteen Fundamental Properties (2022)]]>
+            </title>
+            <description>
+<![CDATA[
+Score 56 | Comments 15 (<a href="https://news.ycombinator.com/item?id=40340220">thread link</a>) | @camillovisini
+<br/>
+May 12, 2024 | https://camillovisini.com/writing/fifteen-fundamental-properties | <a href="https://web.archive.org/web/*/https://camillovisini.com/writing/fifteen-fundamental-properties">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article><!--[--><div><p><!--[-->In the first volume<sup><a aria-current="page" href="https://camillovisini.com/writing/fifteen-fundamental-properties#user-content-fn-1" aria-describedby="footnote-label" data-footnote-ref="" id="user-content-fnref-1"><!--[-->1<!--]--></a></sup> of his seminal tetralogy - <em><!--[-->The Nature of Order: An Essay on the Art of Building and the Nature of the Universe<!--]--></em> - Alexander identifies fifteen fundamental properties from which <em><!--[-->life<!--]--></em> in objects and buildings emerges - they can be understood as a set of reoccurring characteristics, common geometric features and attributes of objects and buildings which contribute to their <em><!--[-->wholeness<!--]--></em>.<!--]--></p><div><div><div><div><picture placeholder=""><source type="image/avif" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_avif/sketches/ffp/1.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_avif/sketches/ffp/1.png 240w"><source type="image/webp" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_webp/sketches/ffp/1.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_webp/sketches/ffp/1.png 240w"><img alt="Levels of Scale" loading="lazy" onerror="this.setAttribute('data-error', 1)" data-nuxt-pic="" src="https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/1.png" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_png/sketches/ffp/1.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/1.png 240w"></picture></div><p>Levels of Scale</p></div></div></div><p><!--[-->Objects and buildings are constructed of constituent elements which differ in their scale. <em><!--[-->Wholeness<!--]--></em> emerges from the composition and distribution of individual elements with significantly different relative scales, resulting in a "dynamic scale profile".<!--]--></p><div><div><div><div><picture placeholder=""><source type="image/avif" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_avif/sketches/ffp/2.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_avif/sketches/ffp/2.png 240w"><source type="image/webp" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_webp/sketches/ffp/2.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_webp/sketches/ffp/2.png 240w"><img alt="Strong Centers" loading="lazy" onerror="this.setAttribute('data-error', 1)" data-nuxt-pic="" src="https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/2.png" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_png/sketches/ffp/2.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/2.png 240w"></picture></div><p>Strong Centers</p></div></div></div><p><!--[-->Objects and buildings feature a hierarchy of centers – distinctive features which attract the spectator's eye. <em><!--[-->Wholeness<!--]--></em> emerges from the placement of strong, meaningful, mutually reinforcing centers. They lend coherence and identity to the whole by tying together – spatially and logically – their surroundings.<!--]--></p><div><div><div><div><picture placeholder=""><source type="image/avif" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_avif/sketches/ffp/3.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_avif/sketches/ffp/3.png 240w"><source type="image/webp" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_webp/sketches/ffp/3.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_webp/sketches/ffp/3.png 240w"><img alt="Thick Boundaries" loading="lazy" onerror="this.setAttribute('data-error', 1)" data-nuxt-pic="" src="https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/3.png" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_png/sketches/ffp/3.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/3.png 240w"></picture></div><p>Thick Boundaries</p></div></div></div><p><!--[-->Objects and buildings incorporate boundaries to partition some areas from others. <em><!--[-->Wholeness<!--]--></em> emerges from delineating areas with thick boundaries. Thin boundaries are ineffective, since they are unable to lend cohesion to the individual centers of an area by encapsulating them to form an "implicit center".<!--]--></p><div><div><div><div><picture placeholder=""><source type="image/avif" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_avif/sketches/ffp/4.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_avif/sketches/ffp/4.png 240w"><source type="image/webp" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_webp/sketches/ffp/4.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_webp/sketches/ffp/4.png 240w"><img alt="Alternating Repetition" loading="lazy" onerror="this.setAttribute('data-error', 1)" data-nuxt-pic="" src="https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/4.png" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_png/sketches/ffp/4.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/4.png 240w"></picture></div><p>Alternating Repetition</p></div></div></div><p><!--[-->Objects and buildings are constructed of repeating elements. <em><!--[-->Wholeness<!--]--></em> emerges from the order and rythm in which these repeating elements are arranged. The alternation of these elements break monotony and banality, and, via the contrast of each element to adjacent elements, results in the formation of "latent centers".<!--]--></p><div><div><div><div><picture placeholder=""><source type="image/avif" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_avif/sketches/ffp/5.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_avif/sketches/ffp/5.png 240w"><source type="image/webp" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_webp/sketches/ffp/5.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_webp/sketches/ffp/5.png 240w"><img alt="Positive Space" loading="lazy" onerror="this.setAttribute('data-error', 1)" data-nuxt-pic="" src="https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/5.png" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_png/sketches/ffp/5.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/5.png 240w"></picture></div><p>Positive Space</p></div></div></div><p><!--[-->Objects and buildings, in striking a balance between figure and ground, evoke both positive and negative space. <em><!--[-->Wholeness<!--]--></em> emerges from the conscious shaping of available space with strong centers, thereby casting meaning even in their immediate surroundings – no space is "leftover space".<!--]--></p><div><div><div><div><picture placeholder=""><source type="image/avif" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_avif/sketches/ffp/6.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_avif/sketches/ffp/6.png 240w"><source type="image/webp" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_webp/sketches/ffp/6.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_webp/sketches/ffp/6.png 240w"><img alt="Good Shape" loading="lazy" onerror="this.setAttribute('data-error', 1)" data-nuxt-pic="" src="https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/6.png" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_png/sketches/ffp/6.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/6.png 240w"></picture></div><p>Good Shape</p></div></div></div><p><!--[-->Objects and buildings can be studied via their shapes and the shapes of their constituent elements. <em><!--[-->Wholeness<!--]--></em> emerges from refining the concrete appearance and shape of details (micro-scale), centers (macro-scale), as well as the con­figuration of individual elements in a cohesive hierarchy of shapes (meso-scale).<!--]--></p><div><div><div><div><picture placeholder=""><source type="image/avif" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_avif/sketches/ffp/7.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_avif/sketches/ffp/7.png 240w"><source type="image/webp" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_webp/sketches/ffp/7.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_webp/sketches/ffp/7.png 240w"><img alt="Local Symmetries" loading="lazy" onerror="this.setAttribute('data-error', 1)" data-nuxt-pic="" src="https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/7.png" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_png/sketches/ffp/7.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/7.png 240w"></picture></div><p>Local Symmetries</p></div></div></div><p><!--[-->Objects and buildings exhibit symmetries at the global and/or local level. <em><!--[-->Wholeness<!--]--></em> emerges from favoring local symmetries in minor elements – fostering flexibility, specificity and adaptibility – over global symmetries – evoking notions of brutality, rigidity, austerity.<!--]--></p><div><div><div><div><picture placeholder=""><source type="image/avif" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_avif/sketches/ffp/8.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_avif/sketches/ffp/8.png 240w"><source type="image/webp" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_webp/sketches/ffp/8.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_webp/sketches/ffp/8.png 240w"><img alt="Deep Interlock and Ambiguity" loading="lazy" onerror="this.setAttribute('data-error', 1)" data-nuxt-pic="" src="https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/8.png" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_png/sketches/ffp/8.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/8.png 240w"></picture></div><p>Deep Interlock and Ambiguity</p></div></div></div><p><!--[-->Objects and buildings bundle individual elements to form a whole – thereby putting them in relation to one another. <em><!--[-->Wholeness<!--]--></em> emerges from reflecting the interfaces of individual elements as ambiguous and transitory boundaries – harmoniously binding and linking, but also apruptly distancing and separating.<!--]--></p><div><div><div><div><picture placeholder=""><source type="image/avif" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_avif/sketches/ffp/9.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_avif/sketches/ffp/9.png 240w"><source type="image/webp" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_webp/sketches/ffp/9.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_webp/sketches/ffp/9.png 240w"><img alt="Contrast" loading="lazy" onerror="this.setAttribute('data-error', 1)" data-nuxt-pic="" src="https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/9.png" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_png/sketches/ffp/9.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/9.png 240w"></picture></div><p>Contrast</p></div></div></div><p><!--[-->Objects and buildings are constructed from elements with distinguishing features. <em><!--[-->Wholeness<!--]--></em> emerges from the juxtaposition of "opposites" – color, shape, spacing, texture, scale, silhouette. Strong contrast allows regions to be integrated into the "mosaic of the whole" – where meaning results precisely from contrast.<!--]--></p><div><div><div><div><picture placeholder=""><source type="image/avif" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_avif/sketches/ffp/10.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_avif/sketches/ffp/10.png 240w"><source type="image/webp" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_webp/sketches/ffp/10.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_webp/sketches/ffp/10.png 240w"><img alt="Gradients" loading="lazy" onerror="this.setAttribute('data-error', 1)" data-nuxt-pic="" src="https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/10.png" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_png/sketches/ffp/10.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/10.png 240w"></picture></div><p>Gradients</p></div></div></div><p><!--[-->Objects and buildings are made of discrete elements, but as a whole, also exhibit continuous attributes. <em><!--[-->Wholeness<!--]--></em> emerges from tying together space in a series of graded centers, each of which relating to the surrounding centers in their relative importance, and allowing one region to transition into another region.<!--]--></p><div><div><div><div><picture placeholder=""><source type="image/avif" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_avif/sketches/ffp/11.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_avif/sketches/ffp/11.png 240w"><source type="image/webp" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_webp/sketches/ffp/11.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_webp/sketches/ffp/11.png 240w"><img alt="Roughness" loading="lazy" onerror="this.setAttribute('data-error', 1)" data-nuxt-pic="" src="https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/11.png" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_png/sketches/ffp/11.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/11.png 240w"></picture></div><p>Roughness</p></div></div></div><p><!--[-->Objects and buildings are precisely constructed, but also afford – conscious or accidential – imperfections. <em><!--[-->Wholeness<!--]--></em> emerges from abandoning regularity. The introduction of "imperfect similarity" and subtle variations gives light to personality and allows conforming to conditions of the external environment.<!--]--></p><div><div><div><div><picture placeholder=""><source type="image/avif" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_avif/sketches/ffp/12.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_avif/sketches/ffp/12.png 240w"><source type="image/webp" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_webp/sketches/ffp/12.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_webp/sketches/ffp/12.png 240w"><img alt="Echoes" loading="lazy" onerror="this.setAttribute('data-error', 1)" data-nuxt-pic="" src="https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/12.png" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_png/sketches/ffp/12.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/12.png 240w"></picture></div><p>Echoes</p></div></div></div><p><!--[-->Objects and buildings can feature a repetition of similar elements, which are translated or scaled across space. <em><!--[-->Wholeness<!--]--></em> emerges from the harmony and familiarity between elements which all seem to belong to the same group, each sharing "internal characteristics" reminiscent of the related elements.<!--]--></p><div><div><div><div><picture placeholder=""><source type="image/avif" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_avif/sketches/ffp/13.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_avif/sketches/ffp/13.png 240w"><source type="image/webp" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_webp/sketches/ffp/13.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_webp/sketches/ffp/13.png 240w"><img alt="The Void" loading="lazy" onerror="this.setAttribute('data-error', 1)" data-nuxt-pic="" src="https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/13.png" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_png/sketches/ffp/13.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/13.png 240w"></picture></div><p>The Void</p></div></div></div><p><!--[-->Objects and buildings consist of parts which are articulated, but also of those which are empty. <em><!--[-->Wholeness<!--]--></em> emerges from balancing concentrated structures with emptiness – the quiet void serving both as foundation for and contradiction to the "delirious detail".<!--]--></p><div><div><div><div><picture placeholder=""><source type="image/avif" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_avif/sketches/ffp/14.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_avif/sketches/ffp/14.png 240w"><source type="image/webp" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_webp/sketches/ffp/14.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_webp/sketches/ffp/14.png 240w"><img alt="Simplicity and Inner Calm" loading="lazy" onerror="this.setAttribute('data-error', 1)" data-nuxt-pic="" src="https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/14.png" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_png/sketches/ffp/14.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/14.png 240w"></picture></div><p>Simplicity and Inner Calm</p></div></div></div><p><!--[-->Objects and buildings feature more or less complex inner and outer structures. <em><!--[-->Wholeness<!--]--></em> emerges from geometric simplicity and purity. With the removal of – not superficially but inherently – superflous elements, the integrity and inner calm of the structure is strengthened.<!--]--></p><div><div><div><div><picture placeholder=""><source type="image/avif" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_avif/sketches/ffp/15.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_avif/sketches/ffp/15.png 240w"><source type="image/webp" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_webp/sketches/ffp/15.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_webp/sketches/ffp/15.png 240w"><img alt="Not-Separateness" loading="lazy" onerror="this.setAttribute('data-error', 1)" data-nuxt-pic="" src="https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/15.png" sizes="(max-width: 640px) 120px, 120px" srcset="https://camillovisini.com/_ipx/w_120&amp;f_png/sketches/ffp/15.png 120w, https://camillovisini.com/_ipx/w_240&amp;f_png/sketches/ffp/15.png 240w"></picture></div><p>Not-Separateness</p></div></div></div><p><!--[-->Objects and buildings connect different elements, but are themselves embedded in their surroundings. <em><!--[-->Wholeness<!--]--></em> emerges from coherence between the individual elements, in which each element is contributing to the seamless integrity of the whole – especially with respect to the whole being "one with the world".<!--]--></p><section data-footnotes=""><ol><!--[--><li id="user-content-fn-1"><!--[-->Christopher Alexander. <em><!--[-->The Phenomenon of Life<!--]--></em> (2002) <a aria-current="page" href="https://camillovisini.com/writing/fifteen-fundamental-properties#user-content-fnref-1" aria-label="Back to reference 1" data-footnote-backref=""><!--[-->↩<!--]--></a><!--]--></li><!--]--></ol></section></div><!--]--></article></div>]]>
+            </description>
+            <link>https://camillovisini.com/writing/fifteen-fundamental-properties</link>
+            <guid isPermaLink="false">hacker-news-small-sites-40340220</guid>
+            <pubDate>Mon, 13 May 2024 06:05:09 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[MSX Elite]]>
             </title>
             <description>
 <![CDATA[
-Score 57 | Comments 13 (<a href="https://news.ycombinator.com/item?id=40340104">thread link</a>) | @ingve
+Score 84 | Comments 20 (<a href="https://news.ycombinator.com/item?id=40340104">thread link</a>) | @ingve
 <br/>
 May 12, 2024 | https://thefoggiest.dev/2024/05/13/msx-elite | <a href="https://web.archive.org/web/*/https://thefoggiest.dev/2024/05/13/msx-elite">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -329,7 +1190,7 @@ May 12, 2024 | https://texelec.com/product/picomem/ | <a href="https://web.archi
             </title>
             <description>
 <![CDATA[
-Score 223 | Comments 310 (<a href="https://news.ycombinator.com/item?id=40338241">thread link</a>) | @fzliu
+Score 224 | Comments 312 (<a href="https://news.ycombinator.com/item?id=40338241">thread link</a>) | @fzliu
 <br/>
 May 12, 2024 | https://trace.yshui.dev/2024-05-copilot.html#did-github-copilot-really-increase-my-productivity | <a href="https://web.archive.org/web/*/https://trace.yshui.dev/2024-05-copilot.html#did-github-copilot-really-increase-my-productivity">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -368,7 +1229,7 @@ May 12, 2024 | https://trace.yshui.dev/2024-05-copilot.html#did-github-copilot-r
             </title>
             <description>
 <![CDATA[
-Score 121 | Comments 97 (<a href="https://news.ycombinator.com/item?id=40337815">thread link</a>) | @Bologo
+Score 123 | Comments 97 (<a href="https://news.ycombinator.com/item?id=40337815">thread link</a>) | @Bologo
 <br/>
 May 12, 2024 | https://suchscience.net/mindfulness-interventions-for-teens-actually-decrease-mindfulness-new-study-finds/ | <a href="https://web.archive.org/web/*/https://suchscience.net/mindfulness-interventions-for-teens-actually-decrease-mindfulness-new-study-finds/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -523,7 +1384,7 @@ May 12, 2024 | https://suchscience.net/mindfulness-interventions-for-teens-actua
             </title>
             <description>
 <![CDATA[
-Score 265 | Comments 72 (<a href="https://news.ycombinator.com/item?id=40337036">thread link</a>) | @mpweiher
+Score 265 | Comments 73 (<a href="https://news.ycombinator.com/item?id=40337036">thread link</a>) | @mpweiher
 <br/>
 May 12, 2024 | https://pointersgonewild.com/2024/04/20/the-alternative-implementation-problem/ | <a href="https://web.archive.org/web/*/https://pointersgonewild.com/2024/04/20/the-alternative-implementation-problem/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -641,7 +1502,7 @@ May 12, 2024 | https://greyenlightenment.com/2024/05/11/the-age-of-rage-why-are-
             </title>
             <description>
 <![CDATA[
-Score 97 | Comments 53 (<a href="https://news.ycombinator.com/item?id=40335921">thread link</a>) | @tosh
+Score 97 | Comments 54 (<a href="https://news.ycombinator.com/item?id=40335921">thread link</a>) | @tosh
 <br/>
 May 12, 2024 | http://nsl.com/papers/idioms_K3.pdf | <a href="https://web.archive.org/web/*/http://nsl.com/papers/idioms_K3.pdf">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>C¨µ¢™šH$ÖC�M„Ç�~²!®cåf¸ô�å?ÖùàEÖ
@@ -1815,7 +2676,7 @@ May 11, 2024 | https://sciinsider.com/2024/05/04/groundbreaking-discovery-dna-an
             </title>
             <description>
 <![CDATA[
-Score 103 | Comments 36 (<a href="https://news.ycombinator.com/item?id=40327543">thread link</a>) | @mpweiher
+Score 104 | Comments 36 (<a href="https://news.ycombinator.com/item?id=40327543">thread link</a>) | @mpweiher
 <br/>
 May 11, 2024 | https://marimo.io/blog/lessons-learned | <a href="https://web.archive.org/web/*/https://marimo.io/blog/lessons-learned">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><blockquote>
@@ -2252,7 +3113,7 @@ the complexity of soft deletion.</p>
             </title>
             <description>
 <![CDATA[
-Score 119 | Comments 18 (<a href="https://news.ycombinator.com/item?id=40326398">thread link</a>) | @goombacloud
+Score 120 | Comments 18 (<a href="https://news.ycombinator.com/item?id=40326398">thread link</a>) | @goombacloud
 <br/>
 May 10, 2024 | https://www.flatcar.org/blog/2024/04/os-innovation-with-systemd-sysext/ | <a href="https://web.archive.org/web/*/https://www.flatcar.org/blog/2024/04/os-innovation-with-systemd-sysext/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div aria-describedby="blogtitle"><p>Flatcar Container Linux has a strong focus on backwards compatibility.
@@ -2487,7 +3348,7 @@ to bring up your use case.&nbsp;</p>
             </title>
             <description>
 <![CDATA[
-Score 193 | Comments 36 (<a href="https://news.ycombinator.com/item?id=40326362">thread link</a>) | @dargscisyhp
+Score 195 | Comments 37 (<a href="https://news.ycombinator.com/item?id=40326362">thread link</a>) | @dargscisyhp
 <br/>
 May 10, 2024 | https://karthinks.com/software/emacs-window-management-almanac/ | <a href="https://web.archive.org/web/*/https://karthinks.com/software/emacs-window-management-almanac/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div itemprop="articleBody">
