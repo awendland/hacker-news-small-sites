@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Sat, 25 May 2024 08:22:16 GMT</lastBuildDate>
+        <lastBuildDate>Sat, 25 May 2024 12:24:00 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-50.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Sat, 25 May 2024 08:22:16 GMT</pubDate>
+        <pubDate>Sat, 25 May 2024 12:24:00 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,41 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Signalfd Is Useless (2015)]]>
+            </title>
+            <description>
+<![CDATA[
+Score 51 | Comments 15 (<a href="https://news.ycombinator.com/item?id=40472539">thread link</a>) | @thunderbong
+<br/>
+May 24, 2024 | https://ldpreload.com/blog/signalfd-is-useless | <a href="https://web.archive.org/web/*/https://ldpreload.com/blog/signalfd-is-useless">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+
+<p>UNIX (well, POSIX) signals are probably one of the worst parts of the UNIX API, and thatâ€™s a relatively high bar. A signal can be sent to your program at any point when itâ€™s running, and you have to deal with it somehow. Traditionally, there are three ways of responding to signals (â€œdispositionsâ€�): you can let the default behavior run, which is often to kill the program; you can ignore it; or you can set up a function to be a signal handler.</p>
+<p>If you register a signal handler, itâ€™s called in the middle of whatever code you happen to be running. This sets up some very onerous restrictions on what a signal handler can do: it canâ€™t assume that any locks are unlocked, any complex data structures are in a reliable state, etc. The restrictions are <em>stronger</em> than the restrictions on thread-safe code, since the signal handler interrupts and <em>stops</em> the original code from running. So, for instance, it canâ€™t even wait on a lock, because the code thatâ€™s holding the lock is paused until the signal handler completes. This means that a lot of convenient functions, including the <code>stdio</code> functions, <code>malloc</code>, etc., are unusable from a signal handler, because they take locks internally. POSIX defines a set of â€œAsync-Signal-Safeâ€� functions that are guaranteed not to rely on locks or non-atomic data structures (because a signal handler could be called between two instructions that update a non-atomic data type). <a href="http://man7.org/linux/man-pages/man7/signal.7.html">Linuxâ€™s <code>signal(7)</code> manual page</a> documents has a list of these functions. But because of the constrained environment, one common approach is to defer the actual work until youâ€™re no longer running in a signal handler. A standard solution is the <a href="http://cr.yp.to/docs/selfpipe.html">â€œself-pipe trickâ€�</a>: open an unnamed pipe, write a byte to it in your signal handler and return, and read from it in the main loop. This makes signal handling resemble the handling of anything else thatâ€™s a file descriptor, like network sockets, which normalizes their handling a bit.</p>
+<p>Thereâ€™s another problem with signal handlers: in addition to interrupting user code, they also need to interrupt <em>kernel</em> code so that it gets delivered. So, if youâ€™re in the middle of reading from a network socket, waiting for a timeout, or even <a href="http://www.daemonology.net/blog/2011-12-17-POSIX-close-is-broken.html">closing a file descriptor</a>, that system call gets aborted so that the signal handler can run. By default, once you exit the signal handler, your system call will appear to return early, with an error exit of <code>errno == EINTR</code> (â€œInterrupted system callâ€�). The intention is that you can <a href="http://250bpm.com/blog:12">restart the call yourself if you want</a>, but in practice, very few libraries do, which causes <a href="http://stackoverflow.com/questions/5360644/sysread-interrupted-system-call-errnoeintr-when-using-ruby-and-mysql">confusing errors for application developers</a>. (Extra credit: explain why the linked solution is wrong.) To avoid these sorts of problems, BSD added a mechanism to mark signal handlers as restartable, which was standardized as the <code>SA_RESTART</code> flag to the <code>sigaction</code> system call. But that does not reliably cause system calls to continue instead of returning <code>EINTR</code>: as documented <a href="http://man7.org/linux/man-pages/man7/signal.7.html">later in <code>signal(7)</code></a>, Linux will return <code>EINTR</code> in some cases even when a system call is interrupted by an <code>SA_RESTART</code> handler. (The rationale for many of these makes sense—e.g., timeouts where restarting the call would start a timer from zero—but understanding the problem doesnâ€™t make it any less of a problem.)</p>
+<p>So, in 2007, Linux gained an API called <a href="http://man7.org/linux/man-pages/man2/signalfd.2.html"><code>signalfd</code></a>, which lets you create a file descriptor that notifies on signals. The idea is that you can avoid the complexity of the self-pipe trick, as well as any problems with <code>EINTR</code>, by just asking the kernel to send you signals via a file descriptor in the first place. You donâ€™t need to register a signal handler, so everything works perfectlyâ€¦ except that <code>signalfd</code> doesnâ€™t actually change how signal dispositions work. If you only create a <code>signalfd</code>, signals still get delivered via the the signal-handling mechanism, so in order to actually get the signal to get delivered over the file descriptor, you need to suspend normal processing of the system. Thereâ€™s another part of the signal API that lets you set a mask to block the signal: the intention is that you can remove the mask later, and then pending signals will get delivered. But this also means that pending signals are readable from the signalfd, and theyâ€™re removed from the queue once read.</p>
+<p>This would work fine if signal masks applied only to your current process, but they also get inherited to children. So if youâ€™re masking a signal like <code>SIGINT</code> in order to receive it via <code>signalfd</code>, and you run a subprocess, then that child process will start up with <code>SIGINT</code> masked. And while programs <em>could</em> reset their own signal masks when they start up, in practice, no software does. So you have to be very careful to reset any masked signals before starting a child process, and unfortunately you need to do this yourself: <a href="https://lwn.net/Articles/415684/">most ways of starting child processes</a>, including <a href="https://github.com/carllerche/mio/issues/16#issuecomment-102151151">the standard libc <code>system(3)</code> function</a>, do not reset handlers or masks.</p>
+<p>Thereâ€™s another problem with masking signals, which is that standard UNIX signals are permitted to coalesce when they queue. Namely, if you have a mask thatâ€™s blocking a signal, and that signal gets delivered twice before you proces the first one from the queue, it only gets reported to you once. For something like <code>SIGINT</code>, this might be okay: probably you donâ€™t need to handle multiple Ctrl-C keystrokes differently from a single one. For something like <code>SIGCHLD</code>, which notifies you that a child process has terminated, this is quite a bit more unfortunate. It now means that you know that <em>at least one</em> child process has terminated. And while signals can have associated info (via the <code>SA_SIGINFO</code> flag to <code>sigaction</code>, or by default for <code>signalfd</code>), and <code>SIGCHLD</code>â€™s siginfo tells you which process has terminated, if it gets coalesced, you only get one set of info. That is, you know that the specified child process has terminated, but also one or more other unspecified child processes could have terminated and <em>the information about which one has been lost</em>. Not only does this apply to unmasking signals and letting them get delivered to a normal signal handler, it also applies to reading signals from a <code>signalfd</code>, since <code>signalfd</code> works by dequeuing signals.</p>
+<p>It turns out that there is, at least in theory, a better way to handle this. Just go back to the old self-pipe trick, but install the handler with the <code>SA_NODEFER</code> flag, which allows signal handlers to interrupt themselves. <s>This way you reliably get one handler called per signal.</s> [<strong>EDIT:</strong> This is wrong, see below.] This brings back the <code>EINTR</code> problem, but thereâ€™s a simple solution to that: simply dedicate a separate thread to signal handling, and make sure all signals get routed there. Then no system calls on any other thread will get interrupted. The only way to ensure this is to mask signals on every <em>other</em> thread, but thatâ€™s no worse than the status quo with <code>signalfd</code>, since we already had to mask signals in order to get them delivered to <code>signalfd</code> alone. As a bonus, this is portable to other operating systems that donâ€™t have <code>signalfd</code>, so this is the solution Iâ€™m planning on implementing for the <a href="https://github.com/carllerche/mio">MIO</a> cross-platform event-handling library for Rust.</p>
+<p>Can <code>signalfd</code> be fixed? I think it can, if we explicitly tie <code>signalfd</code> into the signal-disposition mechanism. If <code>signalfd</code> could claim responsibility for signal delivery, instead of requiring that signals be masked or ignored in addition to using <code>signalfd</code>, this would solve both problems. For inheritance, just set the close-on-exec flag on the signalfd, and signals will go back to the default behavior in child processes, once the fd no longer exists. For multiple delivery, because <code>signalfd</code> no longer interacts with signal queueing, it can just be specfied to send one message per signal. Alternatively, a mechanism to mask or ignore a signal that applies to the current process only would also be an improvement. These proposals would be a change to POSIX signal semantics, but fundamentally so is <code>signalfd</code>, and the only way to get clean handling of signals is to avoid the POSIX API, not work within it.</p>
+<p><strong>EDIT:</strong> Greg Hudson pointed out to me that even traditional handlers can coalesce signals. If a signal is sent twice before the signal-handling thread is scheduled, it still gets coalesced, even if it's destined for a signal handler with <code>SA_NODEFER</code>. So while a signal-handling thread can get you separate siginfo most of the time, it still canâ€™t do so reliably. Iâ€™ve written an <a href="https://ldpreload.com/p/blog/coalesced-signals.c">example of this behavior</a> that uses <code>vfork</code> to prevent the process from being scheduled: it starts multiple children, but only prints one notification. So my claim that thereâ€™s a better alternative to <code>signalfd</code> is wrong, but itâ€™s still true that <code>signalfd</code> doesnâ€™t solve any of the other troubles with signal handling: it just saves you a separate thread.</p>
+<p><em>Thanks to Nelson Elhage for pointing me at the LWN article, and Alex Chernyakhovsky, David Benjamin, and Yehuda Katz for discussions about all the unfortunate parts of signal handling.</em></p>
+<p>17 May 2015</p>
+<p><a href="https://ldpreload.com/pages/copyright"><img src="https://ldpreload.com/images/cc-by-sa-small.png" width="80" height="15" alt="CC-BY-SA"></a>
+</p>
+</div></div>]]>
+            </description>
+            <link>https://ldpreload.com/blog/signalfd-is-useless</link>
+            <guid isPermaLink="false">hacker-news-small-sites-40472539</guid>
+            <pubDate>Sat, 25 May 2024 03:55:15 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Don't microservice, do module]]>
             </title>
             <description>
 <![CDATA[
-Score 113 | Comments 132 (<a href="https://news.ycombinator.com/item?id=40465841">thread link</a>) | @thunderbong
+Score 118 | Comments 137 (<a href="https://news.ycombinator.com/item?id=40465841">thread link</a>) | @thunderbong
 <br/>
 May 24, 2024 | https://yekta.dev/posts/dont-microservice-do-module/ | <a href="https://web.archive.org/web/*/https://yekta.dev/posts/dont-microservice-do-module/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="article" role="article"> <p>The excessive use of microservices is still widespread, and this is bad for the earth! I assumed it was common knowledge
@@ -257,7 +287,7 @@ avoid building a crooked wall.</p> </article></div>]]>
             </title>
             <description>
 <![CDATA[
-Score 69 | Comments 34 (<a href="https://news.ycombinator.com/item?id=40464994">thread link</a>) | @geox
+Score 76 | Comments 34 (<a href="https://news.ycombinator.com/item?id=40464994">thread link</a>) | @geox
 <br/>
 May 24, 2024 | https://www.cam.ac.uk/research/news/imperceptible-sensors-made-from-electronic-spider-silk-can-be-printed-directly-on-human-skin | <a href="https://web.archive.org/web/*/https://www.cam.ac.uk/research/news/imperceptible-sensors-made-from-electronic-spider-silk-can-be-printed-directly-on-human-skin">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><div><p>The method, developed by researchers from the University of Cambridge, takes its inspiration from spider silk, which can conform and stick to a range of surfaces. These ‘spider silks’ also incorporate bioelectronics, so that different sensing capabilities can be added to the ‘web’.</p>
@@ -304,11 +334,26 @@ Wenyu Wang et al. ‘<a href="https://www.nature.com/articles/s41928-024-01174-4
         </item>
         <item>
             <title>
+<![CDATA[Reverse engineering ESP32 Wi-Fi driver: the road ahead]]>
+            </title>
+            <description>
+<![CDATA[
+Score 87 | Comments 24 (<a href="https://news.ycombinator.com/item?id=40464776">thread link</a>) | @redfast00
+<br/>
+May 24, 2024 | https://esp32-open-mac.be/posts/0005-the-road-ahead/ | <a href="https://web.archive.org/web/*/https://esp32-open-mac.be/posts/0005-the-road-ahead/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>First, a short recap of what this project is doing: the Wi-Fi stack for the ESP32 (a popular, cheap microcontroller) is provided through a binary blob. We’re trying to reverse engineer the software and hardware to build our own open-source Wi-Fi stack. This will enable features that the current, closed source ESP32 Wi-Fi implementation does not have, for example 802.11s mesh networking. It will also improve the auditability of the code.</p><p>This is the fifth article in a series about reverse engineering the ESP32 Wi-Fi networking stack, with the goal of building our own open-source MAC layer. In the <a href="https://esp32-open-mac.be/posts/">previous articles</a> in this series, we reverse engineered hardware registers for transmitting and receiving Wi-Fi packets. We wrote some code that implements association with an open access point and then connects the transmit and receive functions to the ESP32 IP networking stack. We also built a low-cost Faraday cage to be able to test our implementation without outside interference.</p><p>One thing we haven’t handled so far, is initialization of the Wi-Fi peripheral: our current approach is to let the binary blob initialize the hardware, after which we kill the FreeRTOS task that is responsible for handling everthing related to Wi-Fi and replace the Wi-Fi interrupt with our own. We will eventually want to also reverse engineer and reimplement this radio initialization; so let’s look at the road ahead!</p><p>First of all, what happens in this hardware initialization? The main function responsible for initializing the hardware is <code>esp_phy_enable</code>. This function mainly does RF calibration to compensate for imperfections of the hardware. According to the data sheet, this does, at least: I/Q phase matching; antenna matching; compensating carrier leakage, baseband nonlinearities, power amplifier nonlinearities and RF nonlinearities. It also sets the frequency and power that packets will be received/transmitted on.</p><p>On the ESP32, interacting with hardware peripherals happens through memory writes/reads: instead of writing to RAM, you write to the address space of a peripheral; each peripheral has their own memory space, and within those memory spaces, each memory address (register) has a different function. We patched Espressifs fork of QEMU to log all accesses to peripheral registers related to Wi-Fi; in addition to logging the addresss and value written/read, we also log the stacktrace, so we can see what functions are writing to what addresses, and what functions are calling those functions, and so on.</p><p>All in all, the complete radio initialization takes 53286 peripheral accesses; in comparison, sending a Wi-Fi packet takes about 10, so we still have a lot of work ahead to implement this. To visualize what this initialization consists of, we converted this list of peripheral memory accesses and stack traces to a flame graph:</p><p><a href="https://esp32-open-mac.be/coverage/branches/main/" target="_blank" rel="noopener">Link to flame graph visualisation</a></p><p>In the above flame graph, the width of each bar is linearly proportional to the amount of peripheral memory accesses; in order to not hide smaller functions, we rescaled each bar to <code>amount_of_accesses**0.4</code>:</p><p>Our current approach of reimplementing the radio initalization, is to one-by-one replace each function with our own implementation, then test that it can still connect to the AP and be pinged.</p><p>After browsing the visualisation for a bit, it appears that the hardware initialisation is very complex, and there don’t appear to be any quick wins. It’s likely that in the near future, we won’t have a complete way to init the hardware.</p><p>In parallel with radio initialization, we can start to implement the Wi-Fi MAC stack, responsible for:</p><ul><li>scanning APs</li><li>authenticating/associating with APs (also WPA2 protected APs)</li><li>changing rate/TX power in response to for example dropped packets</li><li>…</li></ul><p>We would like to avoid having to entirely write this from scratch ourselves as well, so we’ll likely look at using FreeBSDs 802.11 code (Espressif, the manufacturer of the chip and developer of the binary blob, also based their MAC stack on the FreeBSD stack).</p><p>At the moment, we can already send/receive packets and configure the packet filter. What we can’t yet do, is configure other parameters of the packets (for example rate, modulation, frequency or TX power): the parameters that we currently send packets with, are the default parameters after the radio has been initialized: channel 1 and the lowest rate there is. To have a performant Wi-Fi stack, we’ll need to reverse the hardware a bit more to be able to set those parameters.</p></div></div>]]>
+            </description>
+            <link>https://esp32-open-mac.be/posts/0005-the-road-ahead/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-40464776</guid>
+            <pubDate>Fri, 24 May 2024 10:39:32 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Voxel Displacement Renderer – Modernizing the Retro 3D Aesthetic]]>
             </title>
             <description>
 <![CDATA[
-Score 330 | Comments 56 (<a href="https://news.ycombinator.com/item?id=40464558">thread link</a>) | @huhtenberg
+Score 349 | Comments 62 (<a href="https://news.ycombinator.com/item?id=40464558">thread link</a>) | @huhtenberg
 <br/>
 May 24, 2024 | https://blog.danielschroeder.me/2024/05/voxel-displacement-modernizing-retro-3d/ | <a href="https://web.archive.org/web/*/https://blog.danielschroeder.me/2024/05/voxel-displacement-modernizing-retro-3d/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -535,11 +580,166 @@ May 24, 2024 | https://blog.danielschroeder.me/2024/05/voxel-displacement-modern
         </item>
         <item>
             <title>
+<![CDATA[Converting a Cisco 7609 into a beer tap (2021)]]>
+            </title>
+            <description>
+<![CDATA[
+Score 84 | Comments 10 (<a href="https://news.ycombinator.com/item?id=40464496">thread link</a>) | @pantalaimon
+<br/>
+May 24, 2024 | https://blog.jonasbengtson.se/cisco-7609-beer-tap | <a href="https://web.archive.org/web/*/https://blog.jonasbengtson.se/cisco-7609-beer-tap">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+      <div>
+        <div>
+          <p><a href="https://blog.jonasbengtson.se/cisco-7609-beer-tap">August 14, 2021</a></p>
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/5da796ff-ef08-47bc-bb96-c196cd354c2e.jpg" alt="Beer Tap" width="2500" height="2500" data-action="zoom"></p>
+<p>Last year I thought that we had reached some sort of peak in terms of how far one can go in building useless things by converting a <a href="https://blog.jonasbengtson.se/building-a-bar-out-of-42u-rack"><span>42U</span> rack into a bar</a>. Shortly after that the people that built the bar visited San Francisco and we started thinking about what the next project could be. After a good amount of alcohol we discussed memories and I started thinking back to the <a href="https://twitter.com/wbergg/status/610053130399653888" target="_blank"><span></span><span>“</span>Tech PoP”</a> at DreamHack. You see, at DreamHack, the network volunteer crew used to have a couple of racks that they setup for display showcasing the routers that powered the network, a marketing ploy which was cool in 2006 when the bandwidth that DreamHack used actually mattered. Fast forward to 2015 and the network crew started filling the racks with useless hardware just to make it look cool, there was even a big <span>NAS</span> connected that served no purpose other than stroking the egos of the people that volunteered in the tech crew.</p>
+<p>The problem here is not so much that they wanted to build something aesthetically nice but that they didn’t go far enough. If you’re going to have useless hardware, why not explore the concept further rather than a<span></span> <span>“</span>look but don’t touch” visual display of garbage hardware? One of us started joking about converting one of the old core routers to a beer tap and Wberg realized that he might actually be able to source one of the routers of the same model that used to sit in that PoP. Fast forward to 2020 and we start discussing the actual reality of converting a Cisco 7609 into a beer tap. Wberg works as a network architect and has had this idea for a long time, converting a router to a beer tap but it’s not like you can convert <span>1M</span> <span>EUR</span> of hardware into a beer tap. Time did it’s thing and Wberg was able to source a used 7609 in working condition, I don’t think we ever imagined this actually happening but now Wberg posed the question <em><span></span><span>“</span>I have 100 kilos of core router, what do we do with it?”</em></p>
+<p><strong>A quick primer on what the Cisco 7609 is:</strong> Cisco’s top of the line router built around the year 2000 for ISPs to serve as<span></span> <span>“</span>core router”. It’s a chassi containing 2 power supplies, fan packs and a backplane which allows you to mix &amp; match different<span></span> <span>“</span>line cards”. The line cards are the interesting part as they provide the actual network interfacing and is the<span></span> <span>“</span>user interface” of the device. The Cisco 7609 can hold 9 line cards of different types that are mounted vertically into the chassi. The top of the device serves as cable management, allowing you to neatly organize the incoming cables into distinct channels and feed the line cards. Sort of a side note but this device actually went end of support in July 2021, over 20 years of being supported by Cisco.</p>
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/34da53ca-3199-47f3-9c68-7e72dcddc0b0.jpg" alt="7609" width="720" height="925" data-action="zoom"></p>
+
+<h2 id="plan-of-attack">Plan of attack</h2>
+<p>The first was figuring out what the end result was going to be. If we wanted a beer tap then we had to modify the machine quite heavily and it was unlikely to ever work again, however, if the router wouldn’t run then it wouldn’t look as visually pleasing as a real one does. So it was either powering this beast and figuring out how to pipe in beer into a live 7609 <span>OR</span> re-building all the parts that provided visual indication which made it look active. The decision seems easy, why spend a huge amount of time on rebuilding a device that already works? Well, the moment you turn the router on and hear the fans it’s obvious that the only approach is to rebuild it. Behind the cable management tray there are two<span></span> <span>“</span>fan packs” which each packs 4 x <span>48V</span> industrial fans. These fans are built for reliability and air throughput, not for a low noise profile. On top of this, if we were to use the existing line cards we would need to <strong><span>ACTUALLY</span></strong> feed traffic on the ports for the activity <span>LED</span> to look busy.</p>
+<p>With that in mind, how do we go about rebuilding this thing? The constraints are:</p>
+<ul>
+<li>All LEDs on the front needs to work</li>
+<li>Ethernet cables needs to be connected</li>
+<li>Fiber cables needs to be connected</li>
+<li>Can’t sound like a jet engine</li>
+<li>Preferably controllable intensity of the ports</li>
+</ul>
+<p>At this point in time we still believed in the idea that we could salvage the existing LEDs and build a jig that would power them to avoid having to rebuild <span>EVERYTHING</span>. For that reason the approach that made most sense was to remove the unnecessary parts of the line card and keep the structure and LEDs. Since this trash was built in the early 2000s I was skeptical towards cutting these line cards but Bengan &amp; Summa did not let themselves be persuaded by my thoughtfulness about toxic dust and cut right through all of the line cards, removing approx. 70% of them.</p>
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/20a61b09-29f9-4a3f-8572-35bc35129f5e.jpg" alt="bengan cuttar" width="1280" height="720" data-action="zoom"></p>
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/bd65e2bb-02d7-4811-af09-95e0ab6af719.jpg" alt="lcs" width="1280" height="720" data-action="zoom"></p>
+
+<p>It should be said that since this was during 2020 I wasn’t able to travel to see the line cards in person and relied on Wberg’s analysis of the cards to help guide the project into a feasible solution. Once Wberg got back to Stockholm, he and Love (king of electronics) scheduled a quick session to examine the line cards and the outcome was sadly not that positive. Not only was almost every line card different but each <span>LED</span> was a green/orange one without on-board dimming meaning that we would have to build 7 different jigs with tons of standalone <span>PWM</span> chips and shift registers. On top of that, if we somehow blew one of these <span>LED</span><span></span><span>’</span>s the replacement would be a pain as the baseboard was an early 8 layer board with hidden traces.</p>
+<p>Time for <strong><span>PLAN</span> B</strong>. I had worked with <span>APA102</span> previously with the cube and found them easy to work with (except for electrical noise) and encouraged Wberg to buy a strip to play with to explore what could be done if we replaced each <span>LED</span>. Wberg was quickly able to make the strip work and became equally confident that using a separate <span>LED</span> strip was the way forward in this case. Wberg initially explored just attaching the <span>LED</span> strip straight against the profiles on the chassi but the pitch didn’t match up which meant that the LEDs were unaligned from the front profiles. We probably could have gotten away with this but it didn’t look perfect, you could tell that this was a fake and that the router wasn’t booted. If we already gone this deep, going deep enough to make it look perfect is the only option.</p>
+<h2 id="finding-solutions-to-constraints">Finding solutions to constraints</h2>
+<p>So how does one go about making it perfect? At this point neither me or Wberg had any ideas. There were tons of constraints here, especially with the 48 port cards. The 48 port card have about 6mm of clearance underneath the baseboard with 4 mm of clearance against the outer chassi meaning that whatever solution we created it would have to be small. We started by sketching out the line card with most constraints in Fusion360 to have a shared reference of the measurements.</p>
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/3cbeadc4-0b17-4b0f-a9e2-c7c3c3ef9be8.png" alt="outlineboard" width="3000" height="637" data-action="zoom"></p>
+<p>I looked around on the web for some inspiration and ended up disassembling an old computer to see how they piped light from the motherboard to the front panel. In this old computer I found a<span></span> <span>“</span>light pipe”, essentially a plastic part that relies on the fact that the <span>LED</span> is strong enough that refraction doesn’t matter. Think of it as a straw filled with water, if you have a strong enough <span>LED</span> on the other end of the straw the other side will look lit as a result. I designed an array of light pipes that I had my friend Love <span>3D</span> print in order to see if it even worked, <strong>it didn’t work</strong>. The transmission in a <span>3D</span> printed part is way lower than polished injection molded plastic part which sort of killed our idea. Because every part had to be different, injection molding was also off the table due to cost.</p>
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/061aa370-a827-49c4-8cac-d37aaf8606bc.png" alt="lightpipe" width="2853" height="2117" data-action="zoom"></p>
+
+<p>At this point Love asks me: <em><span></span><span>“</span>Why not use optical fiber?”</em>. I was initially dismissive of this idea, thinking of fiber as more as an expensive medium to transmit data but after thinking about i stumble on a link for a <a href="https://www.youtube.com/watch?v=MKi-zWyyF5I" target="_blank"><span></span><span>“</span>star ceiling”</a>, essentially someone piping tons of 3mm fibers into small holes in their ceiling for a very unique light. This time the question actually hits me, why <span>NOT</span> use fiber? Optical fiber is <span>BUILT</span> for this purpose. It’s often flexible and focuses on one thing: transmitting light over distances. If we could mount a fiber cable against each individual <span>APA102</span> light on the strip, could we just pipe the light to where it needed to be? I ordered a bunch of different fiber cables from AliExpress and of course the transmission was exactly what we wanted.</p>
+<p>In hindsight I feel so dumb even writing this. This was the obvious solution, staring us in the face. We were even going to use fiber cables as part of the<span></span> <span>“</span>mock wiring” and I wasn’t able to connect the dots. I think this is a lesson in getting stuck in what the tools one has used can/cannot do. I never imagined fiber cable being used for something other than data transmission which is why I even ruled it out when asked. Growing up in the 90’s, 1 in 5 friends had these lamps with spinning fiber cores in their rooms so of course this is not a new discovery by any chance.</p>
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/7554656d-cd89-4d50-b431-39fbb6cf3802.png" alt="fiberlamp" width="800" height="663" data-action="zoom"></p>
+
+<h2 id="creating-the-parts">Creating the parts</h2>
+<p>With this problem out of the way, the next problem was<span></span> <span>“</span>how are we going to mount the fiber cables against the chassi”? We need to somewhat precisely align the fiber cable which immediately had me reach against <span>3D</span> printing. What if we printed a<span></span> <span>“</span>focuser” that served both as protection and alignment for the <span>LED</span> strip but also as a holder for the fiber and a<span></span> <span>“</span>receiver” that would be glued against where the normal <span>LED</span> would have been positioned. Since I didn’t have the actual line cards in San Francisco, Wberg bought a <span>3D</span> printer in Sweden to allow us to iterate remotely.</p>
+<p>Let’s start with the focuser. I toyed around with a bunch of different ideas on how to design it and settled on a cradle that would hold the strip with a plate that partly locks in place and is held with screws against the focuser. Getting here took a couple of iterations but once I explored the<span></span> <span>“</span>teeth” concept and did a test print which made it was obvious that this was the design to go for. The idea was to reduce the part count as much as possible and to be able to increase the structural integrity in order to lower the amount of stress we would put on the <span>LED</span> strip. One added bonus is that this could be printed with a minimal amount of supports, only requiring supports for the hex nut holders. Being able to avoid supports allowed us to spend less time on finishing the holes that would hold the fiber as the press fit would be equal across the receiver.</p>
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/1ea8a437-2871-42d2-b8b2-b38172f68ef9.png" alt="focuser design" width="2439" height="1977" data-action="zoom"></p>
+<p>What was frustrating was that all line cards have different <span>LED</span> counts (12, 5, 5, 5, 5, 50, 50) and when testing tolerances it was so hard to keep track of what value I had changed after Wberg printed the part. <span>3D</span> printing can be weird with tolerances, especially with holes and <span>PETG</span> and prior to Wberg learning how to properly finish the parts. Eventually I realized that the<span></span> <span>“</span>count” of LEDs really didn’t matter, if I could build a part that worked for 5 we could extend that one. This led me to re-designing the part completely using parametric design. For all you people that 12 months ago had no idea what this even meant, imagine deriving all the measurements in the <span>CAD</span> software from variables to the point where I can type X LEDs and the sketch updates and create the amount that I want. The beauty of making this parametric is that it was much easier to iterate on what values we actually needed to get<span></span> <span>“</span>press fit”, as in the friction of the hole holding the fiber without having to glue it together. This example below is generated from the <span>APA102</span> strip sketch, by extending the <span>LED</span> variable, the strip changes size and this model scales up to fit that strip, deriving the measurments from strip.</p>
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/930c57a1-eb79-4750-9dc6-360970a2a51b.png" alt="parametric design" width="3000" height="449" data-action="zoom"></p>
+<p>The receiver parts seemed easier on paper, so easy that Wberg who’s new to <span>3D</span> printing and <span>CAD</span> managed to make all the ones <span>EXCEPT</span> for the one that would sit underneath the 48 port board. The available space underneath the 48 port board was so tight (5mm) that my approach was to just build a caddy and use epoxy glue to fixate the fibers. This seemed like a really messy idea and I didn’t find a good way to make a cable that’s 4,2mm in diameter fit in a <span>3D</span> printed caddy with 0,8mm to go and still provide strength. We went back and forth on this issue until one day where Wberg flipped the baseboard in the line card upside down and slotted in the ethernet ports into the chassi. Of course it actually fits because the ports are symmetrically placed. That gave us tons of extra space to work with (now closer to 7mm) and only required drilling some holes into the baseboard. After some designing we found that stripping the fibers of cladding and using only the core allowed us to use the most amount of <span>3D</span> printed material, which added to the stability and press fit. The only remaining thing to do was cutting and stripping over a 100 optical fibers and mounting this thing which we saved for a meeting in Anderstorp.</p>
+<h2 id="writing-the-software">Writing the software</h2>
+<p>Since we basically killed all logic in the router we had to create something that could mimic how a router would behave and do more exciting things than just that. I picked apart a lot of the code that I wrote for <a href="https://github.com/coral/nocube" target="_blank">nocube</a> and wrote something new that focused specifically on the router called <a href="https://github.com/anderstorpsfestivalen/slisko" target="_blank">slisko</a>. The intent here was to have a piece of software that ran on a Raspberry Pi, used the <span>SPI</span> port to drive all the LEDs and serve as a web server where one could control the different behaviours of the router such as color changes and strobe.</p>
+<p>The software is based around the idea that there exists<span></span> <span>“</span>LEDs” which are then repackaged in various slices with references in order to have multiple ways of querying the LEDs. You could for example ask for all the <code>system</code> LEDs that belong to a <code>SUP720</code> card.</p>
+<pre><code><span>for</span> _, port := <span>range</span> c.GetCardOfType(<span>"sup720"</span>) {
+    port.Labeled[<span>"system"</span>].SetClamped(<span>0.0</span>, <span>1.0</span>, <span>0.0</span>)
+}</code></pre>
+<p>However if you wanted to query all LEDs of the entire device as a whole, ignoring the realm of line cards you could get all of them visually sequentially mapped.</p>
+<pre><code><span>for</span> m, port := <span>range</span> c.LEDs {
+    <span>if</span> m == <span>int</span>(l) {
+        port.SetClamped(<span>1.0</span>, <span>1.0</span>, <span>0.5</span>)
+    } <span>else</span> {
+        port.SetClamped(<span>0.0</span>, <span>0.0</span>, <span>0.0</span>)
+    }
+}</code></pre>
+<p>I looked at some reference footage that Wberg shot for me of how an actual router<span></span> <span>“</span>blinks”. It’s easy to think that it just blinks randomly on port activity but there is some structure to the blinking. First of all it blinks negative, meaning that the <span>LED</span> is always lit and is turned off on activity. Second is that there are a few distinct<span></span> <span>“</span>speeds” of blinking rather than a curve. It looks like there are steps of 0/20/40/60/80/100 in terms of activity and the ports blinking on these intervals. Third is that there is a common clock across the ports on the same line card, meaning that I need to keep track of the blinks per line card rather than globally. I ended up creating a very simple <a href="https://tour.golang.org/methods/9" target="_blank">interface</a> in Go:</p>
+<pre><code><span>type</span> Fake <span>interface</span> {
+    Trig() <span>float64</span>
+}</code></pre>
+<p>This allowed one to easily build constructs that can be chained, for example a random blinker that is chained into a stepped blinker interface and composed together per line card. In the end I had a bunch of different interfaces that the pattern chains together per linecard to create the illusion of proper blinking. Who knew that something simple as blinking a <span>LED</span> was this complex…</p>
+
+<p>On top of this I ended up building a<span></span> <span>“</span>simulator” to be able to see how the patterns actually looked when developing the system. The simulator reads out the order of the line cards from the mapping and renders them based on a lookup table for the LEDs, consuming exactly the same data as the <span>LED</span> adapter would have done. This approach ended up being a lifesaver when mapping the software against the hardware placement due to the issues we ended up having with all the strips on-site. Being able to quickly write test patterns that query specific intentional LEDs and seeing the result saved a lot of debug time.</p>
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/2b965537-a9c7-4d9d-bded-bbd419393027.png" alt="simulator" width="1942" height="2065" data-action="zoom"></p>
+
+<h2 id="assembling-the-insanity">Assembling the insanity</h2>
+<p>Down in Anderstorp we started with removing as much as we could from the larger chassi. We didn’t need the backplane, so that was removed. Same with the fanpacks, also useless weight. Essentially everything we could remove that didn’t affect the structural integrity was removed to make it easier to plumb pipes of beer into it. We were going to use an external tap cooler and isolate the pipes into the router, relying on the fact that people are drinking quite heavily to keep the beer cool. We opted to keep the <span>PSU</span><span></span><span>’</span>s intact but that was mostly because they can easily be removed and provide a lot of stability, making the router bottom heavy when mounted. I can tell you that they didn’t spare any expenses on metal here, drilling holes in this chassi took our poor metal drill a long time and a lot of oil.</p>
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/40f0e765-fead-4aa6-ae8a-96a4dd21f209.jpg" alt="sit" width="2114" height="2500" data-action="zoom"></p>
+
+<p>Onto the preparation of line cards, as mentioned before we had to do the final <span>3D</span> print and prepare all optical fibers + mount it all together. We started the week by printing out the parts and verifying fit, tweaking some parameters and then burning out the last pieces on the printer. From there it was just a matter of spending an afternoon.</p>
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/888ddae8-9f79-499a-8329-de839318fc1c.jpg" alt="F1" width="2500" height="1667" data-action="zoom"></p>
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/a77ede80-0ceb-463d-a57e-ffd1dbdd7ba1.jpg" alt="F2" width="2500" height="1667" data-action="zoom"></p>
+
+
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/edd3b816-a327-4199-8804-4fbe4544db20.jpg" alt="F3" width="2500" height="1667" data-action="zoom"></p>
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/276e1ad1-9e60-496f-b08d-2c97fe781fd7.jpg" alt="F4" width="2500" height="1667" data-action="zoom"></p>
+
+
+<p>With this out of the way we could start mounting the line cards and wiring the chassis for power. It was one of those really hot nights that I never remember used to happen in Sweden where you were unable to wear anything other than swim trunks at midnight which lends itself well to a night of cabling.</p>
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/2dea60ac-304a-4f47-ac24-ee6ceb706aa8.jpg" alt="F3" width="2500" height="2500" data-action="zoom"></p>
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/abbce3c5-7700-4a61-bd23-3fa43ac49cc9.jpg" alt="F4" width="2500" height="2500" data-action="zoom"></p>
+
+
+<p>After a few resolderings and fixes on the <span>LED</span> strips (soldering 144/M <span>APA102</span> was 1000% less fun than 72/M) it finally started up with all LEDs working. I started adjusting the mapping in the software but noticed a flickering noise, something I’ve sadly encountered before with the cube. The flickering was random, more pronounced on certain dimming frequencies and changed depending on how the cabling was routed which indicated electrical noise. What I didn’t account for is the increased electrical noise that the denser <span>APA102</span> generates, <a href="https://electronics.stackexchange.com/questions/411296/noise-and-flickering-first-led-apa-102" target="_blank">partly because you have over a 100 sources of <span>PWM</span></a> on the same power line without any smoothing. This one took a while to figure out as we experimented with a range of different approaches to solving this issue but the solution ended up being as simple as soldering a capacitor to each power input side of the 48 port cards. After reading up more on this issue it seems like this is quite common with dense <span>APA102</span> (email me if I’m wrong) and adding capacitors to the power helps keep the signal through the strip stable. If you are searching Google like I did looking for how to fix electrical noise for <span>APA102</span>: <strong>Add 1000uF of capacitors to each end of your strip, absolutely solves the problem.</strong></p>
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/80b16521-7f92-4828-a989-777e56d2b854.jpg" alt="F3" width="2500" height="1667" data-action="zoom"></p>
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/ad4a98c7-815a-4104-aa50-4c7b4f8aff3e.jpg" alt="F4" width="2500" height="1667" data-action="zoom"></p>
+
+
+<p>Summalajnen got the honor to<span></span> <span>“</span>brush” the router, meaning aligning all cables in a visually pleasing way, sort of like brushing your own hair but in this case network cables. We wanted all ports to have a connection for it to look like the router was active and Summa spent a good amount of time cabling and stripping the cables to look perfect. We ended up mounting a small 20 <span>LED</span> strip on top of the</p>
+<h2 id="about-the-beer">About the beer</h2>
+<p>With all of this done we had Foxbat, our resident beer brewer, step in and actually connect the beer parts of the machine. Foxbat had consulted with us prior to the festival regarding how to adapt one of his tap coolers (<a href="http://www.lindr.cz/products/kontakt-40k" target="_blank">Lindr Kontakt <span>40K</span></a>) into more of an intermediary fridge. The Kontakt 40 is primarily built to be served out of but Foxbat came up with the clever idea of mounting<span></span> <span>“</span>cleaning adapters” in order to fit extension tubing. A small brass connector that screws into where the tap handles on the Kontakt 40 sits, on which Foxbat then mounted an adapter that allowed connection to regular 3/8” tubing. We coated all of the extension tubing in off the shelf isolation from a hardware store to keep the beer chilled and hoped that the throughput of which we sold beer would be enough to avoid having to serve warm beer.</p>
+<p>For the beer handles on the router, we purchased two chrome plated <a href="https://www.tapyourkeg.com/Beer-dispensing-tap-with-35mm-shank-KOH1944.htm" target="_blank">Lindr dispensers</a> and drilled holes on two of the blanking plates which are used to cover empty slots in the router. Foxbat then piped the output from the Kontakt 40 through the back side of the router to the tap handles on the blanking plate. Almost a magical experience to see the first glass being poured from router after all the work we put into this and the fact that the adapter solution that Foxbat came up with actually worked.</p>
+<p>Foxbat had brewed two beers to the festival. One lager titled <em><span></span><span>“</span>Dr.&nbsp;Ankbat’s Dirty Deeds”</em> in which he added too much malt which made it a stronger lager, initially I found it a bit strong but after drinking shitty canned lager for 2 weeks it served as a nice contrast with more taste. The other beer was a <span>NEIPA</span> (New England India Pale Ale) that we titled <em>“<span>CHONG</span> <span>CHAMBER</span> <span>IPA</span>”</em> after listening to <a href="https://open.spotify.com/album/4u7XtwuEeULmi2JVsSXkfR" target="_blank">Mullah Said by Muslimgauze</a> and reading a review on <a href="https://rateyourmusic.com/music-review/SlarkSlark/muslimgauze/mullah-said/124582393" target="_blank"><span>RYM</span></a> by SlarkSlark that described the album. Personally I really enjoyed both of them, Foxbat has brewed beer for the past two events and although he’s always vocally critical of his own work the result is better than many of the beers you can buy at bars.</p>
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/393638ac-8325-4ce8-aa01-44b6eb7145f6.jpg" alt="brewing" width="936" height="936" data-action="zoom"></p>
+
+
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/2532af66-e4f7-41b6-87dd-03bb6f25ae68.jpg" alt="F3" width="2500" height="1667" data-action="zoom"></p>
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/a1e285e4-216d-4902-93d9-0c022a0da249.jpg" alt="F4" width="2500" height="1667" data-action="zoom"></p>
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/4e8044ab-9131-4ea7-b64c-2994cd76caa4.jpg" alt="F3" width="2500" height="1667" data-action="zoom"></p>
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/ed0f79f1-605a-4f5a-a63c-67ec8707d407.jpg" alt="F4" width="2500" height="1667" data-action="zoom"></p>
+
+<h2 id="takeaways">Takeaways</h2>
+<p>I’m personally extremely happy about how this project turned out. It required me to pull out so many different parts of my mental toolbox and ended up challenging both me and Wberg in various ways. One specific thing I’ve come to realize is how hard it is to describe technical concepts over text. Sure, I can see a picture of a piece but actually holding the piece in my hands allows me to grasp the problem in a much more effective way than asking questions. I wish we had some sort of haptic collaborative <span>VR</span> setup here to iterate on these things when split across time zones but that’s for the future to give us.</p>
+<p>I wish that we had to spend less time debugging the electrical noise. This is one of those that I should have explored in San Francisco rather than tackled at location especially since I’ve run into this issue many times in the past. It sounds so simple to solve but when trying a variety of solutions it’s easy to confuse what solution worked which extended the timeline it took to finish the router. On top of that we were a bit too aggressive with how close we put the <span>LED</span> strip towards the top so the soldering ended up letting go while testing different approaches. This meant that I had to resolder these strips I don’t know how many times so if I end up working with 144/M density strips again I will design some sort of connector protection in the print.</p>
+<p>The beer tap in itself worked perfectly throughout the event, we sold through all beer that Foxbat had brewed and I think that’s partly due to how striking the piece is in reality. It’s this huge router which isn’t supposed to sit in a bar, looking like it’s powered up with two beer handles attached to it.</p>
+<h2 id="result">Result</h2>
+<iframe width="315" height="415" src="https://www.youtube.com/embed/-en7wruitqs" frameborder="0" allow="accelerometer; autoplay; encrypted-media; gyroscope; picture-in-picture" allowfullscreen="">
+</iframe>
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/84964002-bd4f-4156-b07f-a022eea64df2.jpg" alt="F4" width="1667" height="2500" data-action="zoom"></p>
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/ea2004aa-545e-44ae-8c4a-abd2504f03d6.jpg" alt="foxbat pouring" width="2500" height="1667" data-action="zoom"></p>
+<p>You might have one more question: <em>What happened to the backplane?</em> Turned out that the backplane was an excellent gift to hand out to the person that consumed most beer that was considered<span></span> <span>“</span>bad” using our grading system.</p>
+<p><img src="https://cdn.blot.im/blog_bca43ecebf9f4b00be1693d9224431bc/_image_cache/297e4f93-68a5-45f2-9514-a03f0c063f06.jpg" alt="F4" width="2500" height="2500" data-action="zoom"></p>
+
+          
+          <p>
+            <a href="https://blog.jonasbengtson.se/tagged/projects">Projects</a>
+          </p>
+
+          
+          
+
+
+          <hr>
+
+          <a href="https://blog.jonasbengtson.se/planet-s-mad">
+            <h5>Previous post</h5>
+            <span>PLANET'S MAD</span>
+            <span>BAAUER. Yes, this is the person that made “Harlem Shake” back in 2012 and seeing BAAUER released a new album I was skeptical. It took a while but</span>
+          </a>
+
+          <a href="https://blog.jonasbengtson.se/alan-kay">
+            <h5>Next post</h5>
+            <span>Alan Kay</span>
+            <span>Mentioning Alan Kay in San Francisco is like mentioning Steve Jobs, everyone is familiar with him and the work. It did however occur to me that I</span>
+          </a>
+
+        </div>
+        
+              </div>
+    </div></div>]]>
+            </description>
+            <link>https://blog.jonasbengtson.se/cisco-7609-beer-tap</link>
+            <guid isPermaLink="false">hacker-news-small-sites-40464496</guid>
+            <pubDate>Fri, 24 May 2024 09:40:24 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[2D Rigid Body Collision Resolution]]>
             </title>
             <description>
 <![CDATA[
-Score 446 | Comments 62 (<a href="https://news.ycombinator.com/item?id=40463764">thread link</a>) | @atan2
+Score 451 | Comments 62 (<a href="https://news.ycombinator.com/item?id=40463764">thread link</a>) | @atan2
 <br/>
 May 24, 2024 | https://www.sassnow.ski/rigid-body-collisions/1 | <a href="https://web.archive.org/web/*/https://www.sassnow.ski/rigid-body-collisions/1">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><!--[--><div><p><!--[-->From Mario bouncing off a Goomba to two cars bumping into each other in a racing
@@ -818,11 +1018,26 @@ Thank you so much for reading and I hope I'll see you again for the next post.<!
         </item>
         <item>
             <title>
+<![CDATA[LuaRT: Lua programming environment for console, desktop applications for Windows]]>
+            </title>
+            <description>
+<![CDATA[
+Score 64 | Comments 8 (<a href="https://news.ycombinator.com/item?id=40463209">thread link</a>) | @thunderbong
+<br/>
+May 23, 2024 | https://luart.org/index.html | <a href="https://web.archive.org/web/*/https://luart.org/index.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+            </description>
+            <link>https://luart.org/index.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-40463209</guid>
+            <pubDate>Fri, 24 May 2024 05:49:27 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[CSharpRepl: C# REPL with syntax highlighting and intellisense]]>
             </title>
             <description>
 <![CDATA[
-Score 121 | Comments 35 (<a href="https://news.ycombinator.com/item?id=40460296">thread link</a>) | @aragonite
+Score 123 | Comments 36 (<a href="https://news.ycombinator.com/item?id=40460296">thread link</a>) | @aragonite
 <br/>
 May 23, 2024 | https://fuqua.io/CSharpRepl/ | <a href="https://web.archive.org/web/*/https://fuqua.io/CSharpRepl/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -907,7 +1122,7 @@ May 23, 2024 | https://fuqua.io/CSharpRepl/ | <a href="https://web.archive.org/w
             </title>
             <description>
 <![CDATA[
-Score 305 | Comments 184 (<a href="https://news.ycombinator.com/item?id=40457856">thread link</a>) | @timthorn
+Score 307 | Comments 184 (<a href="https://news.ycombinator.com/item?id=40457856">thread link</a>) | @timthorn
 <br/>
 May 23, 2024 | https://www.cam.ac.uk/stories/cement-recycling | <a href="https://web.archive.org/web/*/https://www.cam.ac.uk/stories/cement-recycling">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -947,7 +1162,7 @@ May 23, 2024 | https://www.cam.ac.uk/stories/cement-recycling | <a href="https:/
             </title>
             <description>
 <![CDATA[
-Score 2116 | Comments 818 (<a href="https://news.ycombinator.com/item?id=40456834">thread link</a>) | @asadm
+Score 2127 | Comments 822 (<a href="https://news.ycombinator.com/item?id=40456834">thread link</a>) | @asadm
 <br/>
 May 23, 2024 | https://daylightcomputer.com/product | <a href="https://web.archive.org/web/*/https://daylightcomputer.com/product">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><h2><span>Founders<!-- --> </span><span>Edition</span></h2><div><p><span>For a limited time</span> <br>get the founder’s edition complete with accessories</p><p>Tablet, stylus, charging<!-- --> <span>cable + extras</span></p></div></div><section data-index-title=""></section><div data-index-title="Display"><section></section><section><p><h2>A computer you can use outside</h2></p><div><h3>iPad</h3><p><img alt="Image of an iPad on the grass" draggable="false" loading="lazy" decoding="async" data-nimg="fill" sizes="50vw" srcset="https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fsplit-comparison-1.4f9e14b7.png&amp;w=384&amp;q=75 384w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fsplit-comparison-1.4f9e14b7.png&amp;w=640&amp;q=75 640w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fsplit-comparison-1.4f9e14b7.png&amp;w=750&amp;q=75 750w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fsplit-comparison-1.4f9e14b7.png&amp;w=828&amp;q=75 828w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fsplit-comparison-1.4f9e14b7.png&amp;w=1080&amp;q=75 1080w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fsplit-comparison-1.4f9e14b7.png&amp;w=1200&amp;q=75 1200w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fsplit-comparison-1.4f9e14b7.png&amp;w=1920&amp;q=75 1920w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fsplit-comparison-1.4f9e14b7.png&amp;w=2048&amp;q=75 2048w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fsplit-comparison-1.4f9e14b7.png&amp;w=3840&amp;q=75 3840w" src="https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fsplit-comparison-1.4f9e14b7.png&amp;w=3840&amp;q=75"></p></div><div><h3>Daylight Computer</h3><p><img alt="Image of a Daylight tablet on the grass" draggable="false" loading="lazy" decoding="async" data-nimg="fill" sizes="50vw" srcset="https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fsplit-comparison-2.dd0a3a74.png&amp;w=384&amp;q=75 384w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fsplit-comparison-2.dd0a3a74.png&amp;w=640&amp;q=75 640w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fsplit-comparison-2.dd0a3a74.png&amp;w=750&amp;q=75 750w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fsplit-comparison-2.dd0a3a74.png&amp;w=828&amp;q=75 828w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fsplit-comparison-2.dd0a3a74.png&amp;w=1080&amp;q=75 1080w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fsplit-comparison-2.dd0a3a74.png&amp;w=1200&amp;q=75 1200w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fsplit-comparison-2.dd0a3a74.png&amp;w=1920&amp;q=75 1920w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fsplit-comparison-2.dd0a3a74.png&amp;w=2048&amp;q=75 2048w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fsplit-comparison-2.dd0a3a74.png&amp;w=3840&amp;q=75 3840w" src="https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fsplit-comparison-2.dd0a3a74.png&amp;w=3840&amp;q=75"></p></div><div><h3>Sunlight readable</h3><p>From your garden to national parks, enjoy comfortable and glare-free usage. Bring your favorite books with you wherever you go, and find your best ideas in unexpected places.</p></div></section><section><p><img draggable="false" alt="eyes softly blinking" loading="lazy" width="2048" height="928" decoding="async" data-nimg="1" src="https://daylightcomputer.com/_next/static/media/soft-eyes-dark.89d65ec6.gif"></p><div><h2>Softer on the eyes</h2><div><h3>Flicker-free blacklight</h3><p>We use a dimming technology completely free of PWM flicker — a comfortable experience for even the most sensitive eyes.</p></div><div><h3>Read for hours and hours</h3><p>Live Paper is non-emissive and feels just like reading paper, so you can comfortably use it all day.</p></div></div></section><section id="paperlike-section"><p><img alt="Person writing on a paper-like tablet surface" draggable="false" loading="lazy" width="1174" height="726" decoding="async" data-nimg="1" srcset="https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fhand-writing.7f6a6248.png&amp;w=1200&amp;q=100 1x, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fhand-writing.7f6a6248.png&amp;w=3840&amp;q=100 2x" src="https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fhand-writing.7f6a6248.png&amp;w=3840&amp;q=100"></p><div><h4><span>Paper-like</span> finish</h4><p>Write like on real paper, with a matte finish and textured surface that provide a natural, tactile writing experience— a glare-free note pad for the next chapter of your life.</p></div></section><section id="features-section"><picture><source media="(min-width: 1024px)" srcset="https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Ffeatures.1110c0e2.png&amp;w=640&amp;q=100 640w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Ffeatures.1110c0e2.png&amp;w=750&amp;q=100 750w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Ffeatures.1110c0e2.png&amp;w=828&amp;q=100 828w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Ffeatures.1110c0e2.png&amp;w=1080&amp;q=100 1080w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Ffeatures.1110c0e2.png&amp;w=1200&amp;q=100 1200w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Ffeatures.1110c0e2.png&amp;w=1920&amp;q=100 1920w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Ffeatures.1110c0e2.png&amp;w=2048&amp;q=100 2048w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Ffeatures.1110c0e2.png&amp;w=3840&amp;q=100 3840w"><img alt="Daylight tablet over the sheets" draggable="false" blurwidth="6" blurheight="8" loading="lazy" width="1528" height="2048" decoding="async" sizes="100vw" srcset="https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Ffeatures-tablet.8cffd323.png&amp;w=640&amp;q=100 640w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Ffeatures-tablet.8cffd323.png&amp;w=750&amp;q=100 750w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Ffeatures-tablet.8cffd323.png&amp;w=828&amp;q=100 828w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Ffeatures-tablet.8cffd323.png&amp;w=1080&amp;q=100 1080w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Ffeatures-tablet.8cffd323.png&amp;w=1200&amp;q=100 1200w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Ffeatures-tablet.8cffd323.png&amp;w=1920&amp;q=100 1920w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Ffeatures-tablet.8cffd323.png&amp;w=2048&amp;q=100 2048w, https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Ffeatures-tablet.8cffd323.png&amp;w=3840&amp;q=100 3840w" src="https://daylightcomputer.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Ffeatures-tablet.8cffd323.png&amp;w=3840&amp;q=100"></picture><div><p><h2>Warmer evenings for your eyes</h2></p></div></section></div><div data-index-title="Software"><section></section><section><div><h4>Your Favorite<br>Third-Party apps</h4><p>All the apps you need in one place. Install anything available on Android.</p></div></section></div></div></div>]]>
@@ -962,7 +1177,7 @@ May 23, 2024 | https://daylightcomputer.com/product | <a href="https://web.archi
             </title>
             <description>
 <![CDATA[
-Score 279 | Comments 203 (<a href="https://news.ycombinator.com/item?id=40455478">thread link</a>) | @sleno
+Score 285 | Comments 203 (<a href="https://news.ycombinator.com/item?id=40455478">thread link</a>) | @sleno
 <br/>
 May 23, 2024 | https://www.papertalk.xyz/research/home | <a href="https://web.archive.org/web/*/https://www.papertalk.xyz/research/home">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -977,7 +1192,7 @@ May 23, 2024 | https://www.papertalk.xyz/research/home | <a href="https://web.ar
             </title>
             <description>
 <![CDATA[
-Score 264 | Comments 136 (<a href="https://news.ycombinator.com/item?id=40455208">thread link</a>) | @jacobwg
+Score 267 | Comments 137 (<a href="https://news.ycombinator.com/item?id=40455208">thread link</a>) | @jacobwg
 <br/>
 May 23, 2024 | https://depot.dev/blog/faster-ec2-boot-time | <a href="https://web.archive.org/web/*/https://depot.dev/blog/faster-ec2-boot-time">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>It is possible to increase the speed at which EC2 instances boot! This can be critical for certain types of workloads, where a fresh EC2 instance is needed to process some request or task. At Depot, we accelerate builds, so the
@@ -1080,7 +1295,7 @@ EC2 boot time directly equals the lag time for a build to start processing.</p>
             </title>
             <description>
 <![CDATA[
-Score 246 | Comments 114 (<a href="https://news.ycombinator.com/item?id=40454383">thread link</a>) | @geox
+Score 247 | Comments 114 (<a href="https://news.ycombinator.com/item?id=40454383">thread link</a>) | @geox
 <br/>
 May 23, 2024 | https://www.nottingham.ac.uk/news/first-pictures-from-euclid-satellite-reveal-billions-of-orphan-stars | <a href="https://web.archive.org/web/*/https://www.nottingham.ac.uk/news/first-pictures-from-euclid-satellite-reveal-billions-of-orphan-stars">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
@@ -1095,10 +1310,310 @@ May 23, 2024 | https://www.nottingham.ac.uk/news/first-pictures-from-euclid-sate
             </title>
             <description>
 <![CDATA[
-Score 295 | Comments 107 (<a href="https://news.ycombinator.com/item?id=40453221">thread link</a>) | @LegionMammal978
+Score 297 | Comments 107 (<a href="https://news.ycombinator.com/item?id=40453221">thread link</a>) | @LegionMammal978
 <br/>
 May 23, 2024 | https://www.sligocki.com//2024/05/22/bb-3-4-a14.html | <a href="https://web.archive.org/web/*/https://www.sligocki.com//2024/05/22/bb-3-4-a14.html">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div aria-label="Content">
+      <div>
+        <article itemscope="" itemtype="http://schema.org/BlogPosting">
+
+  
+
+  <div itemprop="articleBody">
+    <p>Pavel has found a 3-state 4-symbol TM which can compute an “Ackermann-level” function and halts with exactly</p><p>
+
+\[(2 \uparrow^{15} 5) + 14\]
+
+</p><p>non-zero symbols on the tape. With a number this large, Knuth up-arrow format is becoming a bit awkward, so we can approximate this bound as:</p><p>
+
+\[BB(3, 4) &gt; Ack(14)\]
+
+</p><p>where \(Ack(14)\) is the 14th <a href="https://mathworld.wolfram.com/AckermannNumber.html">Ackermann number</a> defined as:</p><p>
+
+\[Ack(n) = n \uparrow^n n\]
+
+</p><p>As far as I know, this is the first TM found “in the wild” that is able to simulate an Ackermann-level function.</p>
+
+<h2 id="the-machine">The Machine</h2>
+
+<p><code>1RB3LB1RZ2RA_2LC3RB1LC2RA_3RB1LB3LC2RC</code></p>
+
+<table>
+  <thead>
+    <tr>
+      <th>&nbsp;</th>
+      <th>0</th>
+      <th>1</th>
+      <th>2</th>
+      <th>3</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>A</td>
+      <td>1RB</td>
+      <td>3LB</td>
+      <td>1RZ</td>
+      <td>2RA</td>
+    </tr>
+    <tr>
+      <td>B</td>
+      <td>2LC</td>
+      <td>3RB</td>
+      <td>1LC</td>
+      <td>2RA</td>
+    </tr>
+    <tr>
+      <td>C</td>
+      <td>3RB</td>
+      <td>1LB</td>
+      <td>3LC</td>
+      <td>2RC</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>It halts with final configuration</p><p>
+
+\[0^\infty \;\; 3^{2 g_{15}^{3}(0) + 1} \;\; 2^{16} \;\; 1 \;\; \text{ Z&gt; } \;\; 0^\infty\]
+
+</p><p>which leaves exactly</p><p>
+
+\[\sigma = 2 g_{15}^{3}(0) + 18 = (2 \uparrow^{15} 5) + 14\]
+
+</p><p>non-zero symbols on the tape. (The function \(g_k(m)\) will be defined below).</p>
+
+<h3 id="attribution">Attribution</h3>
+
+<p>This TM was discovered by Pavel Kropitz (@uni) and shared <a href="https://discord.com/channels/960643023006490684/1095740122139480195/1233140768768524358">on Discord</a> on 25 Apr 2024. His code was not able to specify a human-readable bound on the TM score and it was simply specified as <code>Halt(SuperPowers(13))</code> indicating 13 layers of inductive rules needed to prove it. He began a validation of this result using my new “Inductive Proof Validator” (see discussion at end of article).</p>
+
+<p>I completed this validation and was able to extract the precise definition of \(g_k^n(m)\) on 20 May 2024 (<a href="https://discord.com/channels/960643023006490684/1095740122139480195/1242186781672341514">Discord link</a>) and used that to get a bound of \(\sigma &gt; 2 \uparrow^{15} 3\).</p>
+
+<p>Matthew House (@LegionMammal978) discovered on 22 May 2024 (<a href="https://discord.com/channels/960643023006490684/1095740122139480195/1242864786379771985">Discord link</a>) the remarkably simple closed form evaluation:</p><p>
+
+\[g_k^n(0) = \frac{ 2 \uparrow^k (n+2) }{2} - 2\]
+
+</p><p>which led me to rewrite this article with exact values for \(\sigma\)!</p>
+
+<h2 id="analysis">Analysis</h2>
+
+<p>Let</p><p>
+
+\[B(k, n, m) = 0^\infty \;\; 3^{2m+1} \;\; 2^k \;\; \text{ A&gt; } \;\; 1^n\]
+
+</p><p>then we can prove that</p><p>
+
+\[\begin{array}{lcl}
+  0^\infty \;\; \text{A&gt;} \;\; 0^\infty &amp; \xrightarrow{241} &amp; B(16, 3, 0) \;\; 2 \;\; 0^\infty \\
+  B(k, n, m) &amp; \to &amp; B(k, 0, g_{k-1}^n(m)) &amp; \text{if } k \ge 1 \\
+  B(k, 0, m) \;\; 2 &amp; \xrightarrow{1} &amp; 0^\infty \;\; 3^{2m+1} \;\; 2^k \;\; 1 \;\; \text{Z&gt;} \\
+\end{array}\]
+
+</p><p>where</p><p>
+
+\[\begin{array}{l}
+  g_0(m) &amp; = &amp; m + 1 \\
+  g_{k+1}(m) &amp; = &amp; g_k^{2m+2}(0) \\
+\end{array}\]
+
+</p><h3 id="proof-by-double-induction">Proof by Double Induction</h3>
+
+<p>This TM is remarkably simple in the sense that its behavior can be almost completely described by one single rule:</p><p>
+
+\[B(k, n, m) \to B(k, 0, g_{k-1}^n(m))\]
+
+</p><p>but that rule is a whopper requiring double induction to prove!</p>
+
+<hr>
+
+<p>Lemma 1: For all \(k \ge 1\):</p><p>
+
+\[3 \;\; 2^k \;\; \text{&lt;B} \;\; \xrightarrow{2k+1} \;\; 2^k \;\; \text{&lt;B} \;\; 1\]
+
+</p><p>Corollary 2: For all \(k \ge 1, m \ge 0\):</p><p>
+
+\[3^m \;\; 2^k \;\; \text{&lt;B} \;\; \xrightarrow{(2k+1)m} \;\; 2^k \;\; \text{&lt;B} \;\; 1^m\]
+
+</p><p>Proofs left as an exercise to the reader.</p>
+
+<hr>
+
+<p>Theorem 3: For all \(k \ge 1, n \ge 0, m \ge 0\):</p><p>
+
+\[B(k, n, m) \to B(k, 0, g_{k-1}^n(m))\]
+
+</p><p>Proof by Induction on \(k\):</p>
+
+<ul>
+  <li>Base Case (\(k = 1\))
+    <ul>
+      <li>Goal: \(\forall n,m \ge 0: B(1, n+1, m) \to B(1, 0, g_0^{n+1}(m))\)</li>
+      <li>Proof by induction on \(n\). Left as an exercise to the reader.</li>
+    </ul>
+  </li>
+  <li>Induction Case
+    <ul>
+      <li>Assume \(H_k: \forall n,m \ge 0: B(k, n, m) \to B(k, 0, g_k^n(m))\)</li>
+      <li>Goal: \(\forall n,m \ge 0: B(k+1, n, m) \to B(k+1, 0, g_{k+1}^n(m))\)</li>
+      <li>
+        <p>Proof by induction on \(n\):</p>
+
+        <ul>
+          <li>Base Case (\(n = 0\))
+            <ul>
+              <li>Trivially true because \(g_{k-1}^0(m) = m\), so \(B(k, n, m) = B(k, 0, g_{k-1}^n(m))\)</li>
+            </ul>
+          </li>
+          <li>Induction Case
+            <ul>
+              <li>Assume \(H_n: \forall m \ge 0: B(k+1, n, m) \to B(k+1, 0, g_{k+1}^n(m))\)</li>
+              <li>Goal: \(\forall m \ge 0: B(k+1, n+1, m) \to B(k+1, 0, g_{k+1}^{n+1}(m))\)</li>
+            </ul>
+          </li>
+        </ul>
+      </li>
+    </ul>
+  </li>
+</ul><p>
+
+\[\begin{array}{lcl}
+B(k+1, n+1, m) &amp; = &amp;
+  0^\infty \;\; 3^{2m+1} \;\; 2^{k+1} \;\; \text{A&gt;} \;\; 1^{n+1} \\
+&amp; \xrightarrow{1} &amp;
+  0^\infty \;\; 3^{2m+1} \;\; 2^{k+1} \;\; \text{&lt;B} \;\; 3 \;\; 1^n \\
+&amp; \xrightarrow{(2k+3)(2m+1)} &amp;
+  0^\infty \;\; 2^{k+1} \;\; \text{&lt;B} \;\; 1^{2m+1} \;\; 3 \;\; 1^n
+    &amp; \text{by Corollary 2} \\
+&amp; \xrightarrow{2k+2} &amp;
+  0^\infty \;\; 3 \;\; 2^k \;\; \text{A&gt;} \;\; 1^{2m+2} \;\; 3 \;\; 1^n \\
+&amp; = &amp; B(k, 2m+2, 0) \;\; 3 \;\; 1^n \\
+&amp; \to &amp; B(k, 0, g_k^{2m+2}(0)) \;\; 3 \;\; 1^n
+    &amp; \text{by Ind. Hyp. } H_k \\
+&amp; = &amp;
+  0^\infty \;\; 3^{g_k^{2m+2}(0)} \;\; 2^k \;\; \text{A&gt;} \;\; 3 \;\; 1^n \\
+&amp; \xrightarrow{1} &amp;
+  0^\infty \;\; 3^{g_k^{2m+2}(0)} \;\; 2^{k+1} \;\; \text{A&gt;} \;\; 1^n \\
+&amp; = &amp; B(k+1, n, g_k^{2m+2}(0)) = B(k+1, n, g_{k+1}(m)) \\
+&amp; \to &amp; B(k+1, 0, g_{k+1}^n(g_{k+1}(m)))
+    &amp; \text{by Ind. Hyp. } H_n \\
+&amp; = &amp; B(k+1, 0, g_{k+1}^{n+1}(m)) \\
+\end{array}\]
+
+</p><p>QED</p>
+
+<h3 id="exact-values">Exact Values</h3>
+
+<p>Through what appears to be a remarkable series of coincidences, there is a relatively simple closed form evaluation of \(g_k\) using only Knuth up-arrows and arithmetic:</p>
+
+<p>Theorem: For all \(k \ge 0, m \ge 0\):</p><p>
+
+\[2 g_{k+1}(m) + 4 = 2 \uparrow^k (2m+4)\]
+
+</p><p>(where we define \(a \uparrow^0 b = ab\))</p>
+
+<p>Proof by Induction on \(k\):</p>
+
+<ul>
+  <li>Base case (\(k = 0\)):</li>
+</ul><p>
+
+\[\begin{array}{l}
+  g_1(m)        &amp; = &amp; g_0^{2m+2}(0) &amp; = &amp; 2m+2 \\
+  2 g_1(m) + 4  &amp; = &amp; 2 (2m+2) + 4 &amp; = &amp; 4m + 8 &amp; = &amp; 2 \uparrow^0 (2m+4) \\
+\end{array}\]
+
+</p><ul>
+  <li>Inductive case: Assume \(\forall m \ge 0: 2 g_{k+1}(m) + 4 = 2 \uparrow^k (2m+4)\):</li>
+</ul><p>
+
+\[\begin{array}{l}
+  2 g_{k+1}(m) + 4    &amp; = &amp; 2 \uparrow^k (2m+4) \\
+  2 g_{k+1}^n(m) + 4  &amp; = &amp; (2 \uparrow^k)^n (2m+4) \\
+  2 g_{k+2}(m) + 4    &amp; = &amp; g_{k+1}^{2m+2}(0) = (2 \uparrow^k)^{2m+2} 4 = (2 \uparrow^k)^{2m+2} (2 \uparrow^k 2) \\
+                      &amp; = &amp; 2 \uparrow^{k+1} (2m+4) \\
+\end{array}\]
+
+</p><p>QED</p>
+
+<p>Note: This depends upon the coincidence that \(2 \uparrow^k 2 = 4\) for all \(k\). If the parameters had been slightly different and we’d ended up with \((2 \uparrow^k)^{2m+2} 5\) above, I don’t think it would have been possible to get a closed form expression.</p>
+
+<p>Corollary: For all \(k \ge 0, n \ge 0\):</p><p>
+
+\[2 g_k^n(0) + 4 = 2 \uparrow^k (n+2)\]
+
+</p><p>From which it follows directly that:</p><p>
+
+\[\sigma = 2 g_{15}^{3}(0) + 18 = (2 \uparrow^{15} 5) + 14\]
+
+</p><h2 id="permutations">Permutations</h2><p>
+
+\[\begin{array}{lcl}
+  0^\infty \;\; \text{B&gt;} \;\; 0^\infty &amp; \xrightarrow{86} &amp; B(7, 3, 0) \;\; 2 \;\; 0^\infty \\
+  0^\infty \;\; \text{C&gt;} \;\; 0^\infty &amp; \xrightarrow{20} &amp; B(1, 3, 0) \;\; 2 \;\; 0^\infty \\
+\end{array}\]
+
+</p><p>Therefore, we can see that if we switch to:</p>
+<ul>
+  <li>Starting in state <code>B</code>, the TM halts with a score of \(\sigma_B = 2 g_6^3(0) + 9 = (2 \uparrow^6 5) + 5\)</li>
+  <li>Starting in state <code>C</code>, the TM halts with a score of \(\sigma_C = 2 g_0^3(0) + 3 = (2 \uparrow^0 5) - 1 = 9\) (which it does at step 72).</li>
+</ul>
+
+<p>This first permutation (start state <code>B</code>) is another top BB(3, 4) TM. Converted into TNF it is:</p>
+
+<p><code>1RB3RB1LC2LA_2LA2RB1LB3RA_3LA1RZ1LC2RA</code></p>
+
+<table>
+  <thead>
+    <tr>
+      <th>&nbsp;</th>
+      <th>0</th>
+      <th>1</th>
+      <th>2</th>
+      <th>3</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>A</td>
+      <td>1RB</td>
+      <td>3RB</td>
+      <td>1LC</td>
+      <td>2LA</td>
+    </tr>
+    <tr>
+      <td>B</td>
+      <td>2LA</td>
+      <td>2RB</td>
+      <td>1LB</td>
+      <td>3RA</td>
+    </tr>
+    <tr>
+      <td>C</td>
+      <td>3LA</td>
+      <td>1RZ</td>
+      <td>1LC</td>
+      <td>2RA</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="not-collatz">Not Collatz</h2>
+
+<p>One interesting thing about this TM is how surprisingly simple it is. For example, the fact that it does not have any Collatz-like rules (rules which act differently depending on the remainder of some value). Is this the end of the domination of Collatz-like TMs? It is far too early to know, but my guess is that there are Collatz-like Ackermann-level TMs waiting for us, but we are not seeing them right away because of selection bias. Perhaps this was the first Ackermann-level TM found because it is simple enough to be proven halting without having to implement modular arithmetic on Ackermann-level functions.</p>
+
+<h2 id="inductive-proof-validator">Inductive Proof Validator</h2>
+
+<p>This TM was the perfect test case for an “inductive proof” validator I am currently developing. The goal of this project is to develop a standardized certificate format for “inductive proofs” (an umbrella term for all the sort of forward-reasoning, rule-based analyses that are ubiquitous on this blog). The idea is that anyone with an “inductive decider” could write out their rules in this format and then this validator can check these proofs. The system is still very clunky and not ready for prime time, but I have been able (with a little elbow grease) to use it to prove the behavior of many TMs including <a href="https://github.com/sligocki/busy-beaver/blob/49864afd99263b6f18bec0dee028a3b56aa70936/rust/src/validator.rs#L978">this one</a>.</p>
+
+
+
+
+
+  </div>
+</article>
+
+      </div>
+    </div></div>]]>
             </description>
             <link>https://www.sligocki.com//2024/05/22/bb-3-4-a14.html</link>
             <guid isPermaLink="false">hacker-news-small-sites-40453221</guid>
@@ -1347,7 +1862,7 @@ May 22, 2024 | https://fpvsim.com/drone-flying-101 | <a href="https://web.archiv
             </title>
             <description>
 <![CDATA[
-Score 258 | Comments 165 (<a href="https://news.ycombinator.com/item?id=40444267">thread link</a>) | @pulisse
+Score 259 | Comments 165 (<a href="https://news.ycombinator.com/item?id=40444267">thread link</a>) | @pulisse
 <br/>
 May 22, 2024 | https://materializedview.io/p/s3-is-showing-its-age | <a href="https://web.archive.org/web/*/https://materializedview.io/p/s3-is-showing-its-age">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div dir="auto"><p><span>There’s no denying that S3 is a feat of engineering. </span><a href="https://www.youtube.com/watch?v=sc3J4McebHE" rel="">Building and Operating a Pretty Big Storage System</a><span> is a top-tier technology flex. But S3’s feature set is falling behind its competitors. Notably, S3 has no compare-and-swap (CAS) operation—something every single other competitor has. It also lacks multi-region buckets and object appends. Even </span><a href="https://aws.amazon.com/s3/storage-classes/express-one-zone/" rel="">S3 Express</a><span> is proving to be lackluster.</span></p><p><span>These missing features haven’t mattered much for data lakes and offline use cases. But new infrastructure is using object storage as their primary persistence layer—</span><a href="https://materializedview.io/p/cloud-storage-triad-latency-cost-durability" rel="">something</a><span> </span><a href="https://materializedview.io/i/138849066/transactional-key-value-stores-on-s" rel="">I’m</a><span> </span><a href="https://materializedview.io/i/138956120/you-should-be-streaming-data-on-s" rel="">excited</a><span> </span><a href="https://materializedview.io/i/139272203/s-express-one-zone-roundup" rel="">about</a><span>. Here, S3’s feature gaps are a bigger problem.</span></p><p><span>Preconditions (also known as </span><a href="https://en.wikipedia.org/wiki/Compare-and-swap" rel="">compare-and-swap</a><span> (CAS), conditionals, If-None-Match, If-Match, and so on) allow a client to write an object only if a certain condition is met. A client might wish to write an object only if it doesn’t exist, or update an object only if it hasn’t changed since the client last read it. CAS makes this possible. Such operations are used often for locks and transactions in distributed systems. </span></p><p><span>S3 is the only object store that doesn’t support preconditions. Every other object store—</span><a href="https://cloud.google.com/storage" rel="">Google Cloud Storage</a><span> (GCS), </span><a href="https://azure.microsoft.com/en-us/products/storage/blobs" rel="">Azure Blob Store</a><span> (ABS), Cloudflare </span><a href="https://developers.cloudflare.com/r2/" rel="">Ridiculously Reliable</a><span> (R2) storage, </span><a href="https://www.tigrisdata.com/" rel="">Tigris</a><span>, </span><a href="https://min.io/" rel="">MinIO</a><span>—all have this feature.</span></p><p><span>Instead, developers are forced to use a separate transactional store such as </span><a href="https://aws.amazon.com/dynamodb/" rel="">DynamoDB</a><span> to enforce transactional operations. Building a two-phase write between DynamoDB and S3 is not technically difficult, but it’s annoying and </span><a href="https://docs.rs/object_store/latest/object_store/aws/enum.S3CopyIfNotExists.html" rel="">leads to ugly abstractions</a><span>.</span></p><p><span>I was </span><a href="https://x.com/criccomini/status/1729546140163395698" rel="">really excited</a><span> about S3 Express One Zone (S3E1Z) when it first came out. The more time I spend with it, the less impressed I am. The first wart that surfaced was a new </span><a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/directory-buckets-overview.html" rel="">directory bucket</a><span> type, which Amazon introduced for Express.</span></p><p><span>But the gaps don’t stop here. S3E1Z is </span><a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-express-differences.html#s3-express-differences-unsupported-features" rel="">missing a </a><em><a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-express-differences.html#s3-express-differences-unsupported-features" rel="">ton</a></em><a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-express-differences.html#s3-express-differences-unsupported-features" rel=""> of standard S3 features</a><span> including object version support, bucket tags, object locks, object tags, and MD5 checksum ETags. The </span><a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-express-differences.html#s3-express-differences-unsupported-features" rel="">complete list</a><span> is pretty staggering.</span></p><p><span>S3E1Z buckets can’t be treated like a normal S3 buckets. As with CAS operations, developers must design around these deficiencies. And because S3E1Z is not multi-zonal, developers are left to build </span><a href="https://x.com/richardartoul/status/1756808229542051902" rel="">quorum writes</a><span> to multiple availability zones for higher availability.</span></p><p>Factor in S3E1Z’s high storage cost of $0.16/gig—twice elastic block store’s (EBS)  general purpose SSD (gp3) cost—and S3E1Z looks more like an expensive EBS with a half-implemented S3 API.</p><p><span>S3’s availability feature gaps go beyond S3E1Z. S3 doesn’t have dual-region or multi-region buckets. Such buckets are useful for higher availability. Google offers </span><a href="https://cloud.google.com/storage/docs/availability-durability#cross-region-redundancy" rel="">a wide range of options</a><span> in this area.</span></p><p>While not a must-have, higher availability buckets are certainly nice to have.</p><p>The dream is that developers are offered an object store with all of these features: low latency, preconditions, dual-region/multi-region, and so on. But we live in reality, where engineers face a choice: abandon S3 or build around these gaps.</p><p><a href="https://turbopuffer.com/" rel="">Turbopuffer</a><span> is my favorite example of a company that’s gone all-in on abandoning S3.</span></p><p><span>The gamble they’ve made is that S3 will eventually get preconditions. This gamble seems reasonable since Amazon has all of the required building blocks (DynamoDB and S3) and every competitor is beating them here. I’m making the same gamble with the </span><a href="https://materializedview.io/p/cloud-storage-triad-latency-cost-durability" rel="">cloud native LSM I’m working on</a><span>.</span></p><p><span>The challenge with this approach is inter-cloud network cost. All cloud providers charge for network egress. Data transferred to infrastructure running outside amazon web services (AWS) will incur network egress fees. But the inter-cloud cost for AWS users isn’t as bad as you might think. </span><a href="https://sirupsen.com/" rel="">Simon Eskildsen</a><span>, Turbopuffer’s founder and CEO, has </span><a href="https://x.com/Sirupsen/status/1766459050378551611" rel="">written about this extensively</a><span>.</span></p><p><span>The benefit of this is that Turbopuffer has built a beautiful and minimalist design with </span><a href="https://turbopuffer.com/architecture" rel="">just three components</a><span>: a Turbopuffer binary, a RAM/SSD cache, and Google Cloud Storage.</span></p><p>For many, this will seem extreme. The alternative is to house metadata in a transactional store outside of S3.</p><p><span>Once you open yourself up to a separate metadata plane, you’ll find other use cases for it. The path to the </span><a href="https://www.gartner.com/en/research/methodologies/gartner-hype-cycle" rel="">slope of enlightenment</a><span> is to recognize that S3 is an object store not a file system. By embracing DynamoDB as your metadata layer, systems stand to gain a lot.</span></p><p>Ultimately, the decision to abandon S3 or embrace its shortcomings depends on a system’s use cases and design goals. Preconditions on S3 and a unified S3E1Z API would make this decision a lot easier, though.</p><p><span>Support this newsletter by purchasing </span><a href="https://www.amazon.com/Missing-README-Guide-Software-Engineer/dp/1718501838" rel="">The Missing README: A Guide for the New Software Engineer</a><span> for yourself or gifting it to someone.</span></p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fde442631-41a6-4119-a99a-62957cd53edb_870x978.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fde442631-41a6-4119-a99a-62957cd53edb_870x978.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fde442631-41a6-4119-a99a-62957cd53edb_870x978.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fde442631-41a6-4119-a99a-62957cd53edb_870x978.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fde442631-41a6-4119-a99a-62957cd53edb_870x978.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fde442631-41a6-4119-a99a-62957cd53edb_870x978.png" width="146" height="164.12413793103448" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/de442631-41a6-4119-a99a-62957cd53edb_870x978.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:978,&quot;width&quot;:870,&quot;resizeWidth&quot;:146,&quot;bytes&quot;:null,&quot;alt&quot;:&quot;&quot;,&quot;title&quot;:&quot;&quot;,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" title="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fde442631-41a6-4119-a99a-62957cd53edb_870x978.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fde442631-41a6-4119-a99a-62957cd53edb_870x978.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fde442631-41a6-4119-a99a-62957cd53edb_870x978.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fde442631-41a6-4119-a99a-62957cd53edb_870x978.png 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p data-attrs="{&quot;url&quot;:&quot;https://www.amazon.com/Missing-README-Guide-Software-Engineer/dp/1718501838&quot;,&quot;text&quot;:&quot;Buy Now&quot;,&quot;action&quot;:null,&quot;class&quot;:&quot;button-wrapper&quot;}" data-component-name="ButtonCreateButton"><a href="https://www.amazon.com/Missing-README-Guide-Software-Engineer/dp/1718501838" rel=""><span>Buy Now</span></a></p><p><span>I occasionally invest in infrastructure startups. Companies that I’ve invested in are marked with a [$] in this newsletter. See my </span><a href="https://www.linkedin.com/in/riccomini/" rel="">LinkedIn profile</a><span> for a complete list.</span></p></div></div></div>]]>
