@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Mon, 03 Jun 2024 00:29:37 GMT</lastBuildDate>
+        <lastBuildDate>Mon, 03 Jun 2024 04:23:42 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-10.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Mon, 03 Jun 2024 00:29:37 GMT</pubDate>
+        <pubDate>Mon, 03 Jun 2024 04:23:42 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,724 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Building a dynamic lib plugin system for Rust]]>
+            </title>
+            <description>
+<![CDATA[
+Score 14 | Comments 3 (<a href="https://news.ycombinator.com/item?id=40558054">thread link</a>) | @necubi
+<br/>
+June 2, 2024 | https://www.arroyo.dev/blog/rust-plugin-systems | <a href="https://web.archive.org/web/*/https://www.arroyo.dev/blog/rust-plugin-systems">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article><p>Arroyo is a stream processing engine; users write SQL to build real-time
+data pipelines. Now SQL is a great language for data processing, supports
+<a href="https://doc.arroyo.dev/sql/scalar-functions">a huge variety of functions</a>, and
+is adaptable to a wide variety of use cases including
+<a href="https://www.arroyo.dev/blog/what-is-streaming-sql">streaming data</a>.</p>
+<p>But as powerful as SQL is, sometimes there's a computation that just isn't
+easy (or possible) to express as a SQL expression. Maybe you need to parse a
+custom binary data format, implement a complex aggregation strategy, or call
+some pre-existing business logic.</p>
+<p>For these cases many SQL engines support <em>user-defined functions</em>
+(UDFs), which come in several forms: scalar UDFs, UDAFs (aggregate functions,
+which operate over multiple rows), and UDWFs (window function, which can
+reference other rows).</p>
+<p>UDFs make SQL engines <em>extensible</em>. They let users customize the system to their
+needs. This is particularly important for us, as a small startup that can't
+build all of the functionality every user might want ourselves. But Arroyo is
+built in Rust—which likes to build static binaries. How can we support dynamic,
+user-defined behavior?</p>
+<p>Historically, Arroyo supported UDFs via static, Ahead-of-Time (AoT) compilation,
+but with
+<a href="https://www.arroyo.dev/blog/why-arrow-and-datafusion">Arroyo 0.10 dropping AoT in favor of interpreted SQL runtime</a>
+built around <a href="https://arrow.apache.org/">Apache Arrow</a> and
+<a href="https://datafusion.apache.org/">DataFusion</a>, we needed a new strategy. <strong>The
+result is a dynamically-linked, FFI-based plugin system with support for sync
+and async functions.</strong></p>
+<p>You can see how this looks from a user perspective in our
+<a href="https://doc.arroyo.dev/sql/udfs">docs</a>, or jump
+<a href="https://github.com/ArroyoSystems/arroyo/tree/master/crates/arroyo-udf">into the code</a>.
+The rest of this post will dive deep into how we ended up with this design, the
+technical details behind it, and what you need to know to build your own
+FFI-based plugin interface in Rust.</p>
+<h2 id="table-of-contents">Table of Contents</h2>
+<ul>
+<li>
+<p><a href="#the-history">The history</a></p>
+</li>
+<li>
+<p><a href="#living-dynamically">Living dynamically</a></p>
+<ul>
+<li><a href="#1-embed-a-scripting-language">1. Embed a scripting language</a></li>
+<li><a href="#2-run-udfs-are-a-separate-process-with-rpc-calls">2. Run UDFs are a separate process, with RPC calls</a></li>
+<li><a href="#3-compile-to-wasm">3. Compile to Wasm</a></li>
+<li><a href="#4-shared-libraries">4. Shared libraries</a></li>
+</ul>
+</li>
+<li>
+<p><a href="#implementing-a-c-interface">Implementing a C interface</a></p>
+<ul>
+<li><a href="#designing-our-types">Designing our types</a></li>
+<li><a href="#exporting-functions">Exporting functions</a></li>
+<li><a href="#compiling-our-plugin">Compiling our plugin</a></li>
+<li><a href="#calling-ffi-functions">Calling FFI functions</a></li>
+</ul>
+</li>
+<li>
+<p><a href="#putting-it-all-together">Putting it all together</a></p>
+<ul>
+<li><a href="#designing-the-interface">Designing the interface</a></li>
+<li><a href="#the-plugin">The plugin</a></li>
+<li><a href="#the-host">The host</a></li>
+<li><a href="#lets-plug-in-some-stuff">Let's plug in some stuff!!!</a></li>
+</ul>
+</li>
+<li>
+<p><a href="#wrapping-up">Wrapping up</a></p>
+</li>
+</ul>
+<h2 id="the-history">The history</h2>
+<p>Arroyo has supported UDFs since <a href="https://www.arroyo.dev/blog/arroyo-0-3-0">0.3</a>
+and UDAFs since <a href="https://www.arroyo.dev/blog/arroyo-0-6-0">0.6</a>, and it's become
+one of our most widely used features. We supported UDFs very early on in part
+because they were so easy to build into our architecture. Until our recent
+<a href="https://www.arroyo.dev/blog/arroyo-0-10-0">0.10</a> release, we relied on
+ahead-of-time compilation for our pipelines. In short, we would generate Rust
+code with the data types, expressions, and graph structure of the pipeline, then
+compile that into a binary which would execute it against the data streams.</p>
+<p>In this paradigm, supporting UDFs was straightforward. For example, a SQL
+expression like</p>
+<div data-rehype-pretty-code-fragment=""><pre tabindex="0" data-language="sql" data-theme="default"><code data-language="sql" data-theme="default"><span data-line=""><span>LENGTH</span><span>(</span><span>CAST</span><span>((</span><span>counter</span><span> + </span><span>5</span><span>) </span><span>as</span><span> </span><span>TEXT</span><span>))</span></span></code></pre></div>
+<p>would be compiled into something like the following Rust code<sup><a href="#user-content-fn-1" id="user-content-fnref-1" data-footnote-ref="true" aria-describedby="footnote-label">1</a></sup>:</p>
+<div data-rehype-pretty-code-fragment=""><pre tabindex="0" data-language="sql" data-theme="default"><code data-language="sql" data-theme="default"><span data-line=""><span>(</span><span>counter</span><span> + </span><span>5</span><span>).to_string().</span><span>len</span><span>()</span></span></code></pre></div>
+<p>Since we're just generating Rust code, we can slot in a user-provided Rust
+function easily.</p>
+<figure><p><img src="https://www.arroyo.dev/posts/rust-plugins/plugin_ui.png" alt="The Arroyo UDF editor"></p><figcaption><p>The Arroyo UDF editor</p></figcaption></figure>
+<p>The way it worked was this: the Arroyo UI provided an editor where users could
+write UDF functions as Rust code. A UDF function looked like this:</p>
+<div data-rehype-pretty-code-fragment=""><pre tabindex="0" data-language="rust" data-theme="default"><code data-language="rust" data-theme="default"><span data-line=""><span>pub</span><span> </span><span>fn</span><span> </span><span>square</span><span>(</span><span>x</span><span>: </span><span>i64</span><span>) -&gt; </span><span>i64</span><span> {</span></span>
+<span data-line=""><span>    </span><span>x</span><span> * </span><span>x</span></span>
+<span data-line=""><span>}</span></span></code></pre></div>
+<p>UDFs could also include a special comment at the top to add additional
+dependencies, in Cargo.toml format:</p>
+<div data-rehype-pretty-code-fragment=""><pre tabindex="0" data-language="rust" data-theme="default"><code data-language="rust" data-theme="default"><span data-line=""><span>/*</span></span>
+<span data-line=""><span>[dependencies]</span></span>
+<span data-line=""><span>regex = "1"</span></span>
+<span data-line=""><span>*/</span></span></code></pre></div>
+<p>When a user runs a pipeline with this UDF, the system would parse the function
+definition, pull out the arguments and return types, map them to the
+corresponding
+<a href="https://doc.arroyo.dev/sql/data-types">SQL data type</a>,
+and register it with the SQL planner.</p>
+<p>After planning comes codegen. UDFs source code would be written directly to a
+<a href="http://lib.rs/">lib.rs</a> file in a crate, alongside another crate with generated
+wrapper code, which would then be added a dependency to the pipeline crate. At
+this point, it's a normal, statically linked Rust function that could be called
+like any other within the generated expression code.</p>
+<h2 id="living-dynamically">Living dynamically</h2>
+<p>For Arroyo 0.10, we knew we would need a different strategy, since we were no
+longer building a static pipeline binary. Instead, expressions would be executed
+at runtime by a tree-walking interpreter, which would need some way to call out
+to the UDF code without having it available at compile time.</p>
+<p>At this point, we started looking at prior art in the Rust world, and came
+across <a href="https://nullderef.com/series/rust-plugins/">this great blog series</a> on
+Rust plugins from Mario Ortiz Manero, which we're very indebted to. Unfortunately,
+it quickly became clear that this was not a solved problem in Rust.</p>
+<p>There are a number of options for how one can invoke user code at runtime:</p>
+<h3 id="1-embed-a-scripting-language">1. Embed a scripting language</h3>
+<p>languages like Python and JavaScript can be run dynamically without any
+pre-compilation, and ir interpreter could be hosted within the engine. Arroyo
+uses the cross-language-compatible <a href="https://arrow.apache.org/">Apache Arrow</a>
+data format, so there needn't be any serialization across the language barrier.
+However, there would still be a significant performance cost compared to our
+native Rust functions, and this would break backwards-compatibility with existing
+Rust UDFs.</p>
+<p>This approach is common in applications where plugin performance isn't critical,
+for example GUI plugins in creative applications where the plugin code is
+orchestrating rather than processing itself.</p>
+<h3 id="2-run-udfs-are-a-separate-process-with-rpc-calls">2. Run UDFs are a separate process, with RPC calls</h3>
+<p>Each UDF could be compiled as a separate service (or all UDFs for a pipeline
+could be compiled together into a single service) that runs as a sidecar to the
+main worker process. When the UDF is invoked during expression evaluation the
+engine would make an RPC call with the input data and get the return value back.</p>
+<p>There are several advantages to this approach, which isolates user-written code
+from the engine process. It's able to crash independently, and have its own
+resource limits for CPU and memory. And by running it in a separate, locked-down
+container or VM, we could even run potentially malicious UDFs in a cloud
+environment without concern that they could compromise shared infrastructure.</p>
+<p>The downside again is performance. Even with batching, the overhead of an RPC
+call is much higher than a pure function call, and requires serialization and
+deserialization of data. It also adds to the deployment complexity, as this
+would be other services that need to be managed.</p>
+<p>The RPC approach to plugins is often used when the host seeks to isolate itself
+from potentially buggy plugin code and to easily support multiple languages; for
+example text editors today use RPCs via the
+<a href="https://microsoft.github.io/language-server-protocol/">Language Server Protocol</a>
+and in the data space <a href="https://beam.apache.org/">Apache Beam</a> uses RPCs to
+support cross-language UDFs.</p>
+<h3 id="3-compile-to-wasm">3. Compile to Wasm</h3>
+<p>Now we're cooking with gas. Web assembly—Wasm—is the hottest thing in
+cross-language execution. UDF code written in a language like Rust can be
+compiled into a Wasm binary, which can then be dynamically executed by a Wasm
+runtime like <a href="https://wasmtime.dev/">Wasmtime</a> or
+<a href="https://www.wasmer.io/">Wasmer</a>.</p>
+<p>Wasm is a genuinely exciting technology; it's an assembly-like language that is
+portable across languages, operating systems, and CPU architectures. In theory
+this means that a host doesn't need to know or care what the original language
+of the plugin. In addition to the portability, Wasm runtimes are also designed
+to be sandboxes, in theory allowing untrusted user code to run without
+compromising their host. Finally, Wasm supports fine-grained resource
+management; a host can limit how much CPU and memory a plugin can use.</p>
+<p>All of these are great properties for a UDF system, and I have no doubt that
+Wasm will be part of how engines solve this problem in the future. Today,
+though, there are some limitations.</p>
+<p>First, performance. Wasm code is still slower than native (anywhere from 1.5x-3x
+depending on the task). Beyond the runtime cost, sending data to a Wasm function
+generally requires copying it into the Wasm memory, which can be substantial
+overhead for simpler operations.</p>
+<p>Second, compatibility. Not all Rust code can easily be compiled to Wasm. For
+example, anything that requires linking to a C library will not work out of the
+box. Many other features of Rust (threads, syscalls, networking, etc.) are not
+directly supported. The situation for other languages is much worse. For
+dynamic, GC'd languages like Python the best option today is to
+<a href="https://github.com/pyodide/pyodide">compile the interpreter itself to Wasm</a>,
+but this means that most libraries that rely on C extensions (like numpy, scipy,
+pandas) won't work without special support.</p>
+<p>In short, today plugin authors need to be very familiar with Wasm and its
+limitations in order to successfully build more complex UDFs.</p>
+<h3 id="4-shared-libraries">4. Shared libraries</h3>
+<p>Shared objects (<code>.dll</code>s on Windows, <code>.so</code> files on Linux, <code>.dylib</code>s on MacOS)
+are a common way to distribute library code. They can be dynamically linked,
+meaning that the application code needs only to know the interface at compile
+time, but not the actual code. They can even be <em>dynamically loaded</em> after
+program startup.</p>
+<p>Dynamic linking is also a traditional way to implement plugin systems. For
+example, Digital Audio Workstations like Logic Pro and Ableton support
+shared-object plugins to implement effects and instruments, with standards like
+<a href="https://en.wikipedia.org/wiki/Virtual_Studio_Technology">VST</a> and
+<a href="https://en.wikipedia.org/wiki/Audio_Units">AU</a>. Other creative applications
+like photo editors and 3d graphics tools have similarly offered plugin
+interfaces via shared libraries.</p>
+<p>In many ways, this is an obvious choice: functions from shared libraries have
+almost the same performance as native functions<sup><a href="#user-content-fn-2" id="user-content-fnref-2" data-footnote-ref="true" aria-describedby="footnote-label">2</a></sup>, and we would have complete
+compatibility for the wide universe of crates.</p>
+<p>Unfortunately, dynamic linking is quite challenging in Rust. The language
+<a href="https://github.com/rust-lang/rfcs/issues/600">lacks a stable ABI</a> (Application
+<em>Binary</em> Interface), which is the contract between function caller and callees
+about how variables will be laid out in memory, how structures are laid out, and
+other low-level details needed to correctly call out to foreign code. This means
+that shared libraries need to have been compiled with the exactly same compiler
+version (and possibly compiler options) as the host binary in order to be
+loadable.</p>
+<p>But there is a workaround: use the C ABI. Unlike Rust, C <em>does</em> have a stable
+ABI on every major OS and processor architecture. So if we can constrain our
+plugin interface to only use C-compatible data structures and functions we can
+safely link against plugins compiled by any Rust compiler. Even better: as the C
+ABI is the lingua franca in the systems world, many other languages are
+able to emit it, opening the door to supporting UDFs in a variety of compiled
+languages.</p>
+<p>This is the path we took for UDFs in Arroyo.</p>
+<img src="https://www.arroyo.dev/posts/rust-plugins/plugin_archs.png" alt="The four plugin architectures discussed here">
+<h2 id="implementing-a-c-interface">Implementing a C interface</h2>
+<p>So how do you go about building a C ABI in Rust? There are a number of
+limitations and rules to follow to safely call functions over a C FFI boundary.</p>
+<h3 id="designing-our-types">Designing our types</h3>
+<p>The first thing we need to think about is data—the stuff getting passed between
+the host and plugin code. Rust gives us many powerful tools for modeling data,
+including structs, enums, tuples, various data structures… and we're going to
+have to give nearly all of them up. To correctly and reliably pass data over a C
+FFI boundary, we have to follow some very limiting rules.</p>
+<p><strong>Rule 1: repr(C)</strong></p>
+<p>Our first issue is that Rust's data layout is ABI dependent, and can (and does)
+change with different versions of the compiler. So we get to the first rule of
+building a C interface: <strong>all data needs to be <code>#[repr(C)]</code></strong>.</p>
+<div><div><div><p>At this point I'd like to introduce an extremely helpful resource for anyone
+straying from the cosy, warm cottage of safe Rust and out into the deep dark
+night of <code>unsafe</code>: the <a href="https://doc.rust-lang.org/nomicon/">Rustonomicon</a>. It
+helpfully disclaims responsibility for potentially “UNLEASHING INDESCRIBABLE
+HORRORS THAT SHATTER YOUR PSYCHE AND SET YOUR MIND ADRIFT IN THE UNKNOWABLY
+INFINITE COSMOS.”</p><p>With that warning in mind, its section on data layout and <code>repr</code> can be found
+<a href="https://doc.rust-lang.org/nomicon/data.html">here</a>.</p></div></div></div>
+<p>Repr annotations allow developers to specify specific data layouts for structs
+and enums, where the default is “whatever the Rust compiler wants to do and
+thinks is efficient.” There are several support layouts, but the rules for
+<code>repr(C)</code> is pretty simple: just do whatever C does.</p>
+<figure><p><img src="https://www.arroyo.dev/posts/rust-plugins/lovecraftian.jpg" alt="A lovecraftian monster"></p><figcaption><p>Staring too long into the abyss of unsafe Rust can have interesting consequences</p></figcaption></figure>
+<p>To use alternative representations, we can create a data type (struct or enum)
+and annotate it like this:</p>
+<div data-rehype-pretty-code-fragment=""><pre tabindex="0" data-language="rust" data-theme="default"><code data-language="rust" data-theme="default"><span data-line=""><span>#[repr(</span><span>C</span><span>)]</span></span>
+<span data-line=""><span>struct</span><span> </span><span>MyData</span><span> {</span></span>
+<span data-line=""><span>  </span><span>a</span><span>: </span><span>f32</span><span>,</span></span>
+<span data-line=""><span>  </span><span>b</span><span>: </span><span>i64</span><span>,</span></span>
+<span data-line=""><span>  </span><span>c</span><span>: </span><span>u8</span></span>
+<span data-line=""><span>}</span></span></code></pre></div>
+<p>This struct demonstrates why <code>#[repr(C)]</code> is important. Compiling this code
+using the nightly-only rustc option <code>-Zprint-type-sizes</code> we can see that we end
+up with completely different layouts for <code>#[repr(Rust)]</code> and <code>#[repr(C)]:</code></p>
+<div data-rehype-pretty-code-fragment=""><pre tabindex="0" data-language="rust" data-theme="default"><code data-language="rust" data-theme="default"><span data-line=""><span>// #[repr(Rust)]</span></span>
+<span data-line=""><span>print</span><span>-</span><span>type</span><span>-</span><span>size</span><span> </span><span>type</span><span>: `</span><span>MyData</span><span>`: </span><span>16</span><span> </span><span>bytes</span><span>, </span><span>alignment</span><span>: </span><span>8</span><span> </span><span>bytes</span></span>
+<span data-line=""><span>print</span><span>-</span><span>type</span><span>-</span><span>size</span><span>     </span><span>field</span><span> `.b`: </span><span>8</span><span> </span><span>bytes</span></span>
+<span data-line=""><span>print</span><span>-</span><span>type</span><span>-</span><span>size</span><span>     </span><span>field</span><span> `.a`: </span><span>4</span><span> </span><span>bytes</span></span>
+<span data-line=""><span>print</span><span>-</span><span>type</span><span>-</span><span>size</span><span>     </span><span>field</span><span> `.c`: </span><span>1</span><span> </span><span>bytes</span></span>
+<span data-line=""> </span>
+<span data-line=""><span>// #[repr(C)]</span></span>
+<span data-line=""><span>print</span><span>-</span><span>type</span><span>-</span><span>size</span><span> </span><span>type</span><span>: `</span><span>MyData</span><span>`: </span><span>24</span><span> </span><span>bytes</span><span>, </span><span>alignment</span><span>: </span><span>8</span><span> </span><span>bytes</span></span>
+<span data-line=""><span>print</span><span>-</span><span>type</span><span>-</span><span>size</span><span>     </span><span>field</span><span> `.a`: </span><span>4</span><span> </span><span>bytes</span></span>
+<span data-line=""><span>print</span><span>-</span><span>type</span><span>-</span><span>size</span><span>     </span><span>padding</span><span>: </span><span>4</span><span> </span><span>bytes</span></span>
+<span data-line=""><span>print</span><span>-</span><span>type</span><span>-</span><span>size</span><span>     </span><span>field</span><span> `.b`: </span><span>8</span><span> </span><span>bytes</span><span>, </span><span>alignment</span><span>: </span><span>8</span><span> </span><span>bytes</span></span>
+<span data-line=""><span>print</span><span>-</span><span>type</span><span>-</span><span>size</span><span>     </span><span>field</span><span> `.c`: </span><span>1</span><span> </span><span>bytes</span></span>
+<span data-line=""><span>print</span><span>-</span><span>type</span><span>-</span><span>size</span><span>     </span><span>end</span><span> </span><span>padding</span><span>: </span><span>7</span><span> </span><span>bytes</span></span></code></pre></div>
+<p>In fact, the Rust representation is much more efficient, taking up only 16 bytes
+instead of 24 bytes for the C representation. This is because Rust is free to
+reorder the fields to reduce the number of padding bytes needed to align to 8
+bytes. C on the other hand will always lay out fields in order with predictable
+padding rules, which we see in the second version.</p>
+<p>That example struct stuck to simple, primitive data types. And that leads into
+rule number 2:</p>
+<p><strong>Rule 2: all data must be FFI safe</strong></p>
+<p>While <code>#[repr(C)]</code> allows us to create structs and enums that can be passed
+across an FFI boundary, that property is not recursive—that is, it controls the
+layout of fields within the struct, but doesn't affect the representation of the
+fields themselves.</p>
+<p>In fact, we are quite limited in what data types are FFI safe. This is not a
+well documented area of Rust, but an incomplete list of FFI safe types includes:</p>
+<ol>
+<li><strong>Primitive Types</strong>: <strong><code>u8</code></strong>, <strong><code>u16</code></strong>, <strong><code>u32</code></strong>, <strong><code>u64</code></strong>, <strong><code>i8</code></strong>,
+<strong><code>i16</code></strong>, <strong><code>i32</code></strong>, <strong><code>i64</code></strong>, <strong><code>usize</code></strong>, <strong><code>isize</code></strong>, <strong><code>f32</code></strong>,
+<strong><code>f64</code></strong>, and <strong><code>bool</code></strong>.</li>
+<li><strong>Pointers</strong>: Raw pointers <strong><code>const T</code></strong> and <strong><code>mut T</code>;</strong> safe wrappers for
+nullable pointers like <strong><code>Option&lt;NonNull&lt;T&gt;&gt;</code></strong></li>
+<li><strong>C-compatible Enums</strong>: Enums with explicitly defined <strong><code>repr(C)</code></strong>.</li>
+<li><strong>C-compatible Structs</strong>: Structs with <strong><code>repr(C)</code></strong> and containing only
+FFI-safe types.</li>
+<li><strong>Slices</strong>: <strong><code>[T]</code></strong>, <strong><code>const [T]</code></strong>, and <strong><code>mut [T]</code></strong> when length is
+provided separately.</li>
+</ol>
+<p>So no passing <code>String</code>, <code>Vec</code>, <code>HashMap</code>, or random data types from your
+favorite Rust crate. However, we do have tools for passing some useful types of
+data with a little bit of transformation. The
+<a href="https://doc.rust-lang.org/std/ffi/index.html">std::ffi</a> package includes
+CString and CStr which are owned and borrowed null-terminated C-style strings.
+Similarly, we can pass <code>Vec</code> by converting it into a raw pointer + length +
+capacity and then back again.</p>
+<h3 id="exporting-functions">Exporting functions</h3>
+<p>Once we've decided on our data types, we're ready to design our actual API, by
+exporting C-compatible functions. A C FFI function is a bare Rust function with</p>
+<ul>
+<li>A <code>#[no_mangle]</code> annotation, which tells rustc to name the symbol as exactly
+the function name, instead of rewriting it (or “mangling”) to ensure
+uniqueness and include useful metadata</li>
+<li>The <code>extern "C"</code> keyword, which tells rustc to export the function for
+external use using the C ABI</li>
+<li>All arguments and a return type that are FFI safe<sup><a href="#user-content-fn-3" id="user-content-fnref-3" data-footnote-ref="true" aria-describedby="footnote-label">3</a></sup>, as described above</li>
+</ul>
+<p>So putting that together, we can export a C FFI function with the following
+definition</p>
+<div data-rehype-pretty-code-fragment=""><pre tabindex="0" data-language="rust" data-theme="default"><code data-language="rust" data-theme="default"><span data-line=""><span>#[no_mangle]</span></span>
+<span data-line=""><span>extern</span><span> </span><span>"C"</span><span> </span><span>fn</span><span> </span><span>add</span><span>(</span><span>a</span><span>: </span><span>u32</span><span>, </span><span>b</span><span>: </span><span>u32</span><span>) -&gt; </span><span>u32</span><span> {</span></span>
+<span data-line=""><span>  </span><span>a</span><span> + </span><span>b</span></span>
+<span data-line=""><span>}</span></span></code></pre></div>
+<p><em>Within</em> the plugin code, we can use almost any Rust construct or features, so
+long as nothing leaks into the type signature.</p>
+<p>The biggest exception is <code>panic</code>. Rust's default panicking behavior is
+unwinding, which means we travel up the call stack until we hit either a
+<code>catch_unwind</code> call (which stops the unwinding) or the top stack frame for the
+thread, in which case the thread exits. But this is a Rust-specific feature,
+part of the unstable Rust ABI. Unwinding can't cross a C FFI boundary without
+risking undefined behavior.</p>
+<figure><p><img src="https://www.arroyo.dev/posts/rust-plugins/dont_panic.png" alt="The words 'Don't Panic'"></p><figcaption><p>And important rule for hitchhiking across the galaxy and crossing FFI boundaries</p></figcaption></figure>
+<p>There are two ways to handle this: either we need to compile our plugin code
+with <code>panic = 'abort'</code> (which causes the process to terminate on panic) or we
+need to ensure that the plugin cannot panic. But even if we can ensure our own
+code is panic-free<sup><a href="#user-content-fn-4" id="user-content-fnref-4" data-footnote-ref="true" aria-describedby="footnote-label">4</a></sup>, how can we make sure our plugin-writing-users do the
+same?</p>
+<p>One answer is to use a plugin interface with a top-level <code>catch_unwind</code> call
+that converts panics into an Error enum across the FFI boundary.</p>
+<h3 id="compiling-our-plugin">Compiling our plugin</h3>
+<p>Our plugin will be a library crate that's built as a shared object, in a binary
+format that depends on our operating system (.so on Linux, .dll on Windows,
+.dylib on MacOS).</p>
+<p>By default, Rust compiles libraries as an <code>rlib</code> artifact, which is a
+Rust-specific static library format. To tell it to instead build a dynamic
+system library that can be linked by other languages, we'll use the <code>cdylib</code>
+type. This can be specified in a Cargo.toml by setting the <code>lib.crate-type</code>
+option, like this:</p>
+<div data-rehype-pretty-code-fragment=""><pre tabindex="0" data-language="rust" data-theme="default"><code data-language="rust" data-theme="default"><span data-line=""><span>[</span><span>package</span><span>]</span></span>
+<span data-line=""><span>name</span><span> = </span><span>"my-plugin"</span></span>
+<span data-line=""><span>version</span><span> = </span><span>"1.0.0"</span></span>
+<span data-line=""><span>edition</span><span> = </span><span>"2021"</span></span>
+<span data-line=""> </span>
+<span data-line=""><span>[</span><span>lib</span><span>]</span></span>
+<span data-line=""><span>crate</span><span>-</span><span>type</span><span> = [</span><span>"cdylib"</span><span>]</span></span></code></pre></div>
+<h3 id="calling-ffi-functions">Calling FFI functions</h3>
+<p>There are two different ways we might link and call plugin code across an FFI:
+at program start time, or dynamically as the program is executing. In either
+case, we'll use the <code>extern</code> keyword again but without a function body in order
+to tell the host side what the function signature is.</p>
+<p>If we know the name of the library at compile time, Rust provides built-in
+support for loading system libraries using the <code>[link]</code> annotation. It looks
+like this:</p>
+<div data-rehype-pretty-code-fragment=""><pre tabindex="0" data-language="rust" data-theme="default"><code data-language="rust" data-theme="default"><span data-line=""><span>#[link(name = </span><span>"my_plugin"</span><span>)]</span></span>
+<span data-line=""><span>extern</span><span> </span><span>"C"</span><span> {</span></span>
+<span data-line=""><span>    </span><span>fn</span><span> </span><span>add</span><span>(</span><span>a</span><span>: </span><span>u32</span><span>, </span><span>b</span><span>: </span><span>u32</span><span>) -&gt; </span><span>u32</span><span>;</span></span>
+<span data-line=""><span>}</span></span>
+<span data-line=""> </span>
+<span data-line=""><span>fn</span><span> </span><span>main</span><span>() {</span></span>
+<span data-line=""><span>    </span><span>unsafe</span><span> { </span><span>add</span><span>(</span><span>1</span><span>, </span><span>5</span><span>) };</span></span>
+<span data-line=""><span>}</span></span></code></pre></div>
+<p>Rust will look for a shared library with the name <code>my_plugin</code> (for example, on
+Linux it will look for <code>/usr/lib/my_plugin.so</code>, <code>/usr/local/lib/my_plugin.so</code>,
+etc.) and attempt to link it at program start time, and will fail if it can't
+find the library. The function can be called like any other (unsafe) Rust
+function<sup><a href="#user-content-fn-5" id="user-content-fnref-5" data-footnote-ref="true" aria-describedby="footnote-label">5</a></sup>.</p>
+<p>But for a plugin system, having to know the name of the library at compile time
+(and ensuring that it's installed in a system location) is somewhat limiting.
+Instead, we can turn to dynamic loading.</p>
+<p>The interfaces for dynamic library loading are OS-specific, but there are
+several crates that can handle the cross-platform boilerplate for us. The two
+most popular are <a href="https://crates.io/crates/libloading">libloading</a> and
+<a href="https://crates.io/crates/dlopen2">dlopen2</a>. For Arroyo we decided to use
+dlopen2 which has a nicer interface and stronger guarantees around thread
+safety.</p>
+<p>In dlopen2, we can define structs for each of our plugin interfaces. They look
+like this:</p>
+<div data-rehype-pretty-code-fragment=""><pre tabindex="0" data-language="rust" data-theme="default"><code data-language="rust" data-theme="default"><span data-line=""><span>#[derive(</span><span>WrapperApi</span><span>)]</span></span>
+<span data-line=""><span>pub</span><span> </span><span>struct</span><span> </span><span>PluginInterface</span><span> {</span></span>
+<span data-line=""><span>    </span><span>add</span><span>: </span><span>extern</span><span> </span><span>"C"</span><span> </span><span>fn</span><span>(</span><span>a</span><span>: </span><span>u32</span><span>, </span><span>b</span><span>: </span><span>u32</span><span>) -&gt; </span><span>u32</span><span>,</span></span>
+<span data-line=""><span>}</span></span></code></pre></div>
+<p>A plugin can be loaded and called like this:</p>
+<div data-rehype-pretty-code-fragment=""><pre tabindex="0" data-language="rust" data-theme="default"><code data-language="rust" data-theme="default"><span data-line=""><span>let</span><span> </span><span>container</span><span>: </span><span>Container</span><span>&lt;</span><span>PluginInterface</span><span>&gt; = </span><span>unsafe</span><span> {</span></span>
+<span data-line=""><span>	</span><span>Container</span><span>::</span><span>load</span><span>(</span><span>dylib_path</span><span>).</span><span>unwrap</span><span>()</span></span>
+<span data-line=""><span>};</span></span>
+<span data-line=""> </span>
+<span data-line=""><span>unsafe</span><span> { </span><span>container</span><span>.</span><span>add</span><span>(</span><span>1</span><span>, </span><span>3</span><span>) }</span></span></code></pre></div>
+<h2 id="putting-it-all-together">Putting it all together</h2>
+<p>So that was a lot of theory. Let's put it into practice with a complete example!
+We'll be working off a (very simplified) example plugin system found in
+<a href="https://github.com/mwylde/rust-plugin-tutorial">this repo</a>. Clone it locally to
+try this out yourself.</p>
+<p>The code is divided into two parts: the <em>plugin</em>, which compiles to a shared
+object, and the <em>host</em>, which loads the plugin. (In a real system, you'd likely
+want a few more components, including a common library to share definitions
+between the plugin and host, and a macro to do code generation, but we're
+keeping this relatively simple.)</p>
+<h3 id="designing-the-interface">Designing the interface</h3>
+<p>Before we can start writing code, we need to decide on the contract between the
+plugin and the host. For this example, we'll adopt a flexible contract that
+supports a variable number of arguments of various common data types, as would
+be needed for a UDF system.</p>
+<p>The plugin interface has two methods:</p>
+<div data-rehype-pretty-code-fragment=""><pre tabindex="0" data-language="rust" data-theme="default"><code data-language="rust" data-theme="default"><span data-line=""><span>extern</span><span> </span><span>"C"</span><span> </span><span>fn</span><span> </span><span>plugin_metadata</span><span>() -&gt; </span><span>PluginMetadata</span><span>,</span></span>
+<span data-line=""> </span>
+<span data-line=""><span>extern</span><span> </span><span>"C"</span><span> </span><span>fn</span><span> </span><span>plugin_entrypoint</span><span>(</span></span>
+<span data-line=""><span>    </span><span>args</span><span>: *</span><span>const</span><span> </span><span>PluginValue</span><span>, </span><span>args_len</span><span>: </span><span>usize</span><span>) -&gt; </span><span>PluginResult</span></span></code></pre></div>
+<p>The metadata function is called by the host to determine the number and types of
+the arguments the plugin expects, and the type of the data it returns, while the
+entrypoint function is called to actually execute the plugin's logic.</p>
+<p>As discussed in detail above, all of our data types need to be FFI-safe. For
+example, the <code>PluginMetadata</code> type looks like this:</p>
+<div data-rehype-pretty-code-fragment=""><pre tabindex="0" data-language="rust" data-theme="default"><code data-language="rust" data-theme="default"><span data-line=""><span>#[repr(</span><span>C</span><span>)]</span></span>
+<span data-line=""><span>#[derive(</span><span>Copy</span><span>, </span><span>Clone</span><span>)]</span></span>
+<span data-line=""><span>pub</span><span> </span><span>enum</span><span> </span><span>PluginType</span><span> {</span></span>
+<span data-line=""><span>    </span><span>Bool</span><span>,</span></span>
+<span data-line=""><span>    </span><span>Int</span><span>,</span></span>
+<span data-line=""><span>    </span><span>UInt</span><span>,</span></span>
+<span data-line=""><span>    </span><span>Double</span><span>,</span></span>
+<span data-line=""><span>    </span><span>String</span><span>,</span></span>
+<span data-line=""><span>}</span></span>
+<span data-line=""> </span>
+<span data-line=""><span>#[repr(</span><span>C</span><span>)]</span></span>
+<span data-line=""><span>pub</span><span> </span><span>struct</span><span> </span><span>PluginMetadata</span><span> {</span></span>
+<span data-line=""><span>    // should have a static lifetime</span></span>
+<span data-line=""><span>    </span><span>pub</span><span> </span><span>name</span><span>: *</span><span>const</span><span> </span><span>i8</span><span>,</span></span>
+<span data-line=""><span>    </span><span>pub</span><span> </span><span>arg_types</span><span>: *</span><span>const</span><span> PluginType,</span></span>
+<span data-line=""><span>    </span><span>pub</span><span> </span><span>arg_types_len</span><span>: </span><span>usize</span><span>,</span></span>
+<span data-line=""><span>    </span><span>pub</span><span> </span><span>return_type</span><span>: </span><span>PluginType</span><span>,</span></span>
+<span data-line=""><span>}</span></span></code></pre></div>
+<p>Note that instead of of passing a String for the name, we pass a <code>*const i8</code>,
+which represents a null-terminated C-style string. Instead of a
+<code>Vec&lt;PluginType&gt;</code> for the args, we pass a pointer to some memory and a length.</p>
+<p>For the entrypoint function, we'll need to pass our actual data to the plugin.
+That relies on an array of values of the type <code>PluginValue</code>:</p>
+<div data-rehype-pretty-code-fragment=""><pre tabindex="0" data-language="rust" data-theme="default"><code data-language="rust" data-theme="default"><span data-line=""><span>#[repr(</span><span>C</span><span>)]</span></span>
+<span data-line=""><span>pub</span><span> </span><span>enum</span><span> </span><span>PluginValue</span><span> {</span></span>
+<span data-line=""><span>    </span><span>Bool</span><span>(</span><span>bool</span><span>),</span></span>
+<span data-line=""><span>    </span><span>Int</span><span>(</span><span>i64</span><span>),</span></span>
+<span data-line=""><span>    </span><span>UInt</span><span>(</span><span>u64</span><span>),</span></span>
+<span data-line=""><span>    </span><span>Double</span><span>(</span><span>f64</span><span>),</span></span>
+<span data-line=""><span>    // All strings are owned by the host</span></span>
+<span data-line=""><span>    </span><span>String</span><span>(*</span><span>const</span><span> </span><span>i8</span><span>),</span></span>
+<span data-line=""><span>}</span></span></code></pre></div>
+<p>For primitives, we can use them as-is as all Rust primitives are FFI-safe.
+However, strings again need special attention. We have two typical options for
+passing strings: we can pass Rust-style strings (with an array of chars and a
+length) or C-styles strings (whose end is determined by a null byte). While the
+former are much safer and generally preferred in modern APIs, for C interfaces
+the latter is more common as it's more easily supported by languages with a C
+FFI.</p>
+<p>Beyond the format of the data, we also need to consider ownership<sup><a href="#user-content-fn-6" id="user-content-fnref-6" data-footnote-ref="true" aria-describedby="footnote-label">6</a></sup>. Once
+memory is allocated, exactly one part of our code (in this case, one side of the
+host/plugin divide) needs to own that memory. PluginValues are both created by
+the host (to provide data) and by the plugin (to return its result), but to
+simplify the memory management we have documented that in both cases the host
+owns the memory and is responsible for freeing it. This does mean the plugin
+code needs to be careful never to create an owned-object from the memory (in
+this case, a <code>CString</code>) which would free it on drop.</p>
+<p>Finally, we have our return type, which is just an FFI-safe Result type with a
+CString error message:</p>
+<div data-rehype-pretty-code-fragment=""><pre tabindex="0" data-language="rust" data-theme="default"><code data-language="rust" data-theme="default"><span data-line=""><span>#[repr(</span><span>C</span><span>)]</span></span>
+<span data-line=""><span>pub</span><span> </span><span>enum</span><span> </span><span>PluginResult</span><span> {</span></span>
+<span data-line=""><span>    </span><span>Ok</span><span>(</span><span>PluginValue</span><span>),</span></span>
+<span data-line=""><span>    // Null-terminated c-string; he host is responsible for</span></span>
+<span data-line=""><span>    // freeing this value</span></span>
+<span data-line=""><span>    </span><span>Err</span><span>(*</span><span>mut</span><span> </span><span>i8</span><span>),</span></span>
+<span data-line=""><span>}</span></span></code></pre></div>
+<p>Now that we have our common interface, let's see how they're used. We'll start
+with the plugin.</p>
+<div><div><div><p>We're using two different types of raw pointers here: <code>*mut</code> and <code>*const</code>. Why
+is that? What's the difference? In the context of FFI, the answer is: not much.
+The choice of <code>mut</code> vs <code>const</code> doesn't affect the generated code, and you can
+freely cast between them.</p><p>However, they are useful for documenting intent and ownership across an FFI
+boundary. Using <code>*const</code> tells the calling code that they shouldn't modify the
+data behind the pointer, and probably shouldn't free it, while <code>*mut</code> indicates
+that it's ok to modify the data and can also communicate ownership.</p><p>We're playing a bit fast-and-loose here, because we're using a single data type
+(<code>PluginValue</code>) for both our arguments—which the host creates and owns—and our
+return value, which the plugin creates but transfers to the host, so we opt for
+<code>*const</code> to tell the plugin not to modify or free its arguments. However, on the
+host side we then have to cast it to <code>*mut</code> so that we can take ownership.</p></div></div></div>
+<h3 id="the-plugin">The plugin</h3>
+<p>We're going to implement a simple plugin that takes in two arguments, a string
+and a number, and will return the string repeated that number of times:
+<code>f("cool", 3)</code> ⇒ <code>"coolcoolcool"</code> .</p>
+<p>The plugin is responsible for building a shared library, so we need to tell
+Cargo that's what we want. We do that by specifying the crate type as <code>cdylib</code>,
+a C-compatible dynamic library. Our Cargo.toml looks like this:</p>
+<div data-rehype-pretty-code-fragment=""><pre tabindex="0" data-language="toml" data-theme="default"><code data-language="toml" data-theme="default"><span data-line=""><span>[package]</span></span>
+<span data-line=""><span>name</span><span> = </span><span>"plugin"</span></span>
+<span data-line=""><span>version</span><span> = </span><span>"0.1.0"</span></span>
+<span data-line=""><span>edition</span><span> = </span><span>"2021"</span></span>
+<span data-line=""> </span>
+<span data-line=""><span>[lib]</span></span>
+<span data-line=""><span>crate-type</span><span> = [</span><span>"cdylib"</span><span>]</span></span></code></pre></div>
+<p>Next is our src/lib.rs file. This will contain implementations of the plugin
+interface documented above.</p>
+<p>The first function we need to implement is <code>plugin_metadata()</code>, which is pretty
+straightforward, telling the host about our arguments and our return type:</p>
+<div data-rehype-pretty-code-fragment=""><pre tabindex="0" data-language="rust" data-theme="default"><code data-language="rust" data-theme="default"><span data-line=""><span>#[no_mangle]</span></span>
+<span data-line=""><span>pub</span><span> </span><span>extern</span><span> </span><span>"C"</span><span> </span><span>fn</span><span> </span><span>plugin_metadata</span><span>() -&gt; </span><span>PluginMetadata</span><span> {</span></span>
+<span data-line=""><span>    </span><span>PluginMetadata</span><span> {</span></span>
+<span data-line=""><span>        </span><span>name</span><span>: </span><span>"repeat</span><span>\0</span><span>"</span><span>.</span><span>as_ptr</span><span>() </span><span>as</span><span> *</span><span>const</span><span> </span><span>i8</span><span>,</span></span>
+<span data-line=""><span>        </span><span>arg_types</span><span>: [</span><span>PluginType</span><span>::</span><span>String</span><span>, </span><span>PluginType</span><span>::</span><span>UInt</span><span>].</span><span>as_ptr</span><span>(),</span></span>
+<span data-line=""><span>        </span><span>arg_types_len</span><span>: </span><span>2</span><span>,</span></span>
+<span data-line=""><span>        </span><span>return_type</span><span>: </span><span>PluginType</span><span>::</span><span>String</span><span>,</span></span>
+<span data-line=""><span>    }</span></span>
+<span data-line=""><span>}</span></span></code></pre></div>
+<p>Next we'll implement our plugin's unique logic, in this case repeating a string
+N times. I find it easiest to separate this out from the boilerplate that's
+involved in converting to and from FFI types, so that when we're developing the
+logic we can stay in safe, normal Rust land.</p>
+<div data-rehype-pretty-code-fragment=""><pre tabindex="0" data-language="rust" data-theme="default"><code data-language="rust" data-theme="default"><span data-line=""><span>fn</span><span> </span><span>repeat_impl</span><span>(</span><span>input</span><span>: &amp;</span><span>str</span><span>, </span><span>count</span><span>: </span><span>u64</span><span>) -&gt; </span><span>String</span><span> {</span></span>
+<span data-line=""><span>    </span><span>input</span><span>.</span><span>repeat</span><span>(</span><span>count</span><span> </span><span>as</span><span> </span><span>usize</span><span>)</span></span>
+<span data-line=""><span>}</span></span></code></pre></div>
+<p>Nice and simple. Unfortunately, we still need the complex code to bridge the FFI
+and Rust worlds. For this example, it looks like this:</p>
+<div data-rehype-pretty-code-fragment=""><pre tabindex="0" data-language="rust" data-theme="default"><code data-language="rust" data-theme="default"><span data-line=""><span>#[no_mangle]</span></span>
+<span data-line=""><span>pub</span><span> </span><span>extern</span><span> </span><span>"C"</span><span> </span><span>fn</span><span> </span><span>plugin_entrypoint</span><span>(</span><span>args</span><span>: *</span><span>const</span><span> </span><span>PluginValue</span><span>,</span></span>
+<span data-line=""><span>                                    </span><span>args_len</span><span>: </span><span>usize</span><span>) -&gt; </span><span>PluginResult</span><span> {</span></span>
+<span data-line=""><span>    // first we need to check if the arguments are valid</span></span>
+<span data-line=""><span>    </span><span>if</span><span> </span><span>args_len</span><span> != </span><span>2</span><span> {</span></span>
+<span data-line=""><span>        </span><span>return</span><span> </span><span>plugin_error</span><span>(</span><span>"args_len should be 2"</span><span>);</span></span>
+<span data-line=""><span>    }</span></span>
+<span data-line=""> </span>
+<span data-line=""><span>    </span><span>let</span><span> </span><span>PluginValue</span><span>::</span><span>String</span><span>(</span><span>string</span><span>) = (</span><span>unsafe</span><span> { &amp;*</span><span>args</span><span>.</span><span>offset</span><span>(</span><span>0</span><span>) }) </span><span>else</span><span> {</span></span>
+<span data-line=""><span>        </span><span>return</span><span> </span><span>plugin_error</span><span>(</span><span>"arg0 is invalid; expected String"</span><span>);</span></span>
+<span data-line=""><span>    };</span></span>
+<span data-line=""> </span>
+<span data-line=""><span>    </span><span>let</span><span> </span><span>PluginValue</span><span>::</span><span>UInt</span><span>(</span><span>count</span><span>) = (</span><span>unsafe</span><span> { &amp;*</span><span>args</span><span>.</span><span>offset</span><span>(</span><span>1</span><span>) }) </span><span>else</span><span> {</span></span>
+<span data-line=""><span>        </span><span>return</span><span> </span><span>plugin_error</span><span>(</span><span>"arg1 is invalid; expected UInt"</span><span>);</span></span>
+<span data-line=""><span>    };</span></span>
+<span data-line=""> </span>
+<span data-line=""><span>    </span><span>let</span><span> </span><span>string</span><span> = </span><span>match</span><span> </span><span>unsafe</span><span> { </span><span>CStr</span><span>::</span><span>from_ptr</span><span>(*</span><span>string</span><span>) }.</span><span>to_str</span><span>() {</span></span>
+<span data-line=""><span>        </span><span>Ok</span><span>(</span><span>value</span><span>) =&gt; </span><span>value</span><span>,</span></span>
+<span data-line=""><span>        </span><span>Err</span><span>(</span><span>_</span><span>) =&gt; {</span></span>
+<span data-line=""><span>            </span><span>return</span><span> </span><span>plugin_error</span><span>(</span><span>"arg0 is invalid; expected valid UTF-8 string"</span><span>);</span></span>
+<span data-line=""><span>        }</span></span>
+<span data-line=""><span>    };</span></span>
+<span data-line=""> </span>
+<span data-line=""><span>    // then we can call our logic with the converted arguments and re-wrap them</span></span>
+<span data-line=""><span>    // in our Result type, catching any panics that might occur so that they</span></span>
+<span data-line=""><span>    // don't cross the FFI boundary</span></span>
+<span data-line=""><span>    </span><span>match</span><span> </span><span>catch_unwind</span><span>(|| </span><span>repeat_impl</span><span>(</span><span>string</span><span>, *</span><span>count</span><span>)) {</span></span>
+<span data-line=""><span>        </span><span>Ok</span><span>(</span><span>value</span><span>) =&gt; </span><span>PluginResult</span><span>::</span><span>Ok</span><span>(</span></span>
+<span data-line=""><span>          </span><span>PluginValue</span><span>::</span><span>String</span><span>(</span><span>CString</span><span>::</span><span>new</span><span>(</span><span>value</span><span>).</span><span>unwrap</span><span>().</span><span>into_raw</span><span>())),</span></span>
+<span data-line=""><span>        </span><span>Err</span><span>(</span><span>_</span><span>) =&gt; </span><span>plugin_error</span><span>(</span><span>"function panicked"</span><span>),</span></span>
+<span data-line=""><span>    }</span></span>
+<span data-line=""><span>}</span></span></code></pre></div>
+<p>Making your users write all of this unsafe boilerplate for every plugin isn't
+great UX, so you may want to use a macro or just wrapper code (if you don't need
+to support multiple types). You can see the macro for the Arroyo plugin system
+<a href="https://github.com/ArroyoSystems/arroyo/blob/master/crates/arroyo-udf/arroyo-udf-macros/src/lib.rs">here</a>.</p>
+<h3 id="the-host">The host</h3>
+<figure><p><img src="https://www.arroyo.dev/posts/rust-plugins/host.webp" alt="The Host from 'The Host'"></p><figcaption><p>(not this one)</p></figcaption></figure>
+<p>The host is a normal Rust application, created with <code>cargo new</code>. It has one
+dependency, dlopen2, which we'll use to dynamically load our plugin:</p>
+<div data-rehype-pretty-code-fragment=""><pre tabindex="0" data-language="toml" data-theme="default"><code data-language="toml" data-theme="default"><span data-line=""><span>[dependencies]</span></span>
+<span data-line=""><span>dlopen2</span><span> = { </span><span>version</span><span> = </span><span>"0.7.0"</span><span>, </span><span>features</span><span> = [</span><span>"derive"</span><span>] }</span></span></code></pre></div>
+<p>The meat is in src/main.rs, which builds our binary. We need to repeat the
+definitions (or include them from a common library), but we'll also include one
+more, an owned version of PluginValue:</p>
+<div data-rehype-pretty-code-fragment=""><pre tabindex="0" data-language="rust" data-theme="default"><code data-language="rust" data-theme="default"><span data-line=""><span>pub</span><span> </span><span>enum</span><span> </span><span>OwnedPluginValue</span><span> {</span></span>
+<span data-line=""><span>    </span><span>Bool</span><span>(</span><span>bool</span><span>),</span></span>
+<span data-line=""><span>    </span><span>Int</span><span>(</span><span>i64</span><span>),</span></span>
+<span data-line=""><span>    </span><span>UInt</span><span>(</span><span>u64</span><span>),</span></span>
+<span data-line=""><span>    </span><span>Double</span><span>(</span><span>f64</span><span>),</span></span>
+<span data-line=""><span>    </span><span>String</span><span>(</span><span>CString</span><span>),</span></span>
+<span data-line=""><span>}</span></span>
+<span data-line=""> </span>
+<span data-line=""><span>impl</span><span> </span><span>PluginValue</span><span> {</span></span>
+<span data-line=""><span>    </span><span>pub</span><span> </span><span>fn</span><span> </span><span>to_owned</span><span>(</span><span>self</span><span>) -&gt; </span><span>OwnedPluginValue</span><span> {</span></span>
+<span data-line=""><span>        </span><span>match</span><span> </span><span>self</span><span> {</span></span>
+<span data-line=""><span>            </span><span>PluginValue</span><span>::</span><span>Bool</span><span>(</span><span>b</span><span>) =&gt; </span><span>OwnedPluginValue</span><span>::</span><span>Bool</span><span>(</span><span>b</span><span>),</span></span>
+<span data-line=""><span>            </span><span>PluginValue</span><span>::</span><span>Int</span><span>(</span><span>i</span><span>) =&gt; </span><span>OwnedPluginValue</span><span>::</span><span>Int</span><span>(</span><span>i</span><span>),</span></span>
+<span data-line=""><span>            </span><span>PluginValue</span><span>::</span><span>UInt</span><span>(</span><span>u</span><span>) =&gt; </span><span>OwnedPluginValue</span><span>::</span><span>UInt</span><span>(</span><span>u</span><span>),</span></span>
+<span data-line=""><span>            </span><span>PluginValue</span><span>::</span><span>Double</span><span>(</span><span>d</span><span>) =&gt; </span><span>OwnedPluginValue</span><span>::</span><span>Double</span><span>(</span><span>d</span><span>),</span></span>
+<span data-line=""><span>            </span><span>PluginValue</span><span>::</span><span>String</span><span>(</span><span>s</span><span>) =&gt; {</span></span>
+<span data-line=""><span>                </span><span>OwnedPluginValue</span><span>::</span><span>String</span><span>(</span></span>
+<span data-line=""><span>                    </span><span>unsafe</span><span> { </span><span>CString</span><span>::</span><span>from_raw</span><span>(</span><span>s</span><span> </span><span>as</span><span> *</span><span>mut</span><span> </span><span>i8</span><span>) })</span></span>
+<span data-line=""><span>            }</span></span>
+<span data-line=""><span>        }</span></span>
+<span data-line=""><span>    }</span></span>
+<span data-line=""><span>}</span></span></code></pre></div>
+<p>This owned struct will allow us to ensure that values returned from the plugin
+(and the arguments we send it) are eventually freed.</p>
+<p>Next, we'll define the plugin interface using dlopen2's <code>WrapperApi</code> macro:</p>
+<div data-rehype-pretty-code-fragment=""><pre tabindex="0" data-language="rust" data-theme="default"><code data-language="rust" data-theme="default"><span data-line=""><span>#[derive(</span><span>WrapperApi</span><span>)]</span></span>
+<span data-line=""><span>struct</span><span> </span><span>PluginApi</span><span> {</span></span>
+<span data-line=""><span>    </span><span>plugin_metadata</span><span>: </span><span>unsafe</span><span> </span><span>extern</span><span> </span><span>"C"</span><span> </span><span>fn</span><span>() -&gt; </span><span>PluginMetadata</span><span>,</span></span>
+<span data-line=""><span>    </span><span>plugin_entrypoint</span><span>:</span></span>
+<span data-line=""><span>        </span><span>unsafe</span><span> </span><span>extern</span><span> </span><span>"C"</span><span> </span><span>fn</span><span>(</span><span>args</span><span>: *</span><span>const</span><span> </span><span>PluginValue</span><span>, </span><span>args_len</span><span>: </span><span>usize</span><span>)</span></span>
+<span data-line=""><span>            -&gt; </span><span>PluginResult</span><span>,</span></span>
+<span data-line=""><span>}</span></span></code></pre></div>
+<p>This let's us conveniently bundle up all of the plugin functions into a struct
+which we can store and pass around our application.</p>
+<p>Now we're ready to load the plugin and call it. I'll spare you the details of
+CLI argument processing (which you can see in the
+<a href="https://github.com/mwylde/rust-plugin-tutorial/blob/main/host/src/main.rs">full example file</a>).
+Here's the meat of it:</p>
+<div data-rehype-pretty-code-fragment=""><pre tabindex="0" data-language="rust" data-theme="default"><code data-language="rust" data-theme="default"><span data-line=""><span>// load the plugin via the dlopen2's Container API</span></span>
+<span data-line=""><span>let</span><span> </span><span>container</span><span>: </span><span>Container</span><span>&lt;</span><span>PluginApi</span><span>&gt; =</span></span>
+<span data-line=""><span>    </span><span>unsafe</span><span> { </span><span>Container</span><span>::</span><span>load</span><span>(&amp;</span><span>args</span><span>[</span><span>1</span><span>]) }.</span><span>expect</span><span>(</span><span>"Could not load plugin"</span><span>);</span></span>
+<span data-line=""> </span>
+<span data-line=""><span>// get the metadata, which will tell us which arguments to expect</span></span>
+<span data-line=""><span>let</span><span> </span><span>metadata</span><span>: </span><span>PluginMetadata</span><span> = </span><span>unsafe</span><span> { </span><span>container</span><span>.</span><span>plugin_metadata</span><span>() };</span></span>
+<span data-line=""> </span>
+<span data-line=""><span>// read the arguments from the command line</span></span>
+<span data-line=""><span>let</span><span> </span><span>mut</span><span> </span><span>call_args</span><span>: </span><span>Vec</span><span>&lt;</span><span>PluginValue</span><span>&gt; = </span><span>vec!</span><span>[];</span></span>
+<span data-line=""><span>for</span><span> (</span><span>i</span><span>, </span><span>arg</span><span>) </span><span>in</span><span> </span><span>args</span><span>[</span><span>2</span><span>..].</span><span>iter</span><span>().</span><span>enumerate</span><span>() {</span></span>
+<span data-line=""><span>    </span><span>match</span><span> </span><span>unsafe</span><span> { *</span><span>metadata</span><span>.arg_types.</span><span>add</span><span>(</span><span>i</span><span>) } {</span></span>
+<span data-line=""><span>        </span><span>PluginType</span><span>::</span><span>Bool</span><span> =&gt; {</span></span>
+<span data-line=""><span>            </span><span>call_args</span><span>.</span><span>push</span><span>(</span><span>PluginValue</span><span>::</span><span>Bool</span><span>(</span></span>
+<span data-line=""><span>                </span><span>arg</span><span>.</span><span>parse</span><span>().</span><span>expect</span><span>(</span><span>"Invalid bool"</span><span>)))</span></span>
+<span data-line=""><span>        }</span></span>
+<span data-line=""><span>        ...</span></span>
+<span data-line=""><span>    }</span></span>
+<span data-line=""><span>}</span></span>
+<span data-line=""> </span>
+<span data-line=""><span>// call the plugin function</span></span>
+<span data-line=""><span>let</span><span> </span><span>result</span><span> = </span><span>unsafe</span><span> {</span></span>
+<span data-line=""><span>    </span><span>container</span><span>.</span><span>plugin_entrypoint</span><span>(</span><span>call_args</span><span>.</span><span>as_ptr</span><span>(), </span><span>call_args</span><span>.</span><span>len</span><span>())</span></span>
+<span data-line=""><span>};</span></span>
+<span data-line=""> </span>
+<span data-line=""><span>// take ownership and drop the arguments to free their memory</span></span>
+<span data-line=""><span>drop</span><span>(</span><span>call_args</span><span>.</span><span>into_iter</span><span>().</span><span>map</span><span>(|</span><span>t</span><span>| </span><span>t</span><span>.</span><span>to_owned</span><span>()));</span></span>
+<span data-line=""> </span>
+<span data-line=""><span>// print out the result or error to the user</span></span>
+<span data-line=""><span>match</span><span> </span><span>result</span><span> {</span></span>
+<span data-line=""><span>    </span><span>PluginResult</span><span>::</span><span>Ok</span><span>(</span><span>value</span><span>) =&gt; {</span></span>
+<span data-line=""><span>        </span><span>println!</span><span>(</span><span>"Plugin returned: {}"</span><span>, </span><span>value</span><span>.</span><span>to_owned</span><span>());</span></span>
+<span data-line=""><span>    }</span></span>
+<span data-line=""><span>    </span><span>PluginResult</span><span>::</span><span>Err</span><span>(</span><span>err</span><span>) =&gt; {</span></span>
+<span data-line=""><span>        </span><span>eprintln!</span><span>(</span><span>"{}"</span><span>, </span><span>unsafe</span><span> { </span><span>CString</span><span>::</span><span>from_raw</span><span>(</span><span>err</span><span>) }.</span><span>to_string_lossy</span><span>());</span></span>
+<span data-line=""><span>        </span><span>std</span><span>::</span><span>process</span><span>::</span><span>exit</span><span>(</span><span>1</span><span>);</span></span>
+<span data-line=""><span>    }</span></span>
+<span data-line=""><span>}</span></span></code></pre></div>
+<h3 id="lets-plug-in-some-stuff">Let's plug in some stuff!!!</h3>
+<p>Here we are. After more than 5000 words, we're going to actually dynamically
+load some Rust code.</p>
+<figure><p><img src="https://www.arroyo.dev/posts/rust-plugins/plug_it_in.jpg" alt="A hand plugging a plug into a socket"></p><figcaption><p>uhh… not like that</p></figcaption></figure>
+<p>If you want to follow along, check out the example repo</p>
+<div data-rehype-pretty-code-fragment=""><pre tabindex="0" data-language="rust" data-theme="default"><code data-language="rust" data-theme="default"><span data-line=""><span>$ </span><span>git</span><span> </span><span>clone</span><span> </span><span>https</span><span>:</span><span>//github.com/mwylde/rust-plugin-tutorial.git</span></span></code></pre></div>
+<p>Then we're going to build both the plugin and host</p>
+<div data-rehype-pretty-code-fragment=""><pre tabindex="0" data-language="rust" data-theme="default"><code data-language="rust" data-theme="default"><span data-line=""><span>$ </span><span>cd</span><span> </span><span>rust</span><span>-</span><span>plugin</span><span>-</span><span>tutorial</span><span>/</span><span>plugin</span><span> &amp;&amp; </span><span>cargo</span><span> </span><span>build</span></span>
+<span data-line=""><span>$ </span><span>cd</span><span> ../</span><span>host</span><span> &amp;&amp; </span><span>cargo</span><span> </span><span>build</span></span></code></pre></div>
+<p>Now we should have a dynamic library in <code>plugin/target/debug</code> and a host binary
+in <code>host/target/debug</code>. The dynamic library will be named something like
+“libplugin.dylib,” “libplugin.so,” or “libplugin.dll” depending on your
+operating system. Note which it is, then invoke the host like this:</p>
+<div data-rehype-pretty-code-fragment=""><pre tabindex="0" data-language="bash" data-theme="default"><code data-language="bash" data-theme="default"><span data-line=""><span>$</span><span> </span><span>host/target/debug/host</span><span> </span><span>plugin/target/debug/libplugin.dylib</span><span> </span><span>cool</span><span> </span><span>3</span></span>
+<span data-line=""><span>Loaded</span><span> </span><span>plugin</span><span> </span><span>repeat</span></span>
+<span data-line=""><span>Plugin</span><span> </span><span>returned:</span><span> </span><span>coolcoolcool</span></span></code></pre></div>
+<p>If all went well, you should see the output from your plugin code (and no pesky segfaults).</p>
+<h2 id="wrapping-up">Wrapping up</h2>
+<p>So that's the background for how we built our plugin system, and how you can
+build your own.</p>
+<p>Recapping a bit:</p>
+<ul>
+<li>We defined our data types as enums and structs of FFI-safe types</li>
+<li>We defined a plugin interface, as <code>#[no_mangle] extern "C"</code> functions
+consuming and returning those data types</li>
+<li>We used dlopen2 to load and call our plugin interface from the host</li>
+</ul>
+<p>In part 2 of this series, we'll cover how this works in a real, production
+plugin system, including support for async functions. (If you're impatient, all
+of the code can be found
+<a href="https://github.com/ArroyoSystems/arroyo/tree/6bbc5484e2d9f515ca1c067d23ad0e8ff25f9882/crates/arroyo-udf">here</a>.)</p>
+<p>Questions? Concerns? Issues? Abuse? You can reach me on the
+<a href="https://discord.gg/cjCr5rVmyR">Arroyo Discord</a> or at
+<a href="mailto:micah@arroyo.systems">micah@arroyo.systems</a>.</p>
+<section data-footnotes="true">
+<ol>
+<li id="user-content-fn-1">
+<p>This is a bit simplified; the actual compilation has to take into account
+SQL's complex nullability rules. See a more complete example
+<a href="https://www.arroyo.dev/blog/why-arrow-and-datafusion#implementing-expressions">here</a>. <a href="#user-content-fnref-1" data-footnote-backref="true" aria-label="Back to content">↩</a></p>
+</li>
+<li id="user-content-fn-2">
+<p>In practice dynamically-linked functions can run a bit slower as they
+can't be inlined or take advantage of link-time or profile-guided optimizations. <a href="#user-content-fnref-2" data-footnote-backref="true" aria-label="Back to content">↩</a></p>
+</li>
+<li id="user-content-fn-3">
+<p>The Rust compiler will helpfully warn you if you use a non-FFI-safe type
+in an <code>extern</code> function <a href="#user-content-fnref-3" data-footnote-backref="true" aria-label="Back to content">↩</a></p>
+</li>
+<li id="user-content-fn-4">
+<p>Which… of course we all do <a href="#user-content-fnref-4" data-footnote-backref="true" aria-label="Back to content">↩</a></p>
+</li>
+<li id="user-content-fn-5">
+<p>All FFI functions are inherently unsafe, as Rust can't guarantee anything
+on the other side of the FFI boundary. For that reason, It's typical to write
+safe wrappers around FFI functions that ensure the invariants expected by the
+library are upheld. <a href="#user-content-fnref-5" data-footnote-backref="true" aria-label="Back to content">↩</a></p>
+</li>
+<li id="user-content-fn-6">
+<p>Rust-haters complain about the lifetime and borrowchecker systems but
+those issues don't go away just because your compiler doesn't yell at you about
+it. In C APIs you always need to know who owns a piece of memory and who's
+responsible for freeing it. But without language support you just have to
+document it and hope for the best. <a href="#user-content-fnref-6" data-footnote-backref="true" aria-label="Back to content">↩</a></p>
+</li>
+</ol>
+</section></article></div>]]>
+            </description>
+            <link>https://www.arroyo.dev/blog/rust-plugin-systems</link>
+            <guid isPermaLink="false">hacker-news-small-sites-40558054</guid>
+            <pubDate>Sun, 02 Jun 2024 23:48:15 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Lowering resource usage with foot and systemd]]>
             </title>
             <description>
 <![CDATA[
-Score 12 | Comments 0 (<a href="https://news.ycombinator.com/item?id=40557770">thread link</a>) | @HaoZeke
+Score 33 | Comments 7 (<a href="https://news.ycombinator.com/item?id=40557770">thread link</a>) | @HaoZeke
 <br/>
 June 2, 2024 | https://rgoswami.me/posts/lowering-resource-usage-foot-systemd/ | <a href="https://web.archive.org/web/*/https://rgoswami.me/posts/lowering-resource-usage-foot-systemd/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><p>This post is part of the <a href="https://rgoswami.me/series/wayland-wayfinders/">Wayland Wayfinders</a> series.</p></div><blockquote><p>Melding <code>systemd</code> and <code>foot</code> for rapid configuration updates and reduced memory
@@ -104,19 +817,20 @@ is typically the same as <code>/run/user/$(id -u $USER)/</code>, so the server r
 use the same server socket (as shown in <a href="#sway-scratchpads-and-config">Sway Scratchpads and Config</a>).</p><h3 id="scratchpad-clients">Scratchpad clients</h3><p>The clients themselves are equally simple, except that the <code>[UNIT]</code> stanza will
 specify they require <code>foot-server.service</code> and will be run after
 <code>foot-server.service</code>.</p><div><pre tabindex="0"><code data-lang="bash"><span><span>1</span><span>/usr/bin/footclient --server-socket<span>=</span>/run/user/%U/foot-server.sock --app-id<span>=</span><span>"mS"</span> -e tmux new -A -s mS
-</span></span></code></pre></div><p>The full configurations are reproduced in [[Complete configurations<sup id="fnref:1"><a href="#fn:1" role="doc-noteref">1</a></sup>][the next section]].</p><h3 id="tmux-sessions"><code>tmux</code> sessions</h3><p>Additionally, since the goal is to reload <code>foot</code> often via simple <code>killall -9 foot</code> to apply new configurations, it makes sense to add a <code>tmux</code> server into
-the mix.</p><p>For this we need to consider some additional options:</p><div><pre tabindex="0"><code data-lang="systemd"><span><span>1</span><span><span>[Service]</span>
+</span></span></code></pre></div><p>The full configurations are reproduced in the next section.</p><h3 id="tmux-sessions"><code>tmux</code> sessions</h3><p>Additionally, since the goal is to reload <code>foot</code> often via simple <code>killall -9 foot</code> to apply new configurations, it makes sense to add a <code>tmux</code> server into
+the mix, which will also be part of the requires and after keys for the
+scratchpad clients.</p><p>For this we need to consider some additional options:</p><div><pre tabindex="0"><code data-lang="systemd"><span><span>1</span><span><span>[Service]</span>
 </span></span><span><span>2</span><span><span>Type</span><span>=</span><span> # simple (default), forking, oneshot</span>
 </span></span><span><span>3</span><span><span>ExecStop</span><span>=</span>
 </span></span><span><span>4</span><span><span>RemainAfterExit</span><span>=</span><span>yes</span>
 </span></span></code></pre></div><p>Some notes on service types:</p><ul><li>The server will be a <code>forking</code> service, since <code>tmux start-server</code> essentially
 puts itself in the background.</li><li>The clients should be <code>oneshot</code>, since they should complete before other
-dependent services start<sup id="fnref:2"><a href="#fn:2" role="doc-noteref">2</a></sup></li><li>We need to set remain after exit since we have a “rollback” for our service
+dependent services start<sup id="fnref:1"><a href="#fn:1" role="doc-noteref">1</a></sup></li><li>We need to set remain after exit since we have a “rollback” for our service
 (<code>ExecStop</code>) and since we modify system state, i.e. we don’t want to re-run
-the service actions without stopping<sup id="fnref:3"><a href="#fn:3" role="doc-noteref">3</a></sup></li></ul><h3 id="false-starts">False starts</h3><p>I thought I wanted to use sockets (<a href="https://www.freedesktop.org/software/systemd/man/latest/systemd.socket.html">online man-page</a>), but for a constantly
+the service actions without stopping<sup id="fnref:2"><a href="#fn:2" role="doc-noteref">2</a></sup></li></ul><h3 id="false-starts">False starts</h3><p>I thought I wanted to use sockets (<a href="https://www.freedesktop.org/software/systemd/man/latest/systemd.socket.html">online man-page</a>), but for a constantly
 running set of terminals there is very little point. On my machine, the <code>foot</code>
 server takes around 20MB-31MB while each client instance is below 1.5MB, so
-having a a socket for either the server or the clients made little to no sense.</p><h2 id="complete-configurations">Complete configurations<sup id="fnref1:1"><a href="#fn:1" role="doc-noteref">1</a></sup></h2><figure><img src="https://rgoswami.me/ox-hugo/2024-06-02_14-38-48_screenshot.png" alt="Figure 2: Final single server many client view (via btop)"><figcaption><p><span>Figure 2: </span>Final single server many client view (via <code>btop</code>)</p></figcaption></figure><h3 id="sway-scratchpads-and-config">Sway Scratchpads and Config</h3><p>The final <code>sway</code> scratchpad setup is essentially:</p><div><pre tabindex="0"><code data-lang="cfg"><span><span> 1</span><span><span># Settings</span>
+having a a socket for either the server or the clients made little to no sense.</p><h2 id="complete-configurations">Complete configurations<sup id="fnref:3"><a href="#fn:3" role="doc-noteref">3</a></sup></h2><figure><img src="https://rgoswami.me/ox-hugo/2024-06-02_14-38-48_screenshot.png" alt="Figure 2: Final single server many client view (via btop)"><figcaption><p><span>Figure 2: </span>Final single server many client view (via <code>btop</code>)</p></figcaption></figure><h3 id="sway-scratchpads-and-config">Sway Scratchpads and Config</h3><p>The final <code>sway</code> scratchpad setup is essentially:</p><div><pre tabindex="0"><code data-lang="cfg"><span><span> 1</span><span><span># Settings</span>
 </span></span><span><span> 2</span><span><span>set {</span>
 </span></span><span><span> 3</span><span> <span>$ms_pos border none, move position 0 0, resize set 50 ppt 35 ppt</span>
 </span></span><span><span> 4</span><span> <span>$sf_pos border pixel 1, move position center</span>
@@ -226,11 +940,11 @@ pretty gratifying.</p><hr><div><h2>Series info</h2><h3>Wayland Wayfinders series
         </item>
         <item>
             <title>
-<![CDATA[Protecting sensitive data in Elixir GenServers]]>
+<![CDATA[Protecting sensitive data in Elixir GenServers (2023)]]>
             </title>
             <description>
 <![CDATA[
-Score 19 | Comments 3 (<a href="https://news.ycombinator.com/item?id=40557451">thread link</a>) | @gabrielpedepera
+Score 41 | Comments 12 (<a href="https://news.ycombinator.com/item?id=40557451">thread link</a>) | @gabrielpedepera
 <br/>
 June 2, 2024 | https://gabrielpereira.dev/en/posts/protecting-sensitive-data-in-elixir-gen-servers/ | <a href="https://web.archive.org/web/*/https://gabrielpereira.dev/en/posts/protecting-sensitive-data-in-elixir-gen-servers/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="article" role="article">
@@ -504,22 +1218,24 @@ June 2, 2024 | https://gabrielpereira.dev/en/posts/protecting-sensitive-data-in-
             </title>
             <description>
 <![CDATA[
-Score 56 | Comments 40 (<a href="https://news.ycombinator.com/item?id=40557409">thread link</a>) | @Kortaggio
+Score 74 | Comments 68 (<a href="https://news.ycombinator.com/item?id=40557409">thread link</a>) | @Kortaggio
 <br/>
 June 2, 2024 | https://billmei.net/blog/shopping | <a href="https://web.archive.org/web/*/https://billmei.net/blog/shopping">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
       
       
-      
-        <p><img src="https://billmei.net/assets/blog/img/shopping--alt.jpg" alt="Psychological tricks rich people use to look generous (without actually spending more money)"></p>
-      
-      <p><a href="https://www.youtube.com/watch?v=Tqfh991fS7k" target="_blank" rel="noopener"><strong>This blog post is now a video! Watch it on YouTube</strong></a></p>
+      <p>This blog post is now a video! <a href="https://www.youtube.com/watch?v=Tqfh991fS7k" target="_blank" rel="noopener">Watch it on YouTube</a>:</p>
+<div>
+  <a href="https://www.youtube.com/watch?v=Tqfh991fS7k" target="_blank" rel="noopener">
+    <iframe src="https://www.youtube.com/embed/Tqfh991fS7k" frameborder="0"></iframe>
+  </a>
+</div>
 
 <p>If I gift you a $55 coat, you would think I got you a cheap coat, because I would expect coats to cost between $50 to $500, so $55 seems cheap.</p>
 
 <p>But if I gift you a $45 scarf, it would seem like I got you an expensive, luxurious scarf, because I would expect scarves to cost between $5 to $50.</p>
 
-<p>If I only have a fixed budget to spend, then by gifting you a scarf, even though I spent $10 less than I did on the coat, I get more social value from the scarf by being seen as more generous, without actually spending more money, so I can pretending to be rich while being a cheap asshole!<sup id="fnref:less-is-better" role="doc-noteref"><a href="#fn:less-is-better" rel="footnote">1</a></sup></p>
+<p>If I only have a fixed budget to spend, then by gifting you a scarf, even though I spent $10 less than I did on the coat, I get more social value from the scarf by being seen as more generous, without actually spending more money, so I can pretend to be rich while being a cheap asshole!<sup id="fnref:less-is-better" role="doc-noteref"><a href="#fn:less-is-better" rel="footnote">1</a></sup></p>
 
 <p>Now when I’m doing the shopping, I see all of the options available to me. But when you receive a gift, you don’t see everything I considered but didn’t purchase.</p>
 
@@ -547,10 +1263,10 @@ June 2, 2024 | https://billmei.net/blog/shopping | <a href="https://web.archive.
 <p>But if you look at car ads these days, they don’t talk about the features of the car at all. Instead, it’s most about the lifestyle you can live or the “type of person you are” who buys a car like this.</p>
 
 <p><img src="https://billmei.net/assets/blog/img/shopping--new-car-ad.jpg" alt="">
-<a href="https://www.youtube.com/watch?v=rv1qDKmo-ss" target="_blank" rel="noopener">This car ad</a> doesn’t tell anything about how many airbags it has, the towing capacity, or
+<a href="https://www.youtube.com/watch?v=rv1qDKmo-ss" target="_blank" rel="noopener">This car ad</a> doesn’t tell me anything about how many airbags it has, the towing capacity, or
 passenger comfort. It doesn’t even tell me how much it costs!</p>
 
-<p>This is shopping for “signalling”. The book <a href="https://billmei.net/books/spent/">Spent</a> describes the following concepts in this blog post, and it describes the three ways you can signal: Waste, Precision, and Reputation</p>
+<p>This is shopping for “signalling”. The book <a href="https://billmei.net/books/spent/">Spent</a> describes the following concepts in this blog post, including three ways you can signal: Waste, Precision, and Reputation</p>
 
 <h2 id="1-waste">1. Waste</h2>
 
@@ -590,7 +1306,7 @@ Yeah! <em>‘Murica!</em> 🇺🇸🇺🇸🇺🇸🦅💥🎆</p>
 
 <p>Precision is about showing off how much labor, effort, and artisanship you put into the product.</p>
 
-<p>For example: fabergé eggs, intricately ornate furniture that are harder to clean and requires laborious dusting, or anything “hand made”, like a <a href="https://web.archive.org/web/20240425024947/https://www.architecturaldigest.com/story/hastens-beds-are-the-ultimate-luxury" target="_blank" rel="noopener">$30,000 mattress made out of horse hair</a>.</p>
+<p>For example: fabergé eggs, intricately ornate furniture that’s harder to clean and requires laborious dusting, or anything “hand made”, like a <a href="https://web.archive.org/web/20240425024947/https://www.architecturaldigest.com/story/hastens-beds-are-the-ultimate-luxury" target="_blank" rel="noopener">$30,000 mattress made out of horse hair</a>.</p>
 
 <p>Smart fridges, smart lightbulbs, and smart toothbrushes are also about precision: you gotta be a smart human to operate anything more complex than a can opener these days.</p>
 
@@ -810,7 +1526,7 @@ invitation for a whole world of conversation that you can open for me.</p>
             </title>
             <description>
 <![CDATA[
-Score 13 | Comments 2 (<a href="https://news.ycombinator.com/item?id=40557347">thread link</a>) | @thunderbong
+Score 25 | Comments 6 (<a href="https://news.ycombinator.com/item?id=40557347">thread link</a>) | @thunderbong
 <br/>
 June 2, 2024 | https://www.lloydatkinson.net/posts/2024/some-thoughts-as-i-sit-here-in-another-standup/ | <a href="https://web.archive.org/web/*/https://www.lloydatkinson.net/posts/2024/some-thoughts-as-i-sit-here-in-another-standup/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-test-prose-content=""> <p>I’m writing this while I wait for this morning’s exercise in futility: the daily standup. I opened my editor with the intent of documenting what a complete waste of time standups are and I realised that adding an entry for all five of this week’s standups would give more insight into how the industry is afflicted by deep cultural malaise.</p>
@@ -911,7 +1627,7 @@ June 2, 2024 | https://www.lloydatkinson.net/posts/2024/some-thoughts-as-i-sit-h
             </title>
             <description>
 <![CDATA[
-Score 17 | Comments 2 (<a href="https://news.ycombinator.com/item?id=40556793">thread link</a>) | @mmastrac
+Score 28 | Comments 4 (<a href="https://news.ycombinator.com/item?id=40556793">thread link</a>) | @mmastrac
 <br/>
 June 2, 2024 | https://www.byronwasti.com/polling-atomics/ | <a href="https://web.archive.org/web/*/https://www.byronwasti.com/polling-atomics/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -1048,7 +1764,7 @@ June 2, 2024 | https://www.byronwasti.com/polling-atomics/ | <a href="https://we
             </title>
             <description>
 <![CDATA[
-Score 22 | Comments 2 (<a href="https://news.ycombinator.com/item?id=40556342">thread link</a>) | @firstSpeaker
+Score 23 | Comments 2 (<a href="https://news.ycombinator.com/item?id=40556342">thread link</a>) | @firstSpeaker
 <br/>
 June 2, 2024 | https://www.theengineeringmanager.com/growth/the-disappointment-frontier/ | <a href="https://web.archive.org/web/*/https://www.theengineeringmanager.com/growth/the-disappointment-frontier/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="primary" role="main">
@@ -1350,20 +2066,10 @@ June 2, 2024 | https://www.theengineeringmanager.com/growth/the-disappointment-f
             </title>
             <description>
 <![CDATA[
-Score 99 | Comments 64 (<a href="https://news.ycombinator.com/item?id=40554133">thread link</a>) | @xnhbx
+Score 100 | Comments 68 (<a href="https://news.ycombinator.com/item?id=40554133">thread link</a>) | @xnhbx
 <br/>
 June 2, 2024 | https://www.cnsa.gov.cn/n6759533/c10541660/content.html | <a href="https://web.archive.org/web/*/https://www.cnsa.gov.cn/n6759533/c10541660/content.html">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
-    <!--<div class="ft"><a href="#">关于我们</a><span>|</span><a href="#">联系我们</a></div>-->
-    <div>
-           <p><span>版权所有：国家航天局</span><span>承办单位：国家航天局新闻宣传中心</span></p>
-           <p><span>地址：北京市海淀区阜成路甲8号 </span><span>邮编:100048</span><!--<span>邮箱： webmaster@cnsa.gov.cn</span><span>  联系电话：010-88581587</span>--></p>
-           <p><span>网站标识码：bm63000001</span><span><a href="http://beian.miit.gov.cn/" target="_blank">京ICP备05081655号</a></span><span>京公网安备11040102100142号</span></p>
-           <p><a href="http://bszs.conac.cn/sitename?method=show&amp;id=07C77258DFF20FE3E053022819ACB371" target="_blank"><img src="https://www.cnsa.gov.cn/dbsource/6767599/6767790.png"></a></p>
-          <!--<p style="margin-top:6px;"><a href="http://bszs.conac.cn/sitename?method=show&id=07C77258DFF20FE3E053022819ACB371" target="_blank"><img src="../../dbsource/6767599/6767790.png"></a><a  href="http://121.43.68.40/exposure/jiucuo.html?site_code=bm63000001&url=" target="_blank"><img src="../../dbsource/6767667/6768025.jpg"></a></p>-->
-
-  </div>
-   </div></div>]]>
+<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
             </description>
             <link>https://www.cnsa.gov.cn/n6759533/c10541660/content.html</link>
             <guid isPermaLink="false">hacker-news-small-sites-40554133</guid>
@@ -1511,7 +2217,7 @@ esac</code></pre>
             </title>
             <description>
 <![CDATA[
-Score 108 | Comments 102 (<a href="https://news.ycombinator.com/item?id=40553709">thread link</a>) | @davikr
+Score 127 | Comments 119 (<a href="https://news.ycombinator.com/item?id=40553709">thread link</a>) | @davikr
 <br/>
 June 2, 2024 | https://www.circle-lang.org/site/intro/ | <a href="https://web.archive.org/web/*/https://www.circle-lang.org/site/intro/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div role="main" itemscope="itemscope" itemtype="http://schema.org/Article">
@@ -1740,7 +2446,7 @@ int main() {
             </title>
             <description>
 <![CDATA[
-Score 259 | Comments 133 (<a href="https://news.ycombinator.com/item?id=40551070">thread link</a>) | @lostin01010101
+Score 262 | Comments 135 (<a href="https://news.ycombinator.com/item?id=40551070">thread link</a>) | @lostin01010101
 <br/>
 June 1, 2024 | https://www.cam.ac.uk/stories/third-thumb | <a href="https://web.archive.org/web/*/https://www.cam.ac.uk/stories/third-thumb">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="section-BH3xLMAV1a" data-effects="eyJ0ZXh0UGVyTGluZSI6ZmFsc2UsImhhc0VmZmVjdHMiOmZhbHNlLCJuZWVkc0JhY2tncm91bmRDbG9uZSI6ZmFsc2UsImVuY29kZWQiOiIifQ==">
@@ -1797,7 +2503,7 @@ June 1, 2024 | https://www.cam.ac.uk/stories/third-thumb | <a href="https://web.
             </title>
             <description>
 <![CDATA[
-Score 224 | Comments 46 (<a href="https://news.ycombinator.com/item?id=40549250">thread link</a>) | @psj
+Score 225 | Comments 46 (<a href="https://news.ycombinator.com/item?id=40549250">thread link</a>) | @psj
 <br/>
 June 1, 2024 | https://dthompson.us/posts/lisp-icing-or-cake.html | <a href="https://web.archive.org/web/*/https://dthompson.us/posts/lisp-icing-or-cake.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>The <a href="https://itch.io/jam/spring-lisp-game-jam-2024">Spring Lisp Game Jam
@@ -2007,7 +2713,7 @@ Rewrite it in Rust?  No way!  Rewrite it in Lisp!</p></div></div>]]>
             </title>
             <description>
 <![CDATA[
-Score 109 | Comments 191 (<a href="https://news.ycombinator.com/item?id=40547933">thread link</a>) | @todsacerdoti
+Score 109 | Comments 193 (<a href="https://news.ycombinator.com/item?id=40547933">thread link</a>) | @todsacerdoti
 <br/>
 June 1, 2024 | https://zeux.io/2024/05/31/justifiably-slow/ | <a href="https://web.archive.org/web/*/https://zeux.io/2024/05/31/justifiably-slow/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2057,7 +2763,7 @@ June 1, 2024 | https://zeux.io/2024/05/31/justifiably-slow/ | <a href="https://w
             </title>
             <description>
 <![CDATA[
-Score 19 | Comments 4 (<a href="https://news.ycombinator.com/item?id=40547357">thread link</a>) | @meonkeys
+Score 20 | Comments 4 (<a href="https://news.ycombinator.com/item?id=40547357">thread link</a>) | @meonkeys
 <br/>
 June 1, 2024 | https://selfhostbook.com/news/2024/05/ebook-release/ | <a href="https://web.archive.org/web/*/https://selfhostbook.com/news/2024/05/ebook-release/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2616,7 +3322,7 @@ q^t»	a^C™”Ž�Þ‰"¿-»Â¸ÈíE‹u£»ä¢Mï´±#ˆÔ*Š¨Ú¿
             </title>
             <description>
 <![CDATA[
-Score 20 | Comments 1 (<a href="https://news.ycombinator.com/item?id=40545781">thread link</a>) | @deejayy
+Score 21 | Comments 2 (<a href="https://news.ycombinator.com/item?id=40545781">thread link</a>) | @deejayy
 <br/>
 June 1, 2024 | https://webdraft.hu/fonts/nokja-original/ | <a href="https://web.archive.org/web/*/https://webdraft.hu/fonts/nokja-original/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -2631,7 +3337,7 @@ June 1, 2024 | https://webdraft.hu/fonts/nokja-original/ | <a href="https://web.
             </title>
             <description>
 <![CDATA[
-Score 280 | Comments 221 (<a href="https://news.ycombinator.com/item?id=40544283">thread link</a>) | @chrispsn
+Score 281 | Comments 222 (<a href="https://news.ycombinator.com/item?id=40544283">thread link</a>) | @chrispsn
 <br/>
 June 1, 2024 | https://shakti.com/k | <a href="https://web.archive.org/web/*/https://shakti.com/k">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
@@ -3381,7 +4087,7 @@ May 31, 2024 | https://ilya.sukhar.com/blog/an-algorithmic-solution-to-insomnia.
             </title>
             <description>
 <![CDATA[
-Score 190 | Comments 190 (<a href="https://news.ycombinator.com/item?id=40539031">thread link</a>) | @nradk
+Score 191 | Comments 190 (<a href="https://news.ycombinator.com/item?id=40539031">thread link</a>) | @nradk
 <br/>
 May 31, 2024 | https://blog.nradk.com/posts/degoogling/ | <a href="https://web.archive.org/web/*/https://blog.nradk.com/posts/degoogling/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content"><article><p>Over the past few years, I have tried to gradually reduce or eliminate my use of
@@ -3607,7 +4313,7 @@ May 31, 2024 | https://www.warpstream.com/blog/announcing-bento-the-open-source-
 Score 43 | Comments 92 (<a href="https://news.ycombinator.com/item?id=40537134">thread link</a>) | @gnabgib
 <br/>
 May 31, 2024 | https://apo.org.au/sites/default/files/resource-files/2024-05/apo-nid326992.pdf | <a href="https://web.archive.org/web/*/https://apo.org.au/sites/default/files/resource-files/2024-05/apo-nid326992.pdf">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
+<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
             </description>
             <link>https://apo.org.au/sites/default/files/resource-files/2024-05/apo-nid326992.pdf</link>
             <guid isPermaLink="false">hacker-news-small-sites-40537134</guid>
@@ -3619,7 +4325,7 @@ May 31, 2024 | https://apo.org.au/sites/default/files/resource-files/2024-05/apo
             </title>
             <description>
 <![CDATA[
-Score 584 | Comments 259 (<a href="https://news.ycombinator.com/item?id=40536436">thread link</a>) | @tfvlrue
+Score 585 | Comments 259 (<a href="https://news.ycombinator.com/item?id=40536436">thread link</a>) | @tfvlrue
 <br/>
 May 31, 2024 | https://www.unterminated.com/random-fun/how-to-copy-a-file-from-a-30-year-old-laptop | <a href="https://web.archive.org/web/*/https://www.unterminated.com/random-fun/how-to-copy-a-file-from-a-30-year-old-laptop">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4205,7 +4911,7 @@ EÊâkTˆ«”T°8}ÐÓ/RS�ýdÙð[Öµs;¤‡`´•sýqd‹ô&nbsp;U
             </title>
             <description>
 <![CDATA[
-Score 248 | Comments 233 (<a href="https://news.ycombinator.com/item?id=40533484">thread link</a>) | @ColinWright
+Score 249 | Comments 233 (<a href="https://news.ycombinator.com/item?id=40533484">thread link</a>) | @ColinWright
 <br/>
 May 31, 2024 | https://malenfant.net/@didier/112528487189999791 | <a href="https://web.archive.org/web/*/https://malenfant.net/@didier/112528487189999791">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -4220,7 +4926,7 @@ May 31, 2024 | https://malenfant.net/@didier/112528487189999791 | <a href="https
             </title>
             <description>
 <![CDATA[
-Score 593 | Comments 78 (<a href="https://news.ycombinator.com/item?id=40533139">thread link</a>) | @fellerts
+Score 602 | Comments 78 (<a href="https://news.ycombinator.com/item?id=40533139">thread link</a>) | @fellerts
 <br/>
 May 31, 2024 | https://fellerts.no/projects/kintsugi.php | <a href="https://web.archive.org/web/*/https://fellerts.no/projects/kintsugi.php">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>
@@ -4339,7 +5045,7 @@ May 30, 2024 | https://blog.plerion.com/things-you-wish-you-didnt-need-to-know-a
             </title>
             <description>
 <![CDATA[
-Score 140 | Comments 58 (<a href="https://news.ycombinator.com/item?id=40531165">thread link</a>) | @geerlingguy
+Score 141 | Comments 58 (<a href="https://news.ycombinator.com/item?id=40531165">thread link</a>) | @geerlingguy
 <br/>
 May 30, 2024 | https://www.fpgadeveloper.com/multi-camera-yolov5-on-zynq-ultrascale-with-hailo-8-ai-acceleration/ | <a href="https://web.archive.org/web/*/https://www.fpgadeveloper.com/multi-camera-yolov5-on-zynq-ultrascale-with-hailo-8-ai-acceleration/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div role="main">
@@ -5860,7 +6566,7 @@ SLF4J(W): See https://www.slf4j.org/codes.html#noProviders for further details.
             </title>
             <description>
 <![CDATA[
-Score 58 | Comments 4 (<a href="https://news.ycombinator.com/item?id=40527220">thread link</a>) | @federicoponzi
+Score 62 | Comments 4 (<a href="https://news.ycombinator.com/item?id=40527220">thread link</a>) | @federicoponzi
 <br/>
 May 30, 2024 | https://blog.fponzi.me/2024-05-30-distributed-snapshots.html | <a href="https://web.archive.org/web/*/https://blog.fponzi.me/2024-05-30-distributed-snapshots.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -6466,7 +7172,7 @@ We can vary the weighing between the distance transform and the edge map to bala
             </title>
             <description>
 <![CDATA[
-Score 30 | Comments 3 (<a href="https://news.ycombinator.com/item?id=40522134">thread link</a>) | @signa11
+Score 31 | Comments 3 (<a href="https://news.ycombinator.com/item?id=40522134">thread link</a>) | @signa11
 <br/>
 May 30, 2024 | https://linux-regtracking.leemhuis.info/post/frequent-reasons-why-linux-kernel-bug-reports-are-ignored/ | <a href="https://web.archive.org/web/*/https://linux-regtracking.leemhuis.info/post/frequent-reasons-why-linux-kernel-bug-reports-are-ignored/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>[last updated: 2024-01-06]</p>
@@ -6785,7 +7491,7 @@ May 30, 2024 | https://linux-regtracking.leemhuis.info/post/frequent-reasons-why
             </title>
             <description>
 <![CDATA[
-Score 1238 | Comments 684 (<a href="https://news.ycombinator.com/item?id=40521518">thread link</a>) | @mattbessey
+Score 1238 | Comments 686 (<a href="https://news.ycombinator.com/item?id=40521518">thread link</a>) | @mattbessey
 <br/>
 May 30, 2024 | https://bessey.dev/blog/2024/05/24/why-im-over-graphql/ | <a href="https://web.archive.org/web/*/https://bessey.dev/blog/2024/05/24/why-im-over-graphql/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
