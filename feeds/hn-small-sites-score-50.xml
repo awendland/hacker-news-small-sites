@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Sun, 08 Sep 2024 08:22:29 GMT</lastBuildDate>
+        <lastBuildDate>Sun, 08 Sep 2024 12:24:05 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-50.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Sun, 08 Sep 2024 08:22:29 GMT</pubDate>
+        <pubDate>Sun, 08 Sep 2024 12:24:05 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,275 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Don't defer Close() on writable files]]>
+            </title>
+            <description>
+<![CDATA[
+Score 52 | Comments 61 (<a href="https://news.ycombinator.com/item?id=41479283">thread link</a>) | @misonic
+<br/>
+September 8, 2024 | https://www.joeshaw.org/dont-defer-close-on-writable-files/ | <a href="https://web.archive.org/web/*/https://www.joeshaw.org/dont-defer-close-on-writable-files/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p><em>Update</em>: Another approach suggested by the inimitable
+<a href="https://twitter.com/benbjohnson/status/874286396411961345">Ben Johnson</a>
+has been added to the end of the post.</p><p><em>Update 2</em>: Discussion about <code>fsync()</code> added to the end of the post.</p><p>It’s an idiom that quickly becomes rote to Go programmers: whenever
+you conjure up a value that implements the <code>io.Closer</code> interface,
+after checking for errors you immediately <code>defer</code> its <code>Close()</code>
+method. You see this most often when making HTTP requests:</p><div><pre><code data-lang="go">resp, err := http.<span>Get</span>(<span>"https://joeshaw.org"</span>)
+<span>if</span> err != <span>nil</span> {
+    <span>return</span> err
+}
+<span>defer</span> resp.Body.<span>Close</span>()
+</code></pre></div><p>or opening files:</p><div><pre><code data-lang="go">f, err := os.<span>Open</span>(<span>"/home/joeshaw/notes.txt"</span>)
+<span>if</span> err != <span>nil</span> {
+    <span>return</span> err
+}
+<span>defer</span> f.<span>Close</span>()
+</code></pre></div><p>But this idiom is actually harmful for writable files because
+deferring a function call ignores its return value, and the <code>Close()</code>
+method can return errors. <strong>For writable files, Go programmers should
+avoid the <code>defer</code> idiom or very infrequent, maddening bugs will
+occur.</strong></p><p>Why would you get an error from <code>Close()</code> but not an earlier <code>Write()</code>
+call? To answer that we need to take a brief, high-level detour into
+the area of computer architecture.</p><p>Generally speaking, as you move outside and away from your CPU,
+actions get orders of magnitude slower. Writing to a CPU register is
+very fast. Accessing system RAM is quite slow in comparison. Doing
+I/O on disks or networks is an eternity.</p><p>If every <code>Write()</code> call committed the data to the disk synchronously,
+the performance of our systems would be unusably slow. While
+synchronous writes are very important for certain types of software
+(like databases), most of the time it’s overkill.</p><p>The pathological case is writing to a file one byte at a time. Hard
+drives – brutish, mechanical devices – need to physically move a
+magnetic head to the position on the platter and possibly wait for a
+full platter revolution before the data could be persisted. SSDs,
+which store data in blocks and have a finite number of write cycles
+for each block, would quickly burn out as blocks are repeatedly
+written and overwritten.</p><p>Fortunately this doesn’t happen because multiple layers within
+hardware and software implement caching and write buffering. When you
+call <code>Write()</code>, your data is not immediately being written to media.
+The operating system, storage controllers and the media itself are all
+buffering the data in order to batch smaller writes together,
+organizing the data optimally for storage on the medium, and deciding
+when best to commit it. This turns our writes from slow, blocking
+synchronous operations to quick, asynchronous operations that don’t
+directly touch the much slower I/O device. Writing a byte at a time
+is never the most efficient thing to do, but at least we are not
+wearing out our hardware if we do it.</p><p>Of course, the bytes do have to be committed to disk at some point.
+The operating system knows that when we close a file, we are finished
+with it and no subsequent write operations are going to happen. It
+also knows that closing the file is its last chance to tell us
+something went wrong.</p><p>On POSIX systems like Linux and macOS, closing a file is handled by
+the <code>close</code> system call. The BSD man page for <code>close(2)</code> talks about
+the errors it can return:</p><pre><code>ERRORS
+     The close() system call will fail if:
+
+     [EBADF]            fildes is not a valid, active file descriptor.
+
+     [EINTR]            Its execution was interrupted by a signal.
+
+     [EIO]              A previously-uncommitted write(2) encountered an input/output
+                        error.
+</code></pre><p><code>EIO</code> is exactly the error we are worried about. It means that we’ve
+lost data trying to save it to disk, and our Go programs should
+absolutely not return a <code>nil</code> error in that case.</p><p>The simplest way to solve this is simply not to use <code>defer</code> when
+writing files:</p><div><pre><code data-lang="go"><span>func</span> <span>helloNotes</span>() <span>error</span> {
+    f, err := os.<span>Create</span>(<span>"/home/joeshaw/notes.txt"</span>)
+    <span>if</span> err != <span>nil</span> {
+        <span>return</span> err
+    }
+
+    <span>if</span> err = io.<span>WriteString</span>(f, <span>"hello world"</span>); err != <span>nil</span> {
+        f.<span>Close</span>()
+        <span>return</span> err
+    }
+
+    <span>return</span> f.<span>Close</span>()
+}
+</code></pre></div><p>This does mean additional bookkeeping of the file in the case of
+errors: we must explicitly close it in the case where
+<code>io.WriteString()</code> fails (and ignore its error, because the write
+error takes precedence). But it’s clear, straightforward, and
+properly checks the error from the <code>f.Close()</code> call.</p><p>There <em>is</em> a way to handle this case with <code>defer</code> by using named
+return values and a closure:</p><div><pre><code data-lang="go"><span>func</span> <span>helloNotes</span>() (err <span>error</span>) {
+    <span>var</span> f *os.File
+    f, err = os.<span>Create</span>(<span>"/home/joeshaw/notes.txt"</span>)
+    <span>if</span> err != <span>nil</span> {
+        <span>return</span>
+    }
+
+    <span>defer</span> <span>func</span>() {
+        cerr := f.<span>Close</span>()
+        <span>if</span> err == <span>nil</span> {
+            err = cerr
+        }
+    }()
+
+    err = io.<span>WriteString</span>(f, <span>"hello world"</span>)
+    <span>return</span>
+}
+</code></pre></div><p>The main benefit of this pattern is that it’s not possible to forget
+to close the file because the deferred closure always executes. In
+longer functions with more <code>if err != nil</code> conditional branches, this
+pattern can also result in fewer lines of code and less repetition.</p><p>Still, I find this pattern to be a little too magical. I dislike
+using named return values, and modifying the return value after the
+core function finishes is not intuitively clear even to experienced Go
+programmers.</p><p>I am willing to accept the tradeoff of more readable and easily
+understandable code for needing to obsessively review code to ensure
+that the file is closed in all cases, and that’s the approach I
+recommend in code reviews I give to others.</p><h2 id="update">Update</h2><p>On Twitter, <a href="https://twitter.com/benbjohnson/status/874286396411961345">Ben Johnson
+suggested</a>
+that <code>Close()</code> may be safe to run multiple times on files, like so:</p><div><pre><code data-lang="go"><span>func</span> <span>doSomething</span>() <span>error</span> {
+    f, err := os.<span>Create</span>(<span>"foo"</span>)
+    <span>if</span> err != <span>nil</span> {
+        <span>return</span> err
+    }
+    <span>defer</span> f.<span>Close</span>()
+
+    <span>if</span> _, err := f.<span>Write</span>([]<span>byte</span>(<span>"bar"</span>); err != <span>nil</span> {
+        <span>return</span> err
+    }
+
+    <span>if</span> err := f.<span>Close</span>(); err != <span>nil</span> {
+        <span>return</span> err
+    }
+    <span>return</span> <span>nil</span>
+}
+</code></pre></div><p><a href="https://gist.github.com/benbjohnson/9eebd201ec096ab6430e1f33411e6427">(gist)</a></p><p>The Go docs on <code>io.Closer</code> <a href="https://golang.org/pkg/io/#Closer">explicitly say</a> that
+at an interface level behavior after the first call is unspecificed,
+but specific implementations may document their own behavior.</p><p>The docs for <code>*os.File</code> <a href="https://golang.org/pkg/os/#File.Close">unfortunately aren’t clear</a>
+on its behavior, saying only, “Close closes the File, rendering it
+unusable for I/O. It returns an error, if any.” The implemenation as
+of 1.8, however, shows:</p><div><pre><code data-lang="go"><span>func</span> (f *File) <span>Close</span>() <span>error</span> {
+    <span>if</span> f == <span>nil</span> {
+        <span>return</span> ErrInvalid
+    }
+    <span>return</span> f.file.<span>close</span>()
+}
+
+<span>func</span> (file *file) <span>close</span>() <span>error</span> {
+    <span>if</span> file == <span>nil</span> || file.fd == badFd {
+        <span>return</span> syscall.EINVAL
+    }
+    <span>var</span> err <span>error</span>
+    <span>if</span> e := syscall.<span>Close</span>(file.fd); e != <span>nil</span> {
+        err = &amp;PathError{<span>"close"</span>, file.name, e}
+    }
+    file.fd = -<span>1</span> <span>// so it can't be closed again
+</span><span></span>
+    <span>// no need for a finalizer anymore
+</span><span></span>    runtime.<span>SetFinalizer</span>(file, <span>nil</span>)
+    <span>return</span> err
+}
+</code></pre></div><p>For clarity, <code>badFd</code> is defined as -1, so subsequent attempts to close
+an <code>*os.File</code> will do nothing and return <code>syscall.EINVAL</code>. But since
+we are ignoring the error from the <code>defer</code>, this doesn’t matter. It’s
+not idempotent, exactly, but as Ben put later in the Twitter thread,
+it <a href="https://twitter.com/benbjohnson/status/874289044800368640">“won’t blow shit up if you call it
+twice."</a></p><p>The implementation is a good, common-sense one and it seems unlikely
+to change in the future and cause problems. But the lack of
+documentation about this outcome makes me a little nervous. Maybe a
+doc update to codify this behavior would be a good task for Go 1.10.</p><h2 id="update-2">Update 2</h2><p>Closing the file is the last chance the OS has to tell us about
+problems, but the buffers are not necessarily going to be flushed when
+you close the file. It’s entirely possible that flushing the write
+buffer to disk will happen <em>after</em> you close the file, and a failure
+there cannot be caught. If this happens, it usually means you have
+something seriously wrong, like a failing disk.</p><p>However, you can force the write to disk with the <code>Sync()</code> method on
+<code>*os.File</code>, which calls the <code>fsync</code> system call. You should check for
+errors from that call, but then I think it’s safe to ignore an error
+from <code>Close()</code>. Calling <code>fsync</code> has serious implications on
+performance: it’s flushing write buffers out to slow disks. But if
+you really, really want the data on disk, the best pattern to follow
+is probably:</p><div><pre><code data-lang="go"><span>func</span> <span>helloNotes</span>() <span>error</span> {
+    f, err := os.<span>Create</span>(<span>"/home/joeshaw/notes.txt"</span>)
+    <span>if</span> err != <span>nil</span> {
+        <span>return</span> err
+    }
+    <span>defer</span> f.<span>Close</span>()
+
+    <span>if</span> err = io.<span>WriteString</span>(f, <span>"hello world"</span>); err != <span>nil</span> {
+        <span>return</span> err
+    }
+
+    <span>return</span> f.<span>Sync</span>()
+}
+</code></pre></div></div></div>]]>
+            </description>
+            <link>https://www.joeshaw.org/dont-defer-close-on-writable-files/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-41479283</guid>
+            <pubDate>Sun, 08 Sep 2024 09:36:41 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[FutureRack: Server racks are everywhere. Now you can find them in your home]]>
+            </title>
+            <description>
+<![CDATA[
+Score 97 | Comments 50 (<a href="https://news.ycombinator.com/item?id=41477782">thread link</a>) | @zdw
+<br/>
+September 7, 2024 | https://futurerack.info/main.php | <a href="https://web.archive.org/web/*/https://futurerack.info/main.php">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="about">
+          <div>
+                    <div>
+
+                          
+
+
+
+
+                          
+
+                          
+
+                          
+
+
+                            <div id="content">
+                              <div>
+<div>
+<p><img src="https://futurerack.info/img/FR%20Render%20Cropped.jpg" id="intro_img">
+</p>
+</div>
+
+<p>Infrastructure for Living</p>
+<p>
+Server racks are everywhere. Now you can find them in your home.
+</p><div id="breadcrumb_living">
+<div id="next_button">
+<p><a href="#/story_servers" onclick="changeText('NextRoom')">Read more &gt;</a>
+</p></div>
+</div>
+
+</div></div>
+</div>
+</div>
+
+
+
+                          </div></div>]]>
+            </description>
+            <link>https://futurerack.info/main.php</link>
+            <guid isPermaLink="false">hacker-news-small-sites-41477782</guid>
+            <pubDate>Sun, 08 Sep 2024 02:26:56 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[my-new-rust-binary-search]]>
+            </title>
+            <description>
+<![CDATA[
+Score 52 | Comments 51 (<a href="https://news.ycombinator.com/item?id=41475760">thread link</a>) | @ChadNauseam
+<br/>
+September 7, 2024 | https://chadnauseam.com/coding/random/my-new-rust-binary-search | <a href="https://web.archive.org/web/*/https://chadnauseam.com/coding/random/my-new-rust-binary-search">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
+            </description>
+            <link>https://chadnauseam.com/coding/random/my-new-rust-binary-search</link>
+            <guid isPermaLink="false">hacker-news-small-sites-41475760</guid>
+            <pubDate>Sat, 07 Sep 2024 19:10:25 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[WebP: The WebPage Compression Format]]>
             </title>
             <description>
 <![CDATA[
-Score 381 | Comments 140 (<a href="https://news.ycombinator.com/item?id=41475124">thread link</a>) | @Kubuxu
+Score 416 | Comments 149 (<a href="https://news.ycombinator.com/item?id=41475124">thread link</a>) | @Kubuxu
 <br/>
 September 7, 2024 | https://purplesyringa.moe/blog/webp-the-webpage-compression-format/ | <a href="https://web.archive.org/web/*/https://purplesyringa.moe/blog/webp-the-webpage-compression-format/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section><div><p><time>September 7, 2024</time><a href="https://www.reddit.com/r/programming/comments/1fb5pzh/webp_the_webpage_compression_format/"> Discuss on Reddit</a></p><p>I want to provide a smooth experience to my site visitors, so I work on accessibility and ensure it works without JavaScript enabled. I care about page load time because some pages contain large illustrations, so I minify my HTML.</p><p>But one <em>thing</em> makes turning my blog light as a feather a pain in the ass.</p><p>See, a major win in traffic reduction (and thus latency savings on mobile!) comes not from minification but from compression. HTTP supports gzip and Brotli via the <code>Content-Encoding</code> header. This is opt-in because compression takes resources, so transferring uncompressed data might be faster.</p><p>Typically, Brotli is better than gzip, and gzip is better than nothing. gzip is so cheap everyone enables it by default, but Brotli is way slower.</p><p>Annoyingly, I host my blog on GitHub pages, which doesn’t support Brotli. So <a href="https://purplesyringa.moe/blog/recovering-garbled-bitcoin-addresses/">Recovering garbled Bitcoin addresses</a>, the longest post on my site, takes <code>92 KiB</code> instead of <code>37 KiB</code>. This amounts to an unnecessary <code>2.5x</code> increase in load time.</p><p>There’s no <em>reason</em> why GitHub can’t support Brotli. Even if compressing files in-flight is slow, GitHub could still allow repo owners to upload pre-compressed data and use that.</p><p>GitHub doesn’t do that for us, but we can still take advantage of precompressed data. We’ll just have to manually decompress it in JavaScript on the client side.</p><p>Like a good developer, the first thing I do upon finding a problem is search for a solution on Google. <a href="https://www.npmjs.com/package/brotli-dec-wasm">brotli-dec-wasm</a> turned up after a quick search, providing a <code>200 KB</code> Brotli decompressor in WASM. <a href="https://www.npmjs.com/package/tiny-brotli-dec-wasm">tiny-brotli-dec-wasm</a> is even smaller, at <code>71 KiB</code>.</p><p>Alright, so we’re dealing with <code>92 KiB</code> for gzip vs <code>37 + 71 KiB</code> for Brotli. Umm…</p></div></section></div>]]>
@@ -39,7 +303,7 @@ September 7, 2024 | https://purplesyringa.moe/blog/webp-the-webpage-compression-
             </title>
             <description>
 <![CDATA[
-Score 140 | Comments 145 (<a href="https://news.ycombinator.com/item?id=41471488">thread link</a>) | @jandeboevrie
+Score 140 | Comments 152 (<a href="https://news.ycombinator.com/item?id=41471488">thread link</a>) | @jandeboevrie
 <br/>
 September 6, 2024 | https://mariusbancila.ro/blog/2024/09/06/whats-new-in-c26-part-1/ | <a href="https://web.archive.org/web/*/https://mariusbancila.ro/blog/2024/09/06/whats-new-in-c26-part-1/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="post-4733">
@@ -307,7 +571,7 @@ else
             </title>
             <description>
 <![CDATA[
-Score 107 | Comments 17 (<a href="https://news.ycombinator.com/item?id=41471355">thread link</a>) | @8bitsrule
+Score 110 | Comments 17 (<a href="https://news.ycombinator.com/item?id=41471355">thread link</a>) | @8bitsrule
 <br/>
 September 6, 2024 | http://www.theradiohistorian.org/fm/fm.html | <a href="https://web.archive.org/web/*/http://www.theradiohistorian.org/fm/fm.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1798,7 +2062,7 @@ September 6, 2024 | https://evmarketsreports.com/europe-surpasses-900-000-public
             </title>
             <description>
 <![CDATA[
-Score 235 | Comments 282 (<a href="https://news.ycombinator.com/item?id=41464371">thread link</a>) | @mpweiher
+Score 235 | Comments 285 (<a href="https://news.ycombinator.com/item?id=41464371">thread link</a>) | @mpweiher
 <br/>
 September 6, 2024 | http://blog.namangoel.com/swift-is-the-more-convenient-rust | <a href="https://web.archive.org/web/*/http://blog.namangoel.com/swift-is-the-more-convenient-rust">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section id="container">
@@ -1993,14 +2257,14 @@ func handlesErrors() {
     <a href="#kudo">
       
     </a>
-    <p>429</p>
+    <p>432</p>
     <p>Kudos</p>
   </figure>
   <figure id="kudo_side_kf5pNR8Jwc8n6dk7svFLSk">
     <a href="#kudo">
       
     </a>
-    <p>429</p>
+    <p>432</p>
     <p>Kudos</p>
   </figure>
 </article>
@@ -2017,7 +2281,7 @@ func handlesErrors() {
             </title>
             <description>
 <![CDATA[
-Score 189 | Comments 160 (<a href="https://news.ycombinator.com/item?id=41463330">thread link</a>) | @gukoff
+Score 190 | Comments 160 (<a href="https://news.ycombinator.com/item?id=41463330">thread link</a>) | @gukoff
 <br/>
 September 5, 2024 | https://gukov.dev/puzzles/math/2024/09/05/steve-ballmer-was-wrong.html | <a href="https://web.archive.org/web/*/https://gukov.dev/puzzles/math/2024/09/05/steve-ballmer-was-wrong.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div aria-label="Content">
@@ -2222,7 +2486,7 @@ September 5, 2024 | https://benjamindlee.com/posts/2021/why-i-use-nim-instead-of
             </title>
             <description>
 <![CDATA[
-Score 65 | Comments 26 (<a href="https://news.ycombinator.com/item?id=41462494">thread link</a>) | @stevebox
+Score 65 | Comments 27 (<a href="https://news.ycombinator.com/item?id=41462494">thread link</a>) | @stevebox
 <br/>
 September 5, 2024 | https://www.gridbugs.org/frustrating-interactions-with-the-ocaml-ecosystem-while-developing-a-synthesizer-library/ | <a href="https://web.archive.org/web/*/https://www.gridbugs.org/frustrating-interactions-with-the-ocaml-ecosystem-while-developing-a-synthesizer-library/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -3648,7 +3912,7 @@ September 5, 2024 | https://kalmia.difuse.io/doc/ | <a href="https://web.archive
             </title>
             <description>
 <![CDATA[
-Score 136 | Comments 110 (<a href="https://news.ycombinator.com/item?id=41457739">thread link</a>) | @Brajeshwar
+Score 137 | Comments 111 (<a href="https://news.ycombinator.com/item?id=41457739">thread link</a>) | @Brajeshwar
 <br/>
 September 5, 2024 | https://aethermug.com/posts/boxed | <a href="https://web.archive.org/web/*/https://aethermug.com/posts/boxed">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><main components="[object Object]"><p>Last year a researcher from a Japanese lab asked me if he could borrow my <a href="https://en.wikipedia.org/wiki/Aphantasia" rel="nofollow noopener noreferrer" target="_blank">aphantasic</a> brain for an experiment. Neuroscientists have been studying the weird capacity most people have of "visualizing", or mentally conjuring pictures of things that aren't there, for a long time. The problem is that the brain is such a wild tangle of interconnections that it's hard to tell which of its parts are involved in visualization and which are unrelated, or downstream of it. Comparing people who visualize with aphantasics who don't is a very convenient way to partially work around that problem.</p>
@@ -3717,7 +3981,7 @@ September 5, 2024 | https://aethermug.com/posts/boxed | <a href="https://web.arc
             </title>
             <description>
 <![CDATA[
-Score 116 | Comments 29 (<a href="https://news.ycombinator.com/item?id=41457522">thread link</a>) | @yarapavan
+Score 116 | Comments 30 (<a href="https://news.ycombinator.com/item?id=41457522">thread link</a>) | @yarapavan
 <br/>
 September 5, 2024 | https://jnsgr.uk/2024/08/tailscale-on-the-rocks | <a href="https://web.archive.org/web/*/https://jnsgr.uk/2024/08/tailscale-on-the-rocks">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article><header><ol><li><a href="https://jnsgr.uk/"></a><span>/</span></li><li><a href="https://jnsgr.uk/posts/">Blog</a><span>/</span></li><li><a href="https://jnsgr.uk/2024/08/tailscale-on-the-rocks/">Libations: Tailscale on the Rocks</a><span>/</span></li></ol><div><p><time datetime="2024-08-21 00:00:00 +0000 UTC">21 August 2024</time><span>·</span><span>2567 words</span><span>·</span><span title="Reading time">13 mins</span></p></div><div><picture><source srcset="https://jnsgr.uk/2024/08/tailscale-on-the-rocks/cover_hu56fc2a3dadaf1130e3051f6ec97a2250_254425_330x0_resize_q75_h2_box.webp 330w,https://jnsgr.uk/2024/08/tailscale-on-the-rocks/cover_hu56fc2a3dadaf1130e3051f6ec97a2250_254425_660x0_resize_q75_h2_box.webp 660w
@@ -4170,7 +4434,7 @@ September 5, 2024 | https://nsa-codebreaker.org/home | <a href="https://web.arch
             </title>
             <description>
 <![CDATA[
-Score 140 | Comments 47 (<a href="https://news.ycombinator.com/item?id=41456635">thread link</a>) | @edublancas
+Score 146 | Comments 47 (<a href="https://news.ycombinator.com/item?id=41456635">thread link</a>) | @edublancas
 <br/>
 September 5, 2024 | https://blancas.io/blog/html-minify-for-llm/ | <a href="https://web.archive.org/web/*/https://blancas.io/blog/html-minify-for-llm/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4725,7 +4989,7 @@ September 5, 2024 | https://catfox.life/2024/09/05/porting-systemd-to-musl-libc-
             </title>
             <description>
 <![CDATA[
-Score 183 | Comments 42 (<a href="https://news.ycombinator.com/item?id=41454741">thread link</a>) | @thibaut_barrere
+Score 184 | Comments 42 (<a href="https://news.ycombinator.com/item?id=41454741">thread link</a>) | @thibaut_barrere
 <br/>
 September 5, 2024 | https://pikdum.dev/posts/thistle-tea/ | <a href="https://web.archive.org/web/*/https://pikdum.dev/posts/thistle-tea/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -5175,7 +5439,7 @@ I’d like to see how many players this approach can handle and how it compares 
             </title>
             <description>
 <![CDATA[
-Score 143 | Comments 99 (<a href="https://news.ycombinator.com/item?id=41453264">thread link</a>) | @dansalias
+Score 146 | Comments 102 (<a href="https://news.ycombinator.com/item?id=41453264">thread link</a>) | @dansalias
 <br/>
 September 4, 2024 | https://iamdan.me/better-dotfiles | <a href="https://web.archive.org/web/*/https://iamdan.me/better-dotfiles">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
