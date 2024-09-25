@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Wed, 25 Sep 2024 08:23:20 GMT</lastBuildDate>
+        <lastBuildDate>Wed, 25 Sep 2024 12:24:38 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-5.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Wed, 25 Sep 2024 08:23:20 GMT</pubDate>
+        <pubDate>Wed, 25 Sep 2024 12:24:38 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,184 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Rearchitecting: Redis to SQLite]]>
+            </title>
+            <description>
+<![CDATA[
+Score 12 | Comments 3 (<a href="https://news.ycombinator.com/item?id=41645173">thread link</a>) | @thecodemonkey
+<br/>
+September 25, 2024 | https://wafris.org/blog/rearchitecting-for-sqlite | <a href="https://web.archive.org/web/*/https://wafris.org/blog/rearchitecting-for-sqlite">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+             <p>Pssst - want to skip right to the chart? <a href="#chart">click here</a></p>
+<h2>Background</h2>
+<p>We're Wafris, an open-source web application firewall company that, among other frameworks, ships a Rails middleware client.</p>
+<p>At launch, the v1 client required a local Redis datastore to be deployed with your app. We're now releasing v2 of our Rails client which uses SQLite as the backing datastore.</p>
+<p>This article covers the decision-making that went into our migration from Redis to SQLite, performance considerations, and architectural changes. Continue reading this if you're interested in the decision-making that went into our migration to SQLite from Redis for our clients (the deployed middleware)</p>
+<h2>TL;DR</h2>
+<ul>
+<li>SQLite has things it's good and bad at.</li>
+<li>Redis has things it's good and bad at.</li>
+<li>Traditional RDBMS (Postgres/MySQL) have things they're good and bad at.</li>
+</ul>
+<p>These data stores are not drop-in replacements, and if you try to do that, you'll have a bad time. This article walks through the testing and decision-making that went into rearchitecting our v1 Redis-based client to our v2 SQLite-based client.</p>
+<h2>What forced this change?</h2>
+<p>Since day one of Wafris, our goal has been to make it as easy as possible for developers to protect their sites.</p>
+<p>But our v1 has had mixed results in delivering on that promise. We made what we thought at the time was a solid choice to back the Wafris client with a user-owned (bring your own) Redis datastore.</p>
+<p>Partially, this was due to our having come up in the Heroku ecosystem, where Redis is an easy click away to get going and deployed in such a way that it's easy to access remotely. We also looked at successful projects like Sidekiq, which had a similar model.</p>
+<blockquote><p>If we're trying to make things easy on you, we shouldn't casually make you a Redis database admin in the process.</p></blockquote>
+<p>But the ecosystem is much larger than that, and many of our users encountered Redis deployment issues that were difficult to debug and fix.</p>
+<p>In other words, if we're trying to make things easy on you, we shouldn't casually make you a Redis database admin in the process.</p>
+<p>Further, when we exhibited at <a href="https://wafris.org/blog/railsworld-2023-recap" rel="follow">RailsWorld 2023</a>, there was a definite "blood in the water" vibe regarding Redis and the assumption that you'd automatically need a Redis server running alongside your Rails application.</p>
+<h2>What is Speed?</h2>
+<p>While Redis is "fast" in comparison to traditional RDBMS, it's still a database that you have to manage connections, memory, processes, etc., which introduces more brittleness into the stack (the opposite of what we're trying to achieve).</p>
+<p>And more than any of those, if you're in a cloud environment, you're looking at network latency. Network delays are a big deal for us as every inbound HTTP request to your app must be evaluated against the rules stored in Wafris. So while we sweated blood and code to get our v1 client as fast as possible, we'd often wind up in situations where, despite our best efforts, we'd still slow down an application as the network the app was provisioned into was slow.</p>
+<p><img src="https://cdn.buttercms.com/Qgraed3TIekXzqhffUFR" alt="network-latency.webp" width="565" height="228"></p>
+
+<h2>Monolith-ish Assumptions</h2>
+<p>While there certainly exist wholly distributed applications out there, and while most Rails apps are "majestic monoliths" (tm? idk, don't sue me), we've found a lot of distributed apps that messed up our assumptions.</p>
+<p>Apps that deploy to multiple zones, split functionality into servers with overlapping responsibilities, or are only partially Rails and deployed alongside other languages or frameworks.</p>
+<p>Mostly, things aren't that clean in production, introducing even more friction with using Redis.</p>
+<h2>Forcing a rethink of our architecture</h2>
+<p>Wafris is a web application firewall. In Rails, it's installed as a middleware. It lets you set rules like "block the IP 1.2.3.4," and then when someone requests your site, you evaluate that request against those rules.</p>
+<p>Imagine it's this simplified two-step process:</p>
+<ol>
+<li>Compare HTTP request against the rules (if match == 403, else 200)</li>
+<li>Report treatment (blocked, allowed, passed)</li>
+</ol>
+<p>Abstractly, this is a paired "read" of the rules in the database (step 2) and then a "write" of the report detailing what was done with that request along with its data.</p>
+<p>From a logical standpoint, the first "read" half of this process is vastly more important than the latter "write" half:</p>
+<ul>
+<li>Reads, aka "requests," need to be handled sequentially</li>
+<li>Filtering of requests <em>must</em> work or bad requests could get through</li>
+<li>Reads, aka "requests," are time-sensitive as they affect user-perceived site performance.</li>
+<li>Writes, aka "reporting," can be done slower, batched, async, etc.</li>
+</ul>
+<h2>Enter SQLite</h2>
+<p>Others have written far more eloquently about what SQLite is suitable for in general than I could ever hope to do so myself, so on that topic, I'll point you to the following resources:</p>
+<ul>
+<li>Aaron Francis' "High Performance SQLite" course at <a href="https://highperformancesqlite.com/" rel="follow">https://highperformancesqlite.com/</a></li>
+<li>Stephen Margheim's "SQLite on Rails" - <a href="https://fractaledmind.github.io/2024/04/15/sqlite-on-rails-the-how-and-why-of-optimal-performance/" rel="follow">the how and why of optimal performance</a>&nbsp;</li>
+<li>Oldmoe - <a href="https://oldmoe.blog/" rel="follow">https://oldmoe.blog/</a></li>
+</ul>
+<h2>What's good about SQLite for Wafris?</h2>
+<p>As noted above, our major bottleneck is network IO, and Stephen mentioned this line from the SQLite documentation: "SQLite does not compete with client/server databases. SQLite competes with fopen()."</p>
+<blockquote><p>SQLite does not compete with client/server databases. SQLite competes with fopen().</p></blockquote>
+<p>In theory, this should be much faster than a Redis solution solely based on cutting out the network round trip.</p>
+<p>So, we decided to benchmark SQLite vs Redis.</p>
+<h2>Benchmarking SQLite and Redis</h2>
+<p>Benchmarking is a dark art of deceiving yourself with highly precise numbers.</p>
+<p>And benchmarketing datastores is even more fraught. Every single flipping database benchmark I've ever seen has been covered in a layer of asterisks and qualifications, and the comments on HN are full of "if you'd just set this flag when compiling it, you'd get 3% more speed out of reads, and the fact that the people running this didn't do this is proof that they were paid off and that they actively sell shady NFT scams of deranged yacht rock Harambe memes.</p>
+<p><img src="https://cdn.buttercms.com/4QeEUKlrSmSXIwf4F6by" alt="undefined" width="351" height="351"></p>
+<p>However, we have an advantage here. We're not trying to get some absolute number of speed under pristine conditions and carefully tweaked settings. We are creating a wildly specific and biased benchmark against our own data in a use case that lends itself to some extremes that I would neither expect nor hope that anyone else would have to deal with.</p>
+
+<h3>Studiously ignoring optimization tweaks</h3>
+<p>We're trying to optimize for people throwing Wafris into their app and having it "Just Work™" (ok, this one might actually be <a href="https://trademarks.justia.com/776/82/it-just-works-77682144.html">trademarked</a>).</p>
+<p>We're also not testing against some theoretical benchmark suite (that can be gamed ala <a href="https://www.theregister.com/2021/01/28/nvidia_tpc_benchmark/#::text=Nvidia%20has%20been%20accused%20of,very%20umpires%20of%20the%20test">NVIDIA</a>).</p>
+<p>We're testing the hot path of <em>our</em> own application and <em>our</em> worst query.</p>
+<p>Our worst query is a somewhat complicated request for a "lexical decimal" data structure that maps IP ranges (v4 and v6) against categories. The simplest to consider is IP -&gt; Country mapping, where we return the country if an IP address is within a range of two addresses.</p>
+<p>It's terrible because these structures are, by necessity, large (millions of rows), and in the case of IPv6, every single entry is huge.</p>
+<p>To make this happen, we precompute the range lookups and then wrote them to:</p>
+<ul>
+<li>A table in SQLite</li>
+<li>A <a href="https://redis.io/docs/latest/develop/data-types/sorted-sets/">sorted set</a> in Redis</li>
+</ul>
+<p>For each inbound HTTP request, we, in the pathological case, have to check the requesting IP against:</p>
+<ol>
+<li>Custom Allow ranges</li>
+<li>Custom Block ranges</li>
+<li>GeoIP ranges</li>
+<li>IP Reputation ranges</li>
+</ol>
+<p>This is what we mean by "hot path"—this singular query type is so important that we can ignore all the rest of the query types and functions.<a href="https://moderndaymoguls.com/2020/01/05/peloton-bike/" rel="follow"></a></p>
+<p>So, for our benchmarking scripts, we tested only this one query type, saving us days of work porting more significant (but irrelevant to the hot path) portions of the app to the benchmark.</p>
+<h2>The Testing Protocol</h2>
+<p><img src="https://cdn.buttercms.com/HklvqQLITaOLUv9bna3b" alt="undefined"></p>
+<p>Testing was done on my local Macbook Air M2 with a homebrew installed Redis and local SQLite db.</p>
+<ol>
+<li>We tested against our existing ranges dataset (1.2 million entries)</li>
+<li>Multiple sets of IPs were then run in the same order against both SQLite and Redis.</li>
+<li>At each multiple, we ran the test 5 times and took the average of the runs.</li>
+</ol>
+<h2>Testing Results</h2>
+<p><img src="https://cdn.buttercms.com/gd2RyAi4RGiz44JhWGOH" alt="undefined" width="739" height="554"></p>
+
+<p>SQLite beat Redis like an overhyped UFC fighter doing a jump off the fence to land a kick punch (for our particular use case in this niche)</p>
+<p>SQLite was roughly a 3x speed improvement over a locally deployed Redis instance. YMMV. Note again that this is before any network latency is considered.</p>
+<p>From our perspective, this was a fantastic result as even if SQLite were only on par with Redis locally, we'd still win by being able to entirely axe network times.</p>
+<p>I'd like to stress again that this is extremely flawed testing (by design) with really naive settings, but it is done in a way that mirrors the flaws of real-world usage we observed.</p>
+<h2>What's missing from the chart?</h2>
+<p>Benchmarks exist in a vacuum. What the chart fails to capture is that:</p>
+<ul>
+<li>Even if the SQLite performance was significantly worse (like 2x worse) in the benchmark, it would <em>still</em> probably be faster in the "real world" because of network latency, even to a Redis that was in the same data center/region</li>
+<li>Even if you had a super robust Redis server (cluster, sharded, etc.), there are still a bunch of limits around it for network bandwidth, connections, etc., and again cross-region latency. SQLite gets us near-infinite horizontal scaling for "free"; more on this below.</li>
+<li>The onboarding is so much better with SQLite - I imagine most users won't even know that it's being used; they'll just add the gem to their web app and be up and running.</li>
+<li>There are a lot of potential improvements that could be done to get more juice out of Redis. However, we've been unable to consistently persuade users to make even basic configuration changes (like cache eviction policy) to their Redis setups as it's such a pain and they don't want to be Redis admins.</li>
+</ul>
+<p>We're focused on:</p>
+<ol>
+<li>Making Wafris easy to deploy</li>
+<li>Making rule evaluation as fast as possible</li>
+</ol>
+<p>Everything else flows from that, so that's what we're rearchitecting towards. NOT "the best database setup," not "the easiest infrastructure for us (Wafris) to manage," etc.</p>
+<h2>Results are just the start</h2>
+<p>Great, so now that we've established that SQLite is faster than Redis (caveats, caveats, caveats), everything still isn't great because there are real-world tradeoffs.</p>
+<p>One <em>huge</em> tradeoff in the testing above is that we didn't even consider doing any writes.</p>
+<p>While it's never really stated, the whole reason for a "proper" database to have connections, connection pools, transactions, and whatever proprietary magic allows Oracle to charge a billion dollars for a database is to manage writes contending with reads for data in your database.</p>
+<p>Consider an electric Chinese supercar driven by a charming British man - it's fast, it's fantastic, and it is absolute bollocks at hauling a load of concrete blocks across town.</p>
+<p><a href="https://www.youtube.com/watch?v=DzFT5ndMZ_Q" rel="follow"><img src="https://cdn.buttercms.com/iX3Bns2ySayFT5LOKidM" alt="undefined" width="713" height="398"></a></p>
+<p>SQLite is like that NIO EP9 supercar. We need to use it for what it's good at and not force it into a role it's not suited for.</p>
+<h2>Building a sync architecture</h2>
+<p>On v1 (Redis), the update loop looked like this:</p>
+<ol>
+<li>User updates a rule ("block the IP 1.2.3.4") in Wafris Hub</li>
+<li>Wafris Hub updates the rules in your Redis datastore</li>
+</ol>
+<p>This obviously won't work with SQLite because we can't "push" a SQLite database to a web server. There are some newer SQLite as a service providers that let you do a version of this, but for a variety of cost, performance, and security considerations, it won't work for us as we'd still need individual users to deploy them, open ports, allow inbound connections, etc.</p>
+<p>On v2 (SQLite), the update loop looks like this:</p>
+<ol>
+<li>User updates a rule ("block the IP 1.2.3.4") in Wafris Hub</li>
+<li>At some interval (time or number of requests), the client checks for updated rules</li>
+<li>If rules are updated, the client downloads an entirely new SQLite database</li>
+</ol>
+<p>This works well as it removes much of the user's installation and configuration responsibility.</p>
+<p>We're seeing a ~3x increase in successful installs of the v2 client.</p>
+<h2>SQLite Distributed Architecture</h2>
+<p>Consider a Rails app deployed to a cloud provider (AWS, Heroku, Fly, etc). with autoscaling enabled.</p>
+<p>Your requests go from 100 req/s to 10,000 req/s. and your compute (dynos, machines, ec2 instances) start spinning up to handle the load, but does your database?</p>
+<p>The answer is almost certainly no because a bottleneck is a bottleneck without the database, and while you could overprovision it by 100x "just in case," realistically, nobody wants to do that.</p>
+<p><code><img src="https://cdn.buttercms.com/F4yeDPLUSN2JsDEZrOLD" alt="singular.webp"></code></p>
+<p>In practice, this is the number one thing that we see kill Rails apps under heavy load. Rarely is it an actual DDOS attack; more often, it's a credential stuffing attack or a bad bot that is hammering a site, pushing up autoscaling that's then exhausting database connections, which causes the app to fall over.</p>
+<p><code><img src="https://cdn.buttercms.com/kjwGl08yRwiwjX9GLdrp" alt="distributed.webp"></code></p>
+<p>Flipping this to a system where an SQLite DB is synced down to each compute instance solves this problem excellently by keeping all the calls local to the new compute instance.</p>
+<h2>But what about writes?</h2>
+<p>We started this article by discussing splitting the app into a read (rule evaluation) and write (reporting) path and then studiously ignored the write path.</p>
+<p>We did rearchitect the write path to do the following:</p>
+<ul>
+<li>Async connects to Wafris Hub for reporting</li>
+<li>Batch sending of the reports</li>
+<li>Completely removing database writes from the clients</li>
+</ul>
+<p>Which will work for approximately 0% of everybody else, but we don't care about them.</p>
+<p>We care about the 100% of our users who want the Wafris client to be easy to deploy and stupid fast.</p>
+<p>It's hard to know if there's a lesson you can learn from reading all of this, but we sincerely appreciate you taking the time.</p>
+<h2>Conclusion</h2>
+<p>First: thanks to <a href="https://x.com/aarondfrancis" rel="follow">Aaron Francis</a>, <a href="https://x.com/tnorthcutt" rel="follow">Travis Northcutt</a>,&nbsp; <a href="https://brianhogg.com/">Brian Hogg</a>, <a href="https://twitter.com/dceddia.com">Dave Ceddia</a>, <a href="https://push.cx/">Peter Bhat Harkins</a> and <a href="https://x.com/natebosscher?lang=en">Nate Bosscher</a> for their feedback and suggestions on this post.</p>
+<p>Second: we're exceedingly happy with our v2 architecture, which uses SQLite. It's already helped many sites weather attacks and stay online.</p>
+<p>It's much easier to get going, with less support work for us and less hassle for users, which we think is a win for a safer, more secure internet.</p>
+<p>If you'd like to get started, sign up on <a href="https://wafris.org/signup" rel="follow">Wafris Hub</a>.</p>
+          </div></div>]]>
+            </description>
+            <link>https://wafris.org/blog/rearchitecting-for-sqlite</link>
+            <guid isPermaLink="false">hacker-news-small-sites-41645173</guid>
+            <pubDate>Wed, 25 Sep 2024 08:37:48 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Holy Hell, the Social Web Did Not Begin in 2008]]>
             </title>
             <description>
 <![CDATA[
-Score 30 | Comments 20 (<a href="https://news.ycombinator.com/item?id=41644267">thread link</a>) | @erlend_sh
+Score 44 | Comments 42 (<a href="https://news.ycombinator.com/item?id=41644267">thread link</a>) | @erlend_sh
 <br/>
 September 24, 2024 | https://bix.blog/posts/holy-hell-the-social-web-did-not-begin-in-2008 | <a href="https://web.archive.org/web/*/https://bix.blog/posts/holy-hell-the-social-web-did-not-begin-in-2008">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -41,7 +214,7 @@ September 24, 2024 | https://bix.blog/posts/holy-hell-the-social-web-did-not-beg
             </title>
             <description>
 <![CDATA[
-Score 27 | Comments 3 (<a href="https://news.ycombinator.com/item?id=41644062">thread link</a>) | @JNRowe
+Score 34 | Comments 3 (<a href="https://news.ycombinator.com/item?id=41644062">thread link</a>) | @JNRowe
 <br/>
 September 24, 2024 | https://blog.jimmac.eu/2024/wallpapers/ | <a href="https://web.archive.org/web/*/https://blog.jimmac.eu/2024/wallpapers/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div aria-label="Content">
@@ -123,7 +296,7 @@ September 24, 2024 | https://blog.jimmac.eu/2024/wallpapers/ | <a href="https://
             </title>
             <description>
 <![CDATA[
-Score 62 | Comments 20 (<a href="https://news.ycombinator.com/item?id=41643690">thread link</a>) | @stankot
+Score 82 | Comments 29 (<a href="https://news.ycombinator.com/item?id=41643690">thread link</a>) | @stankot
 <br/>
 September 24, 2024 | https://tamulaitis.lt/project/dialrhea/ | <a href="https://web.archive.org/web/*/https://tamulaitis.lt/project/dialrhea/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div> <div>  <article>  <div> 
@@ -691,7 +864,7 @@ September 24, 2024 | https://tamulaitis.lt/project/dialrhea/ | <a href="https://
             </title>
             <description>
 <![CDATA[
-Score 110 | Comments 84 (<a href="https://news.ycombinator.com/item?id=41643573">thread link</a>) | @Flex247A
+Score 122 | Comments 104 (<a href="https://news.ycombinator.com/item?id=41643573">thread link</a>) | @Flex247A
 <br/>
 September 24, 2024 | https://blog.aktsbot.in/no-more-blurry-fonts.html | <a href="https://web.archive.org/web/*/https://blog.aktsbot.in/no-more-blurry-fonts.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
@@ -748,7 +921,7 @@ a heck of a difference for Inter.</p>
             </title>
             <description>
 <![CDATA[
-Score 20 | Comments 13 (<a href="https://news.ycombinator.com/item?id=41643319">thread link</a>) | @todsacerdoti
+Score 28 | Comments 24 (<a href="https://news.ycombinator.com/item?id=41643319">thread link</a>) | @todsacerdoti
 <br/>
 September 24, 2024 | https://catskull.net/thoughts-on-debugging.html | <a href="https://web.archive.org/web/*/https://catskull.net/thoughts-on-debugging.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -820,7 +993,7 @@ September 24, 2024 | https://catskull.net/thoughts-on-debugging.html | <a href="
             </title>
             <description>
 <![CDATA[
-Score 21 | Comments 20 (<a href="https://news.ycombinator.com/item?id=41642772">thread link</a>) | @thunderbong
+Score 24 | Comments 25 (<a href="https://news.ycombinator.com/item?id=41642772">thread link</a>) | @thunderbong
 <br/>
 September 24, 2024 | https://breckyunits.com/microprograms.html | <a href="https://web.archive.org/web/*/https://breckyunits.com/microprograms.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -944,7 +1117,7 @@ tableSearch</code></p></div>
             </title>
             <description>
 <![CDATA[
-Score 13 | Comments 0 (<a href="https://news.ycombinator.com/item?id=41641373">thread link</a>) | @transpute
+Score 16 | Comments 1 (<a href="https://news.ycombinator.com/item?id=41641373">thread link</a>) | @transpute
 <br/>
 September 24, 2024 | https://x86.lol/generic/2024/09/23/user-shadow-stacks.html | <a href="https://web.archive.org/web/*/https://x86.lol/generic/2024/09/23/user-shadow-stacks.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div itemprop="articleBody">
@@ -1040,7 +1213,7 @@ everything works, you’ll see that the stack smashing is prevented:</p>
             </title>
             <description>
 <![CDATA[
-Score 74 | Comments 14 (<a href="https://news.ycombinator.com/item?id=41641367">thread link</a>) | @alexzeitler
+Score 78 | Comments 18 (<a href="https://news.ycombinator.com/item?id=41641367">thread link</a>) | @alexzeitler
 <br/>
 September 24, 2024 | https://mikecoats.com/debian-packaging-first-principles-part-1-simple/ | <a href="https://web.archive.org/web/*/https://mikecoats.com/debian-packaging-first-principles-part-1-simple/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1397,7 +1570,7 @@ Watch as they bury essential features in enterprise plans, forcing you to pay bi
             </title>
             <description>
 <![CDATA[
-Score 27 | Comments 14 (<a href="https://news.ycombinator.com/item?id=41640388">thread link</a>) | @sotix
+Score 28 | Comments 16 (<a href="https://news.ycombinator.com/item?id=41640388">thread link</a>) | @sotix
 <br/>
 September 24, 2024 | https://www.winstoncooke.com/blog/rotation-based-compression | <a href="https://web.archive.org/web/*/https://www.winstoncooke.com/blog/rotation-based-compression">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article><div><p><time datetime="2024-09-23">2024-09-23</time></p><h2 data-svelte-h="svelte-1c47mae">Background</h2> <p data-svelte-h="svelte-sp1ruv">In the late 19th to mid 20th century, the United States Department of Agriculture hired dozens of artists to paint watercolors of every fruit that grows in the United States.
@@ -1495,7 +1668,7 @@ We provide step-by-step instructions and even generate code for you right there.
             </title>
             <description>
 <![CDATA[
-Score 42 | Comments 4 (<a href="https://news.ycombinator.com/item?id=41639589">thread link</a>) | @cvarjas
+Score 43 | Comments 4 (<a href="https://news.ycombinator.com/item?id=41639589">thread link</a>) | @cvarjas
 <br/>
 September 24, 2024 | https://creounity.com/apps/time_machine/index.php?go=&lang=en | <a href="https://web.archive.org/web/*/https://creounity.com/apps/time_machine/index.php?go=&lang=en">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2248,7 +2421,7 @@ September 24, 2024 | https://creounity.com/apps/time_machine/index.php?go=&lang=
             </title>
             <description>
 <![CDATA[
-Score 8 | Comments 1 (<a href="https://news.ycombinator.com/item?id=41639542">thread link</a>) | @niel
+Score 10 | Comments 1 (<a href="https://news.ycombinator.com/item?id=41639542">thread link</a>) | @niel
 <br/>
 September 24, 2024 | https://socialwebfoundation.org/2024/09/24/launch/ | <a href="https://web.archive.org/web/*/https://socialwebfoundation.org/2024/09/24/launch/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2594,7 +2767,7 @@ September 24, 2024 | https://www.tmg.io/insights/articles/moving-to-dbos/ | <a h
             </title>
             <description>
 <![CDATA[
-Score 78 | Comments 7 (<a href="https://news.ycombinator.com/item?id=41638581">thread link</a>) | @jarmitage
+Score 82 | Comments 7 (<a href="https://news.ycombinator.com/item?id=41638581">thread link</a>) | @jarmitage
 <br/>
 September 24, 2024 | https://ijc8.me/2024/08/26/gsoc-difflogic/ | <a href="https://web.archive.org/web/*/https://ijc8.me/2024/08/26/gsoc-difflogic/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -3832,7 +4005,7 @@ September 24, 2024 | https://blog.oodle.ai/building-a-high-performance-low-cost-
             </title>
             <description>
 <![CDATA[
-Score 398 | Comments 178 (<a href="https://news.ycombinator.com/item?id=41635583">thread link</a>) | @JKCalhoun
+Score 417 | Comments 203 (<a href="https://news.ycombinator.com/item?id=41635583">thread link</a>) | @JKCalhoun
 <br/>
 September 24, 2024 | https://engineersneedart.com/blog/movefast/movefast.html | <a href="https://web.archive.org/web/*/https://engineersneedart.com/blog/movefast/movefast.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4103,7 +4276,7 @@ September 24, 2024 | https://engineersneedart.com/blog/movefast/movefast.html | 
 Score 6 | Comments 7 (<a href="https://news.ycombinator.com/item?id=41634889">thread link</a>) | @jayantbhawal
 <br/>
 September 24, 2024 | https://middlewarehq.com/blog/optimizing-openstreetmaps-devops-efficiency-a-data-driven-dora-metrics-analysis | <a href="https://web.archive.org/web/*/https://middlewarehq.com/blog/optimizing-openstreetmaps-devops-efficiency-a-data-driven-dora-metrics-analysis">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
             </description>
             <link>https://middlewarehq.com/blog/optimizing-openstreetmaps-devops-efficiency-a-data-driven-dora-metrics-analysis</link>
             <guid isPermaLink="false">hacker-news-small-sites-41634889</guid>
@@ -4115,7 +4288,7 @@ September 24, 2024 | https://middlewarehq.com/blog/optimizing-openstreetmaps-dev
             </title>
             <description>
 <![CDATA[
-Score 67 | Comments 37 (<a href="https://news.ycombinator.com/item?id=41633899">thread link</a>) | @thunderbong
+Score 68 | Comments 37 (<a href="https://news.ycombinator.com/item?id=41633899">thread link</a>) | @thunderbong
 <br/>
 September 24, 2024 | https://ryelang.org/cookbook/rye-fyne/examples/ | <a href="https://web.archive.org/web/*/https://ryelang.org/cookbook/rye-fyne/examples/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4511,7 +4684,7 @@ September 23, 2024 | https://reconwave.com/blog/post/storing-private-keys-in-txt
             </title>
             <description>
 <![CDATA[
-Score 28 | Comments 7 (<a href="https://news.ycombinator.com/item?id=41630408">thread link</a>) | @blacklight
+Score 28 | Comments 8 (<a href="https://news.ycombinator.com/item?id=41630408">thread link</a>) | @blacklight
 <br/>
 September 23, 2024 | https://manganiello.social/@fabio/posts/AmJ1i018C0Lt2hCWPY | <a href="https://web.archive.org/web/*/https://manganiello.social/@fabio/posts/AmJ1i018C0Lt2hCWPY">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -4526,7 +4699,7 @@ September 23, 2024 | https://manganiello.social/@fabio/posts/AmJ1i018C0Lt2hCWPY 
             </title>
             <description>
 <![CDATA[
-Score 142 | Comments 65 (<a href="https://news.ycombinator.com/item?id=41629916">thread link</a>) | @burningion
+Score 145 | Comments 66 (<a href="https://news.ycombinator.com/item?id=41629916">thread link</a>) | @burningion
 <br/>
 September 23, 2024 | https://www.makeartwithpython.com/blog/a-year-of-showing-up/ | <a href="https://web.archive.org/web/*/https://www.makeartwithpython.com/blog/a-year-of-showing-up/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section itemprop="text">
@@ -4800,7 +4973,7 @@ September 23, 2024 | https://www.makeartwithpython.com/blog/a-year-of-showing-up
             </title>
             <description>
 <![CDATA[
-Score 544 | Comments 193 (<a href="https://news.ycombinator.com/item?id=41629475">thread link</a>) | @mailyk
+Score 549 | Comments 194 (<a href="https://news.ycombinator.com/item?id=41629475">thread link</a>) | @mailyk
 <br/>
 September 23, 2024 | https://www.atomsonly.news/p/franklin-oil | <a href="https://web.archive.org/web/*/https://www.atomsonly.news/p/franklin-oil">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><article><div><div><div dir="auto"><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0f9752ed-6ba9-460d-945c-03eaf39d4d08_1200x800.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0f9752ed-6ba9-460d-945c-03eaf39d4d08_1200x800.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0f9752ed-6ba9-460d-945c-03eaf39d4d08_1200x800.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0f9752ed-6ba9-460d-945c-03eaf39d4d08_1200x800.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0f9752ed-6ba9-460d-945c-03eaf39d4d08_1200x800.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0f9752ed-6ba9-460d-945c-03eaf39d4d08_1200x800.png" width="1200" height="800" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/0f9752ed-6ba9-460d-945c-03eaf39d4d08_1200x800.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:800,&quot;width&quot;:1200,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:833282,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:true,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0f9752ed-6ba9-460d-945c-03eaf39d4d08_1200x800.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0f9752ed-6ba9-460d-945c-03eaf39d4d08_1200x800.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0f9752ed-6ba9-460d-945c-03eaf39d4d08_1200x800.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0f9752ed-6ba9-460d-945c-03eaf39d4d08_1200x800.png 1456w" sizes="100vw" fetchpriority="high"></picture></div></a></figure></div><p>Many decades before the discovery of x-rays and the invention of powerful microscopes, Lord Rayleigh calculated the size of a single molecule. And he did it, remarkably, using little more than oil, water, and a pen. His inspiration was none other than Benjamin Franklin.</p><p>Sometime around 1770, while visiting London, Franklin became intrigued by a phenomenon he had observed during his transatlantic voyage. Specifically, he noticed that when ships discarded greasy slops into the ocean, the surrounding waves would calm. This ancient practice of oiling the seas to pacify turbulent waters was known to the Babylonians and Romans, but Franklin decided to investigate further.</p><p><span>On a windy day in London, he walked to a pond on Clapham Common. Carrying a small quantity of oil — "not more than a Tea Spoonful," according to his diary — Franklin poured it onto the agitated water. The oil spread rapidly across the surface, covering "perhaps half an Acre" of the pond and rendering its waters "as smooth as a Looking Glass." Franklin documented his observations in detail; they can be read today on the </span><a href="https://claphamsociety.com/articles/29two-american/" rel="">Clapham Society's</a><span> website.</span></p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fce72e1d4-91cf-4c50-990c-a6854b54b669_800x600.jpeg" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fce72e1d4-91cf-4c50-990c-a6854b54b669_800x600.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fce72e1d4-91cf-4c50-990c-a6854b54b669_800x600.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fce72e1d4-91cf-4c50-990c-a6854b54b669_800x600.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fce72e1d4-91cf-4c50-990c-a6854b54b669_800x600.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fce72e1d4-91cf-4c50-990c-a6854b54b669_800x600.jpeg" width="800" height="600" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/ce72e1d4-91cf-4c50-990c-a6854b54b669_800x600.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:600,&quot;width&quot;:800,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:59086,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/jpeg&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fce72e1d4-91cf-4c50-990c-a6854b54b669_800x600.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fce72e1d4-91cf-4c50-990c-a6854b54b669_800x600.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fce72e1d4-91cf-4c50-990c-a6854b54b669_800x600.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fce72e1d4-91cf-4c50-990c-a6854b54b669_800x600.jpeg 1456w" sizes="100vw"></picture></div></a><figcaption>Clapham Common in London.</figcaption></figure></div><p>Franklin's oil drop experiment, of course, was just one in a long line of “amateur” science experiments. He was also the first to demonstrate that lightning is electrical in nature (via his famous kite experiments), and he charted the Gulf Stream’s course across the Atlantic ocean, noting that ships traveling from America to England took longer than those going the opposite direction. His experiments at Clapham Common are not nearly as well-known.</p><p><span>But Franklin was a careful experimenter, repeating his oil drop multiple times and taking notes each time. In his journal, he opined on how much oil might be needed to calm various areas of ocean (he was thinking specifically about applications for the Royal Navy) but never grasped the </span><em>molecular implications</em><span> of his experiments. It wasn't until more than a century later that Lord Rayleigh, whose real name was John William Strutt, revisited Franklin's experiment with a brilliant new perspective.</span></p><p>An academic at the University of Cambridge and a baron by title, Rayleigh was renowned for his work in physics. The Rayleigh number, a common parameter used to describe the flow of water, is named for him; as is Rayleigh scattering, which explains how photons diffuse through the atmosphere and color the sky blue. Rayleigh also discovered the noble gas, Argon, earning a Nobel Prize for it in 1904.&nbsp;</p><p>But a little experiment that Rayleigh performed in 1890, inspired directly by Franklin's observations, is not nearly as well-known.</p><p><span>Rayleigh carefully measured a tiny volume of olive oil — 0.81 milligrams, to be exact — and placed it onto a known area of water. The oil quickly spread out and covered an area, which Rayleigh precisely measured. And then he did something that Franklin never thought of: </span><strong>Rayleigh</strong><span> </span><strong>divided the volume of the oil by the area it covered, thus estimating the thickness of the oil film.</strong><span> Assuming that the oil formed a single layer of molecules — a monolayer — then the thickness of the oil film is the same thing as the </span><em>length </em><span>of one oil molecule.&nbsp;</span></p><p><span>This is how Lord Rayleigh became the first person to figure out a single molecule’s dimensions, many years before anyone could </span><em>see </em><span>such molecules.</span></p><p>Here is his equation:</p><div data-component-name="Latex"><p><span>\(Thickness = {\dfrac{Volume}{Area}} = {\dfrac{0.00081 cm^3}{\dfrac{1}{4}\pi \times (84 cm)^2}} \approx 1.63 \times 10^{-7}\)</span></p></div><p><span>Rayleigh’s final result was </span><strong>1.63 nanometers</strong><span>. Olive oil is mainly composed of fat molecules called </span><em>triacylglycerols</em><span>, and we now know that they measure about 1.67 nanometers in length, implying that Rayleigh’s “primitive” estimates were off by just 2 percent. His original paper detailing the experiment can be found </span><a href="https://damtp.cam.ac.uk/user/gold/pdfs/teaching/old_literature/Rayleigh1890.pdf" rel="">here</a><span>.</span></p><p>I love this story because it shows, at least anecdotally, how deep scientific insights can emerge from the simplest of experiments. It's a testament to the idea that you don't always need sophisticated equipment to unlock the secrets of nature — sometimes, all it takes is a drop of oil and a bit of ingenuity.</p><p><span>For those interested in delving deeper into the history of these oil drop experiments, Charles Tanford's book, </span><em><a href="https://global.oup.com/academic/product/ben-franklin-stilled-the-waves-9780192804945?cc=us&amp;lang=en&amp;" rel="">Ben Franklin Stilled the Waves</a></em><span>, offers an extensive exploration.</span></p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F81be1d2b-1449-4b9a-b636-462ce4890599_820x494.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F81be1d2b-1449-4b9a-b636-462ce4890599_820x494.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F81be1d2b-1449-4b9a-b636-462ce4890599_820x494.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F81be1d2b-1449-4b9a-b636-462ce4890599_820x494.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F81be1d2b-1449-4b9a-b636-462ce4890599_820x494.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F81be1d2b-1449-4b9a-b636-462ce4890599_820x494.png" width="820" height="494" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/81be1d2b-1449-4b9a-b636-462ce4890599_820x494.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:494,&quot;width&quot;:820,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:626652,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F81be1d2b-1449-4b9a-b636-462ce4890599_820x494.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F81be1d2b-1449-4b9a-b636-462ce4890599_820x494.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F81be1d2b-1449-4b9a-b636-462ce4890599_820x494.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F81be1d2b-1449-4b9a-b636-462ce4890599_820x494.png 1456w" sizes="100vw" loading="lazy"></picture></div></a><figcaption>An excerpt from Lord Rayleigh’s published manuscript.</figcaption></figure></div></div></div></div></article></div></div></div>]]>
@@ -5049,7 +5222,7 @@ September 23, 2024 | https://www.nightwater.email/ipod/ | <a href="https://web.a
             </title>
             <description>
 <![CDATA[
-Score 68 | Comments 82 (<a href="https://news.ycombinator.com/item?id=41628225">thread link</a>) | @herbertl
+Score 68 | Comments 83 (<a href="https://news.ycombinator.com/item?id=41628225">thread link</a>) | @herbertl
 <br/>
 September 23, 2024 | https://www.trend-mill.com/p/honey-youtubers-are-poisoning-the | <a href="https://web.archive.org/web/*/https://www.trend-mill.com/p/honey-youtubers-are-poisoning-the">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div dir="auto"><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F633db7f5-240a-4a4b-bdbf-ae50907533e1_1800x1200.heic" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F633db7f5-240a-4a4b-bdbf-ae50907533e1_1800x1200.heic 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F633db7f5-240a-4a4b-bdbf-ae50907533e1_1800x1200.heic 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F633db7f5-240a-4a4b-bdbf-ae50907533e1_1800x1200.heic 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F633db7f5-240a-4a4b-bdbf-ae50907533e1_1800x1200.heic 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F633db7f5-240a-4a4b-bdbf-ae50907533e1_1800x1200.heic" width="728" height="485.5" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/633db7f5-240a-4a4b-bdbf-ae50907533e1_1800x1200.heic&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:971,&quot;width&quot;:1456,&quot;resizeWidth&quot;:728,&quot;bytes&quot;:63674,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/heic&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:true,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F633db7f5-240a-4a4b-bdbf-ae50907533e1_1800x1200.heic 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F633db7f5-240a-4a4b-bdbf-ae50907533e1_1800x1200.heic 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F633db7f5-240a-4a4b-bdbf-ae50907533e1_1800x1200.heic 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F633db7f5-240a-4a4b-bdbf-ae50907533e1_1800x1200.heic 1456w" sizes="100vw" fetchpriority="high"></picture></div></a><figcaption>Image: Badly edited by author</figcaption></figure></div><p>My nieces, who range in age between 4 and 11, act as a gateway for me to understand what “the kids are into” these days. But they also show me in real time just how much the Internet is influencing their daily lives.&nbsp;</p><p><span>I remember when PRIME juice first came out. They were going&nbsp;</span><em>fucking gaga</em><span>&nbsp;over it. I asked them how they even knew about it, and of course, they had seen it on YouTube. Anytime they went by a shop window and saw the bottles with the ‘very obviously brightly colored packaging because it appeals to kids’ branding, they’d press their face up to the glass and say crazy things like “Omg, that’s the super rare flavor!” (a flavor that was in every other shop), and would demand to spend their own pocket money to buy one. It was one of the first holy shit moments I had of seeing how putting the Internet in the hands of the young was influencing them in ways they clearly didn’t understand.&nbsp;</span></p><p>One of the biggest culprits — but by far not the only one — is Mr Beast.&nbsp;</p><p>He might be the biggest YouTuber with over 316 million subscribers, but his channel is predatory, pure and simple.&nbsp;</p><p>I’ve always had a hump with him. Perhaps the first-ever “I gave $5,000 to a homeless person” was genuine. It was at least novel. But the moment he realized this generosity could be manufactured to drive engagement, the game was up. From there, “inauthentic authenticity” became his brand. His content was micro-optimized, relentlessly tweaked, endlessly analyzed and overly manufactured to bleed the algorithm dry, all to draw in the eyes of blissfully ignorant kids who think he’s a cool guy who does this stuff just for laughs, and not, you know, to make himself filthy rich and masturbate his ego. And don’t get me started on those freakish thumbnails — you know the ones, the creepy smile and the deadpan eyes — that have now become synonymous with the platform as everyone else tried to copy the formula.&nbsp;</p><p><span>It’s been wildly effective, allowing him to launch chocolate bars (that he convinces his fans to&nbsp;</span><a href="https://x.com/StrewthQueen/status/1632232580430041090?ref_src=twsrc%5Etfw%7Ctwcamp%5Etweetembed%7Ctwterm%5E1632232580430041090%7Ctwgr%5Ea8760e99318a2fb3240683f607703f0707e30be5%7Ctwcon%5Es1_&amp;ref_url=https%3A%2F%2Fwww.businessinsider.com%2Fmrbeast-asks-fans-tidy-grocery-store-shelves-feastables-competition-2023-3" rel="">stock check and tidy up</a><span>&nbsp;for him for free),&nbsp;</span><a href="https://www.polygon.com/23825995/mrbeast-burger-lawsuit-virtual-dining-concept" rel="">shitty burger ghost kitchens</a><span>&nbsp;and more.&nbsp;</span></p><p>It’s also pretty gross.&nbsp;</p><p><span>In some better news, his empire built on the eyeballs of 8-12 year olds is showing signs of cracks. Co-host Ava Kris Tyson quit amid&nbsp;</span><a href="https://time.com/7002654/mrbeast-ava-kris-tyson-quits/" rel="">allegations of grooming</a><span>. There have been allegations of&nbsp;</span><a href="https://www.yahoo.com/news/mrbeast-wants-full-assessment-internal-220217078.html" rel="">workplace harassment</a><span>,&nbsp;</span><a href="https://www.youtube.com/watch?v=vpERJ9kotnQ" rel="">illegal lotteries</a><span>&nbsp;and exploitation. A former employee dropped a huge video claiming&nbsp;</span><a href="https://www.youtube.com/watch?v=k5xf40KrK3I" rel="">the entire brand is a fraud</a><span>. There is the god-awful ‘How to work for Mr Beast’&nbsp;</span><a href="https://drive.google.com/file/d/1YaG9xpu-WQKBPUi8yQ4HaDYQLUSa7Y3J/view" rel="">leaked document</a><span>, which is somehow being heralded as groundbreaking stuff (it contains the line "No doesn't mean no.") And now, his show with Amazon — the one thing that was going to help him make steps towards moving away from his dependancy on YouTube — is </span><a href="https://variety.com/wp-content/uploads/2024/09/MrBeast-Amazon-Beast-Games-Complaint.pdf" rel="">already being sued</a><span>&nbsp;for a failure to prevent sexual harassment, a failure to pay overtime and minimum wage, and failing to provide participants with meals and rest breaks.</span></p><p>But hey, he gives people free money now and then (if they are happy being buried alive for a week or something.)</p><p>I guess he senses the writing is on the wall or, at the very least, that his runway has shortened significantly, especially if the Amazon show is already in trouble.&nbsp;</p><p>That might be why he’s continuing to cash in while he can with his latest creation,&nbsp;Lunchly.</p><p><span>The product is like Lunchables but contains items created by Mr Beast (and fellow YouTubers KSI and Logan Paul). It’s an almost zero health value meal of a sugary electrolyte drink (with a&nbsp;</span><a href="https://www.erc501c3.org/notices/prime-hydration-violation" rel="">healthy dose of lead</a><span>), a chocolate bar and some small cracker snack. Exactly the sort of shit kids will see in shop windows and lose their minds over. I can already hear the words “oh it’s the ultra rare pizza version” being uttered by one of my nieces. The worst thing about it is it’s being&nbsp;promoted as a healthier choice. MrBeast said the goal is to "disrupt the lunch market for kids with healthier, better-tasting options." Let’s be clear here: a healthier alternative to Lunchables — a product that also may contain&nbsp;</span><a href="https://www.health.com/do-lunchables-have-lead-consumer-reports-8630004" rel="">high levels of heavy metals</a><span>&nbsp;— is like saying you made an organic cigarette. It’s worth noting here that this was also the case with Feastables, which were first promoted as a healthier alternative, then quietly had its recipe changed so it, well,&nbsp;</span><a href="https://x.com/RosannaPansino/status/1836167320680698247" rel="">was not very healthy</a><span>.</span></p><p>This latest product launch is desperate and another grim step in the slow demise of YouTube’s biggest star.&nbsp;</p><p>Maybe it’s about time. The whole “my target audience is children” is grim. Those videos of adults playing with dolls and figurines. Videos of adults unboxing kids' toys. Disney park “influencers.” It may all seem innocent on the surface, but never forget the endgame is to monetize the attention of young, innocent eyeballs. They’re kids! They don’t have the faintest idea about the power of marketing and branding. They are the most susceptible, easy-to-influence minds, and here we have guys who are already worth millions and can’t help themselves but dip in for some more.&nbsp;</p><p><span>There’s a reason certain advertising gets pulled from TV hours that kids are most likely watching. There’s a reason junk-food advertising is&nbsp;</span><a href="https://www.bbc.co.uk/news/articles/cp3d33l53r9o" rel="">about to be banned</a><span>&nbsp;before watershed (9 PM) in the UK. It’s because it’s not fair to advertise to a market that isn’t old enough to make their own decisions and can’t understand the difference between choice and influence.&nbsp;</span></p><p><span>But on YouTube and social media, they have free rein. These schmucks can skip out the middleman altogether and take those adverts direct to the source. Perhaps platforms can step up to control what adverts children see.&nbsp;</span><em>Sigh</em><span>. Who are we kidding? YouTube is more than happy to serve them up and has already been&nbsp;</span><a href="https://www.ftc.gov/news-events/news/press-releases/2019/09/google-youtube-will-pay-record-170-million-alleged-violations-childrens-privacy-law" rel="">fined for tracking and targeting children</a><span> with personalized ads. The sad reality is that the whole system is set up to brainwash vulnerable minds at as young an age as possible — another consequence of technology entering their lives far too early.&nbsp;</span></p><p>I wish content creators would take a long, hard look at themselves, especially those who are idolized by younger audiences. That is a very powerful platform and could be put to a lot of great use. Think of the good they could do: education, awareness and opportunities. Instead, we’ve got grown adults flogging shitty food products to children.&nbsp;</p><p><span>As another successful YouTuber, DANTDM, </span><a href="https://x.com/dantdm/status/1835795173789270178" rel="">puts it</a><span>,&nbsp;</span></p><p>“This is selling stuff for the sake of making money, simple. How does this benefit their fans? This is selling crap to kids who don't know better than to trust the people who are selling it to them. Do better.”&nbsp;</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F79ee3e61-3c95-4905-83a8-b3dbafded34f_1200x235.heic" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F79ee3e61-3c95-4905-83a8-b3dbafded34f_1200x235.heic 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F79ee3e61-3c95-4905-83a8-b3dbafded34f_1200x235.heic 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F79ee3e61-3c95-4905-83a8-b3dbafded34f_1200x235.heic 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F79ee3e61-3c95-4905-83a8-b3dbafded34f_1200x235.heic 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F79ee3e61-3c95-4905-83a8-b3dbafded34f_1200x235.heic" width="1200" height="235" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/79ee3e61-3c95-4905-83a8-b3dbafded34f_1200x235.heic&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:235,&quot;width&quot;:1200,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:2490,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/heic&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F79ee3e61-3c95-4905-83a8-b3dbafded34f_1200x235.heic 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F79ee3e61-3c95-4905-83a8-b3dbafded34f_1200x235.heic 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F79ee3e61-3c95-4905-83a8-b3dbafded34f_1200x235.heic 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F79ee3e61-3c95-4905-83a8-b3dbafded34f_1200x235.heic 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div></div></div></div>]]>
@@ -5064,7 +5237,7 @@ September 23, 2024 | https://www.trend-mill.com/p/honey-youtubers-are-poisoning-
             </title>
             <description>
 <![CDATA[
-Score 30 | Comments 14 (<a href="https://news.ycombinator.com/item?id=41627399">thread link</a>) | @todsacerdoti
+Score 31 | Comments 14 (<a href="https://news.ycombinator.com/item?id=41627399">thread link</a>) | @todsacerdoti
 <br/>
 September 23, 2024 | https://lilysthings.org/blog/no-data-lasts-forever/ | <a href="https://web.archive.org/web/*/https://lilysthings.org/blog/no-data-lasts-forever/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content">
@@ -5613,7 +5786,7 @@ September 22, 2024 | https://classysoftware.io/chat-analysis/ | <a href="https:/
             </title>
             <description>
 <![CDATA[
-Score 290 | Comments 210 (<a href="https://news.ycombinator.com/item?id=41618505">thread link</a>) | @laike9m
+Score 290 | Comments 211 (<a href="https://news.ycombinator.com/item?id=41618505">thread link</a>) | @laike9m
 <br/>
 September 22, 2024 | https://laike9m.com/blog/no-one-builds-in-public,160/ | <a href="https://web.archive.org/web/*/https://laike9m.com/blog/no-one-builds-in-public,160/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -6789,7 +6962,7 @@ September 22, 2024 | https://www.pathsensitive.com/2022/03/abstraction-not-what-
             </title>
             <description>
 <![CDATA[
-Score 130 | Comments 48 (<a href="https://news.ycombinator.com/item?id=41616860">thread link</a>) | @AlexeyBrin
+Score 130 | Comments 49 (<a href="https://news.ycombinator.com/item?id=41616860">thread link</a>) | @AlexeyBrin
 <br/>
 September 22, 2024 | https://keleshev.com/compiling-to-assembly-from-scratch | <a href="https://web.archive.org/web/*/https://keleshev.com/compiling-to-assembly-from-scratch">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
@@ -8481,7 +8654,7 @@ September 21, 2024 | https://lscs-software.com/index.html | <a href="https://web
             </title>
             <description>
 <![CDATA[
-Score 233 | Comments 169 (<a href="https://news.ycombinator.com/item?id=41614795">thread link</a>) | @todsacerdoti
+Score 235 | Comments 170 (<a href="https://news.ycombinator.com/item?id=41614795">thread link</a>) | @todsacerdoti
 <br/>
 September 21, 2024 | https://ashishb.net/programming/google-cloud/ | <a href="https://web.archive.org/web/*/https://ashishb.net/programming/google-cloud/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><h2 id="google-domains">Google Domains</h2><p>A year back, I had to migrate my domain after Google decided to <a href="https://blog.pragmaticengineer.com/google-domains-to-shut-down/">shut down</a> Google Domains.
@@ -8506,7 +8679,7 @@ The reliability while not as high as AWS is pretty close.</p><p>However, the con
             </title>
             <description>
 <![CDATA[
-Score 159 | Comments 47 (<a href="https://news.ycombinator.com/item?id=41614567">thread link</a>) | @thunderbong
+Score 159 | Comments 50 (<a href="https://news.ycombinator.com/item?id=41614567">thread link</a>) | @thunderbong
 <br/>
 September 21, 2024 | https://www.lloydatkinson.net/posts/2024/stupid-problems-require-stupid-solutions-cloudflare-is-breaking-my-svgs/ | <a href="https://web.archive.org/web/*/https://www.lloydatkinson.net/posts/2024/stupid-problems-require-stupid-solutions-cloudflare-is-breaking-my-svgs/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
@@ -8521,7 +8694,7 @@ September 21, 2024 | https://www.lloydatkinson.net/posts/2024/stupid-problems-re
             </title>
             <description>
 <![CDATA[
-Score 61 | Comments 9 (<a href="https://news.ycombinator.com/item?id=41613782">thread link</a>) | @mooreds
+Score 62 | Comments 9 (<a href="https://news.ycombinator.com/item?id=41613782">thread link</a>) | @mooreds
 <br/>
 September 21, 2024 | https://cate.blog/2021/11/29/5-signs-its-time-to-quit-your-job/ | <a href="https://web.archive.org/web/*/https://cate.blog/2021/11/29/5-signs-its-time-to-quit-your-job/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
