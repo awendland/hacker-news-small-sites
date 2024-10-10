@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Thu, 10 Oct 2024 16:22:59 GMT</lastBuildDate>
+        <lastBuildDate>Thu, 10 Oct 2024 20:23:57 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-5.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Thu, 10 Oct 2024 16:22:59 GMT</pubDate>
+        <pubDate>Thu, 10 Oct 2024 20:23:57 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -24,7 +24,7 @@
             </title>
             <description>
 <![CDATA[
-Score 21 | Comments 9 (<a href="https://news.ycombinator.com/item?id=41799324">thread link</a>) | @brandonb
+Score 71 | Comments 52 (<a href="https://news.ycombinator.com/item?id=41799324">thread link</a>) | @brandonb
 <br/>
 October 10, 2024 | https://www.empirical.health/blog/apple-watch-blood-pressure/ | <a href="https://web.archive.org/web/*/https://www.empirical.health/blog/apple-watch-blood-pressure/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div> <div> <p> <time datetime="2024-09-03T00:00:00.000Z"> Sep 3, 2024 </time> </p> <h2>Can Apple Watch measure blood pressure? Not yet—but here's how the science would work.</h2>  <hr> </div>  <p>There are many <a href="https://www.bloomberg.com/news/articles/2023-11-01/apple-plans-hypertension-sleep-apnea-detection-for-next-watch">rumors</a> that an upcoming Apple Watch will measure blood pressure; similar features exist on Samsung watches internationally and are likely to come to the US once cleared by the FDA.</p>
@@ -81,6 +81,166 @@ October 10, 2024 | https://langtail.com/voice-role-playing/yc-interview-simulati
         </item>
         <item>
             <title>
+<![CDATA[Designing a Fast Concurrent Hash Table]]>
+            </title>
+            <description>
+<![CDATA[
+Score 37 | Comments 9 (<a href="https://news.ycombinator.com/item?id=41798475">thread link</a>) | @burntsushi
+<br/>
+October 10, 2024 | https://ibraheem.ca/posts/designing-papaya/ | <a href="https://web.archive.org/web/*/https://ibraheem.ca/posts/designing-papaya/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+        <div>
+            
+<div id="content">
+    
+    <p>I recently released <a href="https://github.com/ibraheemdev/papaya">papaya</a>, a fast and feature-complete concurrent hash table for Rust. In this post I want to dive into the design and research that went into creating it, as well as why you might consider using it over existing solutions. If you're looking for an overview of papaya, you might find it more useful to <a href="https://docs.rs/papaya">consult the documentation</a>.</p>
+<h2 id="philosophy"><a href="#philosophy" aria-label="Anchor link for: philosophy">Philosophy</a></h2>
+<p>Concurrent hash tables are a well explored topic, both in academic literature and open-source implementations. In some ways, they are the holy grail of concurrent data structures. On the other hand, a concurrent hash table is an inelegant blob of shared mutable data, often a marker of a poorly architectured program. Hash tables in general have many unfortunate properties, most of which are exacerbated in a concurrent context. However, despite their downsides, hash tables can be a necessary evil, especially for read-heavy use cases where alternative data structures are not competitive in terms of performance.</p>
+<p>There are a few important properties that a concurrent hash table cares about:</p>
+<ul>
+<li>Read throughput/latency</li>
+<li>Write throughput/latency</li>
+<li>Memory usage</li>
+</ul>
+<p>Concurrent hash tables fall into a large spectrum depending on which of the above properties are prioritized. papaya cares a lot more about readers than writers. Reads should be extremely low latency and never blocked by a slow writer. However, it also cares a lot about predictable latency in general. While write throughput may not be exceptional, neither readers nor writers should ever suffer from latency spikes.</p>
+<p>In general, use cases that care about write throughput are likely better served by alternative data structures such as <a href="https://arxiv.org/abs/1709.06056">hash tries</a>, which deserve more experimentation. papaya aims to instead serve read-heavy workloads.</p>
+<p>Another huge consideration was to have an easy to use API. While papaya may use locks internally, with careful consideration, the API is lock-free and impossible to deadlock.</p>
+<h2 id="basic-design"><a href="#basic-design" aria-label="Anchor link for: basic-design">Basic Design</a></h2>
+<p>Consider a basic <code>RwLock&lt;HashMap&lt;K, V&gt;&gt;</code>. There are a few glaring issues with this, the primary one being that every write operation takes exclusive access of the hash map. Not only is this very expensive to synchronize, it also means that readers cannot proceed in the face of even a single writer.</p>
+<p>However, even in a read-heavy or read-only workload, a <code>RwLock</code> is far from ideal. With a reader-writer lock, readers can execute in parallel. However, the lock is still a single-point of contention, even for readers. This means that every read operation will attempt to take exclusive access of the lock state to acquire the lock, resulting in an exorbitant amount of cache-coherency traffic and bringing scalability to a halt. This makes using reader-writer locks impractical for any scalable data-structure.</p>
+<p>There is a small improvement we can make to greatly improve scalability: sharding. Instead of forcing every core to acquire the same lock, we can shard keys across multiple maps with a <code>Box&lt;[RwLock&lt;HashMap&lt;K, V&gt;&gt;]&gt;</code>, deciding which keys go into which map based on their hash. Now, with a sufficient number of shards, the contention is distributed across multiple locks. This is the strategy <a href="https://github.com/xacrimon/dashmap">dashmap</a> uses.</p>
+<p>Sharding reduces contention, but it's far from ideal. Readers are still required to modify shared memory. That memory is less shared, but it's still shared, and writes to shared memory are expensive. Additionally, write operations still block readers, meaning even a small number of writers can greatly affect overall scalability. Locks in general pose a significant problem for read latency distributions in that a single slow writer can result in latency spikes for all readers.</p>
+<p>So how do we do better? The simplest lock-free hash table looks something like this:</p>
+<pre data-lang="rust"><code data-lang="rust"><span>struct </span><span>HashMap&lt;K, V&gt; {
+</span><span>    buckets: AtomicPtr&lt;[AtomicPtr&lt;Node&lt;K, V&gt;&gt;]&gt;
+</span><span>}
+</span><span>
+</span><span>struct </span><span>Node&lt;K, V&gt; {
+</span><span>    key: K,
+</span><span>    value: V,
+</span><span>    next: AtomicPtr&lt;Node&lt;K, V&gt;&gt;,
+</span><span>}
+</span></code></pre>
+<p>There's a couple important layers here. The entire table is wrapped around an atomic pointer, allowing it to be atomically swapped out during a resize. Additionally, every key-value pair is behind an atomic pointer, with collisions forming a concurrent linked-list.</p>
+<p>The use of atomic pointers is important. Most CPUs only support reading values up to 128-bits atomically, without tearing <sup><a href="#0">1</a></sup>. To support keys and values of arbitrary size, entries need to be allocated. This allows us to swap the <em>pointer</em> atomically.</p>
+<p>Note that allocating every entry is a large fundamental design decision. It means sacrificing write throughput under heavy write load due to allocator pressure. However, this tradeoff is worth it, as it allows readers to access the table concurrently with writers. This is the design taken by C#'s <a href="https://learn.microsoft.com/en-us/dotnet/api/system.collections.concurrent.concurrentdictionary-2?view=net-8.0"><code>ConcurrentDictionary</code></a>. However, it introduces another crucial issue.</p>
+<p>Now that every key-value pair is allocated, readers have to go through a pointer to access the key while iterating over the linked-list, implying a cache-miss. The cost of a cache-miss is even more severe in a concurrent setting as entries are being modified by writers, resulting in contention. We want to access as little shared memory as possible.</p>
+<p>Cache locality is also the reason most modern hash tables opt for <em>open addressing</em> over closed chaining. With open addressing, each bucket contains a single key-value pair. Instead of using a linked-list to resolve collisions, writers <em>probe</em> subsequent buckets until an empty one is found. When readers encounter an empty bucket in the sequence, they can stop probing knowing the key is not in the map. This allows the entire table to be represent by a flat <code>[(K, V)]</code>, making access extremely cache-friendly.</p>
+<p>At first glance, open addressing in a concurrent settings doesn't seem to provide much benefit, because entries are allocated anyways.</p>
+<pre data-lang="rust"><code data-lang="rust"><span>struct </span><span>HashMap&lt;K, V&gt; {
+</span><span>    buckets: AtomicPtr&lt;[AtomicPtr&lt;(K, V)&gt;]&gt;
+</span><span>}
+</span></code></pre>
+<p>However, it opens the door for a crucial optimization. Along with the entries array, we can include a second array known as a metadata table. Each key-value pair has a corresponding byte of metadata containing a subset of its hash.</p>
+<pre data-lang="rust"><code data-lang="rust"><span>struct </span><span>HashMap&lt;K, V&gt; {
+</span><span>    table: AtomicPtr&lt;Table&lt;K, V&gt;&gt;
+</span><span>}
+</span><span>
+</span><span>struct </span><span>Table&lt;K, V&gt; {
+</span><span>    metadata: [AtomicU8],
+</span><span>    entries: [AtomicPtr&lt;(K, V)&gt;],
+</span><span>}
+</span></code></pre>
+<p>A metadata table allows reads to be extremely cache-efficient as they can probe the metadata instead of the entries. Note that because we only have 8 bits of metadata, there are still chances of false positives, but it's still a massive improvement.</p>
+<p>Metadata tables are present in most modern hash tables, including <a href="https://abseil.io/about/design/swisstables">swiss tables</a>, the basis of <code>std::collections::HashMap</code>. They are even <em>more</em> crucial in a concurrent hash table as entries are allocated, making probing through entries directly impractical.</p>
+<h2 id="probing-strategy"><a href="#probing-strategy" aria-label="Anchor link for: probing-strategy">Probing Strategy</a></h2>
+<p>One of the biggest decisions to make with an open addressing table is the probing strategy. The probing strategy decides the order in which buckets are probed if the initial bucket is full. While there are many interesting strategies such as <a href="https://en.wikipedia.org/wiki/Cuckoo_hashing">cuckoo</a>, <a href="https://programming.guide/robin-hood-hashing.html">robin-hood</a>, or <a href="https://en.wikipedia.org/wiki/Hopscotch_hashing">hopscotch</a> hashing, these are expensive to implementing concurrently requiring extra synchronization, especially with a metadata table.</p>
+<p>On the other hand, the existence of a metadata table means that probing becomes relatively cheap, and so a simpler probing strategy makes more sense. For example, <a href="https://github.com/rust-lang/hashbrown">hashbrown</a> uses a hybrid linear and quadratic probing strategy. Groups of 16 metadata entries are probed in parallel using a SIMD routine, while group-wise probing is quadratic. This allows for cache-efficient probing while avoiding <a href="https://en.wikipedia.org/wiki/Primary_clustering">primary clustering</a>, a common pitfall of linear probing.</p>
+<p>Unfortunately, there is an issue with SIMD probing in a concurrent hash table — atomic loads must be aligned. This means we can't simply load the next 16 entries from the probing position, we have to load aligned groups. Unfortunately, it turns out that SIMD probing is not worth it when this alignment is required in my testing. In fact, swiss tables saw a 20% performance improvement when switching to unaligned reads due to increased entropy from the hash bits. For this reason, papaya sticks to a traditional quadratic probing strategy, as well as a power-of-two capacity for the typical fast modulo.</p>
+<h2 id="load-factor"><a href="#load-factor" aria-label="Anchor link for: load-factor">Load Factor</a></h2>
+<p>There is another important part of a hash table, its load factor. The load factor determines when the hash table is too full and should resize. Determining whether the load factor has been reached requires keep track of the number of entries in the hash table. However, maintaining a counter is very expensive in a concurrent setting as it forms another singular point of contention! While the counter is only accessed by writers, it still affects performance quite severely.</p>
+<p>There are a couple of ways to work around this problem. The most obvious is to shard the length counter. While this reduces the contention when incrementing the counter, it makes accessing the total length even more expensive. papaya uses a sharded counter and exposes the length for convenience, but accessing all counter shards on every write is infeasible.</p>
+<p>One solution is to rely instead of a probabilistic counter for resizing, similar to <a href="https://en.wikipedia.org/wiki/HyperLogLog">HyperLogLog</a>. However, papaya takes a different approach, inspired by <a href="https://probablydance.com/2017/02/26/i-wrote-the-fastest-hashtable/">this article</a>. Instead of setting a load factor, the hash table sets a maximum <em>probe limit</em> based on the capacity of the table. Once the limit is reached, the table is resized. The probe limit is based on <code>log2</code> of the table's capacity, which tends to a ~80% load factor. I'd be interested in a formalization of probe limits and their relationship to load factor, but this number seems to work very consistently in practice, and avoids the need to synchronize a concurrent counter.</p>
+<h2 id="deletion"><a href="#deletion" aria-label="Anchor link for: deletion">Deletion</a></h2>
+<p>In open addressing, you can't simply unlink a value from the linked-list chain to delete it. Instead, you typically put down a marker value known as a <em>tombstone</em>. There are more complex deletion schemes such as <a href="https://codecapsule.com/2013/11/17/robin-hood-hashing-backward-shift-deletion/">backshift deletion</a>, but these are difficult to implement concurrently without introducing extra synchronization.</p>
+<p>Tombstones are a bit unfortunate as they result in longer probe sequences. However, if an insert encounters a tombstone in its probe sequence, the entry can be reused for the new key. This somewhat mitigates the issue.</p>
+<p>However, concurrent deletions pose a problem with a metadata table. Imagine the following sequence of events:</p>
+<ul>
+<li>Thread 1 inserts key <code>"a"</code></li>
+<li>Thread 2 deletes key <code>"a"</code></li>
+<li>Thread 2 inserts key <code>"b"</code> in the same slot</li>
+<li>Thread 2 writes metadata <code>0b01</code></li>
+<li>Thread 1 writes metadata <code>0b10</code> late</li>
+</ul>
+<p>Synchronizing the entry and its metadata are in separate locations, making them difficult to synchronize when slots are reused. One solution is to store a lock for each entry that is taken when storing an entry and its metadata. This ensures synchronization but is a significant slowdown for writers.</p>
+<p>However, there is another option. Instead of using a lock, we can eliminate the problem entirely by not allowing entries to be reused after being deleted. This means that there is only one metadata value written to a given slot, so we don't have to worry about synchronization. This approach is taken by Cliff Click's <a href="https://www.youtube.com/watch?v=HJ-719EGIts">famous lock-free hash table</a>, although it uses it to synchronize keys and values instead of metadata. However, it is a pretty significant tradeoff, as it means workloads that insert and delete a lot of keys have to resize much more often to free up entries. We'll talk more about resizing later.</p>
+<h2 id="memory-reclamation"><a href="#memory-reclamation" aria-label="Anchor link for: memory-reclamation">Memory Reclamation</a></h2>
+<p>We've been overlooking a large problem up till now, memory reclamation. Concurrent deletion becomes a lot more difficult in a lock-free environment. In particular, there is no obvious way of telling when it is safe to free an object, as arbitrary readers may be concurrently accessing it.</p>
+<p>The obvious solution to this problem is some form of reference counting. Unfortunately, reference counting is similar in cost to a reader-writer lock in that every access requires modifying shared memory. In particular, this is disastrous for synchronizing access to the table itself as it creates a single point of contention for all operations.</p>
+<p>There are many algorithms to solve this problem. One popular scheme is <a href="https://www.cs.otago.ac.nz/cosc440/readings/hazard-pointers.pdf">hazard pointers</a>, which forces threads to announce access to a given object through a thread-local list of pointers. While this can be very memory efficient, it is also quite expensive for readers.</p>
+<p>Another algorithm is <a href="https://www.cl.cam.ac.uk/techreports/UCAM-CL-TR-579.pdf">epoch-based reclamation</a>. Instead of keeping track of individual objects, threads keep track of which <em>epoch</em> they are in, based on a global epoch counter that is incremented occasionally. Objects are retired in a given epoch, and once all threads have moved on from that epoch, they are safe to reclaim.</p>
+<p>EBR is very lightweight. However, it is not as memory efficient as other algorithms as it tracks objects in <em>batches</em>. While this may be an acceptable tradeoff for the improved performance, EBR has a few other downsides.</p>
+<p>The biggest downside with EBR and related schemes is that reclamation is not very predictable. A batch of objects can only be reclaimed once all threads have moved on from the epoch. This means that to reclaim a batch, you must check the status of all active threads, which is very expensive and requires accessing thread-local shared memory. This results in a tradeoff between reclamation balancing and performance depending on how often reclamation is attempted. For example, the <a href="https://github.com/crossbeam-rs/crossbeam/tree/master/crossbeam-epoch">crossbeam-epoch</a> crate checks for garbage every 128 operations. Importantly, the check must be performed by both readers and writers, causing reclamation to trigger unpredictably and leading to poor latency distributions.</p>
+<p>Because papaya allocates every entry and does not reuse tombstones, memory efficiency is a very important factor. Unfortunately, existing memory reclamation algorithms were not up to par in my testing.</p>
+<p>A few years ago, I stumbled across <a href="https://arxiv.org/pdf/1905.07903">hyaline</a>, an algorithm that solves a lot of these issues, which has since been implemented in the <a href="https://github.com/ibraheemdev/seize">seize</a> crate. In hyaline, the expensive cross-thread check is performed when a batch of objects is <em>retired</em>. The batch is propagated to all active threads just once. After this initial retirement phase, the batch is reclaimed using reference counting. This reclamation process is much more predictable, as threads can check for new garbage before every single operation without sacrificing performance. In practice, it tends to outperforms EBR due to the parallelism gains from workload balancing.</p>
+<p>Hyaline also solves another problem with EBR, robustness. In EBR, a single slow thread can prevent the reclamation of all objects in a given epoch. Hyaline counteracts this by keeping track of the epoch an object is created in, filtering out slow threads when reclaiming new objects. These additional properties make hyaline a perfect fit for papaya.</p>
+<h2 id="resizing"><a href="#resizing" aria-label="Anchor link for: resizing">Resizing</a></h2>
+<p>Once a hash table gets too full it needs to resize, relocating all keys and values to a larger table. In a concurrent setting, this can be quite expensive. To reduce the cost of resizing, multiple threads can help out with the migration and copy entries in parallel.</p>
+<p>There many tradeoffs to be made when implementing concurrent resizing. Ideally, readers should be unaffected by resizing. This would require all writers to complete the migration before making progress, allowing for a single source of truth for readers. However, resizing can be slow, introducing latency spikes for writers. For a large table, resizing can take hundreds of milliseconds or even <em>seconds</em> to complete. This is an unacceptable amount of latency for a large number of applications.</p>
+<p>To avoid latency spikes, we can implement <em>incremental resizing</em>, where entries are incrementally copied over to the new table instead of blocking. This is an approach taken even by single-threaded hash tables, such as the <a href="https://crates.io/crates/griddle">griddle</a> crate.</p>
+<p>Managing the state of two tables concurrently is tricky, but papaya implements a migration algorithm that allows concurrent updates to the old table and atomic copies to the new table. This does mean that during migration, many operations have to check both the new and old tables when searching for an entry. However, this is typically an acceptable tradeoff as resize operations are generally uncommon and slightly increased latency for a short period of time is better than extreme latency spikes.</p>
+<p>Incremental resizing also counteracts the effect of permanent tombstones, as the cost of resizing is amortized. However, for flexibility, papaya supports both resizing modes as an option. When write throughput or read latency is the primary concern, blocking resizes can be used instead.</p>
+<p>Note that resizing is the only case where papaya is not lock-free. Allocating the next table involves taking a lock to prevent excessive allocator pressure. Additionally, a write operation may block if its key is in the process of being copied to the new table. papaya uses a hybrid spinning strategy before falling back to blocking in this case. However, note that copying an entry does not involve allocating and is typically very fast. Blocking was an intentional design decision as true lock-free resizing is very expensive, but care was taken to mitigate any issues that might arise from blocking.</p>
+<h2 id="additional-features"><a href="#additional-features" aria-label="Anchor link for: additional-features">Additional Features</a></h2>
+<p>Along with all the performance characteristics mentioned above, papaya has some unique features. </p>
+<p>Because papaya does not contain locks, performing complex operations is more challenging. Instead, papaya exposes a number of atomic operations. The most powerful of these is <a href="https://docs.rs/papaya/latest/papaya/struct.HashMap.html#method.compute"><code>HashMap::compute</code></a>, which allows updating an entry using a compare-and-swap (CAS) function:</p>
+<pre data-lang="rust"><code data-lang="rust"><span>let</span><span> map </span><span>= </span><span>papaya::HashMap::new();
+</span><span>
+</span><span>let </span><span>compute </span><span>= </span><span>|</span><span>entry</span><span>| </span><span>match</span><span> entry {
+</span><span>    </span><span>// Remove the value if it is even.
+</span><span>    </span><span>Some</span><span>((_key, value)) </span><span>if</span><span> value </span><span>% </span><span>2 </span><span>== </span><span>0 </span><span>=&gt; </span><span>{
+</span><span>        Operation::Remove
+</span><span>    }
+</span><span>
+</span><span>    </span><span>// Increment the value if it is odd.
+</span><span>    </span><span>Some</span><span>((_key, value)) </span><span>=&gt; </span><span>{
+</span><span>        Operation::Insert(value </span><span>+ </span><span>1</span><span>)
+</span><span>    }
+</span><span>
+</span><span>    </span><span>// Do nothing if the key does not exist
+</span><span>    </span><span>None </span><span>=&gt; </span><span>Operation::Abort(()),
+</span><span>};
+</span><span>
+</span><span>map.</span><span>pin</span><span>().</span><span>compute</span><span>(</span><span>'A'</span><span>, compute);
+</span></code></pre>
+<p>This allows performing complex operations despite the lack of locks.</p>
+<p>Another unique feature of papaya is async support. One of the biggest downsides of <a href="https://github.com/xacrimon/dashmap">dashmap</a> is that it uses synchronous locks and so holding a reference to an item from a <code>Dashmap</code> will lead to a deadlock. Because papaya has a lock-free API, deadlocking is impossible. However, accessing the map still requires <a href="https://docs.rs/papaya/latest/papaya/#usage">acquiring a guard</a> for memory reclamation, i.e. the call to <code>pin</code> in the above example. This guard is <code>!Send</code> as it is tied to the current thread's memory reclamation state. However, papaya also exposes <a href="https://docs.rs/papaya/latest/papaya/struct.HashMap.html#method.pin_owned">owned guards</a>, which are <code>Send</code> and <code>Sync</code>, independent of any given thread. These are more expensive to create, but are allowed to be held across <code>.await</code> points when using a work-stealing scheduler:</p>
+<pre data-lang="rust"><code data-lang="rust"><span>async </span><span>fn </span><span>run</span><span>(</span><span>map</span><span>: Arc&lt;HashMap&lt;</span><span>i32</span><span>, </span><span>String</span><span>&gt;&gt;) {
+</span><span>    tokio::spawn(async </span><span>move </span><span>{
+</span><span>        </span><span>let</span><span> map </span><span>=</span><span> map.</span><span>pin_owned</span><span>(); </span><span>// &lt;--
+</span><span>        </span><span>for </span><span>(key, value) </span><span>in</span><span> map.</span><span>iter</span><span>() {
+</span><span>            tokio::fs::write(</span><span>"db.txt"</span><span>, format!(</span><span>"</span><span>{key}</span><span>: </span><span>{value}\n</span><span>"</span><span>)).await;
+</span><span>        }
+</span><span>    });
+</span><span>}
+</span></code></pre>
+<p>Async support is something I am very excited about and is not present in any existing concurrent hash tables that I am aware of.</p>
+<h2 id="comparisons"><a href="#comparisons" aria-label="Anchor link for: comparisons">Comparisons</a></h2>
+<p>There are a number of existing concurrent hash table crates. However, most of them lack in terms of read throughput and predictable latency compared to papaya. Additionally, async support is a difficult feature to find. However, there are cases where you might want to consider a different crate.</p>
+<ul>
+<li><a href="https://github.com/xacrimon/dashmap">dashmap</a> has a very simple design built on top of <a href="https://github.com/rust-lang/hashbrown">hashbrown</a>. It also closely mirrors the API of <code>std::collections::HashMap</code>. For write-heavy workloads, it may provide better performance. It is also lower overhead in terms of memory usage.</li>
+<li><a href="https://github.com/wvwwvwwv/scalable-concurrent-containers">scc</a> is similar to dashmap but shards bucket locks even more aggressively. For write-heavy workloads it should probably be your first choice, although the code itself seemed quite complicated and difficult to audit.</li>
+<li><a href="https://github.com/jonhoo/flurry">flurry</a> is a closed-addressing table with striped locks but lock-free reads. However, it suffers from performance and memory usage issues due to allocator pressure. papaya should outperform flurry in general for most workloads.</li>
+<li><a href="https://github.com/jonhoo/evmap">evmap</a> is great for <em>extremely</em> read-heavy use cases. However, it is eventually consistent, and writes are relatively expensive. Scalability suffers under load even for 99% read-heavy workloads.</li>
+<li><a href="https://github.com/robclu/leapfrog">leapfrog</a> provides excellent performance but is limited to 64-bit <code>Copy</code> values. This limitation is common in academic literature, and leapfrog falls back to spinlocks for arbitrary value types, which is unfortunate for a general purpose map.</li>
+</ul>
+<p>Consult the <a href="https://github.com/ibraheemdev/papaya/blob/master/BENCHMARKS.md">benchmarks</a> for more information, but as always, take them with a grain of salt. Always measure for your own workload.</p>
+<hr>
+
+
+</div>
+
+        </div>
+        
+
+    </div></div>]]>
+            </description>
+            <link>https://ibraheem.ca/posts/designing-papaya/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-41798475</guid>
+            <pubDate>Thu, 10 Oct 2024 13:15:28 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Nuance: Preventing Schema Migrations from Causing Outages]]>
             </title>
             <description>
@@ -96,11 +256,11 @@ October 10, 2024 | https://techblog.citystoragesystems.com/p/nuance-preventing-s
         </item>
         <item>
             <title>
-<![CDATA[Why we're helping more wikis move away from Fandom]]>
+<![CDATA[Helping wikis move away from Fandom]]>
             </title>
             <description>
 <![CDATA[
-Score 443 | Comments 216 (<a href="https://news.ycombinator.com/item?id=41797719">thread link</a>) | @creatonez
+Score 736 | Comments 352 (<a href="https://news.ycombinator.com/item?id=41797719">thread link</a>) | @creatonez
 <br/>
 October 10, 2024 | https://weirdgloop.org/blog/why-were-helping-more-wikis-move-away-from-fandom | <a href="https://web.archive.org/web/*/https://weirdgloop.org/blog/why-were-helping-more-wikis-move-away-from-fandom">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -175,7 +335,7 @@ October 10, 2024 | https://weirdgloop.org/blog/why-were-helping-more-wikis-move-
             </title>
             <description>
 <![CDATA[
-Score 63 | Comments 45 (<a href="https://news.ycombinator.com/item?id=41797084">thread link</a>) | @chistev
+Score 63 | Comments 48 (<a href="https://news.ycombinator.com/item?id=41797084">thread link</a>) | @chistev
 <br/>
 October 10, 2024 | https://rxjourney.com.ng/all-we-really-have-in-this-world-is-ourselves | <a href="https://web.archive.org/web/*/https://rxjourney.com.ng/all-we-really-have-in-this-world-is-ourselves">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>Earlier this week, one of my colleagues lost her father. It's really startling how much can happen within a 24-hour period. I'm not exaggerating when I say that something could happen in the next 24 hours that might drastically change your life, either positively or negatively.</p><p>It's crazy that I had worked together with this colleague of mine some 48 hours before, and then I was at work when the information came that she had just lost her father. Obviously, it was heartbreaking news.</p><p>Over the next couple of days, we sent condolence messages through our internship WhatsApp group chat or privately to her, or both. But here's the truly sad part—after those two days, it was business as usual. People became more focused on the low salary we were earning, since we aren't paid well, and on their schedules for 'calls.' For those who don't know, 'calls' refer to shifts where you attend to patients or clients in urgent need of medication, which can be scheduled for the morning, evening, or throughout the night. So, as I mentioned, it was back to normal routine. That girl is probably at home, grieving deeply for the loss of her father, while at the same time, people are on WhatsApp or in their units, discussing their 'call schedules.' Isn’t that heartbreaking?</p><p>This post should not be misconstrued. Obviously, I'm not blaming anyone. I'm just merely stating an observation that people quickly move on, leaving you alone with your grief. Sometimes I'll be at work, and one of my colleagues will start talking about marriage—the importance of getting married at a young age. What goes through my mind during those moments is the question of whether that is all life is about. Is life just about going to school, getting your degree, getting a job, then getting married so you can have children who will then continue the process after you are gone? Is that what all this daily struggle is really about? After all the crying and complaining, is this really all there is?</p><p>I love my job. I love Pharmacy. It’s a fascinating profession. Yes, I know it could be better. I enjoy reading about drugs and their mechanisms of action, even if I don’t remember everything I read. I love dispensing antibiotics to patients and then sitting with them to explain why it’s important to follow their doctor's prescription. I take pleasure in their questions about what happens if they don’t complete their dosage. You should see the excitement in my eyes when I explain the consequences of not adhering to their medication. I’m also thrilled when I discuss drugs with my colleagues. Recently, I was analyzing a prescription with a colleague named Chidera. We went on for over an hour on if the doctor was correct in combining those drugs for that period of time. I truly love my job and always arrive at work early.</p><p>But here's the thing: when it's 4 p.m., I take off my ward coat and tell them I’m going home. I’ll stay at work beyond 4 p.m. only if I’m engaged in an exciting conversation or enjoying the company of my colleagues. I won’t stay late just to do more work because, ultimately, the work will continue without me. My colleagues will send condolences to my family and post nice things about me on social media, but soon enough, it will be business as usual for them. I will not kill myself working overtime when I am not paid to do so. Life is cruel. Life is sad. Life is lonely. Sometimes, at home, I just feel like crying.&nbsp;</p><p>I have probably said enough.</p><!-- HTML_TAG_END --></div></div>]]>
@@ -190,7 +350,7 @@ October 10, 2024 | https://rxjourney.com.ng/all-we-really-have-in-this-world-is-
             </title>
             <description>
 <![CDATA[
-Score 78 | Comments 47 (<a href="https://news.ycombinator.com/item?id=41796748">thread link</a>) | @LordAtlas
+Score 80 | Comments 50 (<a href="https://news.ycombinator.com/item?id=41796748">thread link</a>) | @LordAtlas
 <br/>
 October 10, 2024 | https://megabyterose.com/2024/10/leaving-wordpress-org-or-wpf-still-unsure-which-one/ | <a href="https://web.archive.org/web/*/https://megabyterose.com/2024/10/leaving-wordpress-org-or-wpf-still-unsure-which-one/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="primary">
@@ -257,6 +417,8 @@ October 10, 2024 | https://megabyterose.com/2024/10/leaving-wordpress-org-or-wpf
 
 
 			
+<!-- #comments -->
+
 
 
 		
@@ -279,7 +441,7 @@ October 10, 2024 | https://megabyterose.com/2024/10/leaving-wordpress-org-or-wpf
             </title>
             <description>
 <![CDATA[
-Score 209 | Comments 239 (<a href="https://news.ycombinator.com/item?id=41795561">thread link</a>) | @burglins
+Score 232 | Comments 282 (<a href="https://news.ycombinator.com/item?id=41795561">thread link</a>) | @burglins
 <br/>
 October 9, 2024 | https://roborooter.com/post/wasm-is-the-new-cgi/ | <a href="https://web.archive.org/web/*/https://roborooter.com/post/wasm-is-the-new-cgi/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>I read a wonderful twitter thead about <a href="https://twitter.com/progrium/status/1337074333018189824">CGI and the birth of the web</a> and this triggered a thought I've been kicking around.</p>
@@ -392,7 +554,7 @@ October 9, 2024 | https://blog.lnear.dev/the-case-for-web-components/ | <a href=
             </title>
             <description>
 <![CDATA[
-Score 334 | Comments 189 (<a href="https://news.ycombinator.com/item?id=41793597">thread link</a>) | @todsacerdoti
+Score 364 | Comments 218 (<a href="https://news.ycombinator.com/item?id=41793597">thread link</a>) | @todsacerdoti
 <br/>
 October 9, 2024 | https://beeps.website/blog/2024-10-09-why-govuk-exit-this-page-doesnt-use-escape/ | <a href="https://web.archive.org/web/*/https://beeps.website/blog/2024-10-09-why-govuk-exit-this-page-doesnt-use-escape/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div itemprop="articleBody">
@@ -500,7 +662,7 @@ October 9, 2024 | https://beeps.website/blog/2024-10-09-why-govuk-exit-this-page
             </title>
             <description>
 <![CDATA[
-Score 132 | Comments 61 (<a href="https://news.ycombinator.com/item?id=41791708">thread link</a>) | @yu3zhou4
+Score 137 | Comments 65 (<a href="https://news.ycombinator.com/item?id=41791708">thread link</a>) | @yu3zhou4
 <br/>
 October 9, 2024 | https://rwblickhan.org/newsletters/command-line-tools-i-like-2022/ | <a href="https://web.archive.org/web/*/https://rwblickhan.org/newsletters/command-line-tools-i-like-2022/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article> <a href="https://rwblickhan.org/newsletters">
@@ -706,11 +868,15 @@ increasing resource utilization, higher RPS does not lead to a proportional incr
 or maintain Time to First Token (TTFT). </p>
 <p><img src="https://raw.githubusercontent.com/dstackai/benchmarks/refs/heads/main/amd/inference/charts_rps/mean_ttft_low_tgi_vllm.png" width="725"></p>
 <p>At 1 RPS, vLLM performs slightly better than TGI. However, between 2 and 4 RPS, TGI outperforms vLLM in both throughput and TTFT.</p>
+<blockquote>
 <p>Notably, TGI begins to drop requests once it reaches 5 RPS.</p>
+</blockquote>
 <p>We repeated the test using a higher number of requests, ranging from 300 to 900.</p>
 <p><img src="https://raw.githubusercontent.com/dstackai/benchmarks/refs/heads/main/amd/inference/charts_rps/token_per_second_tpi_vllm.png" width="725"></p>
+<blockquote>
 <p>At 900 requests with a rate of 3 requests per second (RPS), TGI dropped a majority of the requests. However, its
 performance improved notably when the number of requests was below 900.</p>
+</blockquote>
 <p><img src="https://raw.githubusercontent.com/dstackai/benchmarks/refs/heads/main/amd/inference/charts_rps/mean_ttft_tgi_vllm.png" width="725"></p>
 <h3 id="vram-consumption">vRAM consumption<a href="#vram-consumption" title="Permanent link">¶</a></h3>
 <p>When considering vRAM consumption right after loading model weights, TGI allocates approximately 28% less vRAM compared
@@ -718,19 +884,28 @@ to vLLM.</p>
 <p><img src="https://raw.githubusercontent.com/dstackai/benchmarks/refs/heads/main/amd/inference/gpu_vram_tgi_vllm.png" width="750"></p>
 <p>This difference may be related to how vLLM <a href="https://docs.vllm.ai/en/latest/models/performance.html" target="_blank">pre-allocates GPU cache <span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m11.93 5 2.83 2.83L5 17.59 6.42 19l9.76-9.75L19 12.07V5z"></path></svg></span></a>.</p>
 <h2 id="conclusion">Conclusion<a href="#conclusion" title="Permanent link">¶</a></h2>
+<ol>
+<li>For small sequence lengths, starting with a batch size of 64, TGI significantly outperforms vLLM in terms of throughput and TTFT.</li>
+<li>For larger sequence lengths, TGI outperforms vLLM even more in both throughput and TTFT, with the difference increasing as the batch size grows.</li>
+<li>At higher request rates, TGI continues to outperform vLLM, likely due to its superior ability to batch requests efficiently.</li>
+</ol>
+<div>
+<p>Limitation</p>
 <ul>
-<li>TGI is highly efficient at handling medium to high workloads. In our tests on 8x AMD MI300X GPU, medium workloads
-  are defined as RPS between 2 and 4. In these cases, it delivers faster time to first token (TTFT) and higher
-  throughput.</li>
-<li>Conversely, vLLM works well with lower RPS but struggles to scale, making it less ideal for more demanding workloads.</li>
-<li>TGI's edge comes from
-  its <a href="https://huggingface.co/blog/martinigoyanes/llm-inference-at-scale-with-tgi" target="_blank">continuous batching algorithm <span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m11.93 5 2.83 2.83L5 17.59 6.42 19l9.76-9.75L19 12.07V5z"></path></svg></span></a>, which dynamically modifies batch sizes to optimize GPU usage.</li>
+<li>In certain circumstances (e.g., at higher request rates), for unknown reasons, TGI dropped requests, making it
+  impossible to accurately track throughput and TTFT.</li>
+<li>With vLLM, we used the default backend configuration. With better tuning, we might have achieved improved performance.</li>
 </ul>
-<p>To gain a more complete understanding of the performance potential, a wider variety of backend configurations should be tested.</p>
+</div>
+<p>In general, the 8x AMD MI300X is a good fit for larger models and allows us to make the most of its vRAM, especially for
+larger batches.</p>
+<p>If you’d like to support us in doing more benchmarks, please let us know.</p>
 <h2 id="whats-next">What's next?<a href="#whats-next" title="Permanent link">¶</a></h2>
 <p>While we wait for AMD to announce new GPUs and for data centers to offer them, we’re considering tests with NVIDIA GPUs
-like the H100 and H200, and possibly Google TPU.</p>
-<p>If you’d like to support us in doing more benchmarks, please let us know.</p>
+like the H100 and H200, as well as possibly Google TPU. </p>
+<blockquote>
+<p>Also, the next step is to measure how the FP8 version of the model would perform on this hardware.</p>
+</blockquote>
 <h3 id="source-code">Source code<a href="#source-code" title="Permanent link">¶</a></h3>
 <p>The source code used for this benchmark can be found in our 
 <a href="https://github.com/dstackai/benchmarks/tree/main/amd/inference" target="_blank">GitHub repo <span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m11.93 5 2.83 2.83L5 17.59 6.42 19l9.76-9.75L19 12.07V5z"></path></svg></span></a>.</p>
@@ -787,7 +962,7 @@ services.</p>
             </title>
             <description>
 <![CDATA[
-Score 229 | Comments 53 (<a href="https://news.ycombinator.com/item?id=41789242">thread link</a>) | @Hugsun
+Score 235 | Comments 54 (<a href="https://news.ycombinator.com/item?id=41789242">thread link</a>) | @Hugsun
 <br/>
 October 9, 2024 | https://www.arnaldur.be/writing/about/an-n-ball-between-n-balls | <a href="https://web.archive.org/web/*/https://www.arnaldur.be/writing/about/an-n-ball-between-n-balls">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-hk="000000010000000000003">
@@ -1199,7 +1374,7 @@ else do not stay on it you should’ve quit using it years ago</p>
             </title>
             <description>
 <![CDATA[
-Score 189 | Comments 110 (<a href="https://news.ycombinator.com/item?id=41781855">thread link</a>) | @juniperplant
+Score 190 | Comments 110 (<a href="https://news.ycombinator.com/item?id=41781855">thread link</a>) | @juniperplant
 <br/>
 October 8, 2024 | https://roman.pt/posts/dont-let-dicts-spoil-your-code/ | <a href="https://web.archive.org/web/*/https://roman.pt/posts/dont-let-dicts-spoil-your-code/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><figure><img src="https://roman.pt/posts/dont-let-dicts-spoil-your-code/splash_hued0d13a2034a04fbb4bcad55138bdafa_423992_1000x400_fill_q75_box_smart1.jpg" width="1000" alt="Balance"><figcaption>Photo by <a href="https://unsplash.com/@martinsanchez">Martin Sanchez</a></figcaption></figure><p>How often do your simple prototypes or ad-hoc scripts turn into fully-fledged applications?</p><p>The simplicity of organic code growth has a flip side: it becomes too hard to maintain. The proliferation of dicts as primary data structures is a clear signal of tech debt in your code. Fortunately, modern Python provides many viable alternatives to plain dicts.</p><h2 id="whats-wrong-with-dicts">What’s wrong with dicts?</h2><h3 id="dicts-are-opaque">Dicts are opaque</h3><p>Functions that accept dicts are a nightmare to extend and modify. Usually, to change the function that takes a dictionary, you must manually trace the calls back to the roots, where this dict was created. There is often more than one call path, and if a program grows without a plan, you’ll likely have discrepancies in the dict structures.</p><h3 id="dicts-are-mutable">Dicts are mutable</h3><p>Changing dict values to fit a specific workflow is tempting, and programmers often abuse this functionality. In-place mutations may have different names: pre-processing, populating, enriching, data massage, etc. The result is the same. This manipulation hinders the structure of your data and makes it dependent on the workflow of your application.</p><p>Not only do dicts allow you to change their data, but they also allow you to change the very structure of objects. You can add or delete fields or change their types at will. Resorting to this is the worst felony you can commit to your data.</p><h2 id="treat-dicts-as-the-wire-format">Treat dicts as the wire format</h2><p>A common source of dicts in the code is deserializing from JSON. For example, from a third-party API response.</p><div><pre tabindex="0"><code data-lang="python"><span><span><span>&gt;&gt;&gt;</span> requests<span>.</span>get(<span>"https://api.github.com/repos/imankulov/empty"</span>)<span>.</span>json()
@@ -1322,7 +1497,7 @@ Returning a domain model</p><div><pre tabindex="0"><code data-lang="python"><spa
             </title>
             <description>
 <![CDATA[
-Score 222 | Comments 49 (<a href="https://news.ycombinator.com/item?id=41781777">thread link</a>) | @fagnerbrack
+Score 225 | Comments 50 (<a href="https://news.ycombinator.com/item?id=41781777">thread link</a>) | @fagnerbrack
 <br/>
 October 8, 2024 | https://entropicthoughts.com/practices-of-reliable-software-design | <a href="https://web.archive.org/web/*/https://entropicthoughts.com/practices-of-reliable-software-design">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1688,7 +1863,7 @@ October 8, 2024 | https://splits.org/blog/10-year-narratives/ | <a href="https:/
             </title>
             <description>
 <![CDATA[
-Score 290 | Comments 158 (<a href="https://news.ycombinator.com/item?id=41779519">thread link</a>) | @delduca
+Score 290 | Comments 163 (<a href="https://news.ycombinator.com/item?id=41779519">thread link</a>) | @delduca
 <br/>
 October 8, 2024 | https://nullonerror.org/2024/10/08/my-first-game-with-carimbo/ | <a href="https://web.archive.org/web/*/https://nullonerror.org/2024/10/08/my-first-game-with-carimbo/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1843,7 +2018,7 @@ October 8, 2024 | https://nullonerror.org/2024/10/08/my-first-game-with-carimbo/
             </title>
             <description>
 <![CDATA[
-Score 6 | Comments 0 (<a href="https://news.ycombinator.com/item?id=41778939">thread link</a>) | @igrunert
+Score 7 | Comments 0 (<a href="https://news.ycombinator.com/item?id=41778939">thread link</a>) | @igrunert
 <br/>
 October 8, 2024 | https://iangrunert.com//2024/10/07/every-jit-tier-enabled-jsc-windows.html | <a href="https://web.archive.org/web/*/https://iangrunert.com//2024/10/07/every-jit-tier-enabled-jsc-windows.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div aria-label="Content">
@@ -2027,7 +2202,7 @@ opportunistic GC scheduling.</p>
             </title>
             <description>
 <![CDATA[
-Score 28 | Comments 7 (<a href="https://news.ycombinator.com/item?id=41778882">thread link</a>) | @jordanmorgan10
+Score 30 | Comments 7 (<a href="https://news.ycombinator.com/item?id=41778882">thread link</a>) | @jordanmorgan10
 <br/>
 October 8, 2024 | https://www.swiftjectivec.com/elite-hoops-gaining-users-as-an-indie-app-with-paid-ads-and-lessons-learned/ | <a href="https://web.archive.org/web/*/https://www.swiftjectivec.com/elite-hoops-gaining-users-as-an-indie-app-with-paid-ads-and-lessons-learned/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4571,7 +4746,7 @@ October 7, 2024 | https://tylerrussell.dev/2024/10/07/multi-tenant-saml-in-an-af
 
 
 
-<p><strong>[2:30 PM]</strong> Create some test companies and users so that we can see differences across user-entered values. Test with <a href="https://tylerrussell.dev/cdn-cgi/l/email-protection" data-cfemail="f88c9d8b8cc9b89b979588999681c9d69b9795">[email&nbsp;protected]</a> and <a href="https://tylerrussell.dev/cdn-cgi/l/email-protection" data-cfemail="89fdecfafdbbc9eae6e4f9e8e7f0bba7eae6e4">[email&nbsp;protected]</a> work correctly. Any value @company1.com shows SAML and any value @company2.com shows username/password. Update the UI to be a bit prettier without the debug information. </p>
+<p><strong>[2:30 PM]</strong> Create some test companies and users so that we can see differences across user-entered values. Test with <a href="https://tylerrussell.dev/cdn-cgi/l/email-protection" data-cfemail="b9cddccacd88f9dad6d4c9d8d7c08897dad6d4">[email&nbsp;protected]</a> and <a href="https://tylerrussell.dev/cdn-cgi/l/email-protection" data-cfemail="c5b1a0b6b1f785a6aaa8b5a4abbcf7eba6aaa8">[email&nbsp;protected]</a> work correctly. Any value @company1.com shows SAML and any value @company2.com shows username/password. Update the UI to be a bit prettier without the debug information. </p>
 
 
 
@@ -4830,7 +5005,7 @@ October 7, 2024 | https://tylerrussell.dev/2024/10/07/multi-tenant-saml-in-an-af
             </title>
             <description>
 <![CDATA[
-Score 71 | Comments 34 (<a href="https://news.ycombinator.com/item?id=41769275">thread link</a>) | @xnacly
+Score 113 | Comments 73 (<a href="https://news.ycombinator.com/item?id=41769275">thread link</a>) | @xnacly
 <br/>
 October 7, 2024 | https://xnacly.me/posts/2024/fun-with-iterators/ | <a href="https://web.archive.org/web/*/https://xnacly.me/posts/2024/fun-with-iterators/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><section id="single"><p><time datetime="2024-10-07 00:00:00 +0000 UTC">Oct 7, 2024</time>
@@ -7394,7 +7569,7 @@ Notes:<br>
             </title>
             <description>
 <![CDATA[
-Score 179 | Comments 42 (<a href="https://news.ycombinator.com/item?id=41765127">thread link</a>) | @mooreds
+Score 191 | Comments 49 (<a href="https://news.ycombinator.com/item?id=41765127">thread link</a>) | @mooreds
 <br/>
 October 7, 2024 | https://luckymike.dev/posts/warm-handoffs/ | <a href="https://web.archive.org/web/*/https://luckymike.dev/posts/warm-handoffs/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div>
@@ -7526,7 +7701,7 @@ October 7, 2024 | https://luckymike.dev/posts/warm-handoffs/ | <a href="https://
             </title>
             <description>
 <![CDATA[
-Score 40 | Comments 17 (<a href="https://news.ycombinator.com/item?id=41764692">thread link</a>) | @shehjar
+Score 41 | Comments 17 (<a href="https://news.ycombinator.com/item?id=41764692">thread link</a>) | @shehjar
 <br/>
 October 7, 2024 | https://belowwaterlevel.com/2024/10/05/prioritize-through-purpose/ | <a href="https://web.archive.org/web/*/https://belowwaterlevel.com/2024/10/05/prioritize-through-purpose/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -8712,7 +8887,7 @@ October 6, 2024 | https://octothorp.es/docs | <a href="https://web.archive.org/w
             </title>
             <description>
 <![CDATA[
-Score 362 | Comments 191 (<a href="https://news.ycombinator.com/item?id=41761497">thread link</a>) | @gwintrob
+Score 363 | Comments 191 (<a href="https://news.ycombinator.com/item?id=41761497">thread link</a>) | @gwintrob
 <br/>
 October 6, 2024 | https://edwardbenson.com/2024/10/google-ai-thinks-i-left-gatorade-on-the-moon | <a href="https://web.archive.org/web/*/https://edwardbenson.com/2024/10/google-ai-thinks-i-left-gatorade-on-the-moon">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><article>
