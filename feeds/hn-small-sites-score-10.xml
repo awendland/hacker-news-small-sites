@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Sat, 02 Nov 2024 20:22:45 GMT</lastBuildDate>
+        <lastBuildDate>Sun, 03 Nov 2024 00:36:30 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-10.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Sat, 02 Nov 2024 20:22:45 GMT</pubDate>
+        <pubDate>Sun, 03 Nov 2024 00:36:30 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,925 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Breaking CityHash64, MurmurHash2/3, wyhash, and more]]>
+            </title>
+            <description>
+<![CDATA[
+Score 22 | Comments 3 (<a href="https://news.ycombinator.com/item?id=42029542">thread link</a>) | @fanf2
+<br/>
+November 2, 2024 | https://orlp.net/blog/breaking-hash-functions/ | <a href="https://web.archive.org/web/*/https://orlp.net/blog/breaking-hash-functions/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
+
+<time datetime="2024-11-02">2024-11-02</time>
+<p><a href="https://en.wikipedia.org/wiki/Hash_function">Hash functions</a> are incredibly
+neat mathematical objects. They can map arbitrary data to a small fixed-size
+output domain such that the mapping is deterministic, yet appears to be random.
+This “deterministic randomness” is incredibly useful for a variety of purposes,
+such as <a href="https://en.wikipedia.org/wiki/Hash_function">hash tables</a>,
+<a href="https://en.wikipedia.org/wiki/Checksum">checksums</a>, <a href="https://en.wikipedia.org/wiki/Monte_Carlo_algorithm">monte carlo
+algorithms</a>,
+communication-less <a href="https://en.wikipedia.org/wiki/Distributed_algorithm">distributed
+algorithms</a>, etc, the list
+goes on.</p>
+<p>In this article we will take a look at the dark side of hash functions: when
+things go wrong. Luckily this essentially never happens due to unlucky inputs in
+the wild (for good hash functions, at least). However, people exist, and some of
+them may be malicious. Thus we must look towards computer security for answers.
+I will quickly explain some of the basics of hash function security and then
+show how easy it is to break this security for some commonly used
+non-cryptographic hash functions.</p>
+<p>As a teaser, this article explains how you can generate strings
+such as these, thousands per second:</p>
+<pre data-lang="python"><code data-lang="python"><span> cityhash64(</span><span>"orlp-cityhash64-D-:K5yx*zkgaaaaa"</span><span>) == </span><span>1337
+</span><span>murmurhash2(</span><span>"orlp-murmurhash64-bkiaaa&amp;JInaNcZ"</span><span>) == </span><span>1337
+</span><span>murmurhash3(</span><span>"orlp-murmurhash3_x86_32-haaaPa*+"</span><span>) == </span><span>1337
+</span><span> farmhash64(</span><span>"orlp-farmhash64-/v^CqdPvziuheaaa"</span><span>) == </span><span>1337
+</span></code></pre>
+<p>I also show how you can create some really funky pairs of strings that can be
+concatenated arbitrarily such that when concatenating $k$ strings together
+any of the $2^k$ combinations all have the same hash output, regardless of the
+seed used for the hash function:</p>
+<pre data-lang="python"><code data-lang="python"><span>a = </span><span>"xx0rlpx!xxsXъВ"
+</span><span>b = </span><span>"xxsXъВxx0rlpx!"
+</span><span>murmurhash2(a + a, seed) == murmurhash2(a + b, seed)
+</span><span>murmurhash2(a + a, seed) == murmurhash2(b + a, seed)
+</span><span>murmurhash2(a + a, seed) == murmurhash2(b + b, seed)
+</span><span>
+</span><span>a = </span><span>"!&amp;orlpՓ"
+</span><span>b = </span><span>"yǏglp$X"
+</span><span>murmurhash3(a + a, seed) == murmurhash3(a + b, seed)
+</span><span>murmurhash3(a + a, seed) == murmurhash3(b + a, seed)
+</span><span>murmurhash3(a + a, seed) == murmurhash3(b + b, seed)
+</span></code></pre>
+<h2 id="hash-function-security-basics"><a href="#hash-function-security-basics" aria-label="Anchor link for: hash-function-security-basics">Hash function security basics</a></h2>
+<p>Hash functions play a critical role in computer security. Hash
+functions are used not only to verify messages over secure channels, they are
+also used to identify trusted updates as well as known viruses. Virtually every
+signature scheme ever used starts with a hash function.</p>
+<p>If a hash function does not behave randomly, we can break the above security
+constructs. <a href="https://en.wikipedia.org/wiki/Cryptographic_hash_function">Cryptographic hash
+functions</a> thus take
+the randomness aspect very seriously. The ideal hash function would choose an
+output completely at random for each input, remembering that choice for future
+calls. This is called a <a href="https://en.wikipedia.org/wiki/Random_oracle">random
+oracle</a>.</p>
+<p>The problem is that a random oracle requires a true random number generator, and
+more problematically, a globally accessible infinite memory bank. So we
+approximate it using deterministic hash functions instead. These compute their
+output by essentially shuffling their input really, really well, in such a way
+that it is not feasible to reverse.</p>
+<p>To help quantify whether a specific function does a good job of approximating a
+random oracle, cryptographers came up with a variety of properties that a random
+oracle would have. The three most important and well-known properties a secure
+cryptographic hash function should satisfy are:</p>
+<ol>
+<li>
+<p><strong>Pre-image resistance.</strong> For some constant $c$ it should be hard to find
+some input $m$ such that $h(m) = c$.</p>
+</li>
+<li>
+<p><strong>Second pre-image resistance.</strong> For some input $m_1$ it should be hard to
+find another input $m_2$ such that $h(m_1) = h(m_2)$.</p>
+</li>
+<li>
+<p><strong>Collision resistance.</strong> It should be hard to find inputs $m_1, m_2$ such
+that $h(m_1) = h(m_2)$.</p>
+</li>
+</ol>
+
+<p>We generally consider one of these properties <em>broken</em> if there exists a method
+that produces a collision or pre-image faster than simply trying random
+inputs (also known as a <em>brute force attack</em>). However, there are definitely
+gradations in breakage, as some methods are only several orders of magnitude
+faster than brute force. That may sound like a lot, but a method taking
+$2^{110}$ steps instead of $2^{128}$ are still both equally out of reach for
+today’s computers.</p>
+<p><a href="https://en.wikipedia.org/wiki/MD5">MD5</a> used to be a common hash function, and
+<a href="https://en.wikipedia.org/wiki/SHA-1">SHA-1</a> is still in common use today. While
+both were considered cryptographically secure at one point, generating MD5
+collisions now takes less than a second on a modern PC. In 2017 a collaboration
+of researchers from CWI and Google and announced <a href="https://shattered.io/">the first SHA-1
+collision</a>. However, as far as I’m aware, neither MD5 nor
+SHA-1 have practical (second) pre-image attacks, only theoretical ones.</p>
+<h2 id="non-cryptographic-hash-functions"><a href="#non-cryptographic-hash-functions" aria-label="Anchor link for: non-cryptographic-hash-functions">Non-cryptographic hash functions</a></h2>
+<p>Cryptographically secure hash functions tend to have a small problem: they’re
+slow. Modern hash functions such as <a href="https://github.com/BLAKE3-team/BLAKE3">BLAKE3</a>
+resolve this somewhat by heavily vectorizing the hash using
+SIMD instructions, as well as parallelizing over multiple threads, but even then
+they require large input sizes before reaching those speeds.</p>
+
+<p>A lot of problems don’t necessarily require secure hash functions, and people
+would much prefer a faster hash speed. Especially when we are computing many
+small hashes, such as in a <a href="https://en.wikipedia.org/wiki/Hash_table">hash table</a>.
+Let’s take a look what common hash table implementations actually use as their
+hash for strings:</p>
+<ul>
+<li>
+<p>C++: there are multiple standard library implementations, but 64-bit
+<code>clang</code> 13.0.0 on Apple M1 <a href="https://github.com/llvm-mirror/libcxx/blob/78d6a7767ed57b50122a161b91f59f19c9bd0d19/include/utility#L977">ships</a> <a href="https://github.com/google/cityhash"><code>CityHash64</code></a>.
+Currently <code>libstdc++</code> <a href="https://github.com/gcc-mirror/gcc/blob/20d790aa3ea5b0d240032cab997b8e0938cac62c/libstdc%2B%2B-v3/libsupc%2B%2B/hash_bytes.cc#L136">ships</a>
+<a href="https://github.com/aappleby/smhasher/blob/master/src/MurmurHash2.cpp"><code>MurmurHash64A</code></a>,
+a variant of Murmur2 for 64-bit platforms.</p>
+</li>
+<li>
+<p>Java: OpenJDK uses an <a href="https://github.com/openjdk/zgc/blob/ccf2f5837b31cddd24ec81f7f67107d9fc03c294/src/java.base/share/classes/jdk/internal/util/ArraysSupport.java#L212">incredibly simple hash algorithm</a>, which essentially just computes
+<code>h = 31 * h + c</code> for each character <code>c</code>.</p>
+</li>
+<li>
+<p>PHP: the Zend engine uses <a href="https://github.com/php/php-src/blob/master/Zend/zend_string.h#L431">essentially the same algorithm</a>
+as Java, just using unsigned integers and <code>33</code> as its multiplier.</p>
+</li>
+<li>
+<p>Nim: it <a href="https://github.com/nim-lang/Nim/blob/46d2161c23c2aa1905571512b9a1ef7d61ae670e/lib/pure/hashes.nim#L386">used to use</a> <a href="https://github.com/PeterScott/murmur3/blob/master/murmur3.c"><code>MurmurHash3_x86_32</code></a>. While writing this article they appeared to <a href="https://github.com/nim-lang/Nim/blob/46bb47a444bd377860d832fc1c62b262343f36a2/lib/pure/hashes.nim#L537">have switched</a> to use
+<a href="https://github.com/google/farmhash">farmhash</a> by default.</p>
+</li>
+<li>
+<p>Zig: it <a href="https://github.com/ziglang/zig/blob/904f414e7eab7bc0f7ea00f616831bfc3c1f18a4/lib/std/hash_map.zig#L31">uses</a>
+<a href="https://github.com/wangyi-fudan/wyhash/blob/master/wyhash.h"><code>wyhash</code></a> by default, with <code>0</code> as seed.</p>
+</li>
+<li>
+<p>Javascript: in V8 they use <a href="https://github.com/v8/v8/blob/b3776d5dea2f7858e9903a014b63ea86ef30c04f/src/strings/string-hasher-inl.h#L114">a custom</a>
+weak string hash, with a randomly initialized seed.</p>
+</li>
+</ul>
+<p>There were some that used stronger hashes by default as well:</p>
+<ul>
+<li>
+<p>Go <a href="https://github.com/golang/go/blob/d12fe60004ae5e4024c8a93f4f7de7183bb61576/src/runtime/asm_amd64.s#L1117">uses</a> an
+<a href="https://en.wikipedia.org/wiki/Advanced_Encryption_Standard">AES</a>-based hash
+if hardware acceleration is available on x86-64. Even though its construction is custom
+and likely not full-strength cryptographically secure, breaking it is too
+much effort and quite possibly beyond my capabilities.</p>
+<p>If not available, it uses an algorithm <a href="https://github.com/golang/go/blob/d12fe60004ae5e4024c8a93f4f7de7183bb61576/src/runtime/hash64.go#L25">inspired by wyhash</a>.</p>
+</li>
+<li>
+<p>Python and Rust use <a href="https://en.wikipedia.org/wiki/SipHash">SipHash</a> by
+default, which is a cryptographically secure <a href="https://en.wikipedia.org/wiki/Pseudorandom_function_family">pseudorandom function</a>.
+This is effectively a hash function where you’re allowed to use a secret key 
+during hashing, unlike a hash like SHA-2 where everyone knows all information
+involved.</p>
+</li>
+</ul>
+<p>This latter concept is actually really important, at least for protecting
+against <a href="https://en.wikipedia.org/wiki/Collision_attack">HashDoS</a> in hash
+tables. Even if a hash function is perfectly secure over its complete output,
+hash tables further reduce the output to only a couple bits to find the data it
+is looking for. For a static hash function without any randomness it’s possible
+to produce large lists of hashes that collide post-reduction, just by brute
+force. But for non-cryptographic hashes as we’ll see here we often don’t need
+brute force and can generate collisions at high speed for the full output, if
+not randomized by a random seed.</p>
+<h2 id="interlude-inverse-operations"><a href="#interlude-inverse-operations" aria-label="Anchor link for: interlude-inverse-operations">Interlude: inverse operations</a></h2>
+<p>Before we get to breaking some of the above hash functions, I must explain a basic
+technique I will use a lot: the inverting of operations. We are first exposed to
+this in primary school, where we might get faced by a question such as “$2 + x = 10$”.
+There we learn <em>subtraction</em> is the <em>inverse</em> of addition, such that we may find
+$x$ by computing $10 - 2 = 8$.</p>
+<p>Most operations on the integer registers in computers are also invertible, despite
+the integers being reduced modulo $2^{w}$ in the case of overflow. Let
+us study some:</p>
+<ul>
+<li>
+<p>Addition can be inverted using subtraction. That is, <code>x += y</code> can be inverted
+using <code>x -= y</code>. Seems obvious enough.</p>
+</li>
+<li>
+<p>Multiplication by a constant $c$ is <em>not</em> inverted by division. This would
+not work in the case of overflow. Instead, we calculate the <a href="https://en.wikipedia.org/wiki/Modular_multiplicative_inverse">modular
+multiplicative
+inverse</a> of
+$c$. This is an integer $c^{-1}$ such that $c \cdot c^{-1} \equiv 1 \pmod
+{m}$. Then we invert multiplication by $c$ simply by multiplying by $c^{-1}$.</p>
+<p>This constant exists if and only if $c$ is <a href="https://en.wikipedia.org/wiki/Coprime_integers">coprime</a> with our modulus $m$, which for
+us means that $c$ must be odd as $m = 2^n$. For example, multiplication by $2$ is not
+invertible, which is easy to see as such, as it is equivalent to a bit shift
+to the left by one position, losing the most significant bit forever.</p>
+<p>Without delving into the details, here is a snippet of Python code that computes
+the modular multiplicative inverse of an integer using the
+<a href="https://en.wikipedia.org/wiki/Extended_Euclidean_algorithm">extended Euclidean algorithm</a>
+by calculating $x, y$ such that
+$$cx + my = \gcd(c, m).$$
+Then, because $c$ is coprime we find $\gcd(c, m) = 1$, which means that
+$$cx + 0 \equiv 1 \pmod m,$$
+and thus $x = c^{-1}$.</p>
+<pre data-lang="python"><code data-lang="python"><span>def </span><span>egcd(a, b):
+</span><span>    </span><span>if </span><span>a == </span><span>0</span><span>: </span><span>return </span><span>(b, </span><span>0</span><span>, </span><span>1</span><span>)
+</span><span>    g, y, x = egcd(b % a, a)
+</span><span>    </span><span>return </span><span>(g, x - (b // a) * y, y)
+</span><span>
+</span><span>def </span><span>modinv(c, m):
+</span><span>    g, x, y = egcd(c, m)
+</span><span>    </span><span>assert </span><span>g == </span><span>1</span><span>, </span><span>"c, m must be coprime"
+</span><span>    </span><span>return </span><span>x % m
+</span></code></pre>
+<p>Using this we can invert modular multiplication:</p>
+<pre data-lang="python"><code data-lang="python"><span>&gt;&gt;&gt; modinv(</span><span>17</span><span>, </span><span>2</span><span>**</span><span>32</span><span>)
+</span><span>4042322161
+</span><span>&gt;&gt;&gt; </span><span>42 </span><span>* </span><span>17 </span><span>* </span><span>4042322161 </span><span>% </span><span>2</span><span>**</span><span>32
+</span><span>42
+</span></code></pre>
+<p>Magic!</p>
+</li>
+<li>
+<p>XOR can be inverted using… XOR. It is its own inverse. So <code>x ^= y</code> can be
+inverted using <code>x ^= y</code>.</p>
+</li>
+<li>
+<p>Bit shifts can not be inverted, but two common operations in hash functions
+that use bit shifts can be. The first is bit <em>rotation</em> by a constant. This
+is best explained visually, for example a bit rotation to the left by 3
+places on a 8-bit word, where each bit is shown as a letter:</p>
+<pre><code><span>abcdefghi
+</span><span>defghiabc
+</span></code></pre>
+<p>The formula for a right-rotation of <code>k</code> places is <code>(x &gt;&gt; k) | (x &lt;&lt; (w - k))</code>, where <code>w</code> is the width of the integer type. Its inverse is a
+left-rotation, which simply swaps the direction of both shifts.
+Alternatively, the inverse of a right-rotation of <code>k</code> places is another
+right-rotation of <code>w-k</code> places.</p>
+</li>
+<li>
+<p>Another common operation in hash functions is the “xorshift”. It is an operation
+of one of the following forms, with $k &gt; 0$:</p>
+<pre data-lang="cpp"><code data-lang="cpp"><span>x ^= x &lt;&lt; k  </span><span>// Left xorshift.
+</span><span>x ^= x &gt;&gt; k  </span><span>// Right xorshift.
+</span></code></pre>
+<p>How to invert it is entirely analogous between the two, so I will focus on the
+left xorshift.</p>
+<p>An important observation is that the least
+significant $k$ bits are left entirely untouched by the xorshift.
+Thus by repeating the operation, we recover the least significant $2k$ bits,
+as the XOR will invert itself for the next $k$ bits.
+Let’s take a look at the resulting value to see how we should proceed:</p>
+<pre data-lang="cpp"><code data-lang="cpp"><span>v0 = (x &lt;&lt; k) ^ x
+</span><span>// Apply first step of inverse v1 = v0 ^ (v0 &lt;&lt; k).
+</span><span>v1 = (x &lt;&lt; </span><span>2</span><span>*k) ^ (x &lt;&lt; k) ^ (x &lt;&lt; k) ^ x
+</span><span>// Simplify using self-inverse (x &lt;&lt; k) ^ (x &lt;&lt; k) = 0.
+</span><span>v1 = (x &lt;&lt; </span><span>2</span><span>*k) ^ x
+</span></code></pre>
+<p>From this we can conclude the following identity:
+$$\operatorname{xorshift}(\operatorname{xorshift}(x, k), k) = \operatorname{xorshift}(x, 2k)$$
+Now we only need one more observation to complete our algorithm: a xorshift of $k \geq w$ where $w$ is the width of our integer is
+a no-op. Thus we repeatedly apply our doubling identity until we reach
+large enough $q$ such that $\operatorname{xorshift}(x, 2^q \cdot k) = x$.</p>
+<p>For example, to invert a left xorshift by 13 for 64-bit integers we apply the following sequence:</p>
+<pre data-lang="cpp"><code data-lang="cpp"><span>x ^= x &lt;&lt; </span><span>13  </span><span>// Left xorshift by 13.
+</span><span>
+</span><span>x ^= x &lt;&lt; </span><span>13  </span><span>// Inverse step 1.
+</span><span>x ^= x &lt;&lt; </span><span>26  </span><span>// Inverse step 2.
+</span><span>x ^= x &lt;&lt; </span><span>52  </span><span>// Inverse step 3.
+</span><span>// x ^= x &lt;&lt; 104  // Next step would be a no-op.
+</span></code></pre>
+</li>
+</ul>
+<p>Armed with this knowledge, we can now attack.</p>
+<h2 id="breaking-cityhash64"><a href="#breaking-cityhash64" aria-label="Anchor link for: breaking-cityhash64">Breaking <code>CityHash64</code></a></h2>
+<p>Let us take a look at (part of) <a href="https://github.com/llvm-mirror/libcxx/blob/78d6a7767ed57b50122a161b91f59f19c9bd0d19/include/utility#L977">the source code</a> of
+<code>CityHash64</code> from <code>libcxx</code> that’s used for hashing strings on 64-bit platforms:</p>
+
+<pre data-lang="cpp"><code data-lang="cpp"><span>static const uint64_t mul = </span><span>0x9ddfea08eb382d69</span><span>ULL</span><span>;
+</span><span>static const uint64_t k0 = </span><span>0xc3a5c85c97cb3127</span><span>ULL</span><span>;
+</span><span>static const uint64_t k1 = </span><span>0xb492b66fbe98f273</span><span>ULL</span><span>;
+</span><span>static const uint64_t k2 = </span><span>0x9ae16a3b2f90404f</span><span>ULL</span><span>;
+</span><span>static const uint64_t k3 = </span><span>0xc949d7c7509e6557</span><span>ULL</span><span>;
+</span><span>
+</span><span>template</span><span>&lt;</span><span>class</span><span> T&gt;
+</span><span>T loadword(const </span><span>void</span><span>* p) {
+</span><span>    T r;
+</span><span>    std::memcpy(&amp;r, p, sizeof(r));
+</span><span>    </span><span>return</span><span> r;
+</span><span>}
+</span><span>
+</span><span>uint64_t rotate(uint64_t val, </span><span>int </span><span>shift) {
+</span><span>    </span><span>if </span><span>(shift == </span><span>0</span><span>) </span><span>return</span><span> val;
+</span><span>    </span><span>return </span><span>(val &gt;&gt; shift) | (val &lt;&lt; (</span><span>64 </span><span>- shift));
+</span><span>}
+</span><span>
+</span><span>uint64_t hash_len_16(uint64_t u, uint64_t v) {
+</span><span>    uint64_t x = u ^ v;
+</span><span>    x *= mul;
+</span><span>    x ^= x &gt;&gt; </span><span>47</span><span>;
+</span><span>    uint64_t y = v ^ x;
+</span><span>    y *= mul;
+</span><span>    y ^= y &gt;&gt; </span><span>47</span><span>;
+</span><span>    y *= mul;
+</span><span>    </span><span>return</span><span> y;
+</span><span>}
+</span><span>
+</span><span>uint64_t hash_len_17_to_32(const </span><span>char </span><span>*s, uint64_t len) {
+</span><span>    const uint64_t a = loadword&lt;uint64_t&gt;(s) * k1;
+</span><span>    const uint64_t b = loadword&lt;uint64_t&gt;(s + </span><span>8</span><span>);
+</span><span>    const uint64_t c = loadword&lt;uint64_t&gt;(s + len - </span><span>8</span><span>) * k2;
+</span><span>    const uint64_t d = loadword&lt;uint64_t&gt;(s + len - </span><span>16</span><span>) * k0;
+</span><span>    </span><span>return </span><span>hash_len_16(
+</span><span>        rotate(a - b, </span><span>43</span><span>) + rotate(c, </span><span>30</span><span>) + d,
+</span><span>        a + rotate(b ^ k3, </span><span>20</span><span>) - c + len
+</span><span>    );
+</span><span>}
+</span></code></pre>
+<p>To break this, let’s assume we’ll always give length 32 inputs. Then the
+implementation will always call <code>hash_len_17_to_32</code>, and we have full control
+over variables <code>a</code>, <code>b</code>, <code>c</code> and <code>d</code> by changing our input.</p>
+<p>Note that <code>d</code> is only used once, in the final expression. This makes it a
+prime target for attacking the hash. We will choose <code>a</code>, <code>b</code> and <code>c</code> arbitrarily,
+and then solve for <code>d</code> to compute a desired hash outcome.</p>
+<p>Using the above <code>modinv</code> function we first compute the necessary modular multiplicative
+inverses of <code>mul</code> and <code>k0</code>:</p>
+<pre data-lang="python"><code data-lang="python"><span>&gt;&gt;&gt; </span><span>0x9ddfea08eb382d69 </span><span>* </span><span>0xdc56e6f5090b32d9 </span><span>% </span><span>2</span><span>**</span><span>64
+</span><span>1
+</span><span>&gt;&gt;&gt; </span><span>0xc3a5c85c97cb3127 </span><span>* </span><span>0x81bc9c5aa9c72e97 </span><span>% </span><span>2</span><span>**</span><span>64
+</span><span>1
+</span></code></pre>
+<p>We also note that in this case the xorshift is easy to invert, as <code>x ^= x &gt;&gt; 47</code>
+is simply its own inverse. Having all the components ready, we can invert
+the function step by step.</p>
+<p>We first load <code>a</code>, <code>b</code> and <code>c</code> like in the hash function, and compute</p>
+<pre data-lang="cpp"><code data-lang="cpp"><span>uint64_t v = a + rotate(b ^ k3, </span><span>20</span><span>) - c + len;
+</span></code></pre>
+<p>which is the second parameter to <code>hash_len_16</code>. Then, starting from our
+desired return value of <code>hash_len_16(u, v)</code> we work backwards step by step, inverting
+each operation to find the function argument <code>u</code> that would result in our target <code>hash</code>.
+Then once we have found such the unique <code>u</code> we compute our required input <code>d</code>.
+Putting it all together:</p>
+<pre data-lang="cpp"><code data-lang="cpp"><span>static const uint64_t mul_inv = </span><span>0xdc56e6f5090b32d9</span><span>ULL</span><span>;
+</span><span>static const uint64_t k0_inv  = </span><span>0x81bc9c5aa9c72e97</span><span>ULL</span><span>;
+</span><span>
+</span><span>void </span><span>cityhash64_preimage32(uint64_t hash, </span><span>char </span><span>*s) {
+</span><span>    const uint64_t len = </span><span>32</span><span>;
+</span><span>    const uint64_t a = loadword&lt;uint64_t&gt;(s) * k1;
+</span><span>    const uint64_t b = loadword&lt;uint64_t&gt;(s + </span><span>8</span><span>);
+</span><span>    const uint64_t c = loadword&lt;uint64_t&gt;(s + len - </span><span>8</span><span>) * k2;
+</span><span>    
+</span><span>    uint64_t v = a + rotate(b ^ k3, </span><span>20</span><span>) - c + len;
+</span><span>    
+</span><span>    </span><span>// Invert hash_len_16(u, v). Original operation inverted
+</span><span>    </span><span>// at each step is shown on the right, note that it is in
+</span><span>    </span><span>// the inverse order of hash_len_16.
+</span><span>    uint64_t y = hash;    </span><span>// return y;
+</span><span>    y *= mul_inv;         </span><span>// y *= mul;
+</span><span>    y ^= y &gt;&gt; </span><span>47</span><span>;         </span><span>// y ^= y &gt;&gt; 47;
+</span><span>    y *= mul_inv;         </span><span>// y *= mul;
+</span><span>    uint64_t x = y ^ v;   </span><span>// uint64_t y = v ^ x;
+</span><span>    x ^= x &gt;&gt; </span><span>47</span><span>;         </span><span>// x ^= x &gt;&gt; 47;
+</span><span>    x *= mul_inv;         </span><span>// x *= mul;
+</span><span>    uint64_t u = x ^ v;   </span><span>// uint64_t x = u ^ v;
+</span><span>    
+</span><span>    </span><span>// Find loadword&lt;uint64_t&gt;(s + len - 16).
+</span><span>    uint64_t d = u - rotate(a - b, </span><span>43</span><span>) - rotate(c, </span><span>30</span><span>);
+</span><span>    d *= k0_inv;
+</span><span>    std::memcpy(s + len - </span><span>16</span><span>, &amp;d, sizeof(d));
+</span><span>}
+</span></code></pre>
+<p>The chance that a random <code>uint64_t</code> forms 8 printable ASCII bytes is
+$\left(94/256\right)^8 \approx 0.033%$. Not great, but <code>cityhash64_preimage32</code>
+is so fast that having to repeat it on average ~3000 times to get a purely
+ASCII result isn’t so bad.</p>
+<p>For example, the following 10 strings all hash to <code>1337</code> using CityHash64, generated
+using <a href="https://gist.github.com/orlp/8debf0047e7735b43887aafb041c9a01">this code</a>:</p>
+
+<pre><code><span>orlp-cityhash64-D-:K5yx*zkgaaaaa
+</span><span>orlp-cityhash64-TXb7;1j&amp;btkaaaaa
+</span><span>orlp-cityhash64-+/LM$0 ;msnaaaaa
+</span><span>orlp-cityhash64-u'f&amp;&gt;I'~mtnaaaaa
+</span><span>orlp-cityhash64-pEEv.LyGcnpaaaaa
+</span><span>orlp-cityhash64-v~~bm@,Vahtaaaaa
+</span><span>orlp-cityhash64-RxHr_&amp;~{miuaaaaa
+</span><span>orlp-cityhash64-is_$34#&gt;uavaaaaa
+</span><span>orlp-cityhash64-$*~l\{S!zoyaaaaa
+</span><span>orlp-cityhash64-W@^5|3^:gtcbaaaa
+</span></code></pre>
+<h2 id="breaking-murmurhash2"><a href="#breaking-murmurhash2" aria-label="Anchor link for: breaking-murmurhash2">Breaking MurmurHash2</a></h2>
+<p>We can’t let <code>libstdc++</code> get away after targetting <code>libc++</code>, can we? 
+The <a href="https://github.com/gcc-mirror/gcc/blob/97a36b466ba1420210294f0a1dd7002054ba3b7e/libstdc%2B%2B-v3/include/bits/basic_string.h#L4402">default string hash</a>
+<a href="https://github.com/gcc-mirror/gcc/blob/97a36b466ba1420210294f0a1dd7002054ba3b7e/libstdc%2B%2B-v3/include/bits/functional_hash.h#L206">calls</a>
+an <a href="https://github.com/gcc-mirror/gcc/blob/97a36b466ba1420210294f0a1dd7002054ba3b7e/libstdc%2B%2B-v3/libsupc%2B%2B/hash_bytes.cc#L138">implementation of MurmurHash2</a>
+with seed <code>0xc70f6907</code>. The hash—simplified to only handle strings whose
+lengths are multiples of 8—is as follows:</p>
+<pre data-lang="cpp"><code data-lang="cpp"><span>uint64_t murmurhash64a(const </span><span>char</span><span>* s, size_t len, uint64_t seed) {
+</span><span>    const uint64_t mul = </span><span>0xc6a4a7935bd1e995</span><span>ULL</span><span>;
+</span><span>
+</span><span>    uint64_t hash = seed ^ (len * mul);
+</span><span>    </span><span>for </span><span>(const </span><span>char</span><span>* p = s; p != s + len; p += </span><span>8</span><span>) {
+</span><span>        uint64_t data = loadword&lt;uint64_t&gt;(p);
+</span><span>        data *= mul;
+</span><span>        data ^= data &gt;&gt; </span><span>47</span><span>;
+</span><span>        data *= mul;
+</span><span>        hash ^= data;
+</span><span>        hash *= mul;
+</span><span>    }
+</span><span>
+</span><span>    hash ^= hash &gt;&gt; </span><span>47</span><span>;
+</span><span>    hash *= mul;
+</span><span>    hash ^= hash &gt;&gt; </span><span>47</span><span>;
+</span><span>    </span><span>return</span><span> hash;
+</span><span>}
+</span></code></pre>
+<p>We can take a similar approach here as before. We note that the modular
+multiplicative inverse of <code>0xc6a4a7935bd1e995</code> mod $2^{64}$ is 
+<code>0x5f7a0ea7e59b19bd</code>. As an example, we can choose the first 24 bytes
+arbitrarily, and solve for the last 8 bytes:</p>
+<pre data-lang="cpp"><code data-lang="cpp"><span>void </span><span>murmurhash64a_preimage32(uint64_t hash, </span><span>char</span><span>* s, uint64_t seed) {
+</span><span>    const uint64_t mul = </span><span>0xc6a4a7935bd1e995</span><span>ULL</span><span>;
+</span><span>    const uint64_t mulinv = </span><span>0x5f7a0ea7e59b19bd</span><span>ULL</span><span>;
+</span><span>    
+</span><span>    </span><span>// Compute the hash state for the first 24 bytes as normal.
+</span><span>    uint64_t state = seed ^ (</span><span>32 </span><span>* mul);
+</span><span>    </span><span>for </span><span>(const </span><span>char</span><span>* p = s; p != s + </span><span>24</span><span>; p += </span><span>8</span><span>) {
+</span><span>        uint64_t data = loadword&lt;uint64_t&gt;(p);
+</span><span>        data *= mul;
+</span><span>        data ^= data &gt;&gt; </span><span>47</span><span>;
+</span><span>        data *= mul;
+</span><span>        state ^= data;
+</span><span>        state *= mul;
+</span><span>    }
+</span><span>    
+</span><span>    </span><span>// Invert target hash transformation.
+</span><span>                        </span><span>// return hash;
+</span><span>    hash ^= hash &gt;&gt; </span><span>47</span><span>; </span><span>// hash ^= hash &gt;&gt; 47;
+</span><span>    hash *= mulinv;     </span><span>// hash *= mul;
+</span><span>    hash ^= hash &gt;&gt; </span><span>47</span><span>; </span><span>// hash ^= hash &gt;&gt; 47;
+</span><span>
+</span><span>    </span><span>// Invert last iteration for last 8 bytes.
+</span><span>    hash *= mulinv;                </span><span>// hash *= mul;
+</span><span>    uint64_t data = state ^ hash;  </span><span>// hash = hash ^ data;
+</span><span>    data *= mulinv;                </span><span>// data *= mul;
+</span><span>    data ^= data &gt;&gt; </span><span>47</span><span>;            </span><span>// data ^= data &gt;&gt; 47;
+</span><span>    data *= mulinv;                </span><span>// data *= mul;
+</span><span>    std::memcpy(s + </span><span>24</span><span>, &amp;data, </span><span>8</span><span>); </span><span>// data = loadword&lt;uint64_t&gt;(s);
+</span><span>}
+</span></code></pre>
+<p>The following 10 strings all hash to <code>1337</code> using MurmurHash64A with the
+default seed <code>0xc70f6907</code>, generated using <a href="https://gist.github.com/orlp/59470263c1e2b05b035719f3121bcc45">this code</a>:</p>
+<pre><code><span>orlp-murmurhash64-bhbaaat;SXtgVa
+</span><span>orlp-murmurhash64-bkiaaa&amp;JInaNcZ
+</span><span>orlp-murmurhash64-ewmaaa(%J+jw&gt;j
+</span><span>orlp-murmurhash64-vxpaaag"93\Yj5
+</span><span>orlp-murmurhash64-ehuaaafa`Wp`/|
+</span><span>orlp-murmurhash64-yizaaa1x.zQF6r
+</span><span>orlp-murmurhash64-lpzaaaZphp&amp;c F
+</span><span>orlp-murmurhash64-wsjbaa771rz{z&lt;
+</span><span>orlp-murmurhash64-rnkbaazy4X]p&gt;B
+</span><span>orlp-murmurhash64-aqnbaaZ~OzP_Tp
+</span></code></pre>
+<h3 id="universal-collision-attack-on-murmurhash64a"><a href="#universal-collision-attack-on-murmurhash64a" aria-label="Anchor link for: universal-collision-attack-on-murmurhash64a">Universal collision attack on MurmurHash64A</a></h3>
+<p>In fact, MurmurHash64A is so weak that Jean-Philippe Aumasson, Daniel J.
+Bernstein and Martin Boßlet published <a href="https://cr.yp.to/talks/2012.12.29/slides.pdf">an
+attack</a> that creates sets of
+strings which collide <strong>regardless of the random seed used</strong>.</p>
+
+<p>To see how it works, let’s take a look at the core loop of MurmurHash64A:</p>
+<pre data-lang="cpp"><code data-lang="cpp"><span>uint64_t data = loadword&lt;uint64_t&gt;(p);
+</span><span>data *= mul;          </span><span>// Trivially invertible.
+</span><span>data ^= data &gt;&gt; </span><span>47</span><span>;   </span><span>// Trivially invertible.
+</span><span>data *= mul;          </span><span>// Trivially invertible.
+</span><span>state ^= data;
+</span><span>state *= mul;
+</span></code></pre>
+<p>We know we can trivially invert the operations done on <code>data</code> regardless of what the
+current state is, so we might as well have had the following body:</p>
+<pre data-lang="cpp"><code data-lang="cpp"><span>state ^= data;
+</span><span>state *= mul;
+</span></code></pre>
+<p>Now the hash starts looking rather weak indeed. The clever trick they
+employ is by creating two strings simultaneously, such that they
+differ precisely in the top bit in each 8-byte word. Why the top bit?</p>
+<pre data-lang="python"><code data-lang="python"><span>&gt;&gt;&gt; </span><span>1 </span><span>&lt;&lt; </span><span>63
+</span><span>9223372036854775808
+</span><span>&gt;&gt;&gt; (</span><span>1 </span><span>&lt;&lt; </span><span>63</span><span>) * mul % </span><span>2</span><span>**</span><span>64
+</span><span>9223372036854775808
+</span></code></pre>
+<p>Since <code>mul</code> is odd, its least significant bit is set. Multiplying <code>1 &lt;&lt; 63</code> by
+it is equivalent to shifting that bit 63 places to the left, which is once again
+<code>1 &lt;&lt; 63</code>. That is, <code>1 &lt;&lt; 63</code> is a fixed point for the <code>state *= mul</code> operation.
+We also note that for the top bit XOR is equivalent to addition, as the overflow
+from addition is removed mod $2^{64}$.</p>
+<p>So if we have two input strings, one starting with the 8 bytes <code>data</code>, and the
+other starting with <code>data ^ (1 &lt;&lt; 63) == data + (1 &lt;&lt; 63)</code> (after doing the
+trivial inversions). We then find that the two states, regardless of seed,
+differ exactly in the top bit after <code>state ^= data</code>. After multiplication we
+find we have two states <code>x * mul</code> and <code>(x + (1 &lt;&lt; 63)) * mul == x * mul + (1 &lt;&lt; 63)</code>… which again differ exactly in the top bit! We are now back to <code>state ^= data</code> in our iteration, for the next 8 bytes. We can now use this moment to
+cancel our top bit difference, by again feeding two 8-byte strings that
+differ in the top bit (after inverting).</p>
+<p>In fact, we only have to find one pair of such strings that differ in the top
+bit, which we can then repeat twice (in either order) to cancel our difference
+again. When represented as a <code>uint64_t</code> if we choose the first string as <code>x</code> we
+can derive the second string as</p>
+<pre data-lang="cpp"><code data-lang="cpp"><span>x *= mul;        </span><span>// Forward transformation...
+</span><span>x ^= x &gt;&gt; </span><span>47</span><span>;    </span><span>// ...
+</span><span>x *= mul;        </span><span>// ...
+</span><span>x ^= </span><span>1 </span><span>&lt;&lt; </span><span>63</span><span>;    </span><span>// Difference in top bit.
+</span><span>x *= mulinv;     </span><span>// Backwards transformation...
+</span><span>x ^= x &gt;&gt; </span><span>47</span><span>;    </span><span>// ...
+</span><span>x *= mulinv;     </span><span>// ...
+</span></code></pre>
+<p>I was unable to find a printable ASCII string that has another printable
+ASCII string as its partner. But I was able to find the following pair of 8-byte
+UTF-8 strings that differ in exactly the top bit after the Murmurhash64A input
+transformation:</p>
+<pre><code><span>xx0rlpx!
+</span><span>xxsXъВ
+</span></code></pre>
+<p>Combining them as such gives two 16-byte strings that when fed through the hash
+algorithm manipulate the state in the same way: a collision.</p>
+<pre><code><span>xx0rlpx!xxsXъВ
+</span><span>xxsXъВxx0rlpx!
+</span></code></pre>
+<p>But it doesn’t stop there. By concatenating these two strings we can create
+$2^n$ different colliding strings each $16n$ bytes long. With the current
+<code>libstdc++</code> implementation the following prints the same number eight times:</p>
+<pre data-lang="cpp"><code data-lang="cpp"><span>std::hash&lt;std::u8string&gt; h;
+</span><span>std::u8string a = </span><span>u8</span><span>"xx0rlpx!xxsXъВ"</span><span>;
+</span><span>std::u8string b = </span><span>u8</span><span>"xxsXъВxx0rlpx!"</span><span>;
+</span><span>std::cout &lt;&lt; h(a + a + a) &lt;&lt; </span><span>"</span><span>\n</span><span>"</span><span>;
+</span><span>std::cout &lt;&lt; h(a + a + b) &lt;&lt; </span><span>"</span><span>\n</span><span>"</span><span>;
+</span><span>std::cout &lt;&lt; h(a + b + a) &lt;&lt; </span><span>"</span><span>\n</span><span>"</span><span>;
+</span><span>std::cout &lt;&lt; h(a + b + b) &lt;&lt; </span><span>"</span><span>\n</span><span>"</span><span>;
+</span><span>std::cout &lt;&lt; h(b + a + a) &lt;&lt; </span><span>"</span><span>\n</span><span>"</span><span>;
+</span><span>std::cout &lt;&lt; h(b + a + b) &lt;&lt; </span><span>"</span><span>\n</span><span>"</span><span>;
+</span><span>std::cout &lt;&lt; h(b + b + a) &lt;&lt; </span><span>"</span><span>\n</span><span>"</span><span>;
+</span><span>std::cout &lt;&lt; h(b + b + b) &lt;&lt; </span><span>"</span><span>\n</span><span>"</span><span>;
+</span></code></pre>
+<p>Even if the <code>libstdc++</code> would randomize the seed used by MurmurHash64a, the
+strings would <em>still</em> collide.</p>
+<h2 id="breaking-murmurhash3"><a href="#breaking-murmurhash3" aria-label="Anchor link for: breaking-murmurhash3">Breaking MurmurHash3</a></h2>
+<p>Nim <del>uses</del>
+<a href="https://github.com/nim-lang/Nim/blob/46d2161c23c2aa1905571512b9a1ef7d61ae670e/lib/pure/hashes.nim#L386">used to use</a>
+<a href="https://github.com/PeterScott/murmur3/blob/master/murmur3.c"><code>MurmurHash3_x86_32</code></a>,
+so let’s try to break that.</p>
+
+<p>If we once again simplify to strings whose lengths are a multiple of 4 we get the following code:</p>
+<pre data-lang="cpp"><code data-lang="cpp"><span>uint32_t rotl32(uint32_t x, </span><span>int </span><span>r) {
+</span><span>    </span><span>return </span><span>(x &lt;&lt; r) | (x &gt;&gt; (</span><span>32 </span><span>- r));
+</span><span>}
+</span><span>
+</span><span>uint32_t murmurhash3_x86_32(const </span><span>char</span><span>* s, </span><span>int </span><span>len, uint32_t seed) {
+</span><span>    const uint32_t c1 = </span><span>0xcc9e2d51</span><span>;
+</span><span>    const uint32_t c2 = </span><span>0x1b873593</span><span>;
+</span><span>    const uint32_t c3 = </span><span>0x85ebca6b</span><span>;
+</span><span>    const uint32_t c4 = </span><span>0xc2b2ae35</span><span>;
+</span><span>
+</span><span>    uint32_t h = seed;
+</span><span>    </span><span>for </span><span>(const </span><span>char</span><span>* p = s; p != s + len; p += </span><span>4</span><span>) {
+</span><span>        uint32_t k = loadword&lt;uint32_t&gt;(p);
+</span><span>        k *= c1;
+</span><span>        k = rotl32(k, </span><span>15</span><span>);
+</span><span>        k *= c2;
+</span><span>
+</span><span>        h ^= k;
+</span><span>        h = rotl32(h, </span><span>13</span><span>);
+</span><span>        h = h * </span><span>5 </span><span>+ </span><span>0xe6546b64</span><span>;
+</span><span>    }
+</span><span>
+</span><span>    h ^= len;
+</span><span>    h ^= h &gt;&gt; </span><span>16</span><span>;
+</span><span>    h *= c3;
+</span><span>    h ^= h &gt;&gt; </span><span>13</span><span>;
+</span><span>    h *= c4;
+</span><span>    h ^= h &gt;&gt; </span><span>16</span><span>;
+</span><span>    </span><span>return</span><span> h;
+</span><span>} 
+</span></code></pre>
+<p>I think by now you should be able to get this function to spit out any
+value you want if you know the seed. 
+The inverse of
+<code>rotl32(x, r)</code> is <code>rotl32(x, 32-r)</code> and the inverse of <code>h ^= h &gt;&gt; 16</code> is
+once again just <code>h ^= h &gt;&gt; 16</code>. Only <code>h ^= h &gt;&gt; 13</code> is a bit different, it’s the first time
+we’ve seen that a xorshift’s inverse has more than one step:</p>
+<pre><code><span>h ^= h &gt;&gt; 13
+</span><span>h ^= h &gt;&gt; 26
+</span></code></pre>
+<p>Compute the modular inverses
+of <code>c1</code> through <code>c4</code> as well as <code>5</code> mod $2^{32}$, and go to town. 
+If you want to cheat or check your answer, you can check out <a href="https://gist.github.com/orlp/0c33157a0971053b60ac1da84b021bea">the code</a>
+I’ve used to generate the following ten strings that all hash to 1337 when
+fed to <code>MurmurHash3_x86_32</code> with seed <code>0</code>:</p>
+<pre><code><span>orlp-murmurhash3_x86_32-haaaPa*+
+</span><span>orlp-murmurhash3_x86_32-saaaUW&amp;&lt;
+</span><span>orlp-murmurhash3_x86_32-ubaa/!/"
+</span><span>orlp-murmurhash3_x86_32-weaare]]
+</span><span>orlp-murmurhash3_x86_32-chaa5@/}
+</span><span>orlp-murmurhash3_x86_32-claaM[,5
+</span><span>orlp-murmurhash3_x86_32-fraaIx`N
+</span><span>orlp-murmurhash3_x86_32-iwaara&amp;&lt;
+</span><span>orlp-murmurhash3_x86_32-zwaa]&gt;zd
+</span><span>orlp-murmurhash3_x86_32-zbbaW-5G
+</span></code></pre>
+<p>Nim uses <code>0</code> as a fixed seed.</p>
+
+<h3 id="universal-collision-attack-on-murmurhash3"><a href="#universal-collision-attack-on-murmurhash3" aria-label="Anchor link for: universal-collision-attack-on-murmurhash3">Universal collision attack on MurmurHash3</a></h3>
+<p>Suppose that Nim didn’t use <code>0</code> as a fixed seed, but chose a randomly generated
+one. Can we do a similar attack as the one done to MurmurHash2 to still generate
+universal multicollisions?</p>
+<p>Yes we can. Let’s take another look at that core loop body:</p>
+<pre data-lang="cpp"><code data-lang="cpp"><span>uint32_t k = loadword&lt;uint32_t&gt;(p);
+</span><span>k *= c1;            </span><span>// Trivially invertable.
+</span><span>k = rotl32(k, </span><span>15</span><span>);  </span><span>// Trivially invertable.
+</span><span>k *= c2;            </span><span>// Trivially invertable.
+</span><span>
+</span><span>h ^= k;
+</span><span>h = rotl32(h, </span><span>13</span><span>);
+</span><span>h = h * </span><span>5 </span><span>+ </span><span>0xe6546b64</span><span>;
+</span></code></pre>
+<p>Once again we can ignore the first three trivially invertable instructions as we
+can simply choose our input so that we get exactly the <code>k</code> we want.
+Remember from last time that we want to introduce a difference in exactly the
+top bit of <code>h</code>, as the multiplication will leave this difference in place.
+But here there is a bit rotation between the XOR  and the multiplication.
+The solution? Simply place our bit difference such that <code>rotl32(h, 13)</code> shifts
+it into the top position.</p>
+<p>Does the addition of <code>0xe6546b64</code> mess things up? No. Since only the top bit
+between the two states will be different, there is a difference of exactly
+$2^{31}$ between the two states. This difference is maintained by the addition.
+Since two 32-bit numbers with the same top bit can be at most $2^{31} - 1$ 
+apart, we can conclude that the two states still differ in the top bit after
+the addition.</p>
+<p>So we want to find two pairs of 32-bit ints, such that after applying the first
+three instructions the first pair differs in bit <code>1 &lt;&lt; (31 - 13) == 0x00040000</code>
+and the second pair in bit <code>1 &lt;&lt; 31 == 0x80000000</code>.</p>
+<p>After some brute-force searching I found some cool pairs (again forced to use
+UTF-8), which when combined give the following collision:</p>
+<pre data-lang="nim"><code data-lang="nim"><span>a = </span><span>"!&amp;orlpՓ"
+</span><span>b = </span><span>"yǏglp$X"
+</span></code></pre>
+<p>As before, any concatenation of <code>a</code>s and <code>b</code>s of length <code>n</code> collides with all
+other combinations of length <code>n</code>.</p>
+<h2 id="breaking-farmhash64"><a href="#breaking-farmhash64" aria-label="Anchor link for: breaking-farmhash64">Breaking FarmHash64</a></h2>
+<p>Nim switched to
+<a href="https://github.com/nim-lang/Nim/blob/46bb47a444bd377860d832fc1c62b262343f36a2/lib/pure/hashes.nim#L537">farmhash</a>
+since I started writing this post. To break it we can notice that its structure
+is very similar to CityHash64, so we can use those same techniques again. In
+fact, the only changes between the two for lengths 17-32 bytes is that a few
+operators were changed from subtraction/XOR to addition, a rotation operator had
+its constant tweaked, and some <code>k</code> constants are slightly tweaked in usage. The
+process of breaking it is so similar that it’s entirely analogous, so we can
+skip straight to <a href="https://gist.github.com/orlp/f0f3307530841183ddb72a0528ce0742">the result</a>.
+These 10 strings all hash to 1337 with FarmHash64:</p>
+<pre><code><span>orlp-farmhash64-?VrJ@L7ytzwheaaa
+</span><span>orlp-farmhash64-p3`!SQb}fmxheaaa
+</span><span>orlp-farmhash64-pdt'cuI\gvxheaaa
+</span><span>orlp-farmhash64-IbY`xAG&amp;ibkieaaa
+</span><span>orlp-farmhash64-[_LU!d1hwmkieaaa
+</span><span>orlp-farmhash64-QiY!clz]bttieaaa
+</span><span>orlp-farmhash64-&amp;?J3rZ_8gsuieaaa
+</span><span>orlp-farmhash64-LOBWtm5Szyuieaaa
+</span><span>orlp-farmhash64-Mptaa^g^ytvieaaa
+</span><span>orlp-farmhash64-B?&amp;l::hxqmfjeaaa
+</span></code></pre>
+<h2 id="trivial-fixed-seed-wyhash-multicollisions"><a href="#trivial-fixed-seed-wyhash-multicollisions" aria-label="Anchor link for: trivial-fixed-seed-wyhash-multicollisions">Trivial fixed-seed wyhash multicollisions</a></h2>
+<p>Zig uses <a href="https://github.com/wangyi-fudan/wyhash/blob/master/wyhash.h">wyhash</a>
+with a fixed seed of zero. While I was unable to do
+seed-independent attacks against wyhash, using it with a fixed seed makes
+generating collisions trivial. Wyhash is <a href="https://github.com/wangyi-fudan/wyhash/blob/46cebe9dc4e51f94d0dca287733bc5a94f76a10d/wyhash.h#L46">built upon</a>
+the folded multiply, which takes two 64-bit inputs, multiplies them to a 128-bit product before XORing
+together the two halves:</p>
+<pre data-lang="cpp"><code data-lang="cpp"><span>uint64_t folded_multiply(uint64_t a, uint64_t b) {
+</span><span>    __uint128_t full = __uint128_t(a) * __uint128_t(b);
+</span><span>    </span><span>return </span><span>uint64_t(full) ^ uint64_t(full &gt;&gt; </span><span>64</span><span>);
+</span><span>}
+</span></code></pre>
+
+<p>It’s easy to immediately see a critical flaw with this: if one of the two sides
+is zero, the output will also always be zero. To protect against this, wyhash
+always uses a folded multiply in the following form:</p>
+<pre data-lang="cpp"><code data-lang="cpp"><span>out = folded_multiply(input_a ^ secret_a, input_b ^ secret_b);
+</span></code></pre>
+<p>where <code>secret_a</code> and <code>secret_b</code> are determined by the seed, or outputs of
+previous iterations which are influenced by the seed. However, when your seed is
+constant… With <a href="https://gist.github.com/orlp/a9cc8dae3a74b1faaa0a642135ee81df">a bit of creativity</a>
+we can use the start of our string to prepare a ‘secret’ value which we can
+perfectly cancel with another ASCII string later in the input.</p>
+<p>So, without further ado, every 32-byte string of the form</p>
+<pre><code><span>orlp-wyhash-oGf_________tWJbzMJR
+</span></code></pre>
+<p>hashes to the same value with Zig’s default hasher.</p>
+<p>Zig uses a different set of parameters than the defaults found in the wyhash
+repository, so for good measure, this pattern provides arbitrary multicollisions
+for the default parameters found in wyhash when using <code>seed == 0</code>:</p>
+<pre><code><span>orlp-wyhash-EUv_________NLXyytkp
+</span></code></pre>
+<h2 id="conclusion"><a href="#conclusion" aria-label="Anchor link for: conclusion">Conclusion</a></h2>
+<p>We’ve seen that a lot of the hash functions in common use in hash tables today
+are very weak, allowing fairly trivial attacks to produce arbitrary amounts of
+collisions if not randomly initialized. Using a randomly seeded hash table is
+paramount if you don’t wish to become a victim of a hash flooding attack.</p>
+<p>We’ve also seen that some hash functions are vulnerable to attack <em>even if
+randomly seeded</em>. These are completely broken and should not be used if attacks
+are a concern at all. Luckily I was unable to find such attacks against most
+hashes, but the possibility of such an attack existing is quite unnerving.</p>
+<p>With <a href="https://en.wikipedia.org/wiki/Universal_hashing">universal hashing</a> it’s
+possible to construct hash functions for which such an attack is provably
+impossible, last year I published a hash function called
+<a href="https://github.com/orlp/polymur-hash">polymur-hash</a> that has this property. Your
+HTTPS connection to this website also likely uses a universal hash function
+for authenticity of the transferred data, both <a href="https://en.wikipedia.org/wiki/Poly1305">Poly1305</a>
+and <a href="https://en.wikipedia.org/wiki/Galois/Counter_Mode">GCM</a> are based on
+universal hashing for their security proofs.</p>
+
+<p>Of course, if your data is not user-controlled, or there is no reasonable
+security model where your application would face attacks, you can get away with
+faster and insecure hashes.</p>
+<p>More to come on the subject of hashing and hash
+tables and how it can go right or wrong, but for now this article is long enough as-is…</p>
+
+</article></div>]]>
+            </description>
+            <link>https://orlp.net/blog/breaking-hash-functions/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42029542</guid>
+            <pubDate>Sat, 02 Nov 2024 22:07:09 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Next Generation Out of Band Garbage Collection]]>
+            </title>
+            <description>
+<![CDATA[
+Score 49 | Comments 17 (<a href="https://news.ycombinator.com/item?id=42028833">thread link</a>) | @ksec
+<br/>
+November 2, 2024 | https://railsatscale.com/2024-10-23-next-generation-oob-gc/ | <a href="https://web.archive.org/web/*/https://railsatscale.com/2024-10-23-next-generation-oob-gc/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div aria-label="Content">
+      <div>
+        <article itemscope="" itemtype="http://schema.org/BlogPosting">
+
+  
+
+  <div itemprop="articleBody">
+    <p>In 2023, <a href="https://shopify.engineering/adventures-in-garbage-collection">I wrote about how we’ve tuned Ruby’s garbage collector for Shopify’s monolith</a>,
+including how we implemented out-of-band garbage collection to reduce the impact of major collection on latency.</p>
+
+<p>While the latency improvements were massive, we weren’t entirely satisfied with the heuristics used to trigger out-of-band
+garbage collection. It was purely based on averages, so we had to trade latency for capacity.
+More importantly, it didn’t fully eliminate major collection from request cycles, it only made it very rare.</p>
+
+<p>But <a href="https://github.com/rails/rails/issues/50449#issuecomment-1870515141">in December 2023, while discussing with Koichi Sasada, we came up with a new idea</a>.</p>
+
+<h2 id="disabling-major-gc-entirely">Disabling Major GC Entirely</h2>
+
+<p>If we want major GC to never trigger during a request cycle, why not disable it entirely?</p>
+
+<p>In March 2024, during our annual Ruby Infrastructure team gathering, we fleshed out the details of the new feature we wanted,
+and Matthew Valentine-House started working on a proof of concept, which we then deployed to a small percentage of our production servers to see how effective it could be.</p>
+
+<p>First, we needed a way to entirely prevent the Garbage Collector from automatically performing a major collection, but
+also to stop promoting objects to the old generation. Ideally in a web application, aside from some in-memory caches, no object allocated as part of a request should survive longer than the request itself.
+Any object that does is probably something that should be eagerly loaded during boot, or some state that is leaking between requests.
+As such, any object promoted to the old generation during a request cycle is very unlikely to be immortal, so promoting it is wasteful.</p>
+
+<p>We also needed a way to ask the GC whether it would have run a major collection so that we could manually trigger it outside
+of the request cycle, and only exactly as much as needed.</p>
+
+<p><a href="https://bugs.ruby-lang.org/issues/20443">The initial proposal was for three new methods, <code>GC.disable_major</code>, <code>GC.enable_major</code> and <code>GC.needs_major?</code></a>.</p>
+
+<p>After some back and forth with other Ruby committers, it became a single new method: <code>GC.config(rgengc_allow_full_mark: true/false)</code>.
+We also exposed a new key in <code>GC.latest_gc_info</code>, <code>:needs_major_by</code>, for use in checking whether a major GC needs to run: <code>GC.latest_gc_info(:needs_major_by)</code>.</p>
+
+<p>This new feature was released as part of Ruby <code>3.4.0-preview2</code>.</p>
+
+<h2 id="effectiveness">Effectiveness</h2>
+
+<p>Since Shopify monolith runs on Ruby’s master branch, we don’t have to wait for the December release to use these new features,
+so recently I went to work on enabling the new out-of-band GC implementation on 50% of production servers, and the results are amazing on all metrics.</p>
+
+<p>First, as we anticipated, the time spent in GC during request cycles at the very tail end (p95/p99/p99.99) dropped very significantly.</p>
+
+<p>However, more surprisingly, it also improved median latency:</p>
+
+<p><img src="https://railsatscale.com/2024-10-23-next-generation-oob-gc/images/oobgc-gctime-speedup.png" alt=""></p>
+
+<p><img src="https://railsatscale.com/2024-10-23-next-generation-oob-gc/images/oobgc-gctime.png" alt=""></p>
+
+<p>The overall impact on service latency is of course more modest, but still very nice with a 5% reduction of average latency and a 10% reduction of p99 latency:</p>
+
+<p><img src="https://railsatscale.com/2024-10-23-next-generation-oob-gc/images/oobgc-latency-impact.png" alt=""></p>
+
+<p>The impact on capacity, however, is less significant than we had hoped for. During the day, when there are frequent deploys, this doesn’t make much of a difference.
+However when deploys pause for a few hours, the new out-of-band collector runs much less often than the old implementation:</p>
+
+<p><img src="https://railsatscale.com/2024-10-23-next-generation-oob-gc/images/oobgc-count.png" alt=""></p>
+
+<h2 id="implementation">Implementation</h2>
+
+<p>In addition, to be more effective, this new implementation is also radically simple, thanks to the hooks provided by <a href="https://github.com/Shopify/pitchfork">Pitchfork</a></p>
+
+<div><div><pre><code><span># pitchfork.conf.rb</span>
+
+<span>after_worker_fork</span> <span>do</span> <span>|</span><span>_server</span><span>,</span> <span>_worker</span><span>|</span>
+  <span>GC</span><span>.</span><span>config</span><span>(</span><span>rgengc_allow_full_mark: </span><span>false</span><span>)</span>
+<span>end</span>
+
+<span>after_request_complete</span> <span>do</span> <span>|</span><span>_server</span><span>,</span> <span>_worker</span><span>,</span> <span>_rack_env</span><span>|</span>
+  <span>if</span> <span>GC</span><span>.</span><span>latest_gc_info</span><span>(</span><span>:need_major_by</span><span>)</span>
+    <span>GC</span><span>.</span><span>start</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div></div>
+
+<h2 id="next-steps">Next Steps?</h2>
+
+<p>Now that the major collection is out of the picture, the next step is to look at the minor collections.</p>
+
+<p>We can’t disable minor collection, as otherwise large requests that allocate a lot would run out of memory. However, we could try to
+additionally use heuristics from <code>GC.stat</code> to eagerly trigger minor garbage collection out-of-band, so that the majority of requests don’t have
+to spend any time at all in GC.</p>
+
+<p>But the potential gains are much smaller because minor collection is quite fast even on our monolith.</p>
+
+  </div>
+</article>
+
+      </div>
+    </div></div>]]>
+            </description>
+            <link>https://railsatscale.com/2024-10-23-next-generation-oob-gc/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42028833</guid>
+            <pubDate>Sat, 02 Nov 2024 19:57:30 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[M4 Crimes for Metaprogramming Processing]]>
+            </title>
+            <description>
+<![CDATA[
+Score 12 | Comments 1 (<a href="https://news.ycombinator.com/item?id=42028575">thread link</a>) | @todsacerdoti
+<br/>
+November 2, 2024 | https://eighty-twenty.org/2024/07/22/m4-crimes | <a href="https://web.archive.org/web/*/https://eighty-twenty.org/2024/07/22/m4-crimes">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+    <section>
+      <p>Back in June, I made a quick-and-dirty attempt to get the <a href="https://docs.racket-lang.org/teachpack/2htdpuniverse.html">big-bang model of functional
+UI</a> running in <a href="https://processing.org/">Processing
+4</a>.</p>
+
+<p>Unfortunately Processing uses a dialect of Java predating introduction of <a href="https://openjdk.org/jeps/395">Java Records
+(JEP395)</a>, so I, er, creatively broke out
+<a href="https://en.wikipedia.org/wiki/M4_(computer_language)">m4</a> as a preprocessor.</p>
+
+<p>The resulting macros turn this:</p>
+
+<figure><pre><code data-lang="java"><span>_record</span><span>(</span><span>Rect</span> <span>extends</span> <span>Pict</span><span>,</span> <span>{{</span><span>float</span> <span>x</span><span>,</span> <span>float</span> <span>y</span><span>,</span> <span>float</span> <span>w</span><span>,</span> <span>float</span> <span>h</span><span>}},</span> <span>{{</span>
+  <span>public</span> <span>void</span> <span>render</span><span>()</span> <span>{</span>
+    <span>rectMode</span><span>(</span><span>CORNER</span><span>);</span>
+    <span>rect</span><span>(</span><span>this</span><span>.</span><span>x</span><span>,</span> <span>this</span><span>.</span><span>y</span><span>,</span> <span>this</span><span>.</span><span>w</span><span>,</span> <span>this</span><span>.</span><span>h</span><span>);</span>
+  <span>}</span>
+<span>}});</span></code></pre></figure>
+
+<p>into this:</p>
+
+<figure><pre><code data-lang="java"><span>class</span> <span>Rect</span> <span>extends</span> <span>Pict</span> <span>{</span>
+  <span>public</span> <span>final</span> <span>float</span> <span>x</span><span>;</span>
+  <span>public</span> <span>final</span> <span>float</span> <span>y</span><span>;</span>
+  <span>public</span> <span>final</span> <span>float</span> <span>w</span><span>;</span>
+  <span>public</span> <span>final</span> <span>float</span> <span>h</span><span>;</span>
+  <span>public</span> <span>Rect</span><span>(</span><span>float</span> <span>x</span><span>,</span> <span>float</span> <span>y</span><span>,</span> <span>float</span> <span>w</span><span>,</span> <span>float</span> <span>h</span><span>)</span> <span>{</span>
+    <span>this</span><span>.</span><span>x</span> <span>=</span> <span>x</span><span>;</span>
+    <span>this</span><span>.</span><span>y</span> <span>=</span> <span>y</span><span>;</span>
+    <span>this</span><span>.</span><span>w</span> <span>=</span> <span>w</span><span>;</span>
+    <span>this</span><span>.</span><span>h</span> <span>=</span> <span>h</span><span>;</span>
+  <span>}</span>
+
+  <span>public</span> <span>void</span> <span>render</span><span>()</span> <span>{</span>
+    <span>rectMode</span><span>(</span><span>CORNER</span><span>);</span>
+    <span>rect</span><span>(</span><span>this</span><span>.</span><span>x</span><span>,</span> <span>this</span><span>.</span><span>y</span><span>,</span> <span>this</span><span>.</span><span>w</span><span>,</span> <span>this</span><span>.</span><span>h</span><span>);</span>
+  <span>}</span>
+<span>};</span></code></pre></figure>
+
+<h3 id="the-macros">The macros</h3>
+
+<p>Not yet properly factored out into a utility library or anything, just pasted straight at the
+top of the file. Shield your eyes!</p>
+
+<figure><pre><code data-lang="m4">/* -*- mode: java; c-basic-offset: 2 -*- */
+changecom(`//')dnl
+changequote(`{{',`}}')dnl
+dnl);
+define({{_record}}, {{class $1 {_record_fields($2,)
+  public _record_classname($1)($2) {_record_inits($2,)
+  }
+$3dnl;
+}{{}}}})dnl;
+define({{_record_fields}}, {{ifelse({{$#}}, {{1}},, {{
+  public final $1;$0(shift($@))}})}})dnl;
+define({{_record_inits}}, {{ifelse({{$#}}, {{1}},, {{
+    this._record_fieldname({{$1}}) = _record_fieldname({{$1}});$0(shift($@))}})}})dnl;
+define({{_record_classname}}, {{regexp({{$1}}, {{^\(\w+\).*$}}, {{\1}})}})dnl;
+define({{_record_fieldname}}, {{regexp({{$1}}, {{^.+\s\(\w+\)$}}, {{\1}})}})dnl;
+dnl;//---------------------------------------------------------------------------</code></pre></figure>
+
+
+    </section>
+    
+    
+    
+  </div></div>]]>
+            </description>
+            <link>https://eighty-twenty.org/2024/07/22/m4-crimes</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42028575</guid>
+            <pubDate>Sat, 02 Nov 2024 19:24:08 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Starlink satellite phone will have coverage where no other will go]]>
             </title>
             <description>
 <![CDATA[
-Score 11 | Comments 4 (<a href="https://news.ycombinator.com/item?id=42028017">thread link</a>) | @bookofjoe
+Score 13 | Comments 4 (<a href="https://news.ycombinator.com/item?id=42028017">thread link</a>) | @bookofjoe
 <br/>
 November 2, 2024 | https://unionrayo.com/us/starlink-satellite-coverage/ | <a href="https://web.archive.org/web/*/https://unionrayo.com/us/starlink-satellite-coverage/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -59,11 +973,26 @@ November 2, 2024 | https://unionrayo.com/us/starlink-satellite-coverage/ | <a hr
         </item>
         <item>
             <title>
+<![CDATA[Why doesn't Cloudflare use containers in their infrastructure?]]>
+            </title>
+            <description>
+<![CDATA[
+Score 14 | Comments 0 (<a href="https://news.ycombinator.com/item?id=42026886">thread link</a>) | @thunderbong
+<br/>
+November 2, 2024 | https://shivangsnewsletter.com/p/why-doesnt-cloudflare-use-containers | <a href="https://web.archive.org/web/*/https://shivangsnewsletter.com/p/why-doesnt-cloudflare-use-containers">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div dir="auto"><p>Cloudflare enables its customers to run serverless code at the edge globally at blazing speeds with almost zero cold startup time.</p><p>They achieve this with their V8-powered deployment architecture in contrast to going forward with the traditional containers and Kubernetes approach.</p><p>The prime reason behind not using containers or VMs is achieving sub-millisecond serverless latency and supporting a significantly large number of tenants who could run their workloads independently without sharing memory and state at the edge.</p><p>We are aware that serverless instances spin up to handle requests and spin down when idle to save costs. This is a trade-off between latency and running costs. It takes from 500 ms to 10 seconds to spin up a container or a VM to process a request, resulting in an unpredictable code execution time.</p><p>Cloudflare's V8 isolate architecture, in contrast, warms up a function in under 5 milliseconds or less. However, this approach has trade-offs like any other design decision, which I'll discuss in the later part of this post.&nbsp;&nbsp;</p><p>Let's first delve into the V8 isolate design.</p><p>The V8 isolate architecture leverages the V8 engine (a high-performance JavaScript and Web Assembly engine originally developed by Google for Chrome) to run isolates, which are a lightweight sandboxed environment running individual workloads.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0eacbf5d-b0d1-44ec-a0cc-5bc0a1547f9f_1437x1018.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0eacbf5d-b0d1-44ec-a0cc-5bc0a1547f9f_1437x1018.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0eacbf5d-b0d1-44ec-a0cc-5bc0a1547f9f_1437x1018.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0eacbf5d-b0d1-44ec-a0cc-5bc0a1547f9f_1437x1018.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0eacbf5d-b0d1-44ec-a0cc-5bc0a1547f9f_1437x1018.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0eacbf5d-b0d1-44ec-a0cc-5bc0a1547f9f_1437x1018.png" width="1437" height="1018" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/0eacbf5d-b0d1-44ec-a0cc-5bc0a1547f9f_1437x1018.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:1018,&quot;width&quot;:1437,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:70412,&quot;alt&quot;:&quot;Cloudflare V8 isolate architecture&quot;,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:true,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false}" alt="Cloudflare V8 isolate architecture" title="Cloudflare V8 isolate architecture" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0eacbf5d-b0d1-44ec-a0cc-5bc0a1547f9f_1437x1018.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0eacbf5d-b0d1-44ec-a0cc-5bc0a1547f9f_1437x1018.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0eacbf5d-b0d1-44ec-a0cc-5bc0a1547f9f_1437x1018.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0eacbf5d-b0d1-44ec-a0cc-5bc0a1547f9f_1437x1018.png 1456w" sizes="100vw" fetchpriority="high"></picture></div></a></figure></div><p>A single V8 engine instance can run multiple isolates running independent workloads with strict code isolation. Code from one isolate cannot access the memory or data of another.</p><p>However, all these isolates share the same OS process, which makes them extremely lightweight and fast.</p><p>An isolate has its own mechanism to ensure safe memory access, which makes it possible to run untrusted code from many different customers/tenants within a single V8 engine instance run by an operating system process.</p><p>Every isolate executes code in an event-driven model suiting IO-intensive tasks.&nbsp;&nbsp;</p><p>In a traditional serverless architecture, every request to a function instance triggers a container process, which includes an OS layer, application dependencies and the function code.</p><p>Initializing a container has a time delay, aka the cold startup latency, which could range from hundreds of milliseconds to multiple seconds.</p><p>Also, since a function instance ideally runs in its own container process with process-level isolation, running a large number of tenant workloads serving millions of concurrent requests becomes starkly resource-intensive.</p><blockquote><p>In cloud environments, isolation is ideally achieved at the VM or the container-level process. Each workload runs as a separate container or a VM process with its own dedicated resources, reducing the risk of data leaks and unauthorized access. </p><p>Furthermore, if a certain process crashes, it doesn't affect the other workloads running on the same machine.</p></blockquote><p>In contrast to containerized deployments, with isolates, running in V8 engine runtime, the startup time of an isolate on average is sub-milliseconds, since this does not involve boot up of any containers and OS processes.</p><p>The V8 runtime is already running and it spawns an isolate in sub-milliseconds when required to process a request.</p><p>In this architecture, multiple isolates can run within the same V8 engine, requiring minimal resources, enabling the platform to host and run code for a relatively large number of tenants at the edge, allowing instantaneous scaling.</p><p>Also, since a single OS process can run hundreds or thousands of isolates, this averts the inter-process context switching costs associated with container-based deployments.</p><p>This is crucial for Cloudflare as it runs thousands of tenant workloads at the edge on every machine and needs to rapidly switch between them thousands of times per second with minimal overhead.</p><p>If these workloads were running as separate containerized processes, the ability of the infrastructure to support a considerable number of customers would be greatly reduced. This is the key requirement behind coming up with a resource-optimized and scalable deployment approach like V8 isolates.</p><p>Operating systems are split into user space and kernel space to separate application tasks from the core system tasks. Keeping control over how applications interact with the underlying OS and hardware resources is essential for security and performance.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F92ae55e4-5399-42b1-aa79-27f354873631_1437x1018.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F92ae55e4-5399-42b1-aa79-27f354873631_1437x1018.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F92ae55e4-5399-42b1-aa79-27f354873631_1437x1018.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F92ae55e4-5399-42b1-aa79-27f354873631_1437x1018.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F92ae55e4-5399-42b1-aa79-27f354873631_1437x1018.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F92ae55e4-5399-42b1-aa79-27f354873631_1437x1018.png" width="1437" height="1018" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/92ae55e4-5399-42b1-aa79-27f354873631_1437x1018.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:1018,&quot;width&quot;:1437,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:70412,&quot;alt&quot;:&quot;Cloudflare V8 isolate architecture&quot;,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false}" alt="Cloudflare V8 isolate architecture" title="Cloudflare V8 isolate architecture" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F92ae55e4-5399-42b1-aa79-27f354873631_1437x1018.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F92ae55e4-5399-42b1-aa79-27f354873631_1437x1018.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F92ae55e4-5399-42b1-aa79-27f354873631_1437x1018.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F92ae55e4-5399-42b1-aa79-27f354873631_1437x1018.png 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p>The kernel space runs the core OS operations with direct and unrestricted access to the underlying hardware resources. These operations involve handling IO, memory, process and thread management, etc.</p><p>All the user applications, like browsers, code editors, etc., run in the user space and interact with the underlying hardware through the kernel space. The application code that runs in the user space is sandboxed and has to request access to the system resources and other kernel services through system calls hitting the kernel space.</p><p>The separation between the user space and the kernel space is a fundamental design principle in operating systems, facilitating secure, fault-tolerant, and efficient execution of operations.</p><p>The V8 engine runs in the user space and interacts with the OS through the kernel space via system calls. It provides a sandboxed environment to run JavaScript and WebAssembly code.</p><p>When isolates process the requests in an event loop asynchronous IO fashion, the business logic runs in the user space, while the IO tasks rely on the OS kernel to handle the underlying network and other system interactions.</p><p>Each V8 engine instance runs in a user-space process with a process ID and with memory boundaries enforced by the OS. This provides a secure sandboxed V8 execution environment.</p><p>The memory allocated to a V8 instance is distributed across the isolates by the V8 engine. As the number of isolates increases, a V8 engine instance may request more memory from the OS.</p><p>V8 isolates provide strict tenant-level isolation. Though they technically reside in the same OS-allocated memory space inside a V8 engine instance, the V8 architecture ensures no data is shared between these isolates by allocating independent logical memory for each isolate, enforcing strict isolate-level sandboxing.</p><p>Each isolate’s data (objects, functions, closures, etc.) is stored in a distinct memory region managed by the V8 engine. Furthermore, each isolate has its separate garbage collection process as well, upholding strict isolation.</p><p>The isolate architecture is a well-engineered solution for deploying latency-sensitive multi-tenant workloads. However, it only supports JavaScript and languages like Go or Rust, whose code can be compiled to WebAssembly bytecode to run on a platform supporting WebAssembly.</p><p>Other cloud serverless offerings leveraging containerized and VM-based deployments support a range of programming languages based on workload requirements.</p><p>Furthermore, containers and VMs provide process-level isolation often preferred by enterprise workloads with strict security and compliance standards, primarily in the finance, government and healthcare space, which is not possible with isolates.</p><p>Also, isolates aren't designed for compute-intensive and long-running tasks. They have strict memory and compute limits set by the platform, suiting short IO-intensive lightweight operations running at the edge.</p><blockquote><p><span>A discussion post on IO-bound, CPU-bound, and memory-bound operations is in the pipeline, including the subsequent posts in the '</span><a href="https://shivangsnewsletter.com/p/systems-programming-coding-message-broker" rel="">Coding a message broker from the bare bones</a><span>' series. </span></p><p>I'll also discuss the Firecracker MicroVMs by AWS, which are lightweight virtual machines providing startup times close to isolates while retaining the flexibility of containers. Stay tuned.</p></blockquote><p>If you haven't subscribed yet, do subscribe to my newsletter to have my posts slide into your inbox as soon as they are published.</p><p><span>To learn the fundamentals of cloud computing, including concepts like FaaS, containers, VMs, deployment infrastructure and more, do check out my </span><a href="https://learnsoftwarearchitecture.com/cloud-computing-101-master-the-fundamentals" rel="">cloud course</a><span>. It's a part of the </span><a href="https://learnsoftwarearchitecture.com/" rel="">zero to system architecture bundle</a><span>, which takes you from zero to mastering the fundamentals of system architecture.</span></p><p><span>Furthermore, to code distributed systems like Git, Redis, Kafka, and more from the bare bones in the programming language of your choice, check out </span><a href="https://codecrafters.io/?via=techPackets" rel="">CodeCrafters</a><span>.</span></p><p><span>With their interactive, hands-on exercises, you'll get a good understanding of how these systems work. If you decide to make a purchase, you can use&nbsp;</span><a href="https://app.codecrafters.io/join?via=techPackets" rel="">my unique link to get 40% off</a><span> (affiliate).</span></p><blockquote><p><span>If you wish to delve further into V8 isolate architecture, do go through </span><a href="https://developers.cloudflare.com/workers/reference/security-model/" rel="">this resource</a><span>.</span></p></blockquote><p><span>I've implemented a&nbsp;</span><a href="https://shivangsnewsletter.com/p/distributed-programming-part-2" rel="">single-threaded</a><span>&nbsp;and&nbsp;</span><a href="https://shivangsnewsletter.com/p/distributed-programming-part-3" rel="">multithreaded</a><span>&nbsp;TCP/IP server in Java. You can go through the linked posts to understand how servers function.</span></p><p><span>If you found this post insightful, consider sharing it with your friends for more reach. You can find me on&nbsp;</span><a href="https://www.linkedin.com/in/shivang-sarawagi-b7b5881b/" rel="">LinkedIn</a><span>&nbsp;&amp;&nbsp;</span><a href="https://twitter.com/shivang_z" rel="">X</a><span>&nbsp;and can chat with me on&nbsp;</span><a href="https://shivangsnewsletter.com/chat" rel="">Substack chat</a><span>&nbsp;as well. I'll see you in the next post.</span></p><p>Until then, Bye!</p></div></div></div>]]>
+            </description>
+            <link>https://shivangsnewsletter.com/p/why-doesnt-cloudflare-use-containers</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42026886</guid>
+            <pubDate>Sat, 02 Nov 2024 15:18:09 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[SpawELO – small free matchmaking system for LAN parties]]>
             </title>
             <description>
 <![CDATA[
-Score 54 | Comments 8 (<a href="https://news.ycombinator.com/item?id=42025469">thread link</a>) | @Spawek
+Score 99 | Comments 18 (<a href="https://news.ycombinator.com/item?id=42025469">thread link</a>) | @Spawek
 <br/>
 November 2, 2024 | https://blog.spawek.com/SpawELO | <a href="https://web.archive.org/web/*/https://blog.spawek.com/SpawELO">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
@@ -464,7 +1393,7 @@ November 1, 2024 | https://mattgreer.dev/blog/cramming-solitaire-onto-a-nintendo
             </title>
             <description>
 <![CDATA[
-Score 50 | Comments 40 (<a href="https://news.ycombinator.com/item?id=42020406">thread link</a>) | @willemlaurentz
+Score 55 | Comments 41 (<a href="https://news.ycombinator.com/item?id=42020406">thread link</a>) | @willemlaurentz
 <br/>
 November 1, 2024 | https://willem.com/blog/2018-10-09_using-a-budget-android-as-main-smartphone/ | <a href="https://web.archive.org/web/*/https://willem.com/blog/2018-10-09_using-a-budget-android-as-main-smartphone/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="content">
@@ -805,7 +1734,7 @@ Build Faster
             </title>
             <description>
 <![CDATA[
-Score 516 | Comments 230 (<a href="https://news.ycombinator.com/item?id=42019586">thread link</a>) | @thunderbong
+Score 519 | Comments 232 (<a href="https://news.ycombinator.com/item?id=42019586">thread link</a>) | @thunderbong
 <br/>
 November 1, 2024 | https://learnhub.top/celebrating-21-years-of-notepad-the-legendary-journey-of-our-favorite-text-editor/ | <a href="https://web.archive.org/web/*/https://learnhub.top/celebrating-21-years-of-notepad-the-legendary-journey-of-our-favorite-text-editor/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="post-645">
@@ -897,7 +1826,7 @@ November 1, 2024 | https://learnhub.top/celebrating-21-years-of-notepad-the-lege
             </title>
             <description>
 <![CDATA[
-Score 113 | Comments 46 (<a href="https://news.ycombinator.com/item?id=42019318">thread link</a>) | @samlambert
+Score 116 | Comments 47 (<a href="https://news.ycombinator.com/item?id=42019318">thread link</a>) | @samlambert
 <br/>
 November 1, 2024 | https://shellhaters.org/talk | <a href="https://web.archive.org/web/*/https://shellhaters.org/talk">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1672,7 +2601,7 @@ ahem, <code>:joe</code>, <code>B2</code> will need to be re-compiled so that the
 </h2><p>Whether you are a CTO, a tech lead or an individual contributor in a team, please, for your own sake, pay attention to your feedback loop.</p>
 <p>When starting a new project, an experienced engineer will keep a close eye on this, for they know how important it is in the long term to have a <em>fast</em> loop. However, less experienced engineers, or experienced engineers who don’t have a lot of experience with Elixir might not realize they are hurting the feedback loop until it gets too late.</p>
 <p>Optimize the feedback loop your developers (or you) go through on a daily basis. I insist: when it comes to productivity, this is the first metric you should care about.</p>
-<p>This blog post should contain everything you need to identify and permanently fix (re)compilation issues with your codebase. However, if you have questions or comments, feel free to <a href="https://r.ena.to/cdn-cgi/l/email-protection#ed9fad88838cc39982">reach out to me via email</a>.</p>
+<p>This blog post should contain everything you need to identify and permanently fix (re)compilation issues with your codebase. However, if you have questions or comments, feel free to <a href="https://r.ena.to/cdn-cgi/l/email-protection#93e1d3f6fdf2bde7fc">reach out to me via email</a>.</p>
 <hr>
 <h2 id="notes">Notes
 </h2><p>[0] - If you disagree with this assertion, <em>please</em> shoot me an email. I’d love to hear what <em>you</em> consider to be more underestimated than <code>mix xref</code>. <a href="#a-primer-on-mix-xref">^</a></p>
@@ -2418,7 +3347,7 @@ The <code>-debug-actiongraph</code> flag will emit this DAG as a JSON file, alon
 </span></span><span><span>  <span>"TimeStart"</span><span>:</span> <span>"2023-07-05T17:13:41.838775857Z"</span><span>,</span>
 </span></span><span><span>  <span>"TimeDone"</span><span>:</span> <span>"2023-07-05T17:13:41.930219542Z"</span><span>,</span>
 </span></span><span><span>  <span>"Cmd"</span><span>:</span> <span>[</span>
-</span></span><span><span>    <span>"/usr/local/go/pkg/tool/linux_amd64/compile -o /tmp/go-build1707548832/b322/_pkg_.a -trimpath \"/tmp/go-build1707548832/b322=&gt;\" -p github.com/modern-go/concurrent -lang=go1.16 -complete -buildid rfdTmXlzNWtJZwTp13Ge/rfdTmXlzNWtJZwTp13Ge -goversion go1.20.5 -c=4 -nolocalimports -importcfg /tmp/go-build1707548832/b322/importcfg -pack /go/pkg/mod/github.com/modern-go/<a href="https://blog.howardjohn.info/cdn-cgi/l/email-protection" data-cfemail="a4c7cbcac7d1d6d6c1cad0e4d2948a948a94899694959c9497949294959692909089c6c5c7c09dc793c1c295c0c0">[email&nbsp;protected]</a>/executor.go /go/pkg/mod/github.com/modern-go/<a href="https://blog.howardjohn.info/cdn-cgi/l/email-protection" data-cfemail="41222e2f22343333242f350137716f716f716c73717079717271777170737775756c232022257822762427702525">[email&nbsp;protected]</a>/go_above_19.go /go/pkg/mod/github.com/modern-go/<a href="https://blog.howardjohn.info/cdn-cgi/l/email-protection" data-cfemail="ccafa3a2afb9bebea9a2b88cbafce2fce2fce1fefcfdf4fcfffcfafcfdfefaf8f8e1aeadafa8f5affba9aafda8a8">[email&nbsp;protected]</a>/log.go /go/pkg/mod/github.com/modern-go/<a href="https://blog.howardjohn.info/cdn-cgi/l/email-protection" data-cfemail="385b57565b4d4a4a5d564c784e0816081608150a080900080b080e08090a0e0c0c155a595b5c015b0f5d5e095c5c">[email&nbsp;protected]</a>/unbounded_executor.go"</span>
+</span></span><span><span>    <span>"/usr/local/go/pkg/tool/linux_amd64/compile -o /tmp/go-build1707548832/b322/_pkg_.a -trimpath \"/tmp/go-build1707548832/b322=&gt;\" -p github.com/modern-go/concurrent -lang=go1.16 -complete -buildid rfdTmXlzNWtJZwTp13Ge/rfdTmXlzNWtJZwTp13Ge -goversion go1.20.5 -c=4 -nolocalimports -importcfg /tmp/go-build1707548832/b322/importcfg -pack /go/pkg/mod/github.com/modern-go/<a href="https://blog.howardjohn.info/cdn-cgi/l/email-protection" data-cfemail="d0b3bfbeb3a5a2a2b5bea490a6e0fee0fee0fde2e0e1e8e0e3e0e6e0e1e2e6e4e4fdb2b1b3b4e9b3e7b5b6e1b4b4">[email&nbsp;protected]</a>/executor.go /go/pkg/mod/github.com/modern-go/<a href="https://blog.howardjohn.info/cdn-cgi/l/email-protection" data-cfemail="b7d4d8d9d4c2c5c5d2d9c3f7c187998799879a8587868f878487818786858183839ad5d6d4d38ed480d2d186d3d3">[email&nbsp;protected]</a>/go_above_19.go /go/pkg/mod/github.com/modern-go/<a href="https://blog.howardjohn.info/cdn-cgi/l/email-protection" data-cfemail="b9dad6d7dacccbcbdcd7cdf9cf8997899789948b898881898a898f89888b8f8d8d94dbd8dadd80da8edcdf88dddd">[email&nbsp;protected]</a>/log.go /go/pkg/mod/github.com/modern-go/<a href="https://blog.howardjohn.info/cdn-cgi/l/email-protection" data-cfemail="f1929e9f92848383949f85b187c1dfc1dfc1dcc3c1c0c9c1c2c1c7c1c0c3c7c5c5dc93909295c892c69497c09595">[email&nbsp;protected]</a>/unbounded_executor.go"</span>
 </span></span><span><span>  <span>],</span>
 </span></span><span><span>  <span>"CmdReal"</span><span>:</span> <span>87273795</span><span>,</span>
 </span></span><span><span>  <span>"CmdUser"</span><span>:</span> <span>52534000</span><span>,</span>
@@ -2778,7 +3707,7 @@ November 1, 2024 | https://thedailyeconomy.org/article/norways-wealth-tax-is-bac
             </title>
             <description>
 <![CDATA[
-Score 325 | Comments 162 (<a href="https://news.ycombinator.com/item?id=42013762">thread link</a>) | @misonic
+Score 334 | Comments 164 (<a href="https://news.ycombinator.com/item?id=42013762">thread link</a>) | @misonic
 <br/>
 October 31, 2024 | https://technicalwriting.dev/data/embeddings.html | <a href="https://web.archive.org/web/*/https://technicalwriting.dev/data/embeddings.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="main">
@@ -3663,7 +4592,7 @@ currently on. <code><span>Neighbor</span></code> would be the recommended page.<
             </title>
             <description>
 <![CDATA[
-Score 299 | Comments 234 (<a href="https://news.ycombinator.com/item?id=42011770">thread link</a>) | @lachyg
+Score 300 | Comments 236 (<a href="https://news.ycombinator.com/item?id=42011770">thread link</a>) | @lachyg
 <br/>
 October 31, 2024 | https://www.physicalintelligence.company/blog/pi0?blog | <a href="https://web.archive.org/web/*/https://www.physicalintelligence.company/blog/pi0?blog">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><div><div><p>Published</p><p>October 31, 2024</p><p>Email</p><p><span>research@physicalintelligence.company</span><span>Kevin Black, Noah Brown, Danny Driess, Michael Equi, Adnan Esmail, Chelsea Finn, Nick Fusai, Lachy Groom, Karol Hausman, Brian Ichter, Szymon Jakubczak, Tim Jones, Kay Ke, Sergey Levine, Adrian Li-Bell, Mohith Mothukuri, Suraj Nair, Karl Pertsch, Lucy Shi, James Tanner, Quan Vuong, Anna Walling, Haohuan Wang, Ury Zhilinsky</span></p><p>Paper</p></div></div></div>
@@ -3727,7 +4656,7 @@ doesn’t come apart.</p>
             </title>
             <description>
 <![CDATA[
-Score 26 | Comments 30 (<a href="https://news.ycombinator.com/item?id=42010136">thread link</a>) | @retro_guy
+Score 54 | Comments 34 (<a href="https://news.ycombinator.com/item?id=42010136">thread link</a>) | @retro_guy
 <br/>
 October 31, 2024 | https://mattgreer.dev/blog/cramming-solitaire-onto-a-nintendo-ereader-card/ | <a href="https://web.archive.org/web/*/https://mattgreer.dev/blog/cramming-solitaire-onto-a-nintendo-ereader-card/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>I recently finished making Solitaire for the Nintendo E-Reader. I managed to fit it onto a single card, and it's a pretty full featured version of the game. I'm really happy with how it turned out. I figured I'd talk a bit about how I made it in what turned out to be a long blog post :)</p><iframe width="560" height="315" src="https://www.youtube.com/embed/yrCnlQbR8Qw" frameborder="0" allowfullscreen=""></iframe><h2 id="what-is-the-e-reader">What is the E-Reader?</h2><p>The E-Reader is a Game Boy Advance peripheral that Nintendo released in 2002. By scanning cards that have a dot code strip on them, you can load mini games, extra levels, animations and more.</p><figure><img src="https://mattgreer.dev/_next/static/media/ereaderWithCard.ab34b110.jpg" alt="The E-Reader and one of its cards"><figcaption>The E-Reader and one of its cards</figcaption></figure><p>I've always really liked the E-Reader and was sad it didn't do too well in America. So I thought maybe I'd take a stab at making games for it myself.</p><figure><img src="https://mattgreer.dev/_next/static/media/marge.40e3ded1.jpg" alt="Marge Simpson holding up an E-Reader card"><figcaption>Me too, Marge</figcaption></figure><p>And here is the result</p><figure><img src="https://mattgreer.dev/_next/static/media/solitaireCard.14494276.svg" alt="Solitaire as an E-Reader card"><figcaption>Solitaire in its card from</figcaption></figure><p>If you would like to try it, you can get a card at <a tabindex="0" href="https://retrodotcards.com/">retrodotcards.com</a>.</p><h2 id="tools-and-docs-starting-way-back-in-the-past">Tools and docs, starting way back in the past...</h2><p>Where to begin? I remembered there were some old tools and websites about making E-Reader cards from back around when it first came out <!-- -->—<!-- --> twenty years ago! I managed to find <a tabindex="0" href="https://www.schuerewegen.tk/">Tim Schuerewegen's</a> original site in the Wayback Machine. It had some examples, source code and tools. I also refound <a tabindex="0" href="https://caitsith2.com/ereader/">CaitSith2's E-Reader site</a>, which thankfully is still up. It also has some tools and information.</p><div><p>These tools are the backbone of E-Reader dev. Thanks to Tim and CaitSith2 for making them! They were originally made for Windows, but they were also made</p><!-- --> <p><a tabindex="0" href="https://github.com/breadbored/nedclib">multi-platform here</a>.</p></div><p>These initial findings were a great start and got me headed down learning how E-Reader applications are programmed. GBATEK also has <a tabindex="0" href="https://problemkaputt.de/gbatek.htm#gbacartereader">a section on the E-Reader</a> which also contains lots of useful information.</p><p>More recently I found <a tabindex="0" href="https://github.com/AkBKukU/e-reader-dev">AkBKukU's e-reader-dev repo</a> which has also been very helpful.</p><h2 id="pick-your-poison-gba-nes-or--z80">Pick your poison: GBA, NES or ... z80?</h2><p>What kind of E-Reader card should I make? E-Reader cards can come in four broad formats</p><h3 id="game-boy-advance-applications">Game Boy Advance applications</h3><p>These are GBA programs written much like if you were making a normal GBA game. The E-Reader simply loads them in then lets them execute on their own for the most part.</p><h3 id="nes-games">NES games</h3><p>The E-Reader contains a simple NES emulator, so it is possible to directly put simple NES games onto E-Reader cards. The keyword here is "simple", it does not support more advanced NES features. Also the E-Reader has a limit on how many card swipes one application can have. The NES games Nintendo released require 10 card swipes to load! So in the end it is only possible to run early/small NES games. Nintendo used this to release games like Excitebike and Donkey Kong for the E-Reader</p><figure><img src="https://mattgreer.dev/_next/static/media/excitebike.b25f14d4.jpg" alt="Excitebike in E-Reader card format"><figcaption>Excitebike in E-Reader card format</figcaption></figure><h3 id="raw-binaries">Raw binaries</h3><p>Raw E-Reader cards just contain binary data of some kind. Specific games made use of these to add levels, characters, etc. Kind of like a primitive form of DLC. It is up to the specific game to interpret the data as it sees fit.</p><p>Super Mario Advance 4 released cards like this, adding additional levels, power ups and more for the game</p><figure><img src="https://mattgreer.dev/_next/static/media/sma4LevelCards.2f1b78cf.jpg" alt="Super Mario Advance 4 E-Reader level cards"><figcaption>Super Mario Advance 4 E-Reader level cards</figcaption></figure><h3 id="z80-applications">z80 Applications</h3><p>And finally the E-Reader also contains a simple z80 emulator. The z80 is an 8-bit processor that first came out in 1976! It was very successful and found its way into many different computers.</p><p>I don't believe Nintendo ever used a z80 processor in any of their game consoles. So this choice is an interesting one. I'm sure the z80's simplicity was a big factor here, it's pretty easy to emulate.</p><p>I have since been informed that the Game Boy and Game Boy Color have CPUs that are similar to the z80. So that might have influenced Nintendo's decision here. I didn't know that, so thanks to those who informed me.</p><figure><img src="https://mattgreer.dev/_next/static/media/manhole.c4c7c2b1.jpg" alt="Manhole: a simple z80 E-Reader game"><figcaption>Manhole: a simple z80 E-Reader game</figcaption></figure><p>That means E-Reader apps can be written in z80 assembly. The primary advantage here is z80 apps tend to be quite small. In my experimenting, I found an E-Reader z80 app to be about 30-50% smaller than an equivalent E-Reader GBA app. Nintendo almost entirely went this route with their own cards, I'm guessing to keep the number of swipes needed for an application to a minimum.</p><h2 id="z80-e-reader-apps">z80 E-Reader apps</h2><p>I made Solitaire as a z80 application and have become pretty entrenched in this approach. I really like how much smaller the resulting binaries are. But make no doubt about it, z80 assembly is pretty rough. Especially considering you can <a tabindex="0" href="https://github.com/AkBKukU/e-reader-dev">write a GBA E-Reader card in C</a>.</p><h3 id="the-erapi-api">The ERAPI API</h3><p>For z80 games, Nintendo embedded a simple but effective <a tabindex="0" href="https://problemkaputt.de/gbatek.htm#gbacartereaderapifunctions">API</a> into the E-Reader that they can take advantage of. Things like creating sprites, playing music, even multiplying and dividing, can all be done through this API. This helps keep card sizes small, as common functionality doesn't need to be packed into the cards, the E-Reader itself will provide it.</p><p>GBA E-Reader games also can access ERAPI. It's a bit different here and there, but overall it's the same API.</p><p>As a simple example, here is how to create a sprite using the API</p><p><code><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>;&nbsp;<wbr>ERAPI_SpriteCreate()</span></p><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>;&nbsp;<wbr>e&nbsp;<wbr>&nbsp;<wbr>=&nbsp;<wbr>pal#</span></p><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>;&nbsp;<wbr>hl&nbsp;<wbr>=&nbsp;<wbr>sprite&nbsp;<wbr>data</span></p><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>ld&nbsp;<wbr>&nbsp;<wbr>e,&nbsp;<wbr>#2</span></p><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>ld&nbsp;<wbr>&nbsp;<wbr>hl,&nbsp;<wbr>#my_sprite_data_struct</span></p><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>rst&nbsp;<wbr>0</span></p><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>.db&nbsp;<wbr>ERAPI_SpriteCreate</span></p><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>ld&nbsp;<wbr>&nbsp;<wbr>(my_sprite_handle),&nbsp;<wbr>hl</span></p></code></p><p>If you're not familiar with z80 assembly this probably looks bizarre. It is basically the equivalent of</p><p><code><p><span>int</span><span>&nbsp;<wbr>palette_index&nbsp;<wbr></span><span>=</span><span>&nbsp;<wbr></span><span>2</span><span>;</span><span></span></p><p><span></span><span>int</span><span>&nbsp;<wbr>my_sprite_handle&nbsp;<wbr></span><span>=</span><span>&nbsp;<wbr></span><span>SpriteCreate</span><span>(</span><span></span></p><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>palette_index</span><span>,</span><span></span></p><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>my_sprite_data_struct</span></p><p><span></span><span>)</span><span>;</span><span></span></p></code></p><p>The <code>ld</code> calls are "load", and here we are loading the <code>e</code> register with which palette index we want the sprite to use. The <code>hl</code> register is loaded with a pointer to the information about the sprite (its tiles, colors, frames of animation, etc). The <code>rst 0</code> and <code>.db ERAPI_SpriteCreate</code> lines are where we actually make the API call. Without getting too deep on how the z80 works, this is a simple function call. When it is done, it will leave the handle to the sprite in the hl register, so we <code>ld (my_sprite_handle), hl</code> to copy that value off into memory for safe keeping. That handle is later used whenever we want to interact with the sprite, such as changing its position.</p><h3 id="a-crippled-z80">A crippled z80</h3><p>The E-Reader's z80 emulator is not 100% accurate. Nintendo decided to not support some opcodes and some of the registers. I have also found that some opcodes don't seem to work correctly. Hopefully I'm just using them wrong, but some opcodes just cause the GBA to show a black screen and lock up.</p><p>The z80 is already a very limited processor, and this makes it even more so. Sometimes E-Reader z80 development is absolutely painful. But hey, the challenge is part of the fun (right?)</p><p>I often felt like this when trying to implement something</p><figure><img src="https://mattgreer.dev/_next/static/media/austinPowers.5363a338.jpg" alt="Austin Powers trying to turn around in a tunnel"></figure><p>Simple things that I usually take for granted like copying one array to another is just so much harder to do in E-Reader z80 assembly. Thankfully I'm starting to get the hang of it.</p><h3 id="debugging">Debugging</h3><p>Another huge challenge was debugging the game. There's no way to log anything, running the game on a Game Boy Advance is a total black box. GBA emulators like <a tabindex="0" href="https://mgba.io/">mGBA</a> have good debugging features. But this is a z80 emulator running on the GBA's ARM processor. I figured stepping through ARM instructions trying to figure out how z80 instructions worked would be a herculean task, so much so I never even tried. Thankfully I don't think I'll ever need to, more on that below.</p><p>For my first attempt at creating a debugger, I took <a tabindex="0" href="https://github.com/5inf/z80js">z80js</a>, a z80 emulator core created by Molly Howell, and built a small application that would run my binary and log out what the cpu was doing. The output looked like this</p><p><code><p><span>...</span><span></span></p><p><span>0B52</span><span>:</span><span>&nbsp;<wbr>call&nbsp;<wbr>_deck_gfx_render_column&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr></span><span>|</span><span>&nbsp;<wbr>a</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>17</span><span>,</span><span>&nbsp;<wbr></span><span>b</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>00</span><span>,</span><span>&nbsp;<wbr></span><span>c</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>03</span><span>,</span><span>&nbsp;<wbr></span><span>d</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>08</span><span>,</span><span>&nbsp;<wbr></span><span>e</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr>5c</span><span>,</span><span>&nbsp;<wbr></span><span>h</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>00</span><span>,</span><span>&nbsp;<wbr></span><span>l</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>17</span><span>,</span><span>&nbsp;<wbr></span><span>bc</span><span>:</span><span>&nbsp;<wbr></span><span>0003</span><span>,</span><span>&nbsp;<wbr></span><span>de</span><span>:</span><span>&nbsp;<wbr>085c</span><span>,</span><span>&nbsp;<wbr></span><span>hl</span><span>:</span><span>&nbsp;<wbr></span><span>0017</span><span></span></p><p><span>0B5B</span><span>:</span><span>&nbsp;<wbr>ld&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>b</span><span>,</span><span>#</span><span>0x13</span><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr></span><span>|</span><span>&nbsp;<wbr>a</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>17</span><span>,</span><span>&nbsp;<wbr></span><span>b</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>00</span><span>,</span><span>&nbsp;<wbr></span><span>c</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>03</span><span>,</span><span>&nbsp;<wbr></span><span>d</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>08</span><span>,</span><span>&nbsp;<wbr></span><span>e</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr>5c</span><span>,</span><span>&nbsp;<wbr></span><span>h</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>00</span><span>,</span><span>&nbsp;<wbr></span><span>l</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>17</span><span>,</span><span>&nbsp;<wbr></span><span>bc</span><span>:</span><span>&nbsp;<wbr></span><span>0003</span><span>,</span><span>&nbsp;<wbr></span><span>de</span><span>:</span><span>&nbsp;<wbr>085c</span><span>,</span><span>&nbsp;<wbr></span><span>hl</span><span>:</span><span>&nbsp;<wbr></span><span>0017</span><span></span></p><p><span>0B5D</span><span>:</span><span>&nbsp;<wbr>ld&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>c</span><span>,</span><span>#</span><span>0x00</span><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr></span><span>|</span><span>&nbsp;<wbr>a</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>17</span><span>,</span><span>&nbsp;<wbr></span><span>b</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>13</span><span>,</span><span>&nbsp;<wbr></span><span>c</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>03</span><span>,</span><span>&nbsp;<wbr></span><span>d</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>08</span><span>,</span><span>&nbsp;<wbr></span><span>e</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr>5c</span><span>,</span><span>&nbsp;<wbr></span><span>h</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>00</span><span>,</span><span>&nbsp;<wbr></span><span>l</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>17</span><span>,</span><span>&nbsp;<wbr></span><span>bc</span><span>:</span><span>&nbsp;<wbr></span><span>1303</span><span>,</span><span>&nbsp;<wbr></span><span>de</span><span>:</span><span>&nbsp;<wbr>085c</span><span>,</span><span>&nbsp;<wbr></span><span>hl</span><span>:</span><span>&nbsp;<wbr></span><span>0017</span><span></span></p><p><span>0B5F</span><span>:</span><span>&nbsp;<wbr>ld&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>hl</span><span>,</span><span>(</span><span>_deck_gfx_cur_column_addr</span><span>)</span><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr></span><span>|</span><span>&nbsp;<wbr>a</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>17</span><span>,</span><span>&nbsp;<wbr></span><span>b</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>13</span><span>,</span><span>&nbsp;<wbr></span><span>c</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>00</span><span>,</span><span>&nbsp;<wbr></span><span>d</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>08</span><span>,</span><span>&nbsp;<wbr></span><span>e</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr>5c</span><span>,</span><span>&nbsp;<wbr></span><span>h</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>00</span><span>,</span><span>&nbsp;<wbr></span><span>l</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>17</span><span>,</span><span>&nbsp;<wbr></span><span>bc</span><span>:</span><span>&nbsp;<wbr></span><span>1300</span><span>,</span><span>&nbsp;<wbr></span><span>de</span><span>:</span><span>&nbsp;<wbr>085c</span><span>,</span><span>&nbsp;<wbr></span><span>hl</span><span>:</span><span>&nbsp;<wbr></span><span>0017</span><span></span></p><p><span>0B62</span><span>:</span><span>&nbsp;<wbr>ld&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>d</span><span>,</span><span>#</span><span>0x00</span><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr></span><span>|</span><span>&nbsp;<wbr>a</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>17</span><span>,</span><span>&nbsp;<wbr></span><span>b</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>13</span><span>,</span><span>&nbsp;<wbr></span><span>c</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>00</span><span>,</span><span>&nbsp;<wbr></span><span>d</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>08</span><span>,</span><span>&nbsp;<wbr></span><span>e</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr>5c</span><span>,</span><span>&nbsp;<wbr></span><span>h</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>08</span><span>,</span><span>&nbsp;<wbr></span><span>l</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr>5c</span><span>,</span><span>&nbsp;<wbr></span><span>bc</span><span>:</span><span>&nbsp;<wbr></span><span>1300</span><span>,</span><span>&nbsp;<wbr></span><span>de</span><span>:</span><span>&nbsp;<wbr>085c</span><span>,</span><span>&nbsp;<wbr></span><span>hl</span><span>:</span><span>&nbsp;<wbr>085c</span></p><p><span>0B64</span><span>:</span><span>&nbsp;<wbr>ld&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>e</span><span>,</span><span>c&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr></span><span>|</span><span>&nbsp;<wbr>a</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>17</span><span>,</span><span>&nbsp;<wbr></span><span>b</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>13</span><span>,</span><span>&nbsp;<wbr></span><span>c</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>00</span><span>,</span><span>&nbsp;<wbr></span><span>d</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>00</span><span>,</span><span>&nbsp;<wbr></span><span>e</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr>5c</span><span>,</span><span>&nbsp;<wbr></span><span>h</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>08</span><span>,</span><span>&nbsp;<wbr></span><span>l</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr>5c</span><span>,</span><span>&nbsp;<wbr></span><span>bc</span><span>:</span><span>&nbsp;<wbr></span><span>1300</span><span>,</span><span>&nbsp;<wbr></span><span>de</span><span>:</span><span>&nbsp;<wbr>005c</span><span>,</span><span>&nbsp;<wbr></span><span>hl</span><span>:</span><span>&nbsp;<wbr>085c</span></p><p><span>0B65</span><span>:</span><span>&nbsp;<wbr>add&nbsp;<wbr>&nbsp;<wbr>hl</span><span>,</span><span>de&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr></span><span>|</span><span>&nbsp;<wbr>a</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>17</span><span>,</span><span>&nbsp;<wbr></span><span>b</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>13</span><span>,</span><span>&nbsp;<wbr></span><span>c</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>00</span><span>,</span><span>&nbsp;<wbr></span><span>d</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>00</span><span>,</span><span>&nbsp;<wbr></span><span>e</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>00</span><span>,</span><span>&nbsp;<wbr></span><span>h</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr></span><span>08</span><span>,</span><span>&nbsp;<wbr></span><span>l</span><span>:</span><span>&nbsp;<wbr>&nbsp;<wbr>5c</span><span>,</span><span>&nbsp;<wbr></span><span>bc</span><span>:</span><span>&nbsp;<wbr></span><span>1300</span><span>,</span><span>&nbsp;<wbr></span><span>de</span><span>:</span><span>&nbsp;<wbr></span><span>0000</span><span>,</span><span>&nbsp;<wbr></span><span>hl</span><span>:</span><span>&nbsp;<wbr>085c</span></p><p><span></span><span>...</span><span></span></p></code></p><p>That looks like pure gibberish here in the blog because the lines are too long to fit. Each line contains the opcode the cpu executed, and the state of all the registers at that time.</p><p>Here is a single line, cleaned up a bit</p><p><code><p><span>0B5B</span><span>:</span><span>&nbsp;<wbr>ld&nbsp;<wbr>b</span><span>,</span><span>#</span><span>0x13</span><span>&nbsp;<wbr></span><span>|</span><span>&nbsp;<wbr>a</span><span>:</span><span>17</span><span>,</span><span>&nbsp;<wbr></span><span>b</span><span>:</span><span>00</span><span>,</span><span>&nbsp;<wbr></span><span>c</span><span>:</span><span>03</span><span>,</span><span>&nbsp;<wbr></span><span>d</span><span>:</span><span>08</span><span>,</span><span>&nbsp;<wbr></span><span>e</span><span>:</span><span>5c</span><span>,</span><span>&nbsp;<wbr></span><span>h</span><span>:</span><span>00</span><span>,</span><span>&nbsp;<wbr></span><span>l</span><span>:</span><span>17</span><span>,</span><span></span></p><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr></span><span>bc</span><span>:</span><span>0003</span><span>,</span><span>&nbsp;<wbr></span><span>de</span><span>:</span><span>085c</span><span>,</span><span>hl</span><span>:</span><span>&nbsp;<wbr></span><span>0017</span><span></span></p></code></p><p>This ... worked ... I mean it got the job done and I was able to fix bugs by examining this output. But it wasn't very fun. A huge downside to this approach is it wasn't interactive. It just blindly ran the game without allowing any button presses or anything like that. Because of this, I often had to get very creative to get this emulator to run the part of the game I was having troubles with.</p><h3 id="a-proper-debugger">A proper debugger</h3><p>I used this tracing approach to write most of the game. But towards the end there were two mysterious bugs I just could not figure out. I knew I needed a better solution.</p><p>I stumbled across the <a tabindex="0" href="https://github.com/maziac/DeZog">DeZog</a> project, which is a general purpose z80 debugging extension for VS Code. This looked really promising, but then I found <a tabindex="0" href="https://github.com/andrivet/ZX81-Debugger">ZX81-Debugger</a>. Sebastien Andrivet took DeZog as a basis and made a VS Code extension specifically for writing and debugging <a tabindex="0" href="https://en.wikipedia.org/wiki/ZX81">ZX81</a> applications.</p><p>I really liked ZX81-Debugger right away, what a great tool! Just install it and <em>boom</em> you've got a full fledged ZX81 development environment. I forked its code and started adapting it to work with E-Reader apps. Since both platforms have the z80 processor in common, this turned out to not be as difficult as I thought it would be.</p><p>After a long weekend of hacking, I surprisingly had an E-Reader debugger running in VS Code! In the end, I was positively floored how quickly I got this working. I am truly standing on the shoulders of giants ... so thank you to everyone who made all of this possible.</p><figure><img src="https://mattgreer.dev/_next/static/media/ereaderDebugger.7724d380.png" alt="The E-Reader debugger running in VS Code"><figcaption>The E-Reader debugger running in VS Code</figcaption></figure><p><a tabindex="0" href="https://mattgreer.dev/ereaderDebugger.png">Here is that image</a> in full size.</p><p>To get this working I removed most of the ZX81 specific things and then wrote a simple ERAPI emulator. As ERAPI calls come in, the debugger sends them over to my little emulator, which then translates them into a visual GBA screen.</p><figure><img src="https://mattgreer.dev/_next/static/media/erapiScreen.74512747.png" alt="A close up of the ERAPI emulator screen output"><figcaption>A close up of the ERAPI emulator screen output</figcaption></figure><p>The background is green because I've not added most of the background related API functions to the emulator yet. And below the screen I am dumping out the current state of all the sprites that were created through ERAPI.</p><p>You can even take a commercial E-Reader game and run it in the debugger. It will disassemble the binary and provide a nice debugging experience. This will be helpful to further figure out more about how E-Reader cards and ERAPI works.</p><figure><img src="https://mattgreer.dev/_next/static/media/kirbyInDebugger.6b6e5d80.png" alt="An official Nintendo E-Reader card, running in the debugger"><figcaption>An official Nintendo E-Reader card, running in the debugger</figcaption></figure><p>The colors in that Kirby card are all weird because my ERAPI emulator is super raw and does many things incorrectly. It's drawing the image using the wrong palettes. A lot more work needs to be done.</p><p>This is just amazing! I never imagined I'd get a developer experience this powerful on a forgotten, 20 year old, Nintendo peripheral. We really live in exciting times sometimes.</p><p>Ultimately I will open source the E-Reader-Debugger. But as it stands, it's not even alpha quality. I mean it is <i>rough</i>. After I've worked out more kinks, I will throw it up on GitHub.</p><h2 id="challenges-with-the-erapi-api">Challenges with the ERAPI API</h2><p>Overall the E-Reader's ERAPI is very useful, and has lots of great stuff to make development easier. But I did find some of the stuff didn't work out. Either because this stuff is buggy, or maybe I just don't yet understand how to use it properly. Hopefully the latter.</p><p>I really struggled with this when rendering the playfield for Solitaire. Being an old game system, the GBA has limitations when drawing sprites to the screen. You can't put too many on the screen at once or else things like this can happen</p><iframe width="560" height="315" src="https://www.youtube.com/embed/WE4CgMpjD88" frameborder="0" allowfullscreen=""></iframe><p>This video shows Solitaire when I first started working on it. I wanted to see if I could use sprites to draw all the cards. I concluded I couldn't and instead would need to draw the cards into a background. Using backgrounds for graphics like this is a very common tactic on older game systems. And luckily, ERAPI has the function <code>SpriteDrawOnBackground</code>, it seems to be exactly meant for this use case.</p><p>Using this function, I was able to easily draw my sprites into the background and avoid all graphical glitching ... the first time the playfield was drawn. As it was drawn repeatedly, it seemed like the tiles in video RAM were getting corrupted</p><iframe width="560" height="315" src="https://www.youtube.com/embed/jz8RZF68B58" frameborder="0" allowfullscreen=""></iframe><p>In this video I was reshuffling and redealing the deck repeatedly. And each time I dealt it out again, graphical glitches would appear.</p><p>I tried and tried, but I just could not get this to work. I'm not completely sure I wasn't doing something wrong. But ERAPI and the way z80 apps work with the emulator seem pretty straightforward? So I <em>think</em> this function was not meant for rapid use like this.</p><p>ERAPI has another function, <code>LoadCustomBackground</code>, and it was this one that was a winner for my game. It's a lower level and harder to use function than <code>SpriteDrawOnBackground</code>, but it has never caused graphical glitches on me even once.</p><iframe width="560" height="315" src="https://www.youtube.com/embed/4-uaNX9LGN4" frameborder="0" allowfullscreen=""></iframe><p>With this function, it is up to me to figure out which tiles go where to form a background. You need to understand how backgrounds work on the GBA to pull this off. Then once I've figured it all out, I just send it to the GBA in one function call and it appears on the screen.</p><h2 id="z80-e-reader-apps-are-kinda-script-like">z80 E-Reader apps are kinda script-like</h2><p>I have found the way E-Reader z80 apps work to be pretty interesting. The emulator uses the <code>halt</code> opcode to mean "draw a frame to the screen". You can load the <code>a</code> register with how many frames it should draw, accomplishing a very simple way to add waits to your game.</p><iframe width="560" height="315" src="https://www.youtube.com/embed/k5GrjMe4Ef0" frameborder="0" allowfullscreen=""></iframe><p>Take this little intro animation. I built it like this</p><p><code><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>logoHandle&nbsp;<wbr></span><span>=</span><span>&nbsp;<wbr></span><span>createSprite</span><span>(</span><span>logo</span><span>)</span><span>;</span><span></span></p><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr></span><span>setSpritePosition</span><span>(</span><span>logoHandle</span><span>,</span><span>&nbsp;<wbr></span><span>120</span><span>,</span><span>&nbsp;<wbr></span><span>20</span><span>)</span><span>;</span><span></span></p><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>footerHandle&nbsp;<wbr></span><span>=</span><span>&nbsp;<wbr></span><span>createSprite</span><span>(</span><span>footer</span><span>)</span><span>;</span><span></span></p><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr></span><span>setSpritePosition</span><span>(</span><span>footerHandle</span><span>,</span><span>&nbsp;<wbr></span><span>120</span><span>,</span><span>&nbsp;<wbr></span><span>60</span><span>)</span><span></span></p><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr></span><span>playSystemSound</span><span>(</span><span>DRUM_ROLL</span><span>)</span><span>;</span><span></span></p><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr></span><span>for</span><span>&nbsp;<wbr></span><span>(</span><span>let</span><span>&nbsp;<wbr>i&nbsp;<wbr></span><span>=</span><span>&nbsp;<wbr></span><span>0</span><span>;</span><span>&nbsp;<wbr>i&nbsp;<wbr></span><span>&lt;</span><span>&nbsp;<wbr></span><span>NUM_CARDS_TO_DEAL</span><span>)</span><span>&nbsp;<wbr></span><span>{</span><span></span></p><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr></span><span>dealOneCard</span><span>(</span><span>i</span><span>)</span><span>;</span><span></span></p><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr></span><span>halt</span><span>(</span><span>1</span><span>)</span><span>;</span><span></span></p><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr></span><span>}</span><span></span></p><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr></span><span>playSystemSound</span><span>(</span><span>CYMBOL</span><span>)</span><span>;</span><span></span></p><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr></span><span>halt</span><span>(</span><span>30</span><span>)</span><span></span></p><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr></span><span>freeSprite</span><span>(</span><span>logoHandle</span><span>)</span><span>;</span><span></span></p><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr></span><span>freeSprite</span><span>(</span><span>footerHandle</span><span>)</span><span>;</span><span></span></p></code></p><p>In the actual game this was done in assembly, I turned it into pseudo-code here to make it easier to read.</p><p>What I find interesting is I just whipped up a typical game engine loop on the spot, just to deal out the cards. I didn't need to hook all this into a main game loop like you often do with most game development. The entire rest of the game doesn't know or even care that this happens.</p><h2 id="e-reader-assets">E-Reader assets</h2><p>You might have noticed my game has music, sound effects, and a Mars-like rocky background. The E-Reader itself has many assets a game can use. This helps keep the dotcode data small. You can do custom graphics (such as the deck of cards in my game) and sounds, but they tend to be quite large and take up precious space.</p><figure><img src="https://mattgreer.dev/_next/static/media/ereaderSystemBackgrounds.65d3800e.png" alt="Some of the backgrounds found on the E-Reader"><figcaption>Some of the backgrounds found on the E-Reader</figcaption></figure><p>Altogether there are over 100 backgrounds, over 800 sounds (both sound effects and music) and over 200 Pokémon sprites stored in the E-Reader's 8MB ROM. If you're an E-Reader fan, you might have noticed Nintendo's mini games tend to reuse the same sound effects, music and often the same backgrounds. This is why.</p><p>Using them is usually just a simple API call. For example here is how I play the drum roll sound effect</p><p><code><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>ld&nbsp;<wbr>hl,&nbsp;<wbr>755</span></p><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>rst&nbsp;<wbr>8</span></p><p><span>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>&nbsp;<wbr>.db&nbsp;<wbr>ERAPI_PlaySystemSound</span></p></code></p><p>Crazy assembly syntax aside, this is pretty much just <code>PlaySystemSound(755)</code>, where <code>755</code> is the drum roll's id.</p><h2 id="how-big-can-e-reader-apps-be">How big can E-Reader apps be?</h2><p>A single E-Reader dotstrip can store 2,192 bytes of data, which is just over 2kb. But there is some overhead with the headers, and error correction, making the actual amount of data I've been able to store on a single strip a bit less than 2kb. This data on the dotstrip is compressed though, which helps a lot.</p><figure><img src="https://mattgreer.dev/_next/static/media/helloWorld.dotcode.bmp.43c2b440.png" alt="An example dotcode strip"><figcaption>An example dotcode strip</figcaption></figure><figure><img src="https://mattgreer.dev/_next/static/media/helloWorld.dotcode.snippet.bmp.cf8b38ee.png" alt="A closer view at part of the dotstip"><figcaption>A closer view at part of the dotstrip</figcaption></figure><p>The compression makes the total storage size kind of fuzzy. It really depends on how well your data compresses. For example, here are the tiles for my cards</p><figure><img src="https://mattgreer.dev/_next/static/media/deck_strips.e6d0f428.png" alt="The card graphic tiles for Solitaire"><figcaption>The card graphic tiles for Solitaire</figcaption></figure><p>I could have saved space by not repeating the same tile over and over again. But this data compressed <em>very</em> well. So well, I just went with it. Deduping these tiles would have made the drawing routines much more complicated, maybe so much so it would have killed any space savings I had achieved.</p><p>In the end I didn't need to do <em>too</em> much space optimization to keep Solitaire down to two dotstrips (which can be printed onto a single card). I did use up all the space that those two strips alloted me, so any more features would have likely required the game be expanded to three dotstrips, something I really wanted to avoid.</p><p>Honestly I'm a bit surprised how many strips are needed for some of Nintendo's cards. Based on the game contained inside and my experience writing Solitaire, it seems like some of their games could have been done in fewer dotstrips. But that's just a total guess, I don't really know.</p><h3 id="the-e-reader-and-gba-limitations-on-space">The E-Reader and GBA limitations on space</h3><p>The E-Reader itself allows a maximum of 12 strips to be scanned for a single application. Although I've yet to find any application that requires that many. The NES games need 10</p><figure><img src="https://mattgreer.dev/_next/static/media/tenStripsNeeded.612549fa.png" alt="The E-Reader waiting for 9 more strips to load Excitebike"><figcaption>The E-Reader waiting for 9 more strips to load Excitebike</figcaption></figure><p>As for the Game Boy Advance itself, it has 256kb of RAM which is more than enough to store any E-Reader application. The E-Reader will decompress the data into RAM, then execute it. I suppose technically your data could exceed 256kb when decompressed, but realistically I just can't see that happening.</p><h2 id="more-e-reader-cards-to-come">More E-Reader cards to come</h2><p>My goal is to make many more E-Reader apps. I'm already deep into development of the next game. I am hoping to build at least 10 apps and have the cards professionally manufactured. Hopefully packaged up in a booster pack, which would be so cool. Why? Why not. I think the E-Reader is really cool and this is a lot of fun.</p><p>If new E-Reader cards interests you, check out <a tabindex="0" href="https://retrodotcards.com/">https://retrodotcards.com</a> If you want to try Solitaire out for yourself, you can order a card there. They are free.</p><p>I will also be posting to <a tabindex="0" href="https://bsky.app/profile/retrodotcards.com">Bluesky</a> as I progress, and have also started a <a tabindex="0" href="https://www.reddit.com/r/retrodotcards/">subreddit</a> for this, stop on by!</p></div></div>]]>
@@ -3742,7 +4671,7 @@ October 31, 2024 | https://mattgreer.dev/blog/cramming-solitaire-onto-a-nintendo
             </title>
             <description>
 <![CDATA[
-Score 105 | Comments 43 (<a href="https://news.ycombinator.com/item?id=42009196">thread link</a>) | @peerless-app
+Score 106 | Comments 43 (<a href="https://news.ycombinator.com/item?id=42009196">thread link</a>) | @peerless-app
 <br/>
 October 31, 2024 | https://www.sagelyhealth.com/blog-posts/cancers-magic-bullet-antibody-drug-conjugates | <a href="https://web.archive.org/web/*/https://www.sagelyhealth.com/blog-posts/cancers-magic-bullet-antibody-drug-conjugates">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p><em>An exciting frontier in cancer treatment over 100 years in the making.</em></p><p>Shortly after her 49th birthday, Alice was diagnosed with uveal melanoma.&nbsp;</p><p>Uveal melanoma is a cancer that develops in the middle layer of the eye. In Alice’s case, a small (1 millimeter) tumor had formed in her eye and cells from that tumor had entered her bloodstream. By the time she was diagnosed, scans showed the melanoma cells had reached her spine and her liver.</p><p>Alice’s cancer was metastatic and she faced an uphill battle. Uveal melanoma is incredibly difficult to treat. Surgery is not an option once it has spread and standard chemotherapy offers limited benefit. Like many cancer patients, she had few effective options.</p><p>Her doctor started her on a combination of immunotherapies, but after the second dose, the side effects were too much to tolerate and she had to stop. They then tried another combination of drugs, but the tumors continued to grow. They switched to another immunotherapy, but this too, was hard to tolerate and the tumors on her spine and in her liver continued to grow.&nbsp;&nbsp;</p><p>In a moment that too many cancer patients can relate to, Alice’s oncologist shared the difficult news: There were no more standard treatments available.</p><p>However, this is not the end of Alice’s story.</p><p>To understand what happened next, we must go back a bit in time. First to the distant past and then to more recent scientific exploration.</p><p>‍</p><figure><p><img src="https://cdn.prod.website-files.com/62f16dfb522723abf6d9a011/670ec7dda70308d5b33cbda5_670ec7c785bb2e2f6fa9f192_cake-at-sunset.png" loading="lazy" alt=""></p><figcaption>Researchers would discover something about uveal melanoma</figcaption></figure><p>‍</p><h2><strong>The Concept of a Magic Bullet</strong></h2><figure><p><img src="https://cdn.prod.website-files.com/62f16dfb522723abf6d9a011/671163806f73b5ea0b161fa5_671163156360e33acd8a8af5_Paul-Ehrlich.webp" loading="lazy" alt=""></p><figcaption>Paul Ehrlich, Nobel Laureate 1908</figcaption></figure><p>In 1908, the Nobel Prize in Medicine was awarded to German physician and scientist Paul Ehrlich for his work in the field of immunology.&nbsp;</p><p>This age, around the turn of the century, is commonly referred to as the birth of modern medicine. Scientists were discovering the complicated mechanisms at work in our bodies. Antiseptics, vaccines, antibiotics, and diagnostic technologies were born during this era. Doctors were given tools to prevent, diagnose, and treat diseases more effectively.</p><p>In his search to understand and treat disease, Ehrich coined the term <strong>magic bullet </strong>(based on an old German myth about a bullet that cannot miss its target).&nbsp;</p><p>He imagined magic bullet treatments that would kill causes of disease without harming the body itself. In 1908, Ehrlich’s laboratory created its first “magic bullet” of arsphenamine—the first antimicrobial drug (it was synthesized and therefore not an antibiotic). It was the first effective treatment for syphilis.</p><p>This treatment, considered by many to be the first chemotherapy (at least in concept), did offer a cure, but the magic was limited as it caused harsh side effects.</p><p>We have been hunting for magic bullets ever since. </p><p>‍</p><h2><strong>The Anti-Bullet: Chemotherapy</strong></h2><p>Since its first use during World War II, chemotherapy has remained the most common cancer treatment. Chemotherapy is not a bullet. It is a sledgehammer, attacking both cancerous and healthy cells.</p><p>Most chemotherapy travels through the bloodstream entering cells indiscriminately and attacking vulnerable ones. Cells are mostly protected, except when they are dividing. Cancer cells divide often because of their characteristic rapid growth, which is why chemotherapy is effective at killing cancer cells.&nbsp;</p><p>Unfortunately, other healthy cells in our body are regularly dividing as well. Most often, our blood stem cells (special cells in your bone marrow that make blood), the cells that line our digestive tract, and hair follicles. This is the reason for common side effects of hair loss, nausea, and having a reduced number of white blood cells (this is called neutropenia and is important as the immune system needs white blood cells to fight off infection. Chemotherapy is a brutal treatment, causing stress and damage to the patient’s body.</p><p>However, for some, chemotherapy works. It kills cancer cells. And if the patient can tolerate the side effects long enough, the chemotherapy can provide significant benefits to shrink or at least hold off tumor growth for some time. However, most times, the treatment needs to be stopped because side-effects become too harsh or the tumor becomes resistant to the chemotherapy. There are various theories on why this happens, it is usually attributed to an additional cancer cell mutation arising. It nearly always means the patient needs a new treatment option.</p><p>It is easy to see why the magic bullet is so appealing. We have drugs that work to attack cancer, but no way to control how they are delivered once they are in the patient’s body.</p><p>‍</p><figure><p><img src="https://cdn.prod.website-files.com/62f16dfb522723abf6d9a011/67116beb0539c05e277933b3_671169906962a364885114af_adc-abstract.png" loading="lazy" alt=""></p><figcaption>A great deal of scientific progress and creativity has led us here.</figcaption></figure><p>‍</p><h2>‍<strong>The Idea Becomes a Reality</strong></h2><p>The 1970s brought about the rise of molecular biology and gene cloning. The 1980s brought about the genomics revolution. The 1990s brought about greater adoption of computers and the Internet. This has all led us to the turn of another century and another scientific age: the birth of personalized medicine, driven by advances in computation, engineering, and our understanding of complex processes within the human body. This has allowed new concepts to reach the clinic at an accelerating pace.</p><p>We’ve learned that most cells in our body express proteins on their surface as a way to communicate with other cells and interact with their environment. Cancer cells often overexpress unique proteins that aren’t used much by normal cells. These proteins vary widely by the type of cancer and the tumor’s composition, but certain types of cells and certain types of cancer consistently present the same surface proteins.</p><p>We’ve also learned that our immune systems create antibodies—specialized proteins that can recognize and help kill foreign invaders like bacteria or viruses. These antibodies have a shape that is designed to bind (like a key in a lock) to specific proteins on the surface of the bacteria or virus. Once an antibody binds to its target, it can either directly neutralize the invader, mark it for destruction by other immune cells, or block its ability to infect healthy cells. This targeted recognition and binding help the immune system effectively identify and eliminate the threat.</p><p>What a system. Once we understood this, minds got to work. In the 1970s, scientists discovered they could also create these antibodies in the lab and mass-produce them by cloning (replicating) a single antibody. This is why they are referred to as monoclonal (meaning cloned from one cell) antibodies. As technology has advanced, scientists have developed methods of creating antibodies to nearly any protein, including the unique cell-surface proteins on cancer cells.</p><p>If we could identify appropriate targets (proteins common on the surface of cancer cells, but not other healthy cells), we could design an antibody as the key to unlock it. The antibody would stick to the tumor cell and maybe even enter the cell. With the immune system, if the antibody key fits the protein lock, it gets in.</p><p>The concept of the magic bullet now appears to have its fundamental building blocks. We have chemotherapy, effective at killing cancer cells. And now we have monoclonal antibodies, a way to target specific types of cancer cells.</p><p>The magic bullet was ready to become reality, however, the road ahead was uncertain.&nbsp; Scientists still had to figure out how to put these building blocks together to make it all work. This process took time and effort.</p><p>‍</p><h2>‍<strong>Know Your ADCs</strong>‍</h2><p>In order to know how scientists put Antibody Drug Conjugates (ADCs) together, we need to know the parts of one.</p><figure><a href="https://cdn.prod.website-files.com/62f16dfb522723abf6d9a011/6710525993f2db79b226f645_ADC-scaled-V2.png" target="_blank"><p><img src="https://cdn.prod.website-files.com/62f16dfb522723abf6d9a011/671052d4888e6c8ecc4d698d_6710525993f2db79b226f645_ADC-scaled-V2.png" loading="lazy" alt=""></p></a><figcaption>Click to view full size in a new tab</figcaption></figure><p>‍</p><p><strong>An ADC is composed of three key parts (components):</strong></p><ol role="list"><li><strong>Monoclonal Antibody</strong><br>Antibodies recognize and bind to proteins on the surface of cells–they connect like a lock and key. The antibody is designed to target proteins that are typically overexpressed on cancer cells. Different ADCs can use different antibodies.<br>‍<br></li><li><strong>Chemotherapy &nbsp;(also called a toxin)</strong><br>Attached to the antibody is a powerful chemotherapy drug that is released from the antibody once the antibody reaches the cancer cell. The type of chemotherapy used varies between different ADCs.<br>‍</li><li>‍<strong>Chemical Linker<br></strong>The linker is a small chemical bond between the antibody and chemotherapy, that acts like a string. The string is designed to break and release the toxin when the antibody reaches the cancer cell.</li></ol><p>Like most diagrams, this makes things seem simple and neat. However, the creation of effective ADCs has been a long journey and a bumpy road. Dr. Sager has described creating an ADC as “tying a boat and a plane together and expecting them to both travel smoothly.”</p><p>‍</p><figure><p><img src="https://cdn.prod.website-files.com/62f16dfb522723abf6d9a011/67116bec0539c05e277933d1_67116bb99b28af181a6dd646_boat-plane.png" loading="lazy" alt=""></p><figcaption>Dr. Sager described creating an ADC as “tying a boat and a plane together and expecting them to both travel smoothly”</figcaption></figure><p>‍</p><h2>‍<strong>The Challenges</strong></h2><p>To produce an ADC, researchers have faced 4 specific challenges:</p><ol role="list"><li><strong>Target Selection</strong><br>Finding the best protein to target—one that would allow ADCs to attack cancer cells without harming healthy tissue was difficult. The protein should be highly present on cancer cells but minimally expressed on healthy cells. Additionally, the target should allow the antibody to cleanly bind to the cell to deliver the drug effectively. Advances in genomics, proteomics, and immunohistochemistry have helped researchers identify proteins that are uniquely or highly expressed on tumor cells.<br>‍<br></li><li><strong>Antibody Development</strong><br>Creating the antibody is crucial. It must be pure, stable in the bloodstream and be highly likely to bind to its target. The body must accept it and it should not produce unwanted immune system responses. Our ability to create antibodies has improved dramatically over time through various technologies and techniques such as recombinant DNA and “humanization” of non-human antibodies made in the lab.<br>‍</li><li>‍<strong>Linker Stability<br></strong>Something has to hold the chemotherapy in place until the exact right moment. Early ADCs had issues with weak chemical linkers between the antibody and chemotherapy, which resulted in chemotherapy being released before reaching cancer cells. This could damage healthy tissue and cause harmful side effects. Advanced chemistry has allowed us to create linkers that have various releasing mechanisms. Some don’t release until they are inside the cell, some release when the antibody is broken down in the cell, and, as we’ll see with Enhertu, some are able to release their toxin at the moment the antibody binds.<br>‍</li><li><strong>Drug Selection and Potency</strong><br>It was difficult to find the right chemotherapeutic drugs that could kill cancer cells at low doses (since ADCs can only deliver a small amount to each cell). Researchers have developed highly potent cytotoxins that can kill cancer cells with just a few molecules per cell. This still leaves the question of the drug-to-antibody ratio (DAR) that should be used. This becomes a major factor in the success for Enhertu.</li></ol><p>‍</p><figure><p><img src="https://cdn.prod.website-files.com/62f16dfb522723abf6d9a011/671171642405cb797742d346_67116f114af6293adba36a5c_waiting.png" loading="lazy" alt=""></p><figcaption>As with all clinical trials, patients were on the front line, seeking better options</figcaption></figure><p>‍</p><h2><strong>The First Trial, First Approval, and Beyond</strong></h2><p>In 1983, the first patients were treated with an ADC in a clinical trial. As their target, the researchers selected carcinoembryonic antigen (CEA) as it was a highly expressed protein across a variety of cancer types. Their ADC carried the chemotherapy vindesine, but also a radioactive isotope, so they could track where it went in the body.</p><p>Out of 8 patients, 4 had confirmed “localization,” meaning the antibody bound successfully to cancer cells and delivered the chemotherapy.</p><p>The researchers believed that the other patients—for whom the magic bullet did not work—may have not been expressing CEA.</p><p>However, they also found a problem while producing the ADCs, as the antibody, linker, and chemotherapy would cluster together (called aggregation) and reduce the efficacy. The boat and the plane were colliding so to speak.</p><p>Aggregation was a major problem in the early days of ADC development and was typically attributed to the ratio of antibodies to chemotherapies attached. If this ratio was off, the structure of the ADC became ineffective. It took years before these manufacturing and production issues were fixed.</p><p>As is the case with nearly all progress in cancer treatment, dedicated doctors, scientists, and patients forged ahead imagining change was possible.</p><p>Seventeen years after the first clinical trial, the FDA approved the first ADC drug, Mylotarg,<sup> </sup>in 2000. It was approved for adults with acute myeloid leukemia (AML).&nbsp;</p><p>Over the 2 decades that followed, 13 more ADCs were approved for cancer, including the blockbuster drug Enhertu.</p><p>Today, there are over 100 ADCs available to patients in clinical trials, spanning dozens of cancer types.</p><p>‍</p><figure><p><img src="https://cdn.prod.website-files.com/62f16dfb522723abf6d9a011/671171652405cb797742d359_671170e8967967172d0af0c9_drop.png" loading="lazy" alt=""></p><figcaption>Curiosity about a protein used to create a pigment in the eye leads to an unexpected place</figcaption></figure><p>‍</p><h2><strong>An ADC for Alice</strong></h2><p>To return it where we began. It is 2024, and Alice still does not have any remaining standard treatment options. The tumors from her uveal melanoma are growing.</p><p>It’s not clear what she should do. Fortunately for her, twelve years earlier, researchers discovered something very important about uveal melanoma.</p><p>Healthy cells in the eye, from which uveal melanoma orginates, are called melanocytes. One of their jobs is to produce the protein PMEL17 to create the pigment (color) needed for the eye to function.</p><p>The researchers noticed that once a healthy melanocyte became a uveal melanoma (cancer cell), it continued to express this PMEL17 protein, even if it traveled in the bloodstream to other parts of the body. This meant that distant tumors—like the ones on Alice’s spine and in her liver—were expressing this protein.</p><p>Researchers speculated that PMEL17 would be an ideal target for an ADC. They would be able to target these cancerous melanoma cells wherever they were in the body and no other cells in the body were known to produce this protein.&nbsp;</p><p>In 2022, a clinical trial testing DYP688, an ADC targeting PMEL17 for melanoma patients began. It continues to recruit today. We helped Alice enroll in this clinical trial.&nbsp;&nbsp;</p><p>Since beginning treatment, which she has tolerated well, Alice’s liver metastases have shrunk by 10%. Today, her disease remains stable. This type of tumor shrinkage and stability is extremely rare in metastatic uveal melanoma cases.</p><p>Alice’s story and the story of ADCs showcase the power of resilience and the hope that comes from the pursuit of innovation. These potent and precise treatments offer new possibilities for patients who may have run out of standard options and are fighting some of the most challenging cancers to treat.</p><p>ADCs represent a promising step forward in cancer therapy, merging the precision of targeted therapy with the strength of chemotherapy in a way that aims to reduce side effects and improve outcomes for patients. As research progresses, ADCs offer hope for more effective and personalized cancer treatments.</p><p>‍</p><h2><strong>How New Treatments like ADCs are Approved</strong></h2><p>The Food and Drug Administration approves new cancer treatments when they are shown in clinical trials to be more effective than the current approved cancer treatment for a given cancer type. The approval comes when the treatment extends lifespan without overly increasing the risks of serious side effects.</p><p>Sometimes, the incremental improvements over the existing standard of care can seem unremarkable–a small increase in response percentage for a subset of patients of a certain cancer type and treatment history, or a modest average gain of months of stable disease before the tumor grows again.</p><p>When removed from the averages and measured in months to years of a person’s life–life spent with family, life spent seeing the pace of scientific progress continue to quicken–all progress is welcome.</p><p>With some drug approvals, the approval is not so much of a testament to the new treatment’s efficacy, but the dismal state of existing treatment options. </p><p>‍</p><figure><p><img src="https://cdn.prod.website-files.com/62f16dfb522723abf6d9a011/671177038c3a2db4871a89a7_6711743a28f370394dce5c17_HER2.png" loading="lazy" alt=""></p><figcaption>HER2-positive cancer can grow aggressively, but it can also serve as a target</figcaption></figure><p>‍</p><h2><strong>HER2 Positive Breast Cancer</strong></h2><p>There is a protein called HER2 that is overexpressed by a number of different cancer types. HER2 plays a role in regulating cell growth so when there is too much of it, tumors can grow more aggressively. HER2 is overexpressed in approximately 15-20% of breast cancers and is also found, though at varying lower frequencies, in some gastric, lung, colorectal, ovarian, urothelial, salivary gland, and endometrial cancers.</p><p>HER2 has served as a target for treatments for decades now. In 1998, trastuzumab (Herceptin) was approved for the treatment of HER2-positive metastatic breast cancer.&nbsp;</p><p>It is hard to overstate what a game changer Herceptin was for patients with HER2-positive breast cancer. It represented one of the first successful targeted cancer therapies, and it effectively cut recurrence risk by half in early-stage HER2-positive cancer. It also significantly prolonged survival in advanced cases.&nbsp;</p><p>It also set the foundation for further development of HER2-targeted treatments and made what was once one of the most difficult-to-treat breast cancer subtypes into one that is now much more manageable with long-term treatment options.</p><p>However, for some HER2-positive patients, Herceptin doesn’t work or doesn't work for long.</p><p>In 2013, the first ADC targeting HER2 was approved. It was called Kadcyla and it used Herceptin as its monoclonal antibody and emtansine as its toxin. It was approved for metastatic breast cancer patients who had progressed after Herceptin and chemotherapy. While it had fewer side effects, it worked only modestly better than chemotherapy, but it was another option for patients who had few.&nbsp;</p><p>It also advanced the promise and reality of ADCs.</p><p>‍</p><figure><p><img src="https://cdn.prod.website-files.com/62f16dfb522723abf6d9a011/671177038c3a2db4871a89a4_671176a739f5687290e1f9fd_enhertu.png" loading="lazy" alt=""></p><figcaption>A big step forward for ADCs</figcaption></figure><p>‍</p><h2><strong>The Arrival of Enhertu</strong></h2><p>In late 2019, just five days before Christmas, the FDA granted accelerated approval to a new ADC called Enhertu.&nbsp;</p><p>Enhertu, like Kadcyla, used Herceptin as its antibody, but for its toxin, it used a topoisomerase I inhibitor, which is a type of drug that interferes with an enzyme that unwinds and untangles replicating DNA. Essentially, as the cancerous cells are trying to replicate and grow the tumor, the drug mucks up the process and results in dead cancer cells.</p><p>The accelerated approval came after a phase II clinical trial called the <a href="https://www.annalsofoncology.org/article/S0923-7534(23)05108-6/fulltext">DESTINY-Breast01</a> study. In this clinical trial, Enhertu was used to treat metastatic HER2-positive breast cancer patients whose cancer had progressed after treatment with Kadcyla, their last treatment option.</p><p>The response was remarkable:98% of the patients benefited from the treatment and 62% saw significant shrinkage in their tumors.</p><p>The accelerated approval required that another clinical trial be performed to confirm these positive findings. Subsequent trials have demonstrated that Enhertu is much more effective than Kadcyla, but with increased frequency of side effects for some.&nbsp;</p><p>In the <a href="https://www.fda.gov/drugs/resources-information-approved-drugs/fda-disco-burst-edition-fda-approval-enhertu-fam-trastuzumab-deruxtecan-nxki-adult-patients">DESTINY-Breast03 </a>trial, researchers looked at patients who had tumors that could be measured. They found with Entertu, 82.7% of patients had some form of tumor shrinkage compared with just 36.1% in patients receiving Kadcyla.</p><p>This was an enormous step forward for ADCs. Amazingly, the plane and boat were sailing smoothly together.</p><p>Enhertu was developed in a partnership between AstraZeneca, a global biopharmaceutical company with a heavy focus on oncology, and Daiichi Sankyo, a Japanese pharmaceutical company with expertise in ADCs.</p><p>Stemming from the exciting success in treating breast cancer, the drug makers invested in clinical trials using Enhertu to treat other cancer types when HER2-postive, notably gastric cancer and non-small cell lung cancer.&nbsp;&nbsp;</p><p>Since HER2 is expressed by tumors from many types of cancer, their study, the <a href="https://ascopubs.org/doi/10.1200/JCO.23.02005">DESTINY-PanTumor02 </a>aimed to show high response rates in endometrial, cervical, ovarian, bladder, and bile duct cancers.&nbsp;</p><p>It was quite successful and just this year (April 2024), Enhertu became the first ADC that was approved for all metastatic HER2-Positive solid tumors.&nbsp;</p><p>Cancer type has traditionally been the sole driver of treatment options, but now cancer characteristics (what is making the tumor grow) matter, making ADCs and other targeted therapies another powerful option in the fight against cancer.</p><p>‍</p><h2><strong>What It Means for Patients</strong></h2><p>This is very recent in terms of the progress and adoption of cancer treatments, so there are some important things for cancer patients to know.</p><ul role="list"><li>Not all cancer patients have been tested for HER2, and in some cases, their oncologist may not consider the test since, in the past, it has not led to additional treatment options, but now it can. Be proactive. Ask your oncologist about your HER2 status.<br>‍</li><li>HER2 results used to be considered positive or negative, which predicted if Herceptin would work, with about 20% (1 in 5) of breast cancer patients being HER2 “positive”. However, with more powerful treatments like Enhertu, these tests are now being redefined into high, low, and negative. While Herceptin will still be used for positive (high), Enhertu works also for low too, which means that now about 75% (3 of 4) of breast cancer patients have a treatment option many would not have had before.<br>‍</li><li>Therefore, patients who were previously considered HER2-negative may actually be HER2-low, and therefore a candidate for treatments like Enhertu. If you want to learn more, <a href="https://www.sagelyhealth.com/blog-posts/her2-negative-or-her2-low">this webinar</a> goes into more detail.</li></ul><p>‍</p><h2><strong>What Made Enhertu Successful</strong></h2><p>Advances in cancer treatment build upon one another. While there certainly will be winners and losers when it comes to pharmaceutical companies and their investors, generally, for cancer patients, a rising tide lifts all boats.</p><p>While progress is often incremental and modest, sometimes there are leaps like Enhertu. So, what made it different?</p><p>Since we’ve learned a little bit about how ADCs work, the reasons scientists give for Enhertu’s success should make sense.<br>‍</p><p><strong>‍<em>High Drug-to-Antibody Ratio (DAR)</em></strong></p><p>Prior ADCs had 2-5 molecules of chemotherapy per antibody. Remember, getting this right in manufacturing was a challenge. With Enhertu, they achieved an 8-to-1 chemotherapy to antibody ratio while keeping the drug stable and able to reach its target. Essentially, a drug-coated antibody arrived ready to attack at just the right time.<br>‍</p><p><strong><em>The Bystander Effect</em></strong></p><p>In addition to the selection of chemotherapy, Enhertu also had innovations in the chemical linker that held the chemotherapy in place. The linker they used would release the chemotherapy when the antibody connected to the surface protein. With Kadcyla, the chemotherapy is released once pulled into the cell or when the antibody breaks down so the damage to cancer cells is limited to the cell the antibody attaches to.</p><p>With Enhertu, the toxin is released in the space just outside the cell and near other tumor cells. The toxin is also particularly effective at working through cell membranes so it could attack nearby cells from the surface.</p><p>Because cancer is made up of cells that are mutating and accumulating additional genetic changes as they grow and divide, not all cells are the same within a tumor and may not be expressing the same proteins on its surface. This characteristic, called tumor heterogeneity, is important in the case of Enhertu as a patient whose cancer expresses HER2 overall will have a mix of cancer cells: some that have lots of HER2 expressed and some that have very little.</p><p>The special release mechanism means that tumor cells that do not express HER2 could still be killed just by being near a tumor cell that has HER2 on its surface. While this sounds like it could be damaging to healthy cells, the bystander effect of chemotherapy mainly impacts the tumor environment, rather than the rest of the body.</p><p>This is not to say that ADCs are without risks and side effects. Compared to other ADCs, Enhertu has a lower side effect profile, but on the <a href="https://ascopubs.org/doi/10.1200/JCO.23.02005">DESTINY-PanTumor2 trial</a>, 40% of patients experienced severe side effects. Common side effects reported by patients included nausea, diarrhea, fatigue, vomiting, decreased appetite, and hair loss. Most patients could tolerate the treatment, but 8.6% of patients discontinued treatment due to side effects.</p><p>While it’s hard to hear of these challenges, Enhertu, like many ADCs gaining approval, addresses an unmet need for patients with advanced disease who have no strong alternative options.&nbsp;</p><p>ADCs are also changing the way scientists are developing cancer treatments. The pan-tumor (meaning all tumors known to express HER2, regardless of cancer type) approval of Enhertu highlights the importance of testing cancer biomarkers.</p><p>It also marks a transition from focusing nearly completely on cancer type. Targetable characteristics of the cancer should no longer be a secondary consideration when determining the best treatment.</p><p>‍</p><h2><strong>The Current State of ADCs</strong></h2><p>In the past 3 years, the number of ADCs approved by the FDA has tripled.&nbsp;</p><p>Currently, 13 ADCs have been approved by the FDA, and over 100 are being tested in clinical trials.&nbsp;</p><p>The theory behind ADCs was always that they could reduce the side effects for patients while increasing the efficacy of treatment. In terms of efficacy, ADCs have begun to meet the expectations of researchers. They have demonstrated a stronger anti-cancer response compared to both traditional chemotherapy and targeted therapies.&nbsp;</p><p>A 2024 study in Italy (<a href="https://oncologypro.esmo.org/meeting-resources/esmo-congress-2024/the-rome-trial-from-histology-to-target-the-road-to-personalize-targeted-therapy-and-immunotherapy">2024 Boticelli et al.</a>) showed that for traditional chemotherapy, 10% of patients had tumor shrinkage. For targeted therapies, it was about 17%. An improvement for sure, but still leaves much to be desired.</p><p>The response rate for targeted therapies can vary greatly and, in some cases, can be significantly higher. For example, a PARP inhibitor showed an overall response of 77% in BRCA-deficient ovarian cancer in one study. (<a href="https://ascopubs.org/doi/10.1200/JCO.2019.37.15_suppl.5506">2019, Penson et al.</a>)</p><p>With ADCs, the percentage of patients who experience tumor shrinkage ranges from 22-60%, depending on the cancer type and protein targeted (<a href="https://ascopubs.org/doi/pdf/10.1200/JCO.2024.42.16_suppl.e13174#:~:text=Patients%20on%20ADCs%20also%20achieved,%25%2C%20p%2C0.001).">2024 Michelon et al.</a>, <a href="https://www.researchgate.net/publication/376410801_The_clinical_development_of_antibody-drug_conjugates_for_non-small_cell_lung_cancer_therapy">2023, Lui et al.</a>).</p><p>However, the increase in efficacy was only half of the promise of ADCs. When it comes to safety and side effects, ADCs still have a lot of room for improvement.&nbsp;</p><p>According to a <a href="https://www.ncbi.nlm.nih.gov/pmc/articles/PMC10579782/">meta-analysis completed in 2023</a> that compared the safety of ADCs and non-ADC therapies (such as chemotherapies, targeted therapies, and others), ADCs and other anti-cancer treatments had very similar rates of other side effects. ADCs had less hematologic (red and white blood cell-related) side effects, but they also had worse dry mouth, peripheral neuropathy, and reversible eye-related side effects.&nbsp;</p><p>We hope that continued advancements improve the safety of these drugs, but we also encourage patients going through any cancer treatment to explore additional treatments to mitigate side effects as much as possible. Too many patients struggle unnecessarily because palliative and secondary care teams are not brought in to help with managing side effects.</p><p>‍</p><h2><strong>FDA Approved ADCs</strong></h2><p>ADCs that are approved may be prescribed by any oncologist and the list of options is growing.</p><div><table>
@@ -3992,7 +4921,7 @@ October 31, 2024 | https://ericra.com/writing/site_cpu.html | <a href="https://w
             </title>
             <description>
 <![CDATA[
-Score 170 | Comments 113 (<a href="https://news.ycombinator.com/item?id=42008499">thread link</a>) | @whereistimbo
+Score 170 | Comments 114 (<a href="https://news.ycombinator.com/item?id=42008499">thread link</a>) | @whereistimbo
 <br/>
 October 31, 2024 | https://fabulous.systems/posts/2023/07/installing-windows-xp-in-dosbox-x/ | <a href="https://web.archive.org/web/*/https://fabulous.systems/posts/2023/07/installing-windows-xp-in-dosbox-x/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4227,7 +5156,7 @@ October 31, 2024 | https://halcyon.eco/blog/building-with-ai | <a href="https://
             </title>
             <description>
 <![CDATA[
-Score 148 | Comments 44 (<a href="https://news.ycombinator.com/item?id=42005601">thread link</a>) | @aquir
+Score 150 | Comments 45 (<a href="https://news.ycombinator.com/item?id=42005601">thread link</a>) | @aquir
 <br/>
 October 31, 2024 | https://illya.sh/the-codeumentary-blog/regular-expression-check-if-number-is-prime/ | <a href="https://web.archive.org/web/*/https://illya.sh/the-codeumentary-blog/regular-expression-check-if-number-is-prime/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4770,7 +5699,7 @@ interchangeably</li>
             </title>
             <description>
 <![CDATA[
-Score 204 | Comments 47 (<a href="https://news.ycombinator.com/item?id=42004976">thread link</a>) | @todsacerdoti
+Score 204 | Comments 48 (<a href="https://news.ycombinator.com/item?id=42004976">thread link</a>) | @todsacerdoti
 <br/>
 October 31, 2024 | https://entropicthoughts.com/probability-generating-functions | <a href="https://web.archive.org/web/*/https://entropicthoughts.com/probability-generating-functions">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -5313,7 +6242,7 @@ Cross-compiling sometimes leaks information from the host system into the genera
             </title>
             <description>
 <![CDATA[
-Score 102 | Comments 48 (<a href="https://news.ycombinator.com/item?id=42004508">thread link</a>) | @lutzh
+Score 103 | Comments 51 (<a href="https://news.ycombinator.com/item?id=42004508">thread link</a>) | @lutzh
 <br/>
 October 31, 2024 | https://www.reactivesystems.eu/2024/10/31/the-dual-nature-of-events-in-eda.html | <a href="https://web.archive.org/web/*/https://www.reactivesystems.eu/2024/10/31/the-dual-nature-of-events-in-eda.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section>
@@ -5426,7 +6355,7 @@ October 31, 2024 | https://www.reactivesystems.eu/2024/10/31/the-dual-nature-of-
             </title>
             <description>
 <![CDATA[
-Score 332 | Comments 156 (<a href="https://news.ycombinator.com/item?id=42004219">thread link</a>) | @udev4096
+Score 343 | Comments 172 (<a href="https://news.ycombinator.com/item?id=42004219">thread link</a>) | @udev4096
 <br/>
 October 31, 2024 | https://sharpsec.run/rce-vulnerability-in-qbittorrent/ | <a href="https://web.archive.org/web/*/https://sharpsec.run/rce-vulnerability-in-qbittorrent/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -5966,7 +6895,7 @@ October 30, 2024 | https://monokai.pro/history | <a href="https://web.archive.or
             </title>
             <description>
 <![CDATA[
-Score 446 | Comments 240 (<a href="https://news.ycombinator.com/item?id=42000784">thread link</a>) | @type0
+Score 447 | Comments 241 (<a href="https://news.ycombinator.com/item?id=42000784">thread link</a>) | @type0
 <br/>
 October 30, 2024 | https://despairlabs.com/blog/posts/2024-10-27-openzfs-dedup-is-good-dont-use-it/ | <a href="https://web.archive.org/web/*/https://despairlabs.com/blog/posts/2024-10-27-openzfs-dedup-is-good-dont-use-it/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -6329,7 +7258,7 @@ In summary
             </title>
             <description>
 <![CDATA[
-Score 161 | Comments 79 (<a href="https://news.ycombinator.com/item?id=41999923">thread link</a>) | @CharlesW
+Score 161 | Comments 80 (<a href="https://news.ycombinator.com/item?id=41999923">thread link</a>) | @CharlesW
 <br/>
 October 30, 2024 | https://sophiebits.com/2024/10/30/everyone-is-wrong-about-that-slack-flowchart | <a href="https://web.archive.org/web/*/https://sophiebits.com/2024/10/30/everyone-is-wrong-about-that-slack-flowchart">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>Building software is hard. Oftentimes things that seem like they should be simple end up being way more complicated when you get into the details. (<a href="http://johnsalvatier.org/blog/2017/reality-has-a-surprising-amount-of-detail" target="_blank" rel="nofollow">OK, maybe this isn’t specific to software.</a>)</p>
@@ -14807,7 +15736,7 @@ October 30, 2024 | https://www.siliconcontinent.com/p/the-strange-kafka-world-of
             </title>
             <description>
 <![CDATA[
-Score 31 | Comments 1 (<a href="https://news.ycombinator.com/item?id=41995589">thread link</a>) | @mrcgnc
+Score 38 | Comments 2 (<a href="https://news.ycombinator.com/item?id=41995589">thread link</a>) | @mrcgnc
 <br/>
 October 30, 2024 | https://planktonvalhalla.com/20241030-recursion-tidy-stars-and-water-lilies/ | <a href="https://web.archive.org/web/*/https://planktonvalhalla.com/20241030-recursion-tidy-stars-and-water-lilies/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div itemprop="articleBody">
@@ -15112,7 +16041,7 @@ October 30, 2024 | https://langtail.com/blog/introducing-langtail-1-the-best-way
             </title>
             <description>
 <![CDATA[
-Score 343 | Comments 69 (<a href="https://news.ycombinator.com/item?id=41993012">thread link</a>) | @ibobev
+Score 344 | Comments 69 (<a href="https://news.ycombinator.com/item?id=41993012">thread link</a>) | @ibobev
 <br/>
 October 30, 2024 | https://30fps.net/pages/videogame-shadows/ | <a href="https://web.archive.org/web/*/https://30fps.net/pages/videogame-shadows/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="text">
@@ -15820,7 +16749,7 @@ Prism is also used in <a href="https://github.com/natalie-lang/natalie/pull/1213
             </title>
             <description>
 <![CDATA[
-Score 1118 | Comments 447 (<a href="https://news.ycombinator.com/item?id=41992314">thread link</a>) | @noleary
+Score 1121 | Comments 447 (<a href="https://news.ycombinator.com/item?id=41992314">thread link</a>) | @noleary
 <br/>
 October 29, 2024 | https://ssoready.com/blog/engineering/truths-programmers-timezones/ | <a href="https://web.archive.org/web/*/https://ssoready.com/blog/engineering/truths-programmers-timezones/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><p>
