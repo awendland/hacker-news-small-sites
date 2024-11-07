@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Thu, 07 Nov 2024 04:23:14 GMT</lastBuildDate>
+        <lastBuildDate>Thu, 07 Nov 2024 08:22:56 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-20.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Thu, 07 Nov 2024 04:23:14 GMT</pubDate>
+        <pubDate>Thu, 07 Nov 2024 08:22:56 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,423 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Bringing Faster Exceptions to Rust]]>
+            </title>
+            <description>
+<![CDATA[
+Score 25 | Comments 0 (<a href="https://news.ycombinator.com/item?id=42072750">thread link</a>) | @stpn
+<br/>
+November 6, 2024 | https://purplesyringa.moe/blog/bringing-faster-exceptions-to-rust/ | <a href="https://web.archive.org/web/*/https://purplesyringa.moe/blog/bringing-faster-exceptions-to-rust/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section><div><h2>Bringing faster exceptions to Rust</h2><p><time>November 6, 2024</time><a href="https://www.reddit.com/r/rust/comments/1gl050z/bringing_faster_exceptions_to_rust/"> Reddit</a></p><p>Three months ago, I wrote about why <a href="https://purplesyringa.moe/blog/you-might-want-to-use-panics-for-error-handling/">you might want to use panics for error handling</a>. Even though it’s a catchy title, panics are hardly suited for this goal, even if you try to hack around with macros and libraries. The real star is <em>the unwinding mechanism</em>, which powers panics. This post is the first in a series exploring what unwinding is, how to speed it up, and how it can benefit Rust and C++ programmers.</p><p>Check out the <a href="https://lib.rs/lithium">Lithium</a> crate for faster exceptions and unwinding in Rust.</p><p>Typically, a function returns to the statement immediately following the call:</p><pre><code><span>fn</span> <span>f</span>() {
+    <span>let</span> <span>x</span> = <span>g</span>();
+    dbg!(x); 
+}
+
+<span>fn</span> <span>g</span>() <span>-&gt;</span> <span>i32</span> {
+    <span>return</span> <span>123</span>;
+}
+</code></pre><p>Now imagine that calls could specify <em>alternate</em> return points, letting the callee decide the statement to return to:</p><pre><code>
+<span>fn</span> <span>f</span>() {
+    <span>g</span>() alternate |x| {
+        dbg!(x); 
+    };
+}
+
+<span>fn</span> <span>g</span>() <span>-&gt;</span> () alternate <span>i32</span> {
+    return_alternate <span>123</span>;
+}
+</code></pre><p>At first glance, this looks straightforward. Returning to an alternate address shouldn’t be significantly more expensive than returning to the default address, so this has to be cheap.</p><p>But wait. This alternate return mechanism reminds me of something…</p><pre><code>
+<span>fn</span> <span>f</span>() {
+    <span>g</span>() catch |x| {
+        dbg!(x); 
+    };
+}
+
+<span>fn</span> <span>g</span>() <span>-&gt;</span> () throws <span>i32</span> {
+    throw <span>123</span>;
+}
+</code></pre><p>That’s just exceptions! And we all know exceptions are slow. How did we get from alternate return addresses to something you should avoid at all costs in performant code?</p><p>The core of the alternate return mechanism is <em>the unwinder</em>, a system library responsible for mapping default return addresses to alternate return addresses, passing alternate return values across calls, and consuming the return values. The specific API differs between operating systems, but on Linux, the main parts are these two functions:</p><ul><li><code>_Unwind_RaiseException(Exception)</code>: Perform an alternate return, assuming we’re currently in a default return point.</li><li><code>_Unwind_Resume(Exception)</code>: Perform an alternate return, assuming we’re currently in an alternate return point.</li></ul><p>So, what implementation detail makes panics and exceptions so slow? We’ll uncover this in the series, and today, we’ll try to speed up the Rust side of panic handling without modifying the unwinder.</p><h2>Digging deeper</h2><p>Let’s start by measuring Rust’s current panic performance with <a href="https://docs.rs/criterion">criterion</a>:</p><pre><code>
+std::panic::<span>set_hook</span>(<span>Box</span>::<span>new</span>(|_| {}));
+
+b.<span>iter</span>(|| {
+    <span>let</span> <span>_</span> = std::panic::<span>catch_unwind</span>(|| <span>panic!</span>(<span>"Hello, world!"</span>));
+})
+</code></pre><p>Result: <code>2.3814 µs</code>. That’s less than a million panics per second. Why is it this slow?</p><p>Let’s see what happens when you call <code>panic!()</code>. After passing arguments through some macro calls, we land on <code>core::panic::panic_fmt</code>:</p><pre><code><span>pub</span> <span>const</span> <span>fn</span> <span>panic_fmt</span>(fmt: fmt::Arguments&lt;<span>'_</span>&gt;) <span>-&gt;</span> ! {
+    
+
+    <span>extern</span> <span>"Rust"</span> {
+        <span>#[lang = <span>"panic_impl"</span>]</span>
+        <span>fn</span> <span>panic_impl</span>(pi: &amp;PanicInfo&lt;<span>'_</span>&gt;) <span>-&gt;</span> !;
+    }
+
+    <span>let</span> <span>pi</span> = PanicInfo::<span>new</span>(
+        fmt,
+        Location::<span>caller</span>(),
+         <span>true</span>,
+         <span>false</span>,
+    );
+
+    <span>unsafe</span> { <span>panic_impl</span>(&amp;pi) }
+}
+</code></pre><p>The format arguments are type-erased, which prevents some optimizations.</p><p>In addition, many Rust builtins panic, so <code>panic!</code> is defined in <code>core</code>, but the panic mechanism is OS-dependent, so panicking is implemented in <code>std</code>. Therefore, <code>panic_impl</code> is an extern function crossing crate boundaries, which prevents inlining without LTO.</p><pre><code><span>pub</span> <span>fn</span> <span>begin_panic_handler</span>(info: &amp;core::panic::PanicInfo&lt;<span>'_</span>&gt;) <span>-&gt;</span> ! {
+    <span>struct</span> <span>FormatStringPayload</span>&lt;<span>'a</span>&gt; {  }
+
+    
+
+    <span>unsafe</span> <span>impl</span> <span>PanicPayload</span> <span>for</span> <span>FormatStringPayload</span>&lt;<span>'_</span>&gt; {
+        <span>fn</span> <span>take_box</span>(&amp;<span>mut</span> <span>self</span>) <span>-&gt;</span> *<span>mut</span> (<span>dyn</span> Any + <span>Send</span>) {
+            
+            
+            
+            <span>let</span> <span>contents</span> = mem::<span>take</span>(<span>self</span>.<span>fill</span>());
+            <span>Box</span>::<span>into_raw</span>(<span>Box</span>::<span>new</span>(contents))
+        }
+
+        
+    }
+
+    
+
+    crate::sys::backtrace::__rust_end_short_backtrace(<span>move</span> || {
+        <span>if</span> <span>let</span> <span>Some</span>(s) = msg.<span>as_str</span>() {
+            
+        } <span>else</span> {
+            <span>rust_panic_with_hook</span>(
+                &amp;<span>mut</span> FormatStringPayload { inner: &amp;msg, string: <span>None</span> },
+                loc,
+                info.<span>can_unwind</span>(),
+                info.force_no_backtrace(),
+            );
+        }
+    })
+}
+
+
+<span>fn</span> <span>rust_panic_with_hook</span>(
+    payload: &amp;<span>mut</span> <span>dyn</span> PanicPayload,
+    location: &amp;Location&lt;<span>'_</span>&gt;,
+    can_unwind: <span>bool</span>,
+    force_no_backtrace: <span>bool</span>,
+) <span>-&gt;</span> ! {
+    
+    <span>match</span> *HOOK.<span>read</span>().<span>unwrap_or_else</span>(PoisonError::into_inner) {
+        
+        Hook::<span>Custom</span>(<span>ref</span> hook) =&gt; {
+            <span>hook</span>(&amp;PanicHookInfo::<span>new</span>(location, payload.<span>get</span>(), can_unwind, force_no_backtrace));
+        }
+    }
+    
+    <span>rust_panic</span>(payload)
+}
+</code></pre><p>Here, we generate a type-erased panic payload object that wraps the format arguments in another type-erased box, and then we invoke the panic hook – before unwinding even starts!</p><p>Luckily, we can skip most of this logic by calling <code>std::panic::resume_unwind</code> instead of <code>panic!</code>. This function ignores the panic hook and takes a <code>Box&lt;dyn Any + Send&gt;</code> argument instead of an arbitrary format string, which lets us shed some load:</p><pre><code>b.<span>iter</span>(|| {
+    <span>let</span> <span>_</span> = std::panic::<span>catch_unwind</span>(|| std::panic::<span>resume_unwind</span>(<span>Box</span>::<span>new</span>(<span>"Hello, world!"</span>)));
+})
+</code></pre><p>Result: <code>1.8379 µs</code>, a 24% improvement. Not bad for simply removing indirection!</p><p><code>resume_unwind</code> forwards calls to <a href="https://doc.rust-lang.org/1.82.0/src/std/panicking.rs.html#828-850">rust_panic_without_hook</a>:</p><pre><code><span>pub</span> <span>fn</span> <span>rust_panic_without_hook</span>(payload: <span>Box</span>&lt;<span>dyn</span> Any + <span>Send</span>&gt;) <span>-&gt;</span> ! {
+    panic_count::<span>increase</span>(<span>false</span>);
+
+    <span>struct</span> <span>RewrapBox</span>(<span>Box</span>&lt;<span>dyn</span> Any + <span>Send</span>&gt;);
+
+    <span>unsafe</span> <span>impl</span> <span>PanicPayload</span> <span>for</span> <span>RewrapBox</span> {
+        <span>fn</span> <span>take_box</span>(&amp;<span>mut</span> <span>self</span>) <span>-&gt;</span> *<span>mut</span> (<span>dyn</span> Any + <span>Send</span>) {
+            <span>Box</span>::<span>into_raw</span>(mem::<span>replace</span>(&amp;<span>mut</span> <span>self</span>.<span>0</span>, <span>Box</span>::<span>new</span>(())))
+        }
+        
+    }
+    
+    <span>rust_panic</span>(&amp;<span>mut</span> <span>RewrapBox</span>(payload))
+}
+
+<span>fn</span> <span>rust_panic</span>(msg: &amp;<span>mut</span> <span>dyn</span> PanicPayload) <span>-&gt;</span> ! {
+    <span>let</span> <span>code</span> = <span>unsafe</span> { __rust_start_panic(msg) };
+    rtabort!(<span>"failed to initiate panic, error {code}"</span>)
+}
+
+<span>extern</span> <span>"Rust"</span> {
+    
+    
+    <span>fn</span> <span>__rust_start_panic</span>(payload: &amp;<span>mut</span> <span>dyn</span> PanicPayload) <span>-&gt;</span> <span>u32</span>;
+}
+</code></pre><p>There’s still type-erasure here: firstly, the payload is <code>Box&lt;dyn Any + Send&gt;</code>, and secondly, we cast <code>&amp;mut RewrapBox</code> to <code>&amp;mut dyn PanicPayload</code>. None of this is necessary for statically typed alternate returns. The double-panic protection (<code>panic_count</code>) wouldn’t be required in this context either.</p><p>So what do you say we call <code>__rust_start_panic</code> directly?</p><pre><code><span>#![feature(std_internals)]</span>
+
+<span>use</span> core::any::Any;
+<span>use</span> core::panic::PanicPayload;
+
+<span>struct</span> <span>RewrapBox</span>(<span>Box</span>&lt;<span>dyn</span> Any + <span>Send</span>&gt;);
+
+<span>unsafe</span> <span>impl</span> <span>PanicPayload</span> <span>for</span> <span>RewrapBox</span> {
+    <span>fn</span> <span>take_box</span>(&amp;<span>mut</span> <span>self</span>) <span>-&gt;</span> *<span>mut</span> (<span>dyn</span> Any + <span>Send</span> + <span>'static</span>) {
+        <span>Box</span>::<span>into_raw</span>(core::mem::<span>replace</span>(&amp;<span>mut</span> <span>self</span>.<span>0</span>, <span>Box</span>::<span>new</span>(())))
+    }
+
+    <span>fn</span> <span>get</span>(&amp;<span>mut</span> <span>self</span>) <span>-&gt;</span> &amp;(<span>dyn</span> Any + <span>Send</span> + <span>'static</span>) {
+        &amp;*<span>self</span>.<span>0</span>
+    }
+}
+
+<span>impl</span> <span>core</span>::fmt::Display <span>for</span> <span>RewrapBox</span> {
+    <span>fn</span> <span>fmt</span>(&amp;<span>self</span>, f: &amp;<span>mut</span> core::fmt::Formatter&lt;<span>'_</span>&gt;) <span>-&gt;</span> core::fmt::<span>Result</span> {
+        f.<span>write_str</span>(<span>"Box&lt;dyn Any&gt;"</span>)
+    }
+}
+
+<span>unsafe</span> <span>extern</span> <span>"Rust"</span> {
+    safe <span>fn</span> <span>__rust_start_panic</span>(payload: &amp;<span>mut</span> <span>dyn</span> PanicPayload) <span>-&gt;</span> <span>u32</span>;
+}
+
+b.<span>iter</span>(|| {
+    <span>let</span> <span>_</span> = std::panic::<span>catch_unwind</span>(|| {
+        __rust_start_panic(&amp;<span>mut</span> <span>RewrapBox</span>(<span>Box</span>::<span>new</span>(<span>"Hello, world!"</span>)))
+    });
+})
+</code></pre><p>Result: <code>580.44 ns</code>. That’s a 68% improvement! It’s not <em>sound</em>, as we’re now messing with the panic counter, but we’ll fix this soon.</p><p>Let’s figure out how to bypass the mirroring decrement of the panic count. We’re looking for <code>std::panic::catch_unwind</code>, which merely forwards the call <a href="https://doc.rust-lang.org/1.82.0/src/std/panicking.rs.html#474-584">here</a>. After adding <code>#[inline(always)]</code>, removing <code>#[cold]</code>, and removing the panic count decrement, we restore soundness without affecting performance.</p><p>The next layer of abstraction to peel is these two functions:</p><pre><code><span>extern</span> <span>"Rust"</span> <span>fn</span> <span>__rust_start_panic</span>(payload: &amp;<span>mut</span> <span>dyn</span> PanicPayload) <span>-&gt;</span> <span>u32</span>;
+<span>extern</span> <span>"C"</span> <span>fn</span> <span>__rust_panic_cleanup</span>(payload: *<span>mut</span> <span>u8</span>) <span>-&gt;</span> *<span>mut</span> (<span>dyn</span> Any + <span>Send</span> + <span>'static</span>);
+</code></pre><p>Depending on the <code>-C panic="unwind/abort"</code> rustc flag, different crates providing these functions are linked. The crate we are interested in is <code>panic_unwind</code>. Its sources are available <a href="https://github.com/rust-lang/rust/tree/1.82.0/library/panic_unwind">on GitHub</a>.</p><p>Here we finally enter platform-specific code. I’m using Linux, so we’re interested in the Itanium exception handling ABI (called <code>GCC</code> in Rust code). The implementation is <a href="https://github.com/rust-lang/rust/blob/1.82.0/library/panic_unwind/src/gcc.rs#L61-L106">quite simple</a>:</p><pre><code><span>pub</span> <span>unsafe</span> <span>fn</span> <span>panic</span>(data: <span>Box</span>&lt;<span>dyn</span> Any + <span>Send</span>&gt;) <span>-&gt;</span> <span>u32</span> {
+    <span>let</span> <span>exception</span> = <span>Box</span>::<span>new</span>(Exception {
+        _uwe: uw::_Unwind_Exception {
+            exception_class: <span>rust_exception_class</span>(),
+            exception_cleanup: <span>Some</span>(exception_cleanup),
+            private: [core::ptr::<span>null</span>(); uw::unwinder_private_data_size],
+        },
+        canary: &amp;CANARY,
+        cause: data,
+    });
+    <span>let</span> <span>exception_param</span> = <span>Box</span>::<span>into_raw</span>(exception) <span>as</span> *<span>mut</span> uw::_Unwind_Exception;
+    <span>return</span> uw::_Unwind_RaiseException(exception_param) <span>as</span> <span>u32</span>;
+
+    
+}
+
+<span>pub</span> <span>unsafe</span> <span>fn</span> <span>cleanup</span>(ptr: *<span>mut</span> <span>u8</span>) <span>-&gt;</span> <span>Box</span>&lt;<span>dyn</span> Any + <span>Send</span>&gt; {
+    <span>let</span> <span>exception</span> = ptr <span>as</span> *<span>mut</span> uw::_Unwind_Exception;
+    <span>if</span> (*exception).exception_class != <span>rust_exception_class</span>() {
+        
+    }
+
+    <span>let</span> <span>exception</span> = exception.cast::&lt;Exception&gt;();
+    
+    <span>let</span> <span>exception</span> = <span>Box</span>::<span>from_raw</span>(exception <span>as</span> *<span>mut</span> Exception);
+    exception.cause
+}
+</code></pre><p>To throw a panic, we allocate <em>yet another</em> object on the heap and pass it to <code>_Unwind_RaiseException</code>. Catching a panic involves casting it back to a <code>Box</code> and retrieving the <code>cause</code> field.</p><p>To simplify this code for our statically annotated code, we can embed the cause directly in the exception object without wrapping it in <code>Box</code> beforehand. To separate our exceptions from Rust panics, we’ll use a custom exception class:</p><pre><code><span>#[repr(C)]</span>
+<span>struct</span> <span>UwException</span> {
+    class: <span>u64</span>,
+    destructor: <span>Option</span>&lt;<span>extern</span> <span>"C"</span> <span>fn</span>(<span>u32</span>, *<span>mut</span> <span>Self</span>)&gt;,
+    private: [*<span>const</span> (); <span>2</span>],
+}
+
+<span>#[repr(C)]</span>
+<span>struct</span> <span>Exception</span>&lt;E&gt; {
+    uw: UwException,
+    cause: E,
+}
+
+<span>const</span> CLASS: <span>u64</span> = <span>u64</span>::<span>from_ne_bytes</span>(*<span>b"RUSTpurp"</span>);
+
+<span>#[inline(always)]</span>
+<span>fn</span> <span>throw</span>&lt;E&gt;(cause: E) {
+    <span>let</span> <span>exception</span> = <span>Box</span>::<span>new</span>(Exception {
+        uw: UwException {
+            class: CLASS,
+            destructor: <span>Some</span>(destructor),
+            private: [core::ptr::<span>null</span>(); <span>2</span>],
+        },
+        cause,
+    });
+    <span>unsafe</span> {
+        _Unwind_RaiseException(<span>Box</span>::<span>into_raw</span>(exception).<span>cast</span>());
+    }
+    std::process::<span>abort</span>();
+}
+
+<span>extern</span> <span>"C"</span> <span>fn</span> <span>destructor</span>(_code: <span>u32</span>, _exception: *<span>mut</span> UwException) {
+    std::process::<span>abort</span>();
+}
+
+<span>#[inline(always)]</span>
+<span>unsafe</span> <span>fn</span> <span>cleanup</span>&lt;E&gt;(exception: *<span>mut</span> UwException) <span>-&gt;</span> E {
+    <span>if</span> (*exception).class != CLASS {
+        std::process::<span>abort</span>();
+    }
+    <span>Box</span>::<span>from_raw</span>(exception.cast::&lt;Exception&lt;E&gt;&gt;()).cause
+}
+
+<span>extern</span> <span>"C-unwind"</span> {
+    <span>fn</span> <span>_Unwind_RaiseException</span>(exception: *<span>mut</span> UwException) <span>-&gt;</span> <span>u32</span>;
+}
+
+b.<span>iter</span>(|| {
+    <span>let</span> <span>_</span> = catch::&lt;_, &amp;<span>'static</span> <span>str</span>, _&gt;(|| throw::&lt;&amp;<span>'static</span> <span>str</span>&gt;(<span>"Hello, world!"</span>));
+})
+</code></pre><p>Result: <code>562.69 ns</code>, or a 3% improvement. This isn’t much, but every bit matters here.</p><p>We only have one heap allocation remaining now, containing the exception cause next to the <code>_Unwind_Exception</code> header for the system unwinder.</p><p>Why can’t we put it on the stack? When <code>throw</code> performs an alternate return, its call frame can be overwritten by the catch handlers. We could store it inside the <code>catch</code> call frame, but then we’d need to pass a pointer to it to <code>throw</code>, complicating the API.</p><p>Thread-locals are the perfect middle ground, as they are almost as cheap as stack allocation:</p><pre><code>thread_local! {
+    <span>static</span> LOCAL: UnsafeCell&lt;MaybeUninit&lt;[<span>u8</span>; <span>4096</span>]&gt;&gt; = <span>const</span> {
+        UnsafeCell::<span>new</span>(MaybeUninit::<span>uninit</span>())
+    };
+}
+
+<span>unsafe</span> <span>fn</span> <span>local_write</span>&lt;T&gt;(x: T) <span>-&gt;</span> *<span>mut</span> T {
+    <span>let</span> <span>p</span> = LOCAL.<span>with</span>(|local| local.<span>get</span>().cast::&lt;T&gt;());
+    <span>unsafe</span> {
+        p.<span>write</span>(x);
+    }
+    p
+}
+</code></pre><p>While this is just a proof-of-concept (it doesn’t work with nested or greater than 4 KiB exceptions), it indicates the resulting performance: <code>556.32 ns</code>, or a 1.5% improvement.</p><h2>Conclusions</h2><p>Starting at <code>2.3814 µs</code>, we’ve optimized down to <code>556.32 ns</code> – a <eq><math><mrow><mn>4.3</mn><mo>×</mo></mrow></math></eq> speedup without loss in functionality. We secured this win without modifying the Rust compiler or the system unwinder by applying the following optimizations:</p><ul><li>Remove the hook invocation</li><li>Remove type erasure of format arguments</li><li>Remove panic counters</li><li>Get rid of <code>dyn PanicPayload</code></li><li>Add inlining and mark <code>catch</code> code as hot</li><li>Remove various non-inlined cross-crate invocations</li><li>Avoid boxing the exception cause</li><li>Store the exception object in a thread-local</li></ul><p>While unwinding is popular for exception propagation, that’s not the only use case. For example, if success is more rare than an error, success could be the alternate path rather than the error. Another use of lightweight unwinding is coroutines. Thinking outside the box might help you find other applications in your projects.</p><p>To make these optimizations accessible, I have released the <a href="https://lib.rs/lithium">Lithium</a> crate, which supports efficient unwinding in Rust. It’s light as <code>Li</code> and includes features beyond the ones supported by this prototype:</p><ul><li>Efficient rethrowing</li><li>Nested exceptions</li><li>Large exception objects</li><li>Exceptions that aren’t <code>Send + 'static</code></li><li>Broad target support, including Windows, macOS, Emscripten, and WASI</li><li>Compatibility with the stable compiler, falling back to panics</li><li>Support for native Rust panics inside <code>catch</code></li><li><code>#![no_std]</code> support</li></ul><p>Check out <a href="https://github.com/iex-rs/lithium">the GitHub repository</a> and feel free to open issues!</p><p>There are some caveats:</p><ul><li>Using <code>lithium::throw</code> inside <code>std::panic::catch_unwind</code> (rather than <code>lithium::catch</code>) is unsound.</li><li>On nightly, Lithium relies on the implementation details of std and rustc. I monitor changes to unwinding, so this should not be a significant issue.</li><li>Lithium’s API may evolve incompatibly with semver due to interoperability if unsound is discovered in Lithium. I do not expect this to be problematic past the first month.</li></ul><p>In the following posts, we’ll explore Itanium and SEH designs, dive into unwinder implementations, and and figure out how to speed up exceptions significantly based on this knowledge. <a href="https://purplesyringa.moe/blog/feed.rss">Subscribe to RSS</a> if you are interested.</p></div></section></div>]]>
+            </description>
+            <link>https://purplesyringa.moe/blog/bringing-faster-exceptions-to-rust/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42072750</guid>
+            <pubDate>Thu, 07 Nov 2024 02:37:37 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Writing Tiny Desktop Apps in C and GTK3]]>
+            </title>
+            <description>
+<![CDATA[
+Score 25 | Comments 2 (<a href="https://news.ycombinator.com/item?id=42070807">thread link</a>) | @aard
+<br/>
+November 6, 2024 | https://danielc.dev/blog/tiny-windows-linux-gtk-apps/ | <a href="https://web.archive.org/web/*/https://danielc.dev/blog/tiny-windows-linux-gtk-apps/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div title="Post #37"><p>Jan 15 2022</p><hr>
+<p>So you finish up your C/C++ backend, and open up the Electron.js
+documentation to figure out how to make a quick frontend...</p>
+<p><strong>NO!!</strong></p>
+<p>You'd better not <em>dare</em> write your desktop application in <em>HTML</em>.
+<strong>What has this world come to???</strong></p>
+<p><a href="https://eggnog.theres.life/f/29-buegcdwi8nl2u71nuyi4h41i0kewj4.png"><img width="300" src="https://eggnog.theres.life/f/29-buegcdwi8nl2u71nuyi4h41i0kewj4.png" alt="fat wojak" title="fat wojak"></a></p>
+<p>In this tutorial, I will show you how to write a proper GTK3
+app, like a <strong>civilized being</strong>, instead of shipping your
+"desktop app" as a website in a <em>web browser</em>.</p>
+<h2>Setting Up dev stuff</h2>
+<pre><code>sudo apt install libgtk-3-dev
+</code></pre>
+<p>Yeah, that's it. Assuming you have a C compiler, you're golden.</p>
+<p>Now that everything is set up, let's make a real small test file:</p>
+<pre><code>#include &lt;gtk/gtk.h&gt;
+
+int main(int argc, char *argv[]) {
+    gtk_init(&amp;argc, &amp;argv);
+
+    GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(window), "Test Window");
+    gtk_window_set_default_size(GTK_WINDOW(window), 300, 300);
+    g_signal_connect(window, "delete-event", G_CALLBACK(gtk_main_quit), NULL);
+    gtk_widget_show(window);
+
+    GtkWidget *label = gtk_label_new("Hello World");
+    gtk_widget_set_hexpand(label, TRUE);
+    gtk_label_set_justify(GTK_LABEL(label), GTK_JUSTIFY_CENTER);
+    gtk_container_add(GTK_CONTAINER(window), label);
+    gtk_widget_show(label);
+
+    gtk_main();
+}
+</code></pre>
+<p>And to compile it:</p>
+<pre><code>gcc test.c `pkg-config --libs gtk+-3.0 --cflags`
+</code></pre>
+<p>Yay, you've made a <em>decent</em> application!</p>
+<p>Of course, you aren't going to write your UI in C, only an
+<a href="https://github.com/petabyt/mlinstall/blob/69ea49dbf5e9d9c4e2777729eafde21e7e4a9055/gtk.c#L383">idiot would do that</a>. Instead, you want to write it in
+some kind of markup language. Lucky for us, GTK has just that.</p>
+<pre><code>&lt;?xml version="1.0"?&gt;
+&lt;interface&gt;
+  &lt;object class="GtkApplicationWindow" id="window"&gt;
+    &lt;child&gt;
+      &lt;object class="GtkLabel"&gt;
+        &lt;property name="label"&gt;This is a test&lt;/property&gt;
+      &lt;/object&gt;
+    &lt;/child&gt;
+  &lt;/object&gt;
+&lt;/interface&gt;
+</code></pre>
+<p>And some loader code:</p>
+<pre><code>int main(int argc, char *argv[]) {
+    gtk_init(&amp;argc, &amp;argv);
+
+    GtkBuilder *builder = gtk_builder_new();
+    gtk_builder_add_from_file(builder, "test.ui", NULL)
+
+    GtkWidget *window = GTK_WIDGET(gtk_builder_get_object(builder, "window"));
+    g_signal_connect(window, "delete-event", G_CALLBACK(gtk_main_quit), NULL);
+    gtk_window_set_title(GTK_WINDOW(window), "Demo Window");
+    gtk_window_set_default_size(GTK_WINDOW(window), 300, 100);
+
+    gtk_widget_show_all(window);
+    gtk_main();
+    return 0;
+}
+</code></pre>
+<p><a href="https://eggnog.theres.life/f/20-6olbfh531ymgav05lg5xusxekot305.png"><img width="300" src="https://eggnog.theres.life/f/20-6olbfh531ymgav05lg5xusxekot305.png" alt="screenshot of window" title="screenshot of window"></a>
+When it comes to loading this binary in, you have a few options:
+1. Load a UI file in with linker trickery
+2. Convert the file to a C header with <code>xxd -i</code>, and load it in as a string
+3. Just load the file in via path</p>
+<p>I'm gonna go with xxd.</p>
+<pre><code>xxd -i test.ui &gt; test.h
+</code></pre>
+<p>And some loader code:</p>
+<pre><code>#include &lt;gtk/gtk.h&gt;
+#include "test.h"
+
+static void function(GtkWidget *widget, gpointer data) {
+    puts("Hello, World");
+}
+
+int main(int argc, char **argv) {
+    gtk_init(&amp;argc, &amp;argv);
+
+    GtkBuilder *builder = gtk_builder_new();
+    gtk_builder_add_from_string(builder, test_ui, test_ui_len, NULL));
+
+    GtkWidget *window = GTK_WIDGET(gtk_builder_get_object(builder, "window"));
+    g_signal_connect(window, "delete-event", G_CALLBACK(gtk_main_quit), NULL);
+    gtk_window_set_title(GTK_WINDOW(window), "Demo Window");
+    gtk_window_set_default_size(GTK_WINDOW(window), 300, 300);
+
+    GtkWidget *button = GTK_WIDGET(gtk_builder_get_object(builder, "btn"));
+    g_signal_connect(button, "clicked", G_CALLBACK(function), NULL);
+
+    gtk_widget_show_all(window);
+    gtk_main();
+    return 0;
+}
+</code></pre>
+<p>The above code creates the same output as the first example.</p>
+<p>And now, for my final trick: <strong>Easy cross compilation for Windows.</strong></p>
+<pre><code>CC=x86_64-w64-mingw32
+ZIP=win64-gtk-2021.zip
+
+output: test.exe
+    -rm -rf output; mkdir output
+    cp win32/lib/* output/
+    cp test.exe output/
+
+test.exe: win32
+    $(CC)-gcc main.c -Iwin32/include win32/lib/* -o test.exe
+
+win32:
+    wget -4 https://github.com/petabyt/windows-gtk/raw/master/$(ZIP)
+    unzip *.zip
+    rm -rf *.zip
+</code></pre>
+<p>No. That's not a joke. You literally just have to install MinGW
+(<code>sudo apt install gcc-mingw-w64-x86-64</code>), and you can <em>actually</em> compile this.</p>
+<p>Thanks to some archive scouring and msys2 ripping over at my <a href="https://github.com/petabyt/windows-gtk">windows-gtk</a> repository,
+I figured out how to make GTK cross compilation actually <em>not</em> a nightmare.</p>
+<p>Here's a simple example you can use to try it out:
+<a href="https://code.theres.life/p/gtk-cross">https://code.theres.life/p/gtk-cross</a></p>
+<p>Good luck, and make sure to have the <a href="https://docs.gtk.org/gtk3/">GTK3 Docs</a> handy at all times.</p></div></div>]]>
+            </description>
+            <link>https://danielc.dev/blog/tiny-windows-linux-gtk-apps/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42070807</guid>
+            <pubDate>Wed, 06 Nov 2024 22:51:35 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[WebSockets cost us $1M on our AWS bill]]>
             </title>
             <description>
 <![CDATA[
-Score 270 | Comments 161 (<a href="https://news.ycombinator.com/item?id=42067275">thread link</a>) | @tosh
+Score 300 | Comments 181 (<a href="https://news.ycombinator.com/item?id=42067275">thread link</a>) | @tosh
 <br/>
 November 6, 2024 | https://www.recall.ai/post/how-websockets-cost-us-1m-on-our-aws-bill | <a href="https://web.archive.org/web/*/https://www.recall.ai/post/how-websockets-cost-us-1m-on-our-aws-bill">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><div><div>
@@ -137,7 +549,7 @@ November 6, 2024 | https://www.recall.ai/post/how-websockets-cost-us-1m-on-our-a
             </title>
             <description>
 <![CDATA[
-Score 32 | Comments 1 (<a href="https://news.ycombinator.com/item?id=42059336">thread link</a>) | @ksec
+Score 38 | Comments 5 (<a href="https://news.ycombinator.com/item?id=42059336">thread link</a>) | @ksec
 <br/>
 November 6, 2024 | https://blog.bestwebventures.in/understanding-ruby-concurrency-a-comprehensive-guide | <a href="https://web.archive.org/web/*/https://blog.bestwebventures.in/understanding-ruby-concurrency-a-comprehensive-guide">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="post-content-parent"><div id="post-content-wrapper"><p><strong>Ruby 3.3, released with significant improvements in concurrency capabilities,</strong> marks a pivotal shift in how Ruby applications handle parallel processing and concurrent operations.</p>
@@ -716,7 +1128,7 @@ best_model = trainer.train_models_in_parallel(training_data, model_configs)
             </title>
             <description>
 <![CDATA[
-Score 712 | Comments 201 (<a href="https://news.ycombinator.com/item?id=42057431">thread link</a>) | @yen223
+Score 728 | Comments 202 (<a href="https://news.ycombinator.com/item?id=42057431">thread link</a>) | @yen223
 <br/>
 November 5, 2024 | https://weiyen.net/articles/useful-macos-cmd-line-utilities | <a href="https://web.archive.org/web/*/https://weiyen.net/articles/useful-macos-cmd-line-utilities">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-mdx-content="true"><article><p>Sometimes when I'm bored, I like to look at the list of <a href="https://ss64.com/mac/">macOS Bash commands</a>. Here's some commands that I found interesting:</p><h2>Access your Keychain programmatically</h2><p>If you store your secrets in the Keychain (and you should!), you can access them programmatically using <code>security</code>.</p><pre><p><span>security find-internet-password </span><span>-s</span><span> </span><span>"https://example.com"</span></p></pre><p>I found this useful for writing automated scripts that used locally-stored credentials.</p><p>Link: <a href="https://ss64.com/mac/security.html">https://ss64.com/mac/security.html</a></p><p>Bonus tip: If you are using 1Password, there is a <a href="https://developer.1password.com/docs/cli/get-started/">1Password CLI</a> that you can use to access your 1Password items from the command line.</p><h2>Open files from the terminal</h2><p>If you want to open a file from the terminal, you can use the <code>open</code> command.</p><pre><p><span>open</span><span> file.txt</span></p></pre><p>This will open the file in the default application for that file type, as if you had double-clicked it in the Finder.</p><p>Link: <a href="https://ss64.com/mac/open.html">https://ss64.com/mac/open.html</a></p><h2>Copy and paste</h2><p><code>pbcopy</code> and <code>pbpaste</code> are command-line utilities that allow you to copy and paste text to the pasteboard (what other operating systems might call the "clipboard").</p><p><code>pbcopy</code> takes whatever was given in the standard input, and places it in the pasteboard.</p><pre><p><span>echo</span><span> </span><span>"Hello, world!"</span><span> </span><span>|</span><span> pbcopy</span><span>;</span></p></pre><p><code>pbpaste</code> takes whatever is in the pasteboard and prints it to the standard output.</p><pre><p><span>pbpaste</span></p><p><span></span><span>&gt;&gt;</span><span> Hello, world</span><span>!</span></p></pre><p>This is very useful for getting data from files into the browser, or other GUI applications.</p><h4>Links:</h4><ul><li><a href="https://ss64.com/mac/pbcopy.html">https://ss64.com/mac/pbcopy.html</a></li><li><a href="https://ss64.com/mac/pbpaste.html">https://ss64.com/mac/pbpaste.html</a></li></ul><h2>UTC date</h2><p>If you work with servers a lot, it can be useful to know the current time in UTC, when e.g. looking at<!-- --> <!-- -->server logs.</p><p>This is a one-liner in the terminal:</p><pre><p><span>date</span><span> </span><span>-u</span></p></pre><p>Alternatively, you can use</p><pre><p><span>TZ</span><span>=</span><span>UTC </span><span>date</span></p></pre><p>Link: <a href="https://ss64.com/mac/date.html">https://ss64.com/mac/date.html</a></p><h2>Internet speedtest</h2><p>If you want to run an Internet speedtest, you can run one directly from the terminal with</p><pre><p><span>networkQuality  </span></p></pre><p>Link: <a href="https://ss64.com/mac/networkquality.html">https://ss64.com/mac/networkquality.html</a></p><h2>Prevent your Mac from sleeping</h2><p>If you are want to keep your Mac from sleeping, you can run <code>caffeinate</code> in the terminal.</p><pre><p><span>caffeinate</span></p></pre><p><code>caffeinate</code> will keep your Mac awake until you stop it, e.g. by pressing Ctrl+C. <code>caffeinate</code> used to<!-- --> <!-- -->be a third-party tool, but it is now built-in to macOS.</p><p>I use this mostly to prevent my Mac from sleeping when I am running a server.</p><p>Link: <a href="https://ss64.com/mac/caffeinate.html">https://ss64.com/mac/caffeinate.html</a></p><h2>Generate UUIDs</h2><p>If you need to generate a UUID, you can use the <code>uuidgen</code> command.</p><pre><p><span>uuidgen</span></p></pre><p>By default <code>uuidgen</code> outputs a UUID in uppercase. You can combine this with <code>tr</code> and <code>pbcopy</code> to copy the UUID to the clipboard in lowercase.</p><pre><p><span>uuidgen </span><span>|</span><span> </span><span>tr</span><span> </span><span>'[:upper:]'</span><span> </span><span>'[:lower:]'</span><span> </span><span>|</span><span> pbcopy</span></p></pre><p>I use this a lot when writing unit tests that require IDs.</p><p>Link: <a href="https://ss64.com/mac/uuidgen.html">https://ss64.com/mac/uuidgen.html</a></p><h2>Honourable mentions</h2><ul><li><code>mdfind</code>: Spotlight search, but in the terminal. I generally use Spotlight itself (or rather the excellent <a href="https://www.raycast.com/">Raycast</a>). <a href="https://ss64.com/mac/mdfind.html">Link</a></li><li><code>say</code>: This command makes your Mac speak the text you give it. <a href="https://ss64.com/mac/say.html">Link</a></li><li><code>screencapture</code>: This command allows you to take screenshots and save them to a file. I prefer using <code>cmd-shift-5</code> for this. <a href="https://ss64.com/mac/screencapture.html">Link</a></li><li><code>networksetup</code>: This command allows you to configure your network settings programmatically. I found its API very intimidating, and so I haven't really used it much. <a href="https://ss64.com/mac/networksetup.html">Link</a></li></ul></article></div></div>]]>
@@ -731,7 +1143,7 @@ November 5, 2024 | https://weiyen.net/articles/useful-macos-cmd-line-utilities |
             </title>
             <description>
 <![CDATA[
-Score 27 | Comments 6 (<a href="https://news.ycombinator.com/item?id=42056654">thread link</a>) | @breezykermo
+Score 29 | Comments 6 (<a href="https://news.ycombinator.com/item?id=42056654">thread link</a>) | @breezykermo
 <br/>
 November 5, 2024 | https://www.ohrg.org/using-two-remarkables | <a href="https://web.archive.org/web/*/https://www.ohrg.org/using-two-remarkables">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
@@ -847,7 +1259,7 @@ needed.</p>
             </title>
             <description>
 <![CDATA[
-Score 154 | Comments 10 (<a href="https://news.ycombinator.com/item?id=42055616">thread link</a>) | @skidrow
+Score 156 | Comments 11 (<a href="https://news.ycombinator.com/item?id=42055616">thread link</a>) | @skidrow
 <br/>
 November 5, 2024 | https://www.thonking.ai/p/what-shapes-do-matrix-multiplications | <a href="https://web.archive.org/web/*/https://www.thonking.ai/p/what-shapes-do-matrix-multiplications">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><article><div><div><div dir="auto"><p><span>A while back, Karpathy tweeted that </span><em>increasing</em><span> the size of his matmul made it run faster. Surprisingly, it’s not just </span><em>relatively</em><span> faster, it takes less </span><em>absolute</em><span> time. In other words, despite doing more work, it is executing in less time.</span></p><p>This may seem intuitively quite strange. Is cuBLAS just messing up somehow? Why doesn’t the matrix multiplication kernel just pad it to a larger shape? </p><p>It has become tribal knowledge that the particular shapes chosen for matmuls has a surprisingly large effect on their performance. But … why? Can this be understood by mere mortals?</p><p>Let’s take a crack at it.</p><p>First, let’s plot FLOPs achieved for square matmuls. By the end of this article, I will aim to explain all the strange squiggly lines. </p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fda2b6db5-95ca-47c9-adb5-6f5ca85c92f0_2418x1602.jpeg" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fda2b6db5-95ca-47c9-adb5-6f5ca85c92f0_2418x1602.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fda2b6db5-95ca-47c9-adb5-6f5ca85c92f0_2418x1602.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fda2b6db5-95ca-47c9-adb5-6f5ca85c92f0_2418x1602.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fda2b6db5-95ca-47c9-adb5-6f5ca85c92f0_2418x1602.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fda2b6db5-95ca-47c9-adb5-6f5ca85c92f0_2418x1602.jpeg" width="1456" height="965" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/da2b6db5-95ca-47c9-adb5-6f5ca85c92f0_2418x1602.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:965,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:&quot;Image&quot;,&quot;title&quot;:&quot;Image&quot;,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false}" alt="Image" title="Image" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fda2b6db5-95ca-47c9-adb5-6f5ca85c92f0_2418x1602.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fda2b6db5-95ca-47c9-adb5-6f5ca85c92f0_2418x1602.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fda2b6db5-95ca-47c9-adb5-6f5ca85c92f0_2418x1602.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fda2b6db5-95ca-47c9-adb5-6f5ca85c92f0_2418x1602.jpeg 1456w" sizes="100vw"></picture></div></a></figure></div><p>There are 3 general concepts to understand that explain the majority of performance variation among matmul shapes.</p><ol><li><p>Compute Intensity/Parallelization: This explains the general upward trend</p></li><li><p>Tiling: This explains the multiple tiers of lines.</p></li><li><p>Wave Quantization: This explains the strange striped lines.</p></li></ol><p>First of all, as we move along the x-axis, the matrix multiplications generally get more performant. There’s two primary reasons for this. </p><p>The first one is simply “more work/more parallelism”. There are a large number of fixed overheads that come with launching a kernel (e.g. creating new SMs, waiting for all SMs to finish, etc.), and so, the more work we have to do, the less important those fixed overheads are. Along with more work comes more parallelism, and since GPUs have a ton of parallel cores, you need a surprising amount of work in order to fill a GPU up with enough parallelism.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fc5b2ae02-19be-4af7-8fc4-037f7476761b_2196x1668.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fc5b2ae02-19be-4af7-8fc4-037f7476761b_2196x1668.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fc5b2ae02-19be-4af7-8fc4-037f7476761b_2196x1668.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fc5b2ae02-19be-4af7-8fc4-037f7476761b_2196x1668.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fc5b2ae02-19be-4af7-8fc4-037f7476761b_2196x1668.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fc5b2ae02-19be-4af7-8fc4-037f7476761b_2196x1668.png" width="478" height="363.09615384615387" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/c5b2ae02-19be-4af7-8fc4-037f7476761b_2196x1668.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:1106,&quot;width&quot;:1456,&quot;resizeWidth&quot;:478,&quot;bytes&quot;:null,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fc5b2ae02-19be-4af7-8fc4-037f7476761b_2196x1668.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fc5b2ae02-19be-4af7-8fc4-037f7476761b_2196x1668.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fc5b2ae02-19be-4af7-8fc4-037f7476761b_2196x1668.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fc5b2ae02-19be-4af7-8fc4-037f7476761b_2196x1668.png 1456w" sizes="100vw" loading="lazy"></picture></div></a><figcaption>Data movement is expensive!</figcaption></figure></div><p><span>The second one is “arithmetic intensity”. As I’ve </span><a href="https://horace.io/brrr_intro.html" rel="">written about before</a><span>, memory accesses are much more expensive than compute. So, since a square matmul performs 3N^2 memory accesses and 2N^3 FLOPs, at a very minimum, N needs to be in the hundreds before we start spending more time on compute than memory!</span></p><p><span>The desire for sufficient Arithmetic Intensity and Parallelism also compound. For example, let’s say you have your output matrix is </span><code>1024 x 1024</code><span>. If you let each SM compute a </span><code>128 x 128 </code><span>slice of the output, that’s only 64 pieces of “work” for your GPU, not even enough for each one of an A100’s 108 SMs ! If you decrease your output slice size to 64 x 64, we now have 256 pieces of “work” for our GPU, but our arithmetic intensity has also decreased by a factor of 4.</span></p><p>With smaller matrix sizes, you need to worry about problems like this that don’t show up with larger matrices. </p><p>Now that we understand the overall structure of the plot, the next question is: why is the plot all over the place? Why, even for very large matrices, do the TFLOPS jumping between &gt;250 and &lt;100?</p><p>To give a hint, let’s color-code each dot by the highest power of 2 it’s divisible by.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F245e1a67-e758-4561-9521-72191ef5992f_1513x1130.jpeg" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F245e1a67-e758-4561-9521-72191ef5992f_1513x1130.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F245e1a67-e758-4561-9521-72191ef5992f_1513x1130.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F245e1a67-e758-4561-9521-72191ef5992f_1513x1130.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F245e1a67-e758-4561-9521-72191ef5992f_1513x1130.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F245e1a67-e758-4561-9521-72191ef5992f_1513x1130.jpeg" width="1456" height="1087" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/245e1a67-e758-4561-9521-72191ef5992f_1513x1130.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:1087,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:&quot;Image&quot;,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false}" alt="Image" title="Image" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F245e1a67-e758-4561-9521-72191ef5992f_1513x1130.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F245e1a67-e758-4561-9521-72191ef5992f_1513x1130.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F245e1a67-e758-4561-9521-72191ef5992f_1513x1130.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F245e1a67-e758-4561-9521-72191ef5992f_1513x1130.jpeg 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p>As it turns out, the multiple “levels” of FLOPS are due to their shapes’ divisibility. For example, when the shape is odd, the matmul performs significantly worse than when the shape is even. The matmul performs even better when the shape is divisible by 8, with even more performance gains when it’s divisible by 16 or 32.</p><p><span>Now, merely knowing about this effect is very practically useful, but what actually causes this effect? As it turns out, the answer is tiling. But, what even </span><em>is</em><span> tiling? And why does it cause such substantial performance issues?</span></p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F5939a8fd-8356-45a6-8e83-db6fd48c014d_2116x660.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F5939a8fd-8356-45a6-8e83-db6fd48c014d_2116x660.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F5939a8fd-8356-45a6-8e83-db6fd48c014d_2116x660.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F5939a8fd-8356-45a6-8e83-db6fd48c014d_2116x660.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F5939a8fd-8356-45a6-8e83-db6fd48c014d_2116x660.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F5939a8fd-8356-45a6-8e83-db6fd48c014d_2116x660.png" width="1456" height="454" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/5939a8fd-8356-45a6-8e83-db6fd48c014d_2116x660.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:454,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:110115,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F5939a8fd-8356-45a6-8e83-db6fd48c014d_2116x660.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F5939a8fd-8356-45a6-8e83-db6fd48c014d_2116x660.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F5939a8fd-8356-45a6-8e83-db6fd48c014d_2116x660.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F5939a8fd-8356-45a6-8e83-db6fd48c014d_2116x660.png 1456w" sizes="100vw" loading="lazy"></picture></div></a><figcaption>Taken from https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html#tile-quant</figcaption></figure></div><p><span>Some online have mentioned </span><a href="https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html#tile-quant" rel="">tile quantization</a><span> as the culprit. Tile quantization certainly can impact performance, but </span><em>only at tile boundary sizes</em><span>. Basically, tile quantization occurs when the size of your matrix multiplication increases such that the GPU needs to launch another “chunk” of work. For example, imagine that you could multiply 8 elements at a time with a SIMD instruction. Now, if you went from 32 elements to 33 elements (a 3% increase in problem size), you go from needing 4 SIMD instructions to 5 (a 25% increase). Note that crucially, when tile quantization is the culprit, your absolute runtime still grows monotonically, although your efficiency may drop.</span></p><p><span>However, in our above plot, we see much more drastic performance drops! Moreover, like in Karpathy’s original example, we see that the </span><em>absolute runtime decreases despite problem size increasing</em><span>. So, tile quantization cannot be the explanation here.</span></p><p>The true cause is that tiling is just fundamentally worse for certain memory layouts. In other words, by the time we’re trying to execute the matmul, you’ve already lost. The memory layout is poor and your performance will suffer.</p><p>Let’s look at some examples!</p><p>First, let’s think about how our matrix’s memory layout looks like when our size is a multiple of the cache line (pretend it’s 4 elements). </p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F819f8836-c521-4363-b170-49ee039569c6_1170x836.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F819f8836-c521-4363-b170-49ee039569c6_1170x836.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F819f8836-c521-4363-b170-49ee039569c6_1170x836.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F819f8836-c521-4363-b170-49ee039569c6_1170x836.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F819f8836-c521-4363-b170-49ee039569c6_1170x836.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F819f8836-c521-4363-b170-49ee039569c6_1170x836.png" width="520" height="371.55555555555554" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/819f8836-c521-4363-b170-49ee039569c6_1170x836.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:836,&quot;width&quot;:1170,&quot;resizeWidth&quot;:520,&quot;bytes&quot;:624255,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F819f8836-c521-4363-b170-49ee039569c6_1170x836.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F819f8836-c521-4363-b170-49ee039569c6_1170x836.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F819f8836-c521-4363-b170-49ee039569c6_1170x836.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F819f8836-c521-4363-b170-49ee039569c6_1170x836.png 1456w" sizes="100vw" loading="lazy"></picture></div></a><figcaption>I choose to show 3 “cache lines” per row because our matrix logically has 12 elements per row.</figcaption></figure></div><p><span>We see that each row starts on a cache line</span><span><a data-component-name="FootnoteAnchorToDOM" id="footnote-anchor-1-142904770" href="https://www.thonking.ai/p/what-shapes-do-matrix-multiplications#footnote-1-142904770" target="_self" rel="">1</a></span><span>. Among other advantages, this means that we don’t need to perform any “unnecessary” loads to load all yellow elements. We can just load the 3 cache lines that the yellow elements are part of.</span></p><p>However, what happens if we increase the number of elements per row from 12 to 13? </p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F57fffe15-4659-44e1-b516-0944867b9f96_1374x838.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F57fffe15-4659-44e1-b516-0944867b9f96_1374x838.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F57fffe15-4659-44e1-b516-0944867b9f96_1374x838.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F57fffe15-4659-44e1-b516-0944867b9f96_1374x838.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F57fffe15-4659-44e1-b516-0944867b9f96_1374x838.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F57fffe15-4659-44e1-b516-0944867b9f96_1374x838.png" width="520" height="317.14701601164484" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/57fffe15-4659-44e1-b516-0944867b9f96_1374x838.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:838,&quot;width&quot;:1374,&quot;resizeWidth&quot;:520,&quot;bytes&quot;:759750,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F57fffe15-4659-44e1-b516-0944867b9f96_1374x838.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F57fffe15-4659-44e1-b516-0944867b9f96_1374x838.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F57fffe15-4659-44e1-b516-0944867b9f96_1374x838.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F57fffe15-4659-44e1-b516-0944867b9f96_1374x838.png 1456w" sizes="100vw" loading="lazy"></picture></div></a><figcaption>Each logical row (which have 13 elements) no longer starts aligned with a cache line.</figcaption></figure></div><p><span>With an unaligned layout, each row is misaligned relative to our cache line. In other words, if we start loading the beginning of the green row, we </span><em>must</em><span> redundantly load the last element of the blue row as well.</span></p><p>Now, let’s look at what happens when we actually try to load an entire “tile” from these memory layouts.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fcf2a2033-e9bf-44b8-8961-5b50c25eda91_2032x870.jpeg" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fcf2a2033-e9bf-44b8-8961-5b50c25eda91_2032x870.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fcf2a2033-e9bf-44b8-8961-5b50c25eda91_2032x870.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fcf2a2033-e9bf-44b8-8961-5b50c25eda91_2032x870.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fcf2a2033-e9bf-44b8-8961-5b50c25eda91_2032x870.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fcf2a2033-e9bf-44b8-8961-5b50c25eda91_2032x870.jpeg" width="1456" height="623" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/cf2a2033-e9bf-44b8-8961-5b50c25eda91_2032x870.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:623,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:&quot;Image&quot;,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false}" alt="Image" title="Image" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fcf2a2033-e9bf-44b8-8961-5b50c25eda91_2032x870.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fcf2a2033-e9bf-44b8-8961-5b50c25eda91_2032x870.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fcf2a2033-e9bf-44b8-8961-5b50c25eda91_2032x870.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fcf2a2033-e9bf-44b8-8961-5b50c25eda91_2032x870.jpeg 1456w" sizes="100vw" loading="lazy"></picture></div></a><figcaption>Shaded regions = elements we’re trying to load. Crossed out regions = elements we don’t need but must load due to it being in the same cache line.</figcaption></figure></div><p>With the aligned layout, this is very clean! We issue one load per row. One for the 4 blue elements, one for the 4 green elements, one for the 4 yellow elements, and one for the 4 pink elements. </p><p>With the unaligned layout, things are much messier. For example, in order to load the first 4 green elements, we must issue 2 loads! One that gets the last blue element + the first 3 green elements, and one that gets the 4th green element. A similar pattern occurs with loading the 4 yellow elements as well as the 4 pink elements.</p><p><span>So, when our matrix size is divisible by the cache line (which is 32 elements on a GPU), tiling fits nicely within the cache line, and our memory loads are maximally efficient. When it’s not… the kernel needs many more workarounds in order to end up the proper alignment.</span><span><a data-component-name="FootnoteAnchorToDOM" id="footnote-anchor-2-142904770" href="https://www.thonking.ai/p/what-shapes-do-matrix-multiplications#footnote-2-142904770" target="_self" rel="">2</a></span></p><p>This is why even very small changes in our matrix size can lead to substantially worsened performance.</p><p>Ok, so we’ve understood most of the variation in matmul performance. But what about these strange stripes up here? All of these points are with matmuls that are divisible by 32 already. Seeing that the peaks are separated by 256, our first guess might be that this is also memory-layout related, just at a larger scale.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F040453ca-4ac6-4275-bc84-7765a0bc70c4_844x466.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F040453ca-4ac6-4275-bc84-7765a0bc70c4_844x466.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F040453ca-4ac6-4275-bc84-7765a0bc70c4_844x466.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F040453ca-4ac6-4275-bc84-7765a0bc70c4_844x466.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F040453ca-4ac6-4275-bc84-7765a0bc70c4_844x466.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F040453ca-4ac6-4275-bc84-7765a0bc70c4_844x466.png" width="844" height="466" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/040453ca-4ac6-4275-bc84-7765a0bc70c4_844x466.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:466,&quot;width&quot;:844,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:&quot;Image&quot;,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false}" alt="Image" title="Image" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F040453ca-4ac6-4275-bc84-7765a0bc70c4_844x466.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F040453ca-4ac6-4275-bc84-7765a0bc70c4_844x466.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F040453ca-4ac6-4275-bc84-7765a0bc70c4_844x466.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F040453ca-4ac6-4275-bc84-7765a0bc70c4_844x466.png 1456w" sizes="100vw" loading="lazy"></picture></div></a><figcaption>Some truly mysterious patterns….</figcaption></figure></div><p><span>However, as it turns out, these peaks (2944 and 3120) do </span><em>not </em><span>occur when the matrix shapes are divisible by 256, but instead they’re at 128 mod 256! </span></p><p><span>As it turns out, these peaks are not caused by poor memory-layouts, they’re instead caused by a (neatly-named) phenomenon called </span><em>wave quantization</em><span>.</span></p><p>The main idea behind wave quantization is quite simple. </p><p><span>Let’s say we have N parallel tasks (which each take a second) and N CPUs. </span><br><span>Q: How long does it perform to take all tasks?</span><br><span>A: 1 second</span></p><p><span>Q: What about if we have (N+1) parallel tasks, and N CPUs?</span><br><span>A: 2 seconds(!) Now, one CPU must perform two tasks, taking a total of 2 seconds.</span></p><p>So, despite adding just one task, we’ve doubled our overall latency.</p><p>This is exactly what wave quantization is, except with CPUs =&gt; SMs and tasks =&gt; thread blocks.</p><p>As your matrix size increases, the total number of tiles/blocks increases. When this crosses a multiple of the # of SMs, your perf drops since you need to execute an additional "wave".</p><p>Now, let's apply our newfound knowledge to actually explain these curves! Let’s try looking at this sudden drop in performance around 1792 first.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F98d21d15-54c6-44ad-a522-1fa775badc59_434x764.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F98d21d15-54c6-44ad-a522-1fa775badc59_434x764.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F98d21d15-54c6-44ad-a522-1fa775badc59_434x764.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F98d21d15-54c6-44ad-a522-1fa775badc59_434x764.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F98d21d15-54c6-44ad-a522-1fa775badc59_434x764.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F98d21d15-54c6-44ad-a522-1fa775badc59_434x764.png" width="244" height="429.5299539170507" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/98d21d15-54c6-44ad-a522-1fa775badc59_434x764.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:764,&quot;width&quot;:434,&quot;resizeWidth&quot;:244,&quot;bytes&quot;:null,&quot;alt&quot;:&quot;Image&quot;,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false}" alt="Image" title="Image" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F98d21d15-54c6-44ad-a522-1fa775badc59_434x764.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F98d21d15-54c6-44ad-a522-1fa775badc59_434x764.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F98d21d15-54c6-44ad-a522-1fa775badc59_434x764.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F98d21d15-54c6-44ad-a522-1fa775badc59_434x764.png 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p>Since wave quantization depends a lot on the actual kernel parameters, we must look at what kernels are actually being run.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F81f276b8-3a39-418f-b586-8c016abb4285_2532x300.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F81f276b8-3a39-418f-b586-8c016abb4285_2532x300.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F81f276b8-3a39-418f-b586-8c016abb4285_2532x300.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F81f276b8-3a39-418f-b586-8c016abb4285_2532x300.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F81f276b8-3a39-418f-b586-8c016abb4285_2532x300.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F81f276b8-3a39-418f-b586-8c016abb4285_2532x300.png" width="1456" height="173" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/81f276b8-3a39-418f-b586-8c016abb4285_2532x300.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:173,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:&quot;Image&quot;,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false}" alt="Image" title="Image" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F81f276b8-3a39-418f-b586-8c016abb4285_2532x300.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F81f276b8-3a39-418f-b586-8c016abb4285_2532x300.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F81f276b8-3a39-418f-b586-8c016abb4285_2532x300.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F81f276b8-3a39-418f-b586-8c016abb4285_2532x300.png 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p>Using the profiler, we see that we're running a CUTLASS-based matmul with a tile size of 256x128. Note that our matmul kernel *doesn't change at all*, but our perf drops from 60+ TF/s at N=1791 to 43 TF/s at N=1793. </p><p>Now, some basic arithmetic. Our tile grid has dimensions 1792/256 = 7 and 1792/128 = 14. That gives us 7 * 14 = 98 tiles. Since an A100 has 108 SMs, that's still one wave. However, with N=1793 we need to increase the size of our grid. (7+1)*(14+1) = 120 tiles, or 2 waves!</p><p>Now, let’s look at the previous (mysterious) stripes. Specifically, we’ll look at N=3200.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0c110a2b-9845-4305-b9f0-40c2d61b7831_844x466.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0c110a2b-9845-4305-b9f0-40c2d61b7831_844x466.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0c110a2b-9845-4305-b9f0-40c2d61b7831_844x466.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0c110a2b-9845-4305-b9f0-40c2d61b7831_844x466.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0c110a2b-9845-4305-b9f0-40c2d61b7831_844x466.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0c110a2b-9845-4305-b9f0-40c2d61b7831_844x466.png" width="476" height="262.81516587677726" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/0c110a2b-9845-4305-b9f0-40c2d61b7831_844x466.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:466,&quot;width&quot;:844,&quot;resizeWidth&quot;:476,&quot;bytes&quot;:null,&quot;alt&quot;:&quot;Image&quot;,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false}" alt="Image" title="Image" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0c110a2b-9845-4305-b9f0-40c2d61b7831_844x466.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0c110a2b-9845-4305-b9f0-40c2d61b7831_844x466.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0c110a2b-9845-4305-b9f0-40c2d61b7831_844x466.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0c110a2b-9845-4305-b9f0-40c2d61b7831_844x466.png 1456w" sizes="100vw" loading="lazy"></picture></div></a><figcaption>Mysterious no more!</figcaption></figure></div><p><span>Profiling it, we see that the </span><em>proximal</em><span> cause is not actually wave quantization. Instead, CuBLAS decided to  change algorithms. But, why did CuBLAS decide to change algorithms?</span></p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4ccbbbd2-2f3f-46a1-b542-e575decf2f6d_1792x300.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4ccbbbd2-2f3f-46a1-b542-e575decf2f6d_1792x300.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4ccbbbd2-2f3f-46a1-b542-e575decf2f6d_1792x300.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4ccbbbd2-2f3f-46a1-b542-e575decf2f6d_1792x300.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4ccbbbd2-2f3f-46a1-b542-e575decf2f6d_1792x300.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4ccbbbd2-2f3f-46a1-b542-e575decf2f6d_1792x300.png" width="1456" height="244" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/4ccbbbd2-2f3f-46a1-b542-e575decf2f6d_1792x300.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:244,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:&quot;Image&quot;,&quot;title&quot;:&quot;Image&quot;,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false}" alt="Image" title="Image" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4ccbbbd2-2f3f-46a1-b542-e575decf2f6d_1792x300.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4ccbbbd2-2f3f-46a1-b542-e575decf2f6d_1792x300.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4ccbbbd2-2f3f-46a1-b542-e575decf2f6d_1792x300.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4ccbbbd2-2f3f-46a1-b542-e575decf2f6d_1792x300.png 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p>Well, (3200/128) * (3200/128) = 625. 625/108 = 5.8 waves. Thus, at N=3232 we would create another wave.</p><p>In this case, though, it seems that 160x128 still isn't a great tile size. Since the resulting grid (26x21) results in 5.05 waves...</p><p>Well, CuBLAS isn't perfect!</p><p>Beyond the obvious matrix multiplication shape issues, performance loss due to wave quantization often ends up being tricky to find, since it depends upon things like the batch size as well. However, if you take a closer look at each matmul, you might find that there’s another 10-15% performance you can squeeze out of it by choosing the shapes more carefully!</p><p><span>I will note that it’s possible that wave quantization effects may soon be a thing of the past. New matrix multiplication technology like </span><a href="https://arxiv.org/abs/2301.03598" rel="">stream-k</a><span> allow us to completely bypass wave quantization effects. Perhaps I’ll explain the basic idea behind matmul implementation strategies someday.</span></p><p><span>As it turns out, torch.compile does try and pad your matmuls to have the right shape! See the code </span><a href="https://github.com/pytorch/pytorch/blob/6b1f13ea2f3b1bcd575620eecd7d84a4d2e3eb76/torch/_inductor/fx_passes/pad_mm.py#L90" rel="">here</a><span>, or try this benchmark.</span></p><pre><code>import torch
@@ -1132,7 +1544,7 @@ November 5, 2024 | https://www.winestockwebdesign.com/Essays/Eternal_Mainframe.h
             </title>
             <description>
 <![CDATA[
-Score 165 | Comments 61 (<a href="https://news.ycombinator.com/item?id=42054835">thread link</a>) | @radeeyate
+Score 167 | Comments 62 (<a href="https://news.ycombinator.com/item?id=42054835">thread link</a>) | @radeeyate
 <br/>
 November 5, 2024 | https://gekk.info/articles/traceroute.htm | <a href="https://web.archive.org/web/*/https://gekk.info/articles/traceroute.htm">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
@@ -1379,7 +1791,7 @@ November 5, 2024 | https://reducto.ai/blog/rd-tablebench | <a href="https://web.
             </title>
             <description>
 <![CDATA[
-Score 858 | Comments 153 (<a href="https://news.ycombinator.com/item?id=42052143">thread link</a>) | @mooreds
+Score 861 | Comments 153 (<a href="https://news.ycombinator.com/item?id=42052143">thread link</a>) | @mooreds
 <br/>
 November 5, 2024 | https://battleda.sh/blog/ea-account-takeover | <a href="https://web.archive.org/web/*/https://battleda.sh/blog/ea-account-takeover">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -1394,7 +1806,7 @@ November 5, 2024 | https://battleda.sh/blog/ea-account-takeover | <a href="https
             </title>
             <description>
 <![CDATA[
-Score 426 | Comments 132 (<a href="https://news.ycombinator.com/item?id=42051968">thread link</a>) | @ipnon
+Score 427 | Comments 132 (<a href="https://news.ycombinator.com/item?id=42051968">thread link</a>) | @ipnon
 <br/>
 November 5, 2024 | https://docs.hackerfab.org/hacker-fab-space | <a href="https://web.archive.org/web/*/https://docs.hackerfab.org/hacker-fab-space">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><ul><li><div><p><a aria-current="page" href="https://docs.hackerfab.org/hacker-fab-space">Hacker Fab Documentation</a></p></div></li><li><p>Overview</p><ul><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/overview/current-fab-capabilities"><span><span>✨</span>Current Fab Capabilities</span><span><svg style="mask-image:url(https://ka-p.fontawesome.com/releases/v6.6.0/svgs/regular/chevron-right.svg?v=2&amp;token=a463935e93);mask-repeat:no-repeat;mask-position:center"></svg></span></a></p></div></li></ul></li><li><p><span>🟡</span>Guides</p><ul><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/guides/required-reading-todo">Required Reading (todo)</a></p></div></li><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/guides/build-a-fab-to-do">Build-a-Fab</a></p></div></li><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/guides/filling-in-the-gaps-background-resources">Filling in the Gaps - Background Resources</a></p></div></li><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/guides/part-sourcing">Part Sourcing</a></p></div></li></ul></li><li><p><span>📜</span>Processes</p><ul><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/processes/self-aligned-nmos-v1">Self-Aligned NMOS V1</a></p></div></li></ul></li><li><p>Fab Toolkit</p><ul><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/fab-toolkit/patterning"><span><span>🎥</span>Patterning</span><span><svg style="mask-image:url(https://ka-p.fontawesome.com/releases/v6.6.0/svgs/regular/chevron-right.svg?v=2&amp;token=a463935e93);mask-repeat:no-repeat;mask-position:center"></svg></span></a></p></div></li><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/fab-toolkit/deposition"><span><span>🧱</span>Deposition</span><span><svg style="mask-image:url(https://ka-p.fontawesome.com/releases/v6.6.0/svgs/regular/chevron-right.svg?v=2&amp;token=a463935e93);mask-repeat:no-repeat;mask-position:center"></svg></span></a></p></div></li><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/fab-toolkit/etching"><span><span>🕳️</span>Etching</span><span><svg style="mask-image:url(https://ka-p.fontawesome.com/releases/v6.6.0/svgs/regular/chevron-right.svg?v=2&amp;token=a463935e93);mask-repeat:no-repeat;mask-position:center"></svg></span></a></p></div></li><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/fab-toolkit/other-processing-machines"><span><span>🛠️</span>Other Processing Machines</span><span><svg style="mask-image:url(https://ka-p.fontawesome.com/releases/v6.6.0/svgs/regular/chevron-right.svg?v=2&amp;token=a463935e93);mask-repeat:no-repeat;mask-position:center"></svg></span></a></p></div></li><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/fab-toolkit/metrology-characterization"><span><span>🔍</span>Metrology / Characterization</span><span><svg style="mask-image:url(https://ka-p.fontawesome.com/releases/v6.6.0/svgs/regular/chevron-right.svg?v=2&amp;token=a463935e93);mask-repeat:no-repeat;mask-position:center"></svg></span></a></p></div></li><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/fab-toolkit/chemicals-materials"><span><span>⚗️</span>Chemicals / Materials</span><span><svg style="mask-image:url(https://ka-p.fontawesome.com/releases/v6.6.0/svgs/regular/chevron-right.svg?v=2&amp;token=a463935e93);mask-repeat:no-repeat;mask-position:center"></svg></span></a></p></div></li><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/fab-toolkit/automation"><span><span>🧠</span>Automation</span><span><svg style="mask-image:url(https://ka-p.fontawesome.com/releases/v6.6.0/svgs/regular/chevron-right.svg?v=2&amp;token=a463935e93);mask-repeat:no-repeat;mask-position:center"></svg></span></a></p></div></li><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/fab-toolkit/submodules"><span><span>🏘️</span>Submodules</span><span><svg style="mask-image:url(https://ka-p.fontawesome.com/releases/v6.6.0/svgs/regular/chevron-right.svg?v=2&amp;token=a463935e93);mask-repeat:no-repeat;mask-position:center"></svg></span></a></p></div></li></ul></li><li><p><span>🧑‍🍳</span>Standard Operating Procedures</p><ul><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/standard-operating-procedures/patterning-sop-stepper-v2">Patterning SOP - Stepper V2<span><svg style="mask-image:url(https://ka-p.fontawesome.com/releases/v6.6.0/svgs/regular/chevron-right.svg?v=2&amp;token=a463935e93);mask-repeat:no-repeat;mask-position:center"></svg></span></a></p></div></li><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/standard-operating-procedures/plasma-etcher-sop">Plasma Etcher SOP</a></p></div></li><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/standard-operating-procedures/spin-on-glass-sop">Spin on Glass SOP<span><svg style="mask-image:url(https://ka-p.fontawesome.com/releases/v6.6.0/svgs/regular/chevron-right.svg?v=2&amp;token=a463935e93);mask-repeat:no-repeat;mask-position:center"></svg></span></a></p></div></li><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/standard-operating-procedures/tube-furnace-sop">Tube Furnace SOP</a></p></div></li><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/standard-operating-procedures/glass-acid-etch-sop">Glass Acid Etch SOP</a></p></div></li><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/standard-operating-procedures/diy-thermal-evaporator-sop">DIY Thermal Evaporator SOP</a></p></div></li><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/standard-operating-procedures/evaporator-sop">Evaporator SOP</a></p></div></li><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/standard-operating-procedures/aluminum-etch-sop">Aluminum Etch SOP</a></p></div></li><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/standard-operating-procedures/probe-station-sop">Probe Station SOP</a></p></div></li><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/standard-operating-procedures/probe-station-sop-v2">Probe Station SOP - V2</a></p></div></li><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/standard-operating-procedures/wafer-cleaving-sop">Wafer Cleaving SOP</a></p></div></li><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/standard-operating-procedures/dry-oxide-growth-sop">Dry Oxide Growth SOP</a></p></div></li><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/standard-operating-procedures/profilometer-sop">Profilometer SOP</a></p></div></li></ul></li><li><p><span>🟢</span>WORKING DOCS</p><ul><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/working-docs/nand-+-inverter-characterization">NAND + Inverter Characterization</a></p></div></li></ul></li><li><p><span>🔲</span>Templates (to do)</p><ul><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/templates-to-do/build-manual-template">Build Manual Template</a></p></div></li><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/templates-to-do/bought-equipment-template">Bought Equipment Template</a></p></div></li><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/templates-to-do/standard-operating-procedure-template">Standard Operating Procedure Template</a></p></div></li><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/templates-to-do/bom-template">BOM Template</a></p></div></li><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/templates-to-do/hardware-x-template-for-reference">Hardware X Template (for reference)</a></p></div></li></ul></li><li><p>Archive</p><ul><li><div><p><a href="https://docs.hackerfab.org/hacker-fab-space/archive/patterning-sop-stepper-v1">Patterning SOP - Stepper V1</a></p></div></li></ul></li></ul><div><div><a target="_blank" href="https://www.gitbook.com/?utm_source=content&amp;utm_medium=trademark&amp;utm_campaign=XgXjz6D0Vz2o0EOp8JO5"><svg style="mask-image:url(/~gitbook/static/icons/svgs/custom-icons/gitbook.svg?v=2);mask-repeat:no-repeat;mask-position:center"></svg>Powered by GitBook</a></div></div></div></div>]]>
@@ -1492,7 +1904,7 @@ November 5, 2024 | https://spiralprogress.com/2024/11/04/why-shouldnt-you-give-m
             </title>
             <description>
 <![CDATA[
-Score 181 | Comments 165 (<a href="https://news.ycombinator.com/item?id=42051197">thread link</a>) | @art049
+Score 184 | Comments 168 (<a href="https://news.ycombinator.com/item?id=42051197">thread link</a>) | @art049
 <br/>
 November 5, 2024 | https://codspeed.io/blog/state-of-python-3-13-performance-free-threading | <a href="https://web.archive.org/web/*/https://codspeed.io/blog/state-of-python-3-13-performance-free-threading">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>CPython 3.13 was released two weeks ago and this release is the most
@@ -1822,7 +2234,7 @@ free-threaded CPython</p>
             </title>
             <description>
 <![CDATA[
-Score 147 | Comments 143 (<a href="https://news.ycombinator.com/item?id=42049418">thread link</a>) | @gnabgib
+Score 148 | Comments 143 (<a href="https://news.ycombinator.com/item?id=42049418">thread link</a>) | @gnabgib
 <br/>
 November 4, 2024 | https://www.bgu.ac.il/en/news-and-articles/blood-sugar-control-is-key-factor-in-slowing-brain-aging/ | <a href="https://web.archive.org/web/*/https://www.bgu.ac.il/en/news-and-articles/blood-sugar-control-is-key-factor-in-slowing-brain-aging/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
@@ -2717,7 +3129,7 @@ You may see that in the <a href="https://github.com/Thomascountz/petri_dish/blob
             </title>
             <description>
 <![CDATA[
-Score 230 | Comments 55 (<a href="https://news.ycombinator.com/item?id=42045509">thread link</a>) | @greenie_beans
+Score 230 | Comments 57 (<a href="https://news.ycombinator.com/item?id=42045509">thread link</a>) | @greenie_beans
 <br/>
 November 4, 2024 | https://www.clunyjournal.com/p/machines-of-loving-grace | <a href="https://web.archive.org/web/*/https://www.clunyjournal.com/p/machines-of-loving-grace">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div dir="auto"><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7f73bae3-4bb1-4da8-a3a0-1bf68ef71239_8334x11750.jpeg" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7f73bae3-4bb1-4da8-a3a0-1bf68ef71239_8334x11750.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7f73bae3-4bb1-4da8-a3a0-1bf68ef71239_8334x11750.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7f73bae3-4bb1-4da8-a3a0-1bf68ef71239_8334x11750.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7f73bae3-4bb1-4da8-a3a0-1bf68ef71239_8334x11750.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7f73bae3-4bb1-4da8-a3a0-1bf68ef71239_8334x11750.jpeg" width="1456" height="2053" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/7f73bae3-4bb1-4da8-a3a0-1bf68ef71239_8334x11750.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:2053,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:16961853,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/jpeg&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:true,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7f73bae3-4bb1-4da8-a3a0-1bf68ef71239_8334x11750.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7f73bae3-4bb1-4da8-a3a0-1bf68ef71239_8334x11750.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7f73bae3-4bb1-4da8-a3a0-1bf68ef71239_8334x11750.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7f73bae3-4bb1-4da8-a3a0-1bf68ef71239_8334x11750.jpeg 1456w" sizes="100vw" fetchpriority="high"></picture></div></a><figcaption>Henry Alan Dragon, May 23, 2024, 1:26 pm.</figcaption></figure></div><p>Last year, at a Panera-catered “new faculty appreciation” luncheon, the Dean of my college told me—as I folded my hands across my seven-months-pregnant belly—that I should look for long-term academic employment elsewhere. My research and practice was not centered enough on “AI” and “emerging technology” to fit within the institution; they wanted someone with more of an explicit emphasis on tech. My work in publishing, writing, web-design—and even my reproductive state—couldn’t possibly be separated from these things, but, more than any other effects AI may have on humanity in the future, this is one of the main effects now: people feel compelled to talk about it, and it’s a good way for sclerotic institutions to feel like they’re keeping up with the times. I smiled, thanked him, and left with an M&amp;M cookie.&nbsp;</p><p><span>Earlier this month, at the recommendation of a colleague, I registered to attend a Zoom seminar that boasted a discussion on “the future of design education and academia.” As the Zoom window expanded, I was met with a looping Pornhub threesome montage next to a side-screen grid of six or so designers front-facing the camera. The hosts clicked around, grunting and gasping as the camera cut to new angles and positions. I opened my department group chat and texted my colleagues </span><em>OH NO. DO NOT JOIN THE CALL.</em><span> The colleague who recommended the talk echoed me: </span><em>DO NOT LOG IN! SOMEONE Hacked their Zoom.</em></p><p>The hosts spoke to each other saying things like:</p><p><em>I think it’s you.&nbsp;</em></p><p><em>Wait. Oh wait. No.&nbsp;</em></p><p><em>This type of thing happened all the time during Covid. So annoying.</em></p><p><em>Who is *bot-generated-username*?&nbsp;</em></p><p>It was a long two minutes before someone finally had the sense to end the call.&nbsp;</p><p><span>A few hours later, a nearby university, who employs one of the guest speakers, posted a carousel of screenshots on their Instagram page from the talk, which had apparently reconvened. The description read </span><em>Thanks to our Program Director ************** for an amazing panel discussion on the future of design education &amp; academia today!</em><span> 🚀</span></p><p>I tried to follow up with the panel about what happened, and received no reply.&nbsp;</p><p>The way this talk was handled reminded me that technology, for all its promise of connection and innovation, can have real and tangible repercussions if we’re not careful—it illuminates our fundamental responsibility to one another.</p><p><span>In “A Rant about Technology,” Ursula K. Le Guin says that technology is </span><em>how a society copes with physical reality</em><span>. That it </span><em>is the active human interface with the material world.</em><span> Technology is also a spoon. Technology is also language. Yet, I am shocked when AI does not stop Outlook Messenger from bursting confetti across my desktop in response to the </span><em>Congratulations</em><span> reply I receive when HR misreads my email about both adding and removing our late son from my health insurance.&nbsp;&nbsp;</span></p><p>As a 6th grader in a Dallas suburb, I attended a school assembly where a traveling speaker talked to us about sex. He said that sex was like fire. It was a life force. The discovery of fire sparked a massive advance of civilization. He told us that if we were not careful with fire, if we did not watch it closely and respect the power that it held, we could burn down a whole village. He told us to start a fire someday, but only with someone who you trusted to tend to it while you slept. I believe now that this same sort of diligence must also be extended to our use of technology.&nbsp;</p><p><span>This year I experienced many technological interventions to my body, as many do when they become pregnant. Of all the new ways to be measured and monitored, my favorite was when my sister-in-law, due just a few weeks before me, guessed my midsection's exact circumference with a piece of string. My least favorite was the transvaginal ultrasound. My OB in Virginia had a sort of nonchalance and slapstick humor to him that initially made me feel comfortable in his office. The temperature changed during my nine week appointment when he, quite unexpectedly, shook the ultrasound wand inside of me (with vigor!) in an attempt to wake the baby for the pictures. He mutter-yelled </span><em>Move little bugger. Move! </em><span>I looked to the nurse witness, who looked forward at the door. We received a letter in December that his practice would be closing in April. We received another at the end of summer telling us that he had died.</span></p><p><span>During this same pregnancy, another doctor does imaging on me, externally. With the wand in his hand in the almost pitch black room he tells us that there are two small and one moderate-sized holes in our son’s heart and that he will need to be rushed to surgery as soon as he is born. I am still fully reclined and covered in gel. He tells us to come back in two weeks. On his walk out of the room he hands us an information pamphlet where he drew on the back two versions of the human heart—one </span><em>normal</em><span>, one </span><em>our situation</em><span>.&nbsp;</span></p><p><span>Because of this experience, we transfer care to Massachusetts, where my husband’s family lives and works in the medical field. We navigate this with someone who is known as “The worldwide head of second opinion.” At the new hospital the gel is cleared off my belly each time. I cry in the ultrasound room as the video of the baby in my belly is labeled “practice breathing.” The sonographer walks us to a conference room where we’re met with cardiac specialists, social workers and obstetrics. Our meetings are prefaced with </span><em>This is going to be a hard conversation</em><span> and when we stand up to leave the room, we are encouraged to take the entire box of tissues with us. Someone even goes to the cupboard to get us a new box, of superior quality and softness.&nbsp;</span></p><p><span>We are told that we may not get to meet him, but we do. The windowless OR looks perfectly encapsulated in pure even daylight. We have a team of thirty people and everyone knows the choreography. The anesthesiologist tells me that I may feel a shock of sorts before she administers a liquid into my spine. I am beaming. I feel strong and I wait for the shock. I squeal. The staff echos my laughter when I tell them that it feels like I sat on a firecracker. They had not heard that one before. The team yells out </span><em>Happy Birthday Henry!</em><span> as he is lifted from my abdominal cavity, screaming and alive. The anesthesiologist tells us with urgency to touch him and she guides our hands to meet his head through the dividing screen. I keep my fingers at the place he fogged the plastic as he is carried away to receive care.&nbsp;</span></p><p>While my layers are being stitched up, my husband notices that the TVs near the ceiling are screening the surgery from above. When a nurse sees him watching, they switch off the monitors. The birth was photographed by our social worker, who printed and laminated the images. A whole stack is waiting for us in our room on the meal tray when we return.</p><p>When I see him next, there is a whole room dedicated to beating his heart. I am wheeled to his side and told not to worry about the beeping, it is just an indication of a new switch to flip. That it is not as time sensitive as it sounds. Henry wraps his hand around my finger, then around the beak of his woodpecker Jellycat. He is on a high platform and adorned in wires and tubing like some sort of cybernetic king. One part of the room-machine spins constantly. It whirls and re-oxygenates the donor blood that has exited him in a slightly less vibrant shade of red than what entered.&nbsp;</p><p>He fights for two days. On his third, when he chooses peace, it is the quietest room I have ever endured. The cardiologist encloses us with the curtain and lets us stay as long as we can.&nbsp;&nbsp;</p><p>We have a mass in Henry’s name. Afterward, family comes over. They bring food and two new pink babies. I hold my niece and keep checking that my hair does not wrap around her fingers. Our dog screams in the face of the two-year-old cousin, who seems completely unaffected. He says “dog” and pats him. He points to the angel on the mantle and says “Amen.” We set up a small box in the living room with photographs printed out from the hospital. As his mother, I feel protective of his image. I do not want people to look at him on their phones. I want to be in control of how he is seen in his corporeal form. I want people to sit on the couch and hold him, looking together at the same time and passing him around as they would any other baby. I become upset when I log in to Facebook for the first time in years, to sell a lamp, and see that some of our pictures from the hospital were posted to the family’s facebook group. I stew on this for a while, then release it when my husband reminds me about when they were posted, his first good day on the ECMO machine. We were two proud normal parents. They were asking the family for prayers.&nbsp;</p><p>During the next three months, I look at his pictures for fifteen minutes every three hours to trigger a milk letdown. I imagine kissing his head and can still taste his baptismal holy water on my lips. Smell the perfumed oil. I nurse a small machine all summer and a refrigerated car comes by to pick up the milk that will be processed, divided, and sent off to babies I will never know. My husband wakes up in the middle of the night to wash the flanges, label the bags, and place them in the freezer. At home, we keep a white noise machine of the ocean waves playing in the bedroom at all times. We have done this for years, but I only just now am paying attention to it. When my dog unplugs it, I notice its absence.</p><p>Earlier this spring my department chair threw me a baby shower. My students ate cupcakes and giggled as we failed to answer baby related pop-culture trivia from the 80’s. At the end of summer I send them a sad email to thank them for their patience last year and I ask for it again. This fall I sit in class with them, smiling as laughter bubbles from the corners of their mouths in response to the recording I play of Richard Brautigan reciting this poem:&nbsp;&nbsp;</p><div data-component-name="PreformattedTextBlockToDOM"><p><label contenteditable="false">Text within this block will maintain its original spacing when published</label></p><pre><em>I like to think (and
@@ -3397,7 +3809,7 @@ November 4, 2024 | https://www.dogesec.com/blog/bad_software_keeps_security_indu
             </title>
             <description>
 <![CDATA[
-Score 369 | Comments 288 (<a href="https://news.ycombinator.com/item?id=42043939">thread link</a>) | @gus_leonel
+Score 370 | Comments 288 (<a href="https://news.ycombinator.com/item?id=42043939">thread link</a>) | @gus_leonel
 <br/>
 November 4, 2024 | https://jarosz.dev/article/writing-secure-go-code/ | <a href="https://web.archive.org/web/*/https://jarosz.dev/article/writing-secure-go-code/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -3439,7 +3851,7 @@ November 4, 2024 | https://jarosz.dev/article/writing-secure-go-code/ | <a href=
 </ul>
 <h2 id="mailing-list">Mailing list</h2>
 <p>Let’s start with the most obvious place - the Go mailing list. We need to subscribe to get all critical security information right from the source.
-All releases that contain security fixes are announced to the <code><a href="https://jarosz.dev/cdn-cgi/l/email-protection" data-cfemail="1c7b73707d727b317d72727369727f795c7b73737b70797b6e73696c6f327f7371">[email&nbsp;protected]</a></code> list.
+All releases that contain security fixes are announced to the <code><a href="https://jarosz.dev/cdn-cgi/l/email-protection" data-cfemail="5730383b3639307a363939382239343217303838303b323025382227247934383a">[email&nbsp;protected]</a></code> list.
 Once we subscribe to the list, we can be sure we won’t miss any important announcements.</p>
 <h2 id="keeping-go-version-up-to-date">Keeping Go version up to date</h2>
 <p>The second step is to keep the Go versions in our projects current. Even though we don’t use the latest and greatest language features, bumping the Go version gives us all security patches for discovered vulnerabilities. Also, the new Go version ensures compatibility with newer dependencies.
@@ -3541,7 +3953,7 @@ Let’s install <code>govulncheck</code> locally and try basic functionality.</p
 </span></span></code></pre></div><p>It’s time to check if the installation process went well:</p>
 <div><pre tabindex="0"><code data-lang="shell"><span><span>govulncheck -version
 </span></span><span><span>Go: go1.23.2
-</span></span><span><span>Scanner: <a href="https://jarosz.dev/cdn-cgi/l/email-protection" data-cfemail="4d2a223b3821232e25282e260d3b7c637c637e">[email&nbsp;protected]</a>
+</span></span><span><span>Scanner: <a href="https://jarosz.dev/cdn-cgi/l/email-protection" data-cfemail="a0c7cfd6d5cccec3c8c5c3cbe0d6918e918e93">[email&nbsp;protected]</a>
 </span></span><span><span>DB: https://vuln.go.dev
 </span></span><span><span>DB updated: 2024-10-17 15:37:30 +0000 UTC
 </span></span><span><span>...
@@ -3569,8 +3981,8 @@ Let’s install <code>govulncheck</code> locally and try basic functionality.</p
 </span></span><span><span>    Incorrect detection of reserved device names on Windows in path/filepath
 </span></span><span><span>  More info: https://pkg.go.dev/vuln/GO-2023-2186
 </span></span><span><span>  Standard library
-</span></span><span><span>    Found in: path/<a href="https://jarosz.dev/cdn-cgi/l/email-protection" data-cfemail="dfb9b6b3baafbeabb79fb8b0eef1edeff1ea">[email&nbsp;protected]</a>
-</span></span><span><span>    Fixed in: path/<a href="https://jarosz.dev/cdn-cgi/l/email-protection" data-cfemail="7a1c13161f0a1b0e123a1d154b54484a544b4b">[email&nbsp;protected]</a>
+</span></span><span><span>    Found in: path/<a href="https://jarosz.dev/cdn-cgi/l/email-protection" data-cfemail="5b3d32373e2b3a2f331b3c346a75696b756e">[email&nbsp;protected]</a>
+</span></span><span><span>    Fixed in: path/<a href="https://jarosz.dev/cdn-cgi/l/email-protection" data-cfemail="13757a7f766372677b53747c223d21233d2222">[email&nbsp;protected]</a>
 </span></span><span><span>
 </span></span><span><span><span>===</span> Module Results <span>===</span>
 </span></span><span><span>
@@ -3578,16 +3990,16 @@ Let’s install <code>govulncheck</code> locally and try basic functionality.</p
 </span></span><span><span>    Stack exhaustion in Parse in go/build/constraint
 </span></span><span><span>  More info: https://pkg.go.dev/vuln/GO-2024-3107
 </span></span><span><span>  Standard library
-</span></span><span><span>    Found in: <a href="https://jarosz.dev/cdn-cgi/l/email-protection" data-cfemail="265552424a4f44664149170814160813">[email&nbsp;protected]</a>
-</span></span><span><span>    Fixed in: <a href="https://jarosz.dev/cdn-cgi/l/email-protection" data-cfemail="b9cacdddd5d0dbf9ded688978b8b978e">[email&nbsp;protected]</a>
+</span></span><span><span>    Found in: <a href="https://jarosz.dev/cdn-cgi/l/email-protection" data-cfemail="790a0d1d15101b391e1648574b49574c">[email&nbsp;protected]</a>
+</span></span><span><span>    Fixed in: <a href="https://jarosz.dev/cdn-cgi/l/email-protection" data-cfemail="661512020a0f04260109574854544851">[email&nbsp;protected]</a>
 </span></span><span><span>...
 </span></span><span><span>
 </span></span><span><span>Vulnerability <span>#18: GO-2023-1878</span>
 </span></span><span><span>    Insufficient sanitisation of Host header in net/http
 </span></span><span><span>  More info: https://pkg.go.dev/vuln/GO-2023-1878
 </span></span><span><span>  Standard library
-</span></span><span><span>    Found in: <a href="https://jarosz.dev/cdn-cgi/l/email-protection" data-cfemail="d3a0a7b7bfbab193b4bce2fde1e3fde6">[email&nbsp;protected]</a>
-</span></span><span><span>    Fixed in: <a href="https://jarosz.dev/cdn-cgi/l/email-protection" data-cfemail="e39097878f8a81a3848cd2cdd1d3cdd5">[email&nbsp;protected]</a>
+</span></span><span><span>    Found in: <a href="https://jarosz.dev/cdn-cgi/l/email-protection" data-cfemail="3b484f5f5752597b5c540a15090b150e">[email&nbsp;protected]</a>
+</span></span><span><span>    Fixed in: <a href="https://jarosz.dev/cdn-cgi/l/email-protection" data-cfemail="ee9d9a8a82878cae8981dfc0dcdec0d8">[email&nbsp;protected]</a>
 </span></span><span><span>
 </span></span><span><span>Your code is affected by <span>0</span> vulnerabilities.
 </span></span><span><span>This scan also found <span>1</span> vulnerability in packages you import and <span>18</span>
@@ -3732,7 +4144,7 @@ November 4, 2024 | https://oasis.decart.ai/starting-point | <a href="https://web
             </title>
             <description>
 <![CDATA[
-Score 202 | Comments 151 (<a href="https://news.ycombinator.com/item?id=42038139">thread link</a>) | @mooreds
+Score 203 | Comments 151 (<a href="https://news.ycombinator.com/item?id=42038139">thread link</a>) | @mooreds
 <br/>
 November 3, 2024 | https://sgringwe.com/2019/10/10/Please-just-stop-saying-just.html | <a href="https://web.archive.org/web/*/https://sgringwe.com/2019/10/10/Please-just-stop-saying-just.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div itemprop="articleBody">
@@ -3831,982 +4243,6 @@ November 3, 2024 | https://sgringwe.com/2019/10/10/Please-just-stop-saying-just.
             <link>https://sgringwe.com/2019/10/10/Please-just-stop-saying-just.html</link>
             <guid isPermaLink="false">hacker-news-small-sites-42038139</guid>
             <pubDate>Mon, 04 Nov 2024 03:25:49 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[Building My Resume in HTML Using Eleventy]]>
-            </title>
-            <description>
-<![CDATA[
-Score 85 | Comments 70 (<a href="https://news.ycombinator.com/item?id=42037120">thread link</a>) | @michaelengen
-<br/>
-November 3, 2024 | https://michaelengen.com/posts/my-eleventy-resume/ | <a href="https://web.archive.org/web/*/https://michaelengen.com/posts/my-eleventy-resume/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
-    <article>
-      
-      
-      <p>Like many before me, I've built and rebuilt my resume many times over the years.
-I've used many different approaches, including <a href="https://en.wikipedia.org/wiki/LaTeX">LaTeX</a> and visual editors, in search of something that fulfilled my aspirational criteria:</p>
-<ul>
-<li>the development experience should be pleasant,</li>
-<li>the content and layout should work well with version control, and</li>
-<li>the output should be easy to access.</li>
-</ul>
-<p>I've spent the last few years learning more about front-end web development, so, this time around, I reached for HTML and CSS. Behold, <a href="https://michaelengen.com/resume">my resume (website)</a>!</p>
-<figure>
-<!-- !["A screenshot of my resume, including a header with contact information above a summary and a cut-off list of work experience."]("/images/resume-wide.png") -->
-<img src="https://michaelengen.com/images/resume-wide.png" alt="A screenshot of my resume, including a header with contact information above a summary and a cut-off list of work experience.">
-The top third or so of my resume.
-</figure>
-<p>In this article, I'll walk through some of the decisions I made as well as some challenges I faced along the way.</p>
-<div>
-<h2 id="the-benefits-of-html-and-css">The Benefits of HTML and CSS</h2>
-</div>
-<p>The immediate benefit of building my resume with web-native technologies is that I can host my resume online!
-Web-native documents permit flexible layouts, enabling my resume to look good across a wide variety of browser and font sizes.
-HTML's many <a href="https://developer.mozilla.org/en-US/docs/Learn/Accessibility/HTML#good_semantics">semantic elements</a> provide meaningful structure to the document, aiding accessibility.</p>
-<p>CSS has improved tremendously in recent years, incorporating many new language features that benefit both development and its formatting capabilities.
-The advent of native <a href="https://developer.mozilla.org/en-US/docs/Web/CSS/CSS_nesting">CSS nesting</a> makes authoring CSS much more pleasant, and <a href="https://developer.mozilla.org/en-US/docs/Web/CSS/CSS_grid_layout">grid-based layouts</a> are a simple yet powerful means for designing user interfaces.
-CSS's ubiquity, along with a heightened enthusiasm from the community, also brings a wealth of excellent documentation, guides, and discussion, which I've found invaluable during my research.</p>
-<div>
-<h3 id="but-i-cant-upload-html-to-indeed">But, I Can't Upload HTML to Indeed</h3>
-</div>
-<p>True, Indeed and other job platforms don't accept HTML documents, and a recent straw poll among my unwilling friends concluded that a <code>resume.html</code> email attachment is <em>definitely a virus</em>.
-Thankfully, producing a beautiful glossy PDF can be as simple as opening the file in a browser and printing to a PDF.
-I can tweak the precise layout of the printed PDF, e.g., to ensure it fits on one page, using CSS's print styles without affecting the web layout.</p>
-
-<p>One could just open up <code>resume.html</code> and go <em>ham</em>, but that isn't the best development experience.
-Brad Frost wrote about <a href="https://bradfrost.com/blog/post/raw-dogging-websites/">his enjoyment of this unencumbered approach to building websites</a>, although he too noted "ergononmic inefficiences".</p>
-<p>Thankfully, there is a lot of great tooling available in the form of <em>static site generators</em>, whose principal purpose is to meld data, structure, and styling into files for the web.
-I've chosen to use <a href="https://www.11ty.dev/">Eleventy</a>, a static site generator written in JavaScript that uses plain JS for its configuration, but there are many options for JS and other languages.
-The process has three principal steps:</p>
-<ol>
-<li>Writing the resume's data.</li>
-<li>Structuring the data with HTML.</li>
-<li>Styling the structure with CSS.</li>
-</ol>
-
-<p>Eleventy supports a wide variety of data file types, but I've opted to use JSON for its simplicity.
-The <a href="https://jsonresume.org/">JSON Resume</a> schema provides a solid foundation for our content, and there are hundreds of "JSON Resume" themes publicly available that use a wide variety of build systems.
-I did add some new fields in cases where I wanted to include something outside the schema, e.g., my research focus during my graduate studies:</p>
-<pre tabindex="0"><code><span><span>{</span></span>
-<span><span>  "</span><span>education</span><span>"</span><span>:</span><span> [</span></span>
-<span><span>    {</span></span>
-<span><span>      "</span><span>studyType</span><span>"</span><span>:</span><span> "</span><span>Doctor of Philosophy</span><span>"</span><span>,</span></span>
-<span><span>      "</span><span>area</span><span>"</span><span>:</span><span> "</span><span>Mathematics</span><span>"</span><span>,</span></span>
-<span><span>      "</span><span>focus</span><span>"</span><span>:</span><span> "</span><span>Combinatorics</span><span>"</span><span>,</span><span> // New!</span></span>
-<span><span>      // ...</span></span>
-<span><span>    },</span></span>
-<span><span>    // ...</span></span>
-<span><span>  ],</span></span>
-<span><span>  // ...</span></span>
-<span><span>}</span></span></code></pre>
-<p>This data will be funneled into Eleventy's <a href="https://www.11ty.dev/docs/data-cascade/">data cascade</a>, which in turn will pour into its HTML templates.</p>
-
-<!-- With our data neatly contained in a `resume.json` file, we can begin structuring our content with , which makes our HTML document more accessible to assistive technology like screenreaders.  -->
-<p>Eleventy will read the data at build time, inserting it into HTML templates using a <a href="https://www.11ty.dev/docs/languages/">template language</a>.
-By default, Eleventy uses the <a href="https://www.11ty.dev/docs/languages/liquid/">Liquid templating language</a>, and its straightforward interface makes it well suited for this use case.
-The primary Liquid syntax needed is minimal. In a <code>.liquid</code> file,</p>
-<ul>
-<li>the snippet <code>{{ myVariable }}</code> will be replaced by the <code>myVariable</code> and</li>
-<li>the snippet <code>{% include "file.ext" %}</code> will be replaced by the contents of <code>"file.ext"</code>, which may itself be a template.</li>
-</ul>
-<p>Our document's <code>&lt;head&gt;</code> requires only these constructs:</p>
-<pre tabindex="0"><code><span><span>&lt;</span><span>head</span><span>&gt;</span></span>
-<span><span>  &lt;</span><span>meta</span><span> charset</span><span>=</span><span>"</span><span>UTF-8</span><span>"</span><span> /&gt;</span></span>
-<span><span>  &lt;</span><span>meta</span><span> </span></span>
-<span><span>    name</span><span>=</span><span>"</span><span>viewport</span><span>"</span><span> </span></span>
-<span><span>    content</span><span>=</span><span>"</span><span>width=device-width, initial-scale=1</span><span>"</span><span> </span></span>
-<span><span>  /&gt;</span></span>
-<span><span>  &lt;</span><span>style</span><span>&gt;</span></span>
-<span><span>    {</span><span>% </span><span>include</span><span> "</span><span>styles</span><span>.</span><span>css</span><span>" %</span><span>}</span></span>
-<span><span>  &lt;/</span><span>style</span><span>&gt;</span></span>
-<span><span>  &lt;</span><span>title</span><span>&gt;</span></span>
-<span><span>    {{ resume.basics.name }}'s Resume </span></span>
-<span><span>  &lt;/</span><span>title</span><span>&gt;</span></span>
-<span><span>&lt;/</span><span>head</span><span>&gt;</span></span></code></pre>
-<p>In addition to some HTML boilerplate, I've inlined my stylesheet, so that my resume is contained to just one file.
-My resume has four sections:</p>
-<ul>
-<li>header/contact info,</li>
-<li>a summary,</li>
-<li>relevant work experience, and</li>
-<li>formal education.</li>
-</ul>
-<p>I've marked up these sections each with their own template, passing in just the data needed for that section:</p>
-<pre tabindex="0"><code><span><span>&lt;</span><span>body</span><span>&gt;</span></span>
-<span><span>  {% </span></span>
-<span><span>    include "components/header.liquid", </span></span>
-<span><span>    basics: resume.basics</span></span>
-<span><span>  %}</span></span>
-<span><span>  &lt;</span><span>main</span><span>&gt;</span></span>
-<span><span>    {% </span></span>
-<span><span>      include "components/summary.liquid", </span></span>
-<span><span>      summary: resume.basics.summary </span></span>
-<span><span>    %}</span></span>
-<span><span>    {% </span></span>
-<span><span>      include "components/experience.liquid", </span></span>
-<span><span>      work: resume.work</span></span>
-<span><span>    %}</span></span>
-<span><span>    {% </span></span>
-<span><span>      include "components/education.liquid", </span></span>
-<span><span>      education: resume.education</span></span>
-<span><span>    %}</span></span>
-<span><span>  &lt;/</span><span>main</span><span>&gt;</span></span>
-<span><span>&lt;/</span><span>body</span><span>&gt;</span></span></code></pre>
-<p>In each of the above <code>{% include %}</code> statements, I've passed just the <code>resume</code> data necessary to "render" the template.
-The referenced templates can be very simple, like with my summary:</p>
-<pre tabindex="0"><code><span><span>&lt;</span><span>section</span><span>&gt;</span></span>
-<span><span>  &lt;</span><span>h2</span><span>&gt;</span><span>Summary</span><span>&lt;/</span><span>h2</span><span>&gt;</span></span>
-<span><span>  &lt;</span><span>p</span><span>&gt;</span><span>{{ summary }}</span><span>&lt;/</span><span>p</span><span>&gt;</span></span>
-<span><span>&lt;/</span><span>section</span><span>&gt;</span></span></code></pre>
-<p>Or, they can be more involved, like this template for my work experience, which loops through the <code>work</code> array and includes an option for dates to be displayed through a <code>period</code>, like "Summer 2017", rather than a range.</p>
-<pre tabindex="0"><code><span><span>&lt;</span><span>section</span><span>&gt;</span></span>
-<span><span>  &lt;</span><span>h2</span><span>&gt;</span><span>Experience</span><span>&lt;/</span><span>h2</span><span>&gt;</span></span>
-<span><span>  {% for work in resume.work %}</span></span>
-<span><span>    &lt;</span><span>section</span><span>&gt;</span></span>
-<span><span>      &lt;</span><span>header</span><span>&gt;</span></span>
-<span><span>        &lt;</span><span>h3</span><span>&gt;</span><span>{{ work.position }}</span><span>&lt;/</span><span>h3</span><span>&gt;</span></span>
-<span><span>        &lt;</span><span>span</span><span>&gt;</span><span>{{ work.name }}</span><span>&lt;/</span><span>span</span><span>&gt;</span></span>
-<span><span>        &lt;</span><span>span</span><span> class</span><span>=</span><span>"</span><span>date</span><span>"</span><span>&gt;</span></span>
-<span><span>          {% if work.period %}</span></span>
-<span><span>            {{ work.period }}</span></span>
-<span><span>          {% else %}</span></span>
-<span><span>            {{ work.startDate }} </span><span>&amp;</span><span>ndash</span><span>;&amp;</span><span>nbsp</span><span>;</span><span>{{ work.endDate }}</span></span>
-<span><span>          {% endif %}</span></span>
-<span><span>        &lt;/</span><span>span</span><span>&gt;</span></span>
-<span><span>      &lt;/</span><span>header</span><span>&gt;</span></span>
-<span><span>      &lt;</span><span>ul</span><span>&gt;</span></span>
-<span><span>        {% for highlight in work.highlights %}</span></span>
-<span><span>          &lt;</span><span>li</span><span>&gt;</span><span>{{ highlight }}</span><span>&lt;/</span><span>li</span><span>&gt;</span></span>
-<span><span>        {% endfor %}</span></span>
-<span><span>      &lt;/</span><span>ul</span><span>&gt;</span></span>
-<span><span>    &lt;/</span><span>section</span><span>&gt;</span></span>
-<span><span>  {% endfor %}</span></span>
-<span><span>&lt;/</span><span>section</span><span>&gt;</span></span></code></pre>
-
-<p>When designing my resume's layout, I wanted a single content column to provide a natural reading order, while also keeping the width of the primary content short enough as to not impair readability.
-I opted to place the section labels in a gutter on the page's left side, allowing my content to fill most, but not all, of the page's width.</p>
-<p>CSS can solve this in a few ways, but first let's look at the basic structure of the resume with most of the content removed:</p>
-<pre tabindex="0"><code><span><span>&lt;</span><span>main</span><span>&gt;</span></span>
-<span><span>  &lt;</span><span>section</span><span>&gt;</span></span>
-<span><span>    &lt;</span><span>h2</span><span>&gt;</span><span>Experience</span><span>&lt;/</span><span>h2</span><span>&gt;</span></span>
-<span><span>    &lt;</span><span>section</span><span>&gt;</span></span>
-<span><span>      &lt;!-- Much experience --&gt;</span></span>
-<span><span>    &lt;/</span><span>section</span><span>&gt;</span></span>
-<span><span>    &lt;</span><span>section</span><span>&gt;</span></span>
-<span><span>      &lt;!-- Wow --&gt;</span></span>
-<span><span>    &lt;/</span><span>section</span><span>&gt;</span></span>
-<span><span>  &lt;/</span><span>section</span><span>&gt;</span></span>
-<span><span>  &lt;</span><span>section</span><span>&gt;</span></span>
-<span><span>    &lt;</span><span>h2</span><span>&gt;</span><span>Education</span><span>&lt;/</span><span>h2</span><span>&gt;</span></span>
-<span><span>    &lt;</span><span>section</span><span>&gt;</span></span>
-<span><span>      &lt;!-- University --&gt;</span></span>
-<span><span>    &lt;/</span><span>section</span><span>&gt;</span></span>
-<span><span>    &lt;</span><span>section</span><span>&gt;</span></span>
-<span><span>      &lt;!-- College, maybe --&gt;</span></span>
-<span><span>    &lt;/</span><span>section</span><span>&gt;</span></span>
-<span><span>  &lt;/</span><span>section</span><span>&gt;</span></span>
-<span><span>&lt;/</span><span>main</span><span>&gt;</span></span></code></pre>
-<p>I want the section-label gutter column to only be as wide as its content, which can be achieved by placing the <code>&lt;h2&gt;</code> labels into the same column and setting its width to <code>max-content</code>, but the labels don't have a common parent!
-Thankfully, they share a common grandparent, and each of that grandparent's children may inherit the grandparent's columns through a <a href="https://developer.mozilla.org/en-US/docs/Web/CSS/CSS_grid_layout/Subgrid">subgrid</a>: <code>grid-template-columns: subgrid;</code>.</p>
-<figure>
-<!-- !["A screenshot of my resume, including a header with contact information above a summary and a cut-off list of work experience."]("/images/resume-wide.png") -->
-<img src="https://michaelengen.com/images/resume-wide.png" alt="A resume with the section labels 'summary' and 'experience' down a narrow lefthand column and content down a wide righthand column.">
-The two-column layout of my resume.
-</figure>
-<pre tabindex="0"><code><span><span>main</span><span> {</span></span>
-<span><span>  display</span><span>:</span><span> grid</span><span>;</span></span>
-<span><span>  grid-template-columns</span><span>:</span><span> max-content</span><span> 1</span><span>fr</span><span>;</span></span>
-<span></span>
-<span><span>  &gt;</span><span>section</span><span> {</span></span>
-<span><span>    grid-column</span><span>:</span><span> 1</span><span> / </span><span>3</span><span>;</span></span>
-<span></span>
-<span><span>    display</span><span>:</span><span> grid</span><span>;</span></span>
-<span><span>    grid-template-columns</span><span>:</span><span> subgrid</span><span>;</span></span>
-<span><span>    justify-items</span><span>:</span><span> start</span><span>;</span></span>
-<span><span>    align-items</span><span>:</span><span> start</span><span>;</span></span>
-<span></span>
-<span><span>    h</span><span>2 {</span></span>
-<span><span>      grid-column</span><span>:</span><span> 1</span><span> / span </span><span>1</span><span>;</span></span>
-<span><span>    }</span></span>
-<span><span>    section</span><span> {</span></span>
-<span><span>      grid-column</span><span>:</span><span> 2</span><span> / </span><span>3</span><span>;</span></span>
-<span><span>    }</span></span>
-<span><span>  }</span></span>
-<span><span>}</span></span></code></pre>
-<p>Additionally, I wanted the section labels to collapse to be inline with the resume's content for narrow viewports, which only required changing a few of the grid-layout parameters in a <a href="https://developer.mozilla.org/en-US/docs/Glossary/Media_query">media query</a>.</p>
-<figure>
-  <!-- ![The one-column layout of my resume.](/images/resume-narrow.png) -->
-  <img src="https://michaelengen.com/images/resume-narrow.png" alt="The one-column layout of my resume.">
-</figure>
-<pre tabindex="0"><code><span><span>main</span><span> {</span></span>
-<span><span>  &gt;</span><span>section</span><span> {</span></span>
-<span><span>    @</span><span>media</span><span> screen</span><span> and</span><span> (</span><span>max-width</span><span>:</span><span> 50</span><span>rem</span><span>) {</span></span>
-<span><span>      h</span><span>2 {</span></span>
-<span><span>        grid-column-end</span><span>:</span><span> span </span><span>2</span><span>;</span></span>
-<span><span>        justify-self</span><span>:</span><span> center</span><span>;</span></span>
-<span><span>      }</span></span>
-<span><span>      section</span><span> {</span></span>
-<span><span>        grid-column-start</span><span>:</span><span> 1</span><span>;</span></span>
-<span><span>      }</span></span>
-<span><span>    }</span></span>
-<span><span>  }</span></span>
-<span><span>}</span></span></code></pre>
-
-<p>With all this in place, I'll outline my "development experience"—what is required to edit and distribute my resume in this format?
-Once set up, I produce clean builds of my resume with <code>npx @11ty/eleventy</code> or <code>npm run build</code>, which produces the single HTML resume file.</p>
-<p>While I'm editing my resume, Eleventy will stand up a local webserver on <code>localhost:8080</code> with <code>npx @11ty/eleventy --serve</code> or <code>npm run start</code>.
-This is handy as it includes functionality to reload the webpage in response to changes in the source, so any edits are reflected when the content is saved.
-The local server is also helpful for producing the PDF version of my resume, as we can use web automation tools to print-to-PDF from the command line!
-I use this short <code>print.js</code> script that uses Puppeteer to make the PDF, and I run it with <code>node print.js</code>.</p>
-<pre tabindex="0"><code><span><span>import</span><span> puppeteer</span><span> from</span><span> "</span><span>puppeteer</span><span>"</span><span>;</span></span>
-<span><span> </span></span>
-<span><span>async</span><span> function</span><span> printPDF</span><span>()</span><span> {</span></span>
-<span><span>  const</span><span> browser</span><span> =</span><span> await</span><span> puppeteer</span><span>.</span><span>launch</span><span>({</span><span> headless</span><span>:</span><span> true</span><span> });</span></span>
-<span><span>  const</span><span> page</span><span> =</span><span> await</span><span> browser</span><span>.</span><span>newPage</span><span>();</span></span>
-<span><span>  await</span><span> page</span><span>.</span><span>goto</span><span>(</span><span>'</span><span>http://localhost:8080/</span><span>'</span><span>,</span><span> {</span><span> waitUntil</span><span>:</span><span> '</span><span>networkidle0</span><span>'</span><span> });</span></span>
-<span><span>  await</span><span> page</span><span>.</span><span>pdf</span><span>({</span><span> format</span><span>:</span><span> '</span><span>letter</span><span>'</span><span>,</span><span> path</span><span>:</span><span> '</span><span>./resume.pdf</span><span>'</span><span> });</span></span>
-<span><span>  await</span><span> browser</span><span>.</span><span>close</span><span>();</span></span>
-<span><span>}</span></span>
-<span></span>
-<span><span>await</span><span> printPDF</span><span>();</span></span></code></pre>
-<p>For those interested, I've uploaded this project to <a href="https://github.com/engenmt/my-eleventy-resume">GitHub</a>. If you'd like to see other approaches to HTML resumes, see these posts by <a href="https://ericwbailey.website/published/how-to-not-make-a-resume-in-react/">Eric Bailey</a>, <a href="https://mxb.dev/blog/eleventy-resume-builder/">Max Böck</a>, and <a href="https://ktema.org/articles/the-overengineered-resume/">David Reed</a>. If you have any feedback, I'm available on <a href="https://mastodon.social/@mengen">Mastodon</a>. Thanks for reading!</p>
-
-    </article>
-  </div></div>]]>
-            </description>
-            <link>https://michaelengen.com/posts/my-eleventy-resume/</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42037120</guid>
-            <pubDate>Sun, 03 Nov 2024 23:50:44 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[Hertz-dev, the first open-source base model for conversational audio]]>
-            </title>
-            <description>
-<![CDATA[
-Score 290 | Comments 53 (<a href="https://news.ycombinator.com/item?id=42036995">thread link</a>) | @mnk47
-<br/>
-November 3, 2024 | https://si.inc/hertz-dev/ | <a href="https://web.archive.org/web/*/https://si.inc/hertz-dev/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
-    
-
-    <article>
-      <p>For the last few months, we at Standard Intelligence have been researching scalable cross-modality learning. We're excited to announce that we're open-sourcing current checkpoints of our full-duplex, audio-only base model, hertz-dev, with a total of 8.5 billion parameters and three primary parts:</p>
-
-
-      <ul>
-        <li><strong>Hertz-codec:</strong> a convolutional audio VAE which takes mono, 16kHz speech and encodes a 8Hz latent representation with a KL-regularized 1kbps bitrate. The codec latents have no residuals, just a single 32-dim latent per 125ms frame. The codec outperforms Soundstream and Encodec at 6kbps and is on par with DAC at 8kbps in subjective evaluations, while having lower tokens per second than any popular tokenizer, critical for language modeling. Hertz-codec has 5 million encoder parameters and 95 million decoder parameters.</li>
-        
-        <li><strong>Hertz-lm:</strong> a 6.6 billion parameter, 32-layer decoder-only transformer with a context of 2048 input tokens (~4.5 mins). Hertz-lm receives as input the full latent history, but predicts a series of quantized representations, which are 15-bit compressed versions of the hertz-codec tokens. It acts like a typical language model trained on next-token prediction loss.
-          <ul>
-            <li>We're releasing two versions of the one-channel stack, both trained on 20 million hours of audio data. The <a href="https://ckpt.si.inc/hertz-dev/inference_caraway_112000.pt">primary checkpoint</a> has weights initialized from the weights of a pretrained language model trained on 2T text tokens. The <a href="https://ckpt.si.inc/hertz-dev/inference_syrup_110000.pt">second</a> is an ablation that was trained purely on audio, with no text pretraining. While the one that began with text training had higher coherence in subjective evaluations, both exhibit similar linguistic understanding, and we're excited to learn that audio alone contains sufficient grounding for the model to learn language.</li>
-            <li>The two-channel version of hertz-lm predicts two quantized latents, which are used as input for two separate instances of hertz-vae and hertz-codec.</li>
-          </ul>
-        </li>
-        
-        <li><strong>Hertz-vae:</strong> a 1.8 billion parameter, 8 layer decoder-only transformer. The first four layers receive as input the latent history. During training, layer 5 receives the ground-truth, 15-bit quantized representation of the next latent. During inference, we directly sample hertz-lm's next token prediction and provide it to hertz-vae as the quantized representation.
-          <ul>
-            <li>We evaluate hertz-vae during training by doing autoregressive generation while holding the ground-truth quantized latents static, and measure the quality of <em>resynthesis:</em> how well the model is able to reconstruct the original speech from just quantized latents, prompt, and generation history. From transcript evaluations, hertz-vae is near-perfect at reconstructing the semantics of speech from just 120 bits per second of information.</li>
-          </ul>
-        </li>
-      </ul>
-
-      <p>Hertz-dev is the first publicly released audio base model of its kind. Base models accurately predict the distribution of the data that they were trained on, as opposed to models that have had substantial RL tuning done to collapse their generation distributions. This makes base models the best starting point to fine-tune for a large number of different tasks. We're currently training a larger, more advanced version of Hertz, which will use a scaled base model recipe and RL tuning to substantially improve the raw capabilities and final coherence of the model. Hertz-dev is a glimpse at the future of real-time voice interaction, and is the easiest conversational audio model in the world for researchers to fine-tune and build on top of.</p>
-
-      <h2>Sample Generations</h2>
-      <p>To demonstrate the audio modeling capabilities of hertz-dev, we sample both one-channel and two-channel generations as well as a live conversation between the model and a human.</p>
-
-      <h3>One-channel</h3>
-      <div>
-        <p><audio controls="">
-            <source src="https://publicr2.si.inc/hertz-dev/generations/gen_football.wav" type="audio/wav">
-            Your browser does not support the audio element.
-          </audio>
-        </p>
-        <p><audio controls="">
-            <source src="https://publicr2.si.inc/hertz-dev/generations/I_like_jpegs_generation.wav" type="audio/wav">
-            Your browser does not support the audio element.
-          </audio>
-        </p>
-        <p><audio controls="">
-            <source src="https://publicr2.si.inc/hertz-dev/generations/gen_as_an_assistant.wav" type="audio/wav">
-            Your browser does not support the audio element.
-          </audio>
-        </p>
-        <p><audio controls="">
-            <source src="https://publicr2.si.inc/hertz-dev/generations/gen_any_given_time.wav" type="audio/wav">
-            Your browser does not support the audio element.
-          </audio>
-        </p>
-      </div>
-
-      <h3>Two-channel</h3>
-      <div>
-        <p><audio controls="">
-            <source src="https://publicr2.si.inc/hertz-dev/generations/gen_counting.wav" type="audio/wav">
-            Your browser does not support the audio element.
-          </audio>
-        </p>
-        <p><audio controls="">
-            <source src="https://publicr2.si.inc/hertz-dev/generations/gen_if_it_came_with_the_movie.wav" type="audio/wav">
-            Your browser does not support the audio element.
-          </audio>
-        </p>
-        <p><audio controls="">
-            <source src="https://publicr2.si.inc/hertz-dev/generations/gen_60s_and_70s.wav" type="audio/wav">
-            Your browser does not support the audio element.
-          </audio>
-        </p>
-      </div>
-
-      <h3>Interactive</h3>
-      <div>
-        <div>
-          <p><audio controls="">
-            <source src="https://publicr2.si.inc/hertz-dev/generations/ai_talk.wav" type="audio/wav">
-            Your browser does not support the audio element.
-          </audio></p><p>9 seconds of prompt included.</p>
-        </div>
-      </div>
-      
-      <h2>Live Inference</h2>
-
-      <p>Here's what a simple, 1-channel forward pass of the model for inference looks like:</p>
-      <ul>
-        <li>Hertz-codec transforms the audio prompt from 16 kHz into a latent representation with dim 32 and sequence length 8 tokens per second. This latent representation can be almost perfectly reconstructed into original speech; it has similar amounts of compression to leading audio codecs like Opus.</li>
-        <li>Hertz-lm takes these representations as input and outputs a single quantized representation of the next token. This quantized representation has just 15 bits of information, and is passed to layer 5 of hertz-vae.</li>
-        <li>Hertz-vae outputs the parameters of a Gaussian mixture, which we sample from to get a 32-dimensional latent representation; we then use hertz-codec to upsample this back into audio.</li>
-      </ul>
-
-      <p>During live inference, the model needs to run at 8 forward passes per second, doing constant autoregressive generation. It takes two separate channels as input, but in conversations only returns one. At each step, it receives the human’s audio and tokenizes it into a latent, combining this with the model’s latest generated latent and feeding both into hertz-vae and hertz-lm.</p>
-
-      <p>This allows the latency, measured as the average time between user utterance and model response, to be 62.5ms (the average time between any given utterance and the end of one token) + the time for forward pass + round-trip internet delay. By running on servers close to the end user, we have achieved a real-world average latency of 120ms. This is 2x lower than any other audio model—which is necessary for a model that can interact with you in human-like ways instead of what feels like a delayed, choppy phone call.</p>
-
-      
-    </article>
-  </div></div>]]>
-            </description>
-            <link>https://si.inc/hertz-dev/</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42036995</guid>
-            <pubDate>Sun, 03 Nov 2024 23:30:48 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[Bill Atkinson doxxed Douglas Adams in 1987]]>
-            </title>
-            <description>
-<![CDATA[
-Score 99 | Comments 97 (<a href="https://news.ycombinator.com/item?id=42036165">thread link</a>) | @harryvederci
-<br/>
-November 3, 2024 | https://not.withoutdistractions.com/blog/2024/11/03/bill-atkinson-doxxed-douglas-adams-in-1987 | <a href="https://web.archive.org/web/*/https://not.withoutdistractions.com/blog/2024/11/03/bill-atkinson-doxxed-douglas-adams-in-1987">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
-            </description>
-            <link>https://not.withoutdistractions.com/blog/2024/11/03/bill-atkinson-doxxed-douglas-adams-in-1987</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42036165</guid>
-            <pubDate>Sun, 03 Nov 2024 21:19:02 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[Moving Off Heroku, Slowly]]>
-            </title>
-            <description>
-<![CDATA[
-Score 79 | Comments 52 (<a href="https://news.ycombinator.com/item?id=42036163">thread link</a>) | @craigkerstiens
-<br/>
-November 3, 2024 | https://jamie.ideasasylum.com/2024/10/30/moving-off-heroku-slowly | <a href="https://web.archive.org/web/*/https://jamie.ideasasylum.com/2024/10/30/moving-off-heroku-slowly">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>I was a huge fan of Heroku about ten years ago.</p>
-
-<p>It was one of the reasons Podia was able to iterate so quickly and avoid spending too much time thinking about infrastructure. And, in the places that Heroku couldn’t support our use case, like providing custom domains for our users, we had to expend considerable effort and stress managing servers. It sucked and Heroku proved its worth.</p>
-
-<p>For many years after the acquisition by Salesforce, Heroku was an outlier: an acquired company that kept iterating and didn’t get shut down, or enshittified by the parent company. It was a miracle! I can’t remember the exact date but that all seemed to change once Heroku started requiring a salesforce login prompt and everything was stamped with the Salesforce branding (and the sales team became much much worse). From that point onwards, Heroku seem to calcify and my enthusiasm transitioned to “it’s fine”.</p>
-
-<p>Our escape plan for Podia since Day 1 has always been “when our Heroku bill hits ~$20k/mo, that would fund two engineers to manage our infrastructure instead”. We’ve not hit that level in 9 years and so, even with the stagnated platform, it made sense to stay.</p>
-
-<p>At that point we were making full use of the platform: our tests ran on Heroku CI, we used review apps to share our work and get feedback on the functionality, we deployed to a staging app, and in production we used Heroku Postgres and Redis databases, Heroku scheduler, and various services through their add-on marketplace. We even used Heroku for hosting our Metabase instance.</p>
-
-<p>Then the month-long CI outage happened in 2021 and we moved our builds over to GitHub Actions. They never came back.</p>
-
-<p>Then we negotiated rates with various add-on providers by going directly to them. Heroku takes a 30% cut of all add-on revenue so it’s a win-win situation to go directly to a provider and say “hey, we’re paying you $100 dollars on Heroku, how about we pay you $85 directly?”. You save money; they make more money. It’s also lazy revenue for Heroku and right now we need to be encouraging them to really strive and earn their money.</p>
-
-<p>We moved to a hosted Metabase instance that meant one less thing for us to manage (and didn’t suffer from the 30sec Heroku timeout on queries).</p>
-
-<p>Around 2023, I started hearing a lot about CrunchyData and a few of my friends started moving their databases over there. That kicked off our big database migration—Postgres databases went to Crunchdata and redis databases went to redis.com. This was easily the most impactful part of our slow move away from Heroku because with a Postgres database and two redis databases in production, we were suffering forced maintenance periods roughly every 2 weeks. Yes, every second Friday there was mild panic as all the errors and alarms went off when Heroku took the database offline and did whatever they needed to do, then restarted the app. This whole process took about 10 minutes but it was the stress which really got to me: I had to inform our support team, update our status page, coordinate a developer to watch the process and acknowledge the alerts etc. TWICE A MONTH! It was a ridiculous situation that our database provider was the main cause of our downtime! If anyone is going to be the cause of downtime, it should be <em>us</em> not our providers.</p>
-
-<p>That’s our situation now: we’ve divested Heroku of our CI, add-ons, and databases so now the only thing left running over there are the dynos powering the web and background processes.</p>
-
-<p>That’s a great place to be! We don’t need to go any further if it doesn’t make any sense right now; but we’re primed and ready to jump to a different infrastructure when the time is right.</p>
-
-<p>And I’ve done the maths recently. We could definitely save money by moving to dedicated servers, even with over-provisioning to the max-autoscaling capacity with have on Heroku (which is more than double our typical usage). At the current moment, we have a good discount on an enterprise contract with Heroku and that means the savings from moving our servers to another provider just don’t justify the risk and opportunity cost.</p>
-
-<p>For the moment.</p>
-
-<p>If those costs rise, it would be easy to justify a business case for moving away and a relatively straightforward technical migration.</p>
-
-<p>So if you are still fully-in on Heroku, here are my recommendations:</p>
-
-<ol>
-  <li>Move all your add-ons to direct billing. You’ll save money, they’ll make more money, and Heroku stops earning money for doing fuck-all. No brainer.</li>
-  <li>Extract your databases to a hosted database provider. I throughly recommend <a href="https://www.crunchydata.com/">CrunchyData</a> for Postgres databases because they’re just such a no-drama provider. I think I’ve talked to them more often at conferences than I’ve needed to for support, which is exactly what I’m looking for.</li>
-  <li>Your next step would be to move CI to another provider. GitHub is fine and well-supported by the community but there are also specialised providers like BuildKite or CircleCI.</li>
-  <li>The last step: moving your compute off Heroku to another PaaS, orchestration layer on top of AWS, or dedicated servers deployed with Kamal. There are a gazillion options here—many many more than there were a decade ago<sup id="fnref:1" role="doc-noteref"><a href="#fn:1" rel="footnote">1</a></sup>. Just remember to consider the total cost and all the trade-offs involved. You get paid the big bucks to think about the entire system and not just to blindly chase down costs to the lowest possible level.</li>
-</ol>
-
-<p>I think my original “when we hit $20k/mo” rule has served us well but today, with all the options available and ever widening gap between hardware advances and Heroku’s choices, I think a better rule is: once your Heroku bill hits $10k/mo (after negotiations), and you can save more than 50% by switching, then it’s definitely time to move.</p>
-
-<p>And if you’re wondering: but what about the review apps? How can I replace them? Well, I have a story to tell there too (soon).</p>
-
-
-</div></div>]]>
-            </description>
-            <link>https://jamie.ideasasylum.com/2024/10/30/moving-off-heroku-slowly</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42036163</guid>
-            <pubDate>Sun, 03 Nov 2024 21:18:32 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[Missing open-source contributor presents a dilemma when accepting their PR]]>
-            </title>
-            <description>
-<![CDATA[
-Score 90 | Comments 68 (<a href="https://news.ycombinator.com/item?id=42034196">thread link</a>) | @FrankRay78
-<br/>
-November 3, 2024 | https://bettersoftware.uk/2024/11/03/missing-open-source-contributor-presents-a-dilemma-when-accepting-their-contribution/ | <a href="https://web.archive.org/web/*/https://bettersoftware.uk/2024/11/03/missing-open-source-contributor-presents-a-dilemma-when-accepting-their-contribution/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="site-content">
-		<article>
-
-			
-			<!-- .entry-header -->
-
-			<div>
-
-				
-<p>I faced the following situation recently as a maintainer of a popular open-source project, and I wondered what to do.</p>
-
-
-
-
-
-
-
-<p><strong>Situation</strong><br>A first-time contributor submits a PR to <a href="https://github.com/spectreconsole/spectre.console">Spectre.Console</a>, a Microsoft .Net Foundation open-source project. It’s a small, but important change to guard against a null input parameter on a public method.</p>
-
-
-
-<p>The contribution bot asks for confirmation the code change is copyright-free, but the contributor doesn’t respond. The bot proceeded to remind the contributor several times, and I even attempted to make contact through other channels, but the contributor didn’t respond.</p>
-
-
-
-<p>I wish to merge the contribution, I wish to behave in a legally compliant manner, and I wish to encourage other first-time contributors.</p>
-
-
-
-
-
-
-
-<p><strong>Question</strong><br>What is the ‘proper’ open source etiquette regarding this PR?</p>
-
-
-
-<ol>
-<li>Leave it open, wait indefinitely</li>
-
-
-
-<li>Close it with a comment</li>
-
-
-
-<li>Close it with a comment, then submit my own PR with exactly the same code</li>
-
-
-
-<li>Merge it anyway</li>
-</ol>
-
-
-
-
-
-
-
-<p><strong>Answer</strong><br>‘4. Merge it anyway’ is probably the right course of action, for the reasons that follow.</p>
-
-
-
-<p>The repository is MIT-licensed, and clearly advertised as such, so it’s reasonable to expect all contributions are made under that license, even before the bot comes along. Additionally, the change is trivial and widely considered industry best practice, so it’s hard to see how anyone could enforce a copyright claim. Anyhow, code change could easily be reversed, and I find it hard to see how damages could be levied in this situation.</p>
-
-
-
-<p>However, a more extensive contribution could prove to be problematic. So, I’ll consider an update to the PR template (and contributing guidelines) to explicitly state that all contributions are MIT-licensed and not to proceed otherwise.</p>
-				
-				
-
-<!-- FRANK START -->
-
-<p><em>If your developers are struggling, perhaps they need better guidance?</em></p>
-<p><em>Our <a href="https://bettersoftware.uk/services/" data-type="page" data-id="291">Software Requirements</a> can help with that.</em></p>
-
-<!--
-<p style="margin-top: 60px; margin-bottom: 10px;"><em>If your developers are struggling, perhaps they need better guidance?</em></p>
-<p style="margin-bottom: 80px;"><em>Our <a href="http://localhost:8082/agile-booster">Agile Booster 🚀</a> can help with that.</p>
--->
-<!-- FRANK END -->
-				
-			</div> <!-- .content -->
-
-			
-				
-<!-- .post-pagination -->
-
-			
-		 <!-- .post -->
-
-					 <!-- footer -->
-
-		</article></div></div>]]>
-            </description>
-            <link>https://bettersoftware.uk/2024/11/03/missing-open-source-contributor-presents-a-dilemma-when-accepting-their-contribution/</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42034196</guid>
-            <pubDate>Sun, 03 Nov 2024 16:58:50 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[I Waited 10B Cycles and All I Got Was This Loading Screen]]>
-            </title>
-            <description>
-<![CDATA[
-Score 63 | Comments 59 (<a href="https://news.ycombinator.com/item?id=42032693">thread link</a>) | @preyneyv
-<br/>
-November 3, 2024 | https://blog.preyneyv.dev/doing-less-with-more | <a href="https://web.archive.org/web/*/https://blog.preyneyv.dev/doing-less-with-more">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div aria-label="Content">
-      <div>
-        <article itemscope="" itemtype="http://schema.org/BlogPosting">
-
-  
-
-  <div itemprop="articleBody">
-    <p>Modern hardware is unbelievably fast. The M1 Max that I’m writing this article
-on runs at 3.2GHz. That is <a href="https://www.cpubenchmark.net/cpu.php?cpu=Apple+M1+Max+10+Core+3200+MHz&amp;id=4585">3.2 <em>BILLION</em> clock cycles per second</a>. Yet,
-Microsoft Teams takes 3 seconds to open a link, and I refuse to believe it takes
-9.6 BILLION clock cycles to open a link. Obviously, that’s an
-over-simplification, but the point stands: how is it that hardware gets faster,
-but the applications we use only get slower?</p>
-
-<p>“That’s just because we’re doing so much more.” These are the words of a
-<a href="https://www.youtube.com/watch?v=4EmstuO0Em8">late-stage capitalism enjoyer</a>. Let me explain.</p>
-
-<p>An excellent example of the power of modern computing is video games. I can
-simulate massive 3D environments, complete with physics and ray-traced
-lighting, and play in real-time with my friends in other states or even
-countries, all while pushing 124 million pixels per second<sup id="fnref:1" role="doc-noteref"><a href="#fn:1" rel="footnote">1</a></sup> on reasonably
-attainable consumer hardware.</p>
-
-<p>Looking at it in the other direction, people have managed to <a href="https://www.reddit.com/r/itrunsdoom">run DOOM on just
-about anything that can compute</a>: calculators, iPods, cameras. Incredibly
-low-power, practically disposable devices still have enough computing power to
-run a state-of-the-art game from 1993. This isn’t particularly surprising,
-given it’s been three decades, but it shows how far we’ve come.</p>
-
-<h3 id="web-is-bad">“Web is bad”</h3>
-
-<p>Web is cool. In fact, web is so cool that it’s in its own class of backwards
-compatibility, cross-platform-ness, and approachability. Web also has an
-event-driven model that makes UIs a lot easier to write. Of course, these
-conveniences also come at a cost: speed. It’s inherently difficult to execute a
-language as flexible as JS, and it’s likely the first thing you blame when
-comparing a fast, native application against a sluggish, web-based one. Of
-course the interpreted, dynamically-typed language is going to use more memory
-and run slower.</p>
-
-<p>Depending on what you’re doing, JS might deserve the blame. For instance,
-<a href="https://github.com/webpack/webpack">webpack</a> has to parse thousands of files, build an AST, and do some fancy
-CPU-intensive things I don’t fully understand, so it makes sense that <a href="https://github.com/evanw/esbuild">esbuild
-(Go)</a> and <a href="https://github.com/swc-project/swc">swc (Rust)</a> are much faster than webpack at that.</p>
-
-<p>In the case of general web applications though, nope; web isn’t the reason your
-glorified IRC chat application runs at 5 FPS. An example that was floating
-around <a href="https://twitter.com/KennethCassel/status/1847034096062710087">Twitter</a> a couple weeks ago is <a href="https://mcmaster.com/">McMaster-Carr’s catalog</a>. Through
-aggressive preloading and server-side rendering, they’re able to make the
-website feel incredibly snappy to use and navigate, while using decades-old
-technologies (ASP.NET, jQuery). Bandwagon jumpers are in shambles.</p>
-
-<p>If you’re a React hater, this may seem like a great argument against React and
-other “modern” JS frameworks, but that’s entirely<sup id="fnref:2" role="doc-noteref"><a href="#fn:2" rel="footnote">2</a></sup> the wrong takeaway. Check
-out <a href="https://next-faster.vercel.app/">NextFaster</a> (<a href="https://github.com/ethanniser/NextFaster">repo</a>) for an equally-or-faster copy of the McMaster
-catalog built with Next.js and hosted on Vercel.</p>
-
-<p>Probably the epitome of web technologies is <a href="https://www.figma.com/">Figma</a>. A full-blown design
-tool running at 60 FPS with real-time multiplayer is kind of insane when you
-think about it. To be fair, it’s not entirely JS; a large portion of the app
-runs in WebAssembly and WebGL. Could they squeeze more performance out of a
-native app? Probably. But that would also mean giving up the convenience of
-being a website you can just… go to. Instead, they <a href="https://www.figma.com/blog/quality-and-performance/">went all-in on
-optimization</a> and proved that browser can absolutely rip.</p>
-
-<p>Side Note: Massive shout-out to V8, SpiderMonkey, and JavaScriptCore devs for
-making all of this possible. It’s because of your arcane work that the rest of
-us are able to build anything at all.</p>
-
-<h3 id="electron-is-bad">“Electron is bad”</h3>
-
-<p><em>Note: I am using “Electron” as a stand-in for Electron, CEF, WKWebView, Edge
-WebView2 and any other web-to-native wrapper.</em></p>
-
-<p><a href="https://www.electronjs.org/">Electron</a> made it possible to make web applications and deploy them as
-desktop applications. The appeal of this is undeniable. Now, you can hire a
-single skill set, build a single application a single time, then have “desktop”
-apps for every architecture and architecture and OS under the sun (yes, even
-Linux).</p>
-
-<p>The trade-off? The only reliable way to
-run web applications is a web browser, so Electron just… shipped a web
-browser. What could go wrong? ¯\_(ツ)_/¯</p>
-
-<p>Turns out, a lot of things could go wrong. Over the last decade, it’s become
-socially acceptable for application downloads to be over 500 MB, and for them to
-use egregious amounts of RAM and CPU, slowly killing your battery life in the
-process. And for all the resources they suck back, it’s not even like they feel
-good to use. So many apps leak their non-nativity through strange scrolling and
-selection behavior, appearance, and navigation handling, not to mention the
-dismal sluggishness that comes with changing screens. Discord and Teams are
-great examples of this Electron-ification. They both have solid mobile apps that
-look and feel good to use, but desktop just gets a re-boxed website. <em>Why?</em></p>
-
-<p>It’s not really fair to blame Electron for this. Electron simply said, “here’s a
-way to put your web app in a window”.</p>
-
-<p>The real responsibility lies with the companies building these apps. It’s
-definitely possible to build good Electron apps - Slack, Obsidian, and Notion
-are prime examples. You just have to care.</p>
-
-<p>A section on Electron wouldn’t be complete without mentioning <a href="https://brackets.io/">Brackets</a>,
-<a href="https://github.com/atom/atom">Atom</a>, and more famously, <a href="https://code.visualstudio.com/">VS Code</a>. It’s honestly impressive that VS
-Code runs as well as it does, considering that editing large files in JS is
-approximately like shooting yourself in the foot and running a marathon: a point
-was proved, but I’m not sure which one.</p>
-
-<p>It’s undeniable that a large portion of VS Code’s success should be attributed
-to the plugin ecosystem around it, and that’s in no small part because of the
-approachability of the web stack. Having recently written a <a href="https://www.github.com/preyneyv/swc-plugin-use-prompt">(meme) plugin for
-SWC</a>, I can confidently say that native plugin DX isn’t anywhere close to
-the über-fast iteration cycles of the web.</p>
-
-<h3 id="native-is-bad">“Native is bad”</h3>
-
-<p>All this web technology disparaging may have you believe that I love using
-native apps. Most native apps feel great to use (<a href="https://eggerapps.at/postico2/">Postico</a>, <a href="https://zed.dev/">Zed</a>) and I
-often find myself reaching for them whenever possible.</p>
-
-<p>Having switched to <a href="https://zed.dev/">Zed</a> a couple months ago, I don’t think I can go back to
-VS Code. Everything (and I mean everything) happens <em>instantly</em>. You may think
-VS Code is “fast enough”, but it’s like the speed of sound versus the speed of
-light. You can just barely perceive it, but it really makes all the difference.
-How does Zed do it? By writing their <a href="https://www.gpui.rs/">own GPU framework from scratch</a> and
-writing the entire editor in Rust. When you actually use modern hardware, it’s
-<em>really</em> fast. Who would’ve thunk?</p>
-
-<p>One thing I’m keen to play around with more is <a href="https://reactnative.dev/">React Native</a> for desktop.
-RN’s DOM-like rendering model appeals to my web-dev sensibilities, and I think
-it strikes the balance between great DX and great performance, especially with
-the <a href="https://reactnative.dev/blog/2024/10/23/the-new-architecture-is-here">New Architecture</a>. It is presently unclear to me why RN for desktop
-isn’t particularly common, because it seems like the ideal balance on paper
-(though it may just come down to first-party support).</p>
-
-<p>Unfortunately, all is not well in native-land. Adobe products are
-known to crash exceptionally often. The search menu on Windows 11 is comically
-bad. Activity Monitor on macOS takes 5 seconds to populate a list of running
-programs.</p>
-
-<h3 id="so-were-doomed-then">So we’re doomed, then?</h3>
-
-<p>Clearly, these issues aren’t localized to a specific programming language,
-operating system, or industry. It’s a broader trend to build things faster and
-worse. Delivery over quality.</p>
-
-<h4 id="tragedy-of-the-commons">Tragedy of the Commons</h4>
-
-<p>Things are particularly worse in recent years because modern computers are so
-much faster than what the average person needs. If you scroll YouTube Shorts on
-a desktop browser, it starts leaking RAM (over 2 GB!) until it eventually hits a
-resource limit. That kind of stuff wouldn’t fly in times of yore, where
-computers only had 2 GB of RAM total. The seemingly ample computing resources of
-modern machines have become an excuse to build worse things.</p>
-
-<h4 id="the-good-enough-psy-op">The “Good Enough” Psy-Op</h4>
-
-<p>Clearly, I care a lot about things feeling good to use, but from talking to
-various people, I realized it’s not as common as you might think. Most people
-are “okay” with waiting 500ms for a right-click context menu to appear, and they
-look past the janky reflow that happens when you resize a window. It’s either a
-hold-over from a bygone era of waiting 15 seconds for an image to load or a
-learned resignation to poor user experience. We can do better. We have the
-technology.</p>
-
-<h4 id="ship-it-culture">“Ship It” Culture</h4>
-
-<p>Build things, and build things fast. This article isn’t an indictment of rapid
-iteration on new ideas, but there’s a massive difference between treating
-performance as tech debt and ignoring performance entirely. In so many of the
-things we use day-to-day, it feels like performance isn’t even an afterthought,
-and it’s more like they wait for hardware to catch up. That’s a valid approach
-if you’re doing something bleeding-edge, but if your job is to put text on a
-screen, I find that hard to agree with.</p>
-
-<h3 id="performative-performance">Performative performance</h3>
-
-<p>From reading this article, you may infer that my recommendation is to optimize
-everything down to the CPU instruction. While that is impressive in its own
-right, it is entirely intractable for most software (unless you’re Chris Sawyer
-making RollerCoaster Tycoon). This article also isn’t about performance for
-the sake of performance. It is simply the realization that large-scale modern
-software seems to care very little about how it feels to use, because you’ll use
-it anyway. That’s a future I don’t want.</p>
-
-<p>If you are a software developer, I encourage you to build things with precision
-and quality. Pay attention to the milliseconds. Appreciate the things you like
-to use. Take pride in your craftsmanship.</p>
-
-<p>Stop doing less with more.</p>
-
-<hr>
-
-<p>Discuss on <a href="https://news.ycombinator.com/item?id=42032693">Hacker News</a> and <a href="https://www.reddit.com/r/programming/comments/1gilzhk/i_waited_10_billion_cycles_and_all_i_got_was_this/">r/programming</a></p>
-
-<hr>
-
-
-  </div>
-</article>
-
-      </div>
-    </div></div>]]>
-            </description>
-            <link>https://blog.preyneyv.dev/doing-less-with-more</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42032693</guid>
-            <pubDate>Sun, 03 Nov 2024 12:33:18 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[Rust's Most Subtle Syntax]]>
-            </title>
-            <description>
-<![CDATA[
-Score 52 | Comments 14 (<a href="https://news.ycombinator.com/item?id=42032065">thread link</a>) | @todsacerdoti
-<br/>
-November 3, 2024 | https://zkrising.com/writing/rusts-most-subtle-syntax/ | <a href="https://web.archive.org/web/*/https://zkrising.com/writing/rusts-most-subtle-syntax/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><time datetime="2024-11-02">Published on: <span>2024-11-02</span></time><p>Psst. Hey kid. You wanna write confusing Rust? I’ve got just the thing.</p><p>Quick rundown on <code>let</code> and <code>const</code> in Rust:</p><h2 id="let"><code>let</code></h2><p>You use let to declare a new variable. Wow.</p><pre data-lang="rs"><code data-lang="rs"><span>let</span><span> x </span><span>= </span><span>5</span><span>;
-</span></code></pre><p>This is in the form <code>let PAT = EXPR;</code>, which makes it a bit more powerful than first seems.</p><pre data-lang="rs"><code data-lang="rs"><span>//  +---- this is a pattern. Same as the things you use in matches.
-</span><span>//  |
-</span><span>//  vvvvv
-</span><span>let </span><span>(a, b) </span><span>= </span><span>(</span><span>5</span><span>, </span><span>10</span><span>);
-</span></code></pre><p>You can combine this with other parts of Rust to get some seriously convenient stuff.</p><pre data-lang="rs"><code data-lang="rs"><span>// this is either Some("...") or None
-</span><span>let</span><span> maybe_string: </span><span>Option</span><span>&lt;</span><span>String</span><span>&gt; </span><span>= ..</span><span>;
-</span><span>
-</span><span>// here: `Some(value)` is our pattern. This is a "refutable" pattern, which is to say
-</span><span>// that it *might not match*.
-</span><span>//
-</span><span>// as such, we need to handle the case where it is refuted.
-</span><span>let </span><span>Some</span><span>(value) </span><span>=</span><span> maybe_string </span><span>else </span><span>{
-</span><span>	</span><span>panic!</span><span>(</span><span>"die horribly"</span><span>)
-</span><span>};
-</span></code></pre><h2 id="const"><code>const</code></h2><p>Constants are variables that are calculated at compile time and embedded, literally, into what you compile.</p><pre data-lang="rs"><code data-lang="rs"><span>const </span><span>MY_VAR</span><span>: </span><span>&amp;</span><span>str </span><span>= </span><span>"heyyyyyyyy man"</span><span>;
-</span><span>const </span><span>SECRET</span><span>: </span><span>i32 </span><span>= </span><span>0x1234</span><span>;
-</span></code></pre><p>The embedding bit here isn’t relevant, but the gist of it is that you can’t change these variables. At all. They’re like “aliases” for values you’ll use throughout the program.</p><p>Unlike <code>let</code>, <code>const</code> declarations are of the form</p><pre data-lang="rs"><code data-lang="rs"><span>const </span><span>IDENT</span><span>: </span><span>TYPE </span><span>= </span><span>EXPR</span><span>;
-</span><span>
-</span><span>// vs.
-</span><span>let </span><span>PAT </span><span>= </span><span>EXPR</span><span>;
-</span></code></pre><p>This means two things:</p><ul><li>a const declaration must declare its type (like <code>: i32</code>)</li><li>a const declaration CANNOT be a pattern. It can only be an identifier.</li></ul><p>In practice, this means this just isn’t possible:</p><pre data-lang="rs"><code data-lang="rs"><span>//     (A, B) is a pattern, not an identifier
-</span><span>const </span><span>(A, B): (</span><span>i32</span><span>, </span><span>i32</span><span>) </span><span>= </span><span>(</span><span>5</span><span>, </span><span>10</span><span>);
-</span></code></pre><p>Ok, now that we’re up to speed on <code>let</code> and <code>const</code>, lets start throwing in the weird stuff.</p><p>Firstly, <code>const</code> declarations are hoisted. Remember hoisting? From javascript?</p><pre data-lang="rs"><code data-lang="rs"><span>// this compiles, even though X is defined after Y.
-</span><span>const</span><span> Y: </span><span>i32 </span><span>=</span><span> X </span><span>+</span><span> X;
-</span><span>const</span><span> X: </span><span>i32 </span><span>= </span><span>5</span><span>;
-</span></code></pre><p>This is a wonderful feature. For the same reason that we don’t want to have to care about the “order” our functions are declared, we don’t have to care about the order our consts are evaluated.</p><p>Secondly, you can declare constants anywhere.</p><pre data-lang="rs"><code data-lang="rs"><span>fn </span><span>oh_boy</span><span>() -&gt; </span><span>i32 </span><span>{
-</span><span>	</span><span>const</span><span> X: </span><span>i32 </span><span>= </span><span>5</span><span>;
-</span><span>
-</span><span>	</span><span>return</span><span> X;
-</span><span>}
-</span></code></pre><p>Let’s combine these two features…</p><pre data-lang="rs"><code data-lang="rs"><span>fn </span><span>oh_boy</span><span>() -&gt; </span><span>i32 </span><span>{
-</span><span>	</span><span>return</span><span> X;
-</span><span>	</span><span>const</span><span> X: </span><span>i32 </span><span>= </span><span>5</span><span>;
-</span><span>	</span><span>// ^ this compiles and works. No warning!
-</span><span>}
-</span></code></pre><p>Now this is fun. If you work with programmers coming from Javascript and just learning Rust, this is an excellent one to baffle them with.</p><p>But ultimately, this is a harmless consequence of a great feature.</p><p>That’s boring. Let’s start writing harmful consequences.</p><p>Before we cover the worst bit, lets explain patterns a bit more.</p><pre data-lang="rs"><code data-lang="rs"><span>// let PAT = EXPR;
-</span><span>let</span><span> x </span><span>= </span><span>5</span><span>;
-</span><span>
-</span><span>// in this case, `x` is a pattern. We check whether `5` can be put into `x`.
-</span><span>// This pattern always matches -- we can always put 5 into a variable called `x`.
-</span><span>
-</span><span>// not all patterns have to match. For example:
-</span><span>let </span><span>(</span><span>5</span><span>, x) </span><span>= </span><span>(a, b);
-</span><span>// the expression here only "matches" the pattern if a == 5.
-</span><span>//
-</span><span>// This is called a "refutable" pattern.
-</span><span>//
-</span><span>// In `let` declarations, refutable patterns need to have their "refused"
-</span><span>// case handled:
-</span><span>let </span><span>(</span><span>5</span><span>, x) </span><span>= </span><span>(a, b) </span><span>else </span><span>{ </span><span>panic!</span><span>() };
-</span><span>//
-</span><span>// ...otherwise you could have "conditionally existing" variables, which sucks.
-</span></code></pre><p>Which brings us to <code>match</code>. What is a match?</p><pre data-lang="rs"><code data-lang="rs"><span>// match is a list of patterns and what to do if they match.
-</span><span>//
-</span><span>// match EXPR {
-</span><span>//    PAT =&gt; EXPR
-</span><span>//    PAT =&gt; EXPR
-</span><span>//    ..
-</span><span>// }
-</span><span>
-</span><span>match </span><span>(a, b) {
-</span><span>	(</span><span>5</span><span>, x) </span><span>=&gt; </span><span>{
-</span><span>		</span><span>// if (a,b) matches (5,x), this block is executed
-</span><span>	},
-</span><span>	(x, </span><span>5</span><span>) </span><span>=&gt; </span><span>{
-</span><span>		</span><span>// same thing: if (a,b) matches (x, 5)..
-</span><span>	},
-</span><span>	(x, y) </span><span>=&gt; </span><span>{
-</span><span>		</span><span>// and this is our "catch all" pattern, the same way let (x,y) = (a,b) works.
-</span><span>	}
-</span><span>}
-</span></code></pre><p>Confusing people is fun and all, but what about causing abject misery and real bugs?</p><p>This is - in my opinion - Rust’s <strong>most subtle</strong> syntax:</p><p>If there is one interesting line in this post it is this:</p><blockquote><p><strong>Rust’s most subtle syntax is that constants, themselves, are patterns</strong>.</p></blockquote><p>This syntax adds for some nice ergonomics around matching:</p><pre data-lang="rs"><code data-lang="rs"><span>let</span><span> input: </span><span>i32 </span><span>= ..</span><span>;
-</span><span>
-</span><span>const </span><span>GOOD</span><span>: </span><span>i32 </span><span>= </span><span>1</span><span>;
-</span><span>const </span><span>BAD</span><span>: </span><span>i32 </span><span>= </span><span>2</span><span>;
-</span><span>
-</span><span>match</span><span> input {
-</span><span>	</span><span>// this checks that input == GOOD, because GOOD is a const.
-</span><span>	</span><span>GOOD </span><span>=&gt; </span><span>println!</span><span>(</span><span>"input was 1"</span><span>),
-</span><span>	</span><span>// this checks that input == BAD, because BAD is a const.
-</span><span>	</span><span>BAD </span><span>=&gt; </span><span>println!</span><span>(</span><span>"input was 2"</span><span>),
-</span><span>	</span><span>// this defines otherwise = input, and always matches...
-</span><span>	otherwise </span><span>=&gt; </span><span>println!</span><span>(</span><span>"input was </span><span>{otherwise}</span><span>"</span><span>),
-</span><span>}
-</span></code></pre><p>But capitalizing constants is just a convention. It’s just a compiler warning to not do it.</p><pre data-lang="rs"><code data-lang="rs"><span>const</span><span> good: </span><span>i32 </span><span>= </span><span>1</span><span>;
-</span><span>const</span><span> bad: </span><span>i32 </span><span>= </span><span>2</span><span>;
-</span><span>match</span><span> input {
-</span><span>	</span><span>// um...
-</span><span>	good </span><span>=&gt; </span><span>{},
-</span><span>	bad </span><span>=&gt; </span><span>{},
-</span><span>	otherwise </span><span>=&gt; </span><span>{},
-</span><span>}
-</span></code></pre><p>And now we have three branches that look the same, yet what they do depends on whether constants exist with those names!</p><p>Let’s get worse. What do you think happens here?</p><pre data-lang="rs"><code data-lang="rs"><span>const </span><span>GOOD</span><span>: </span><span>i32 </span><span>= </span><span>1</span><span>;
-</span><span>match</span><span> input {
-</span><span>	</span><span>// typo...
-</span><span>	</span><span>GOD </span><span>=&gt; </span><span>println!</span><span>(</span><span>"input was 1"</span><span>),
-</span><span>	otherwise </span><span>=&gt; </span><span>println!</span><span>(</span><span>"input was not 1"</span><span>)
-</span><span>}
-</span></code></pre><p>You will get a compiler warning here, but this code will <em>always</em> print <code>input was 1</code>.</p><p>Or more realistically:</p><pre data-lang="rs"><code data-lang="rs"><span>// whoops, accidentally commented out or deleted this import
-</span><span>// use crate::{SOME_GL_CONSTANT, OTHER_THING}
-</span><span>
-</span><span>// uh oh!
-</span><span>match</span><span> value {
-</span><span>	</span><span>SOME_GL_CONSTANT </span><span>=&gt; ..</span><span>,
-</span><span>	</span><span>OTHER_THING </span><span>=&gt; ..</span><span>,
-</span><span>	</span><span>_ =&gt; ..</span><span>,
-</span><span>}
-</span></code></pre><p>This trips people, especially when they try fancy things with enums.</p><pre data-lang="rs"><code data-lang="rs"><span>enum </span><span>MyEnum </span><span>{
-</span><span>	A, B, C
-</span><span>}
-</span><span>
-</span><span>// this is how you would normally write this
-</span><span>match</span><span> value {
-</span><span>	MyEnum::A </span><span>=&gt; ..</span><span>,
-</span><span>	MyEnum::B </span><span>=&gt; ..</span><span>,
-</span><span>	MyEnum::C </span><span>=&gt; ..</span><span>,
-</span><span>}
-</span><span>
-</span><span>// but you can write it like this.
-</span><span>use </span><span>MyEnum::</span><span>*</span><span>;
-</span><span>match</span><span> value {
-</span><span>	A </span><span>=&gt; </span><span>{},
-</span><span>	B </span><span>=&gt; </span><span>{},
-</span><span>	C </span><span>=&gt; </span><span>{}
-</span><span>}
-</span></code></pre><pre data-lang="rs"><code data-lang="rs"><span>// and then, if you ever change MyEnum...
-</span><span>enum </span><span>MyEnum </span><span>{ A, B, D, E };
-</span><span>use </span><span>MyEnum::</span><span>*</span><span>;
-</span><span>
-</span><span>// this still compiles!
-</span><span>match</span><span> value {
-</span><span>	A </span><span>=&gt; </span><span>{},
-</span><span>	B </span><span>=&gt; </span><span>{},
-</span><span>	C </span><span>=&gt; </span><span>{},
-</span><span>}
-</span><span>
-</span><span>// `C` now ends up being a "catch all" pattern, as nothing like `C` is in scope.
-</span><span>// you're doing let C = value, which always matches!!!
-</span></code></pre><p>Clippy has a bunch of rules warning you to not do this, because it gets people <em>all</em> the time.</p><p>But this can be made even more confusing. Check this out:</p><pre data-lang="rs"><code data-lang="rs"><span>// binds x to 5, irrefutably...
-</span><span>let</span><span> x </span><span>= </span><span>5</span><span>;
-</span><span>
-</span><span>// ...wait...
-</span><span>const</span><span> x: </span><span>i32 </span><span>= </span><span>4</span><span>;
-</span></code></pre><p>This code won’t compile, because <code>const x</code> is a pattern, constants are hoisted, and now this code is evaluated as:</p><pre data-lang="rs"><code data-lang="rs"><span>let </span><span>4 </span><span>= </span><span>5</span><span>;
-</span><span>
-</span><span>// error[E0005]: refutable pattern in local binding
-</span><span>//  --&gt; src/main.rs:3:5
-</span><span>//   |
-</span><span>// 3 | let x = 5;
-</span><span>//   |     ^
-</span><span>//   |     |
-</span><span>//   |     patterns `i32::MIN..=3_i32` and `5_i32..=i32::MAX` not covered
-</span><span>//   |     missing patterns are not covered because `x` is interpreted as a constant pattern, not a new variable
-</span><span>//   |     help: introduce a variable instead: `x_var`
-</span><span>//   |
-</span><span>//   = note: `let` bindings require an "irrefutable pattern", like a `struct` or an `enum` with only one variant
-</span></code></pre><p>“expr equals 4” isn’t an irrefutable match, and you aren’t handling the case where it doesn’t. Sweet. Ok.</p><p>Let’s go further.</p><pre data-lang="rs"><code data-lang="rs"><span>// let's say we have `maybe`, which is an Option&lt;&amp;str&gt;. It might be some text,
-</span><span>// or it might be None.
-</span><span>let</span><span> maybe_username: </span><span>Option</span><span>&lt;</span><span>&amp;</span><span>str</span><span>&gt; </span><span>= ..</span><span>;
-</span><span>
-</span><span>// this is a common pattern in rust for one-line matches. If this thing matches Some(..)
-</span><span>// we can do something with the string.
-</span><span>if let </span><span>Some</span><span>(username) </span><span>=</span><span> maybe_username {
-</span><span>	</span><span>// so ok, this code will run if the username exists...
-</span><span>	</span><span>return</span><span> username.</span><span>to_uppercase</span><span>();
-</span><span>}
-</span><span>
-</span><span>// except, uh... Now that code will only run if 'username' matches Some("hey")
-</span><span>const</span><span> username: </span><span>&amp;</span><span>str </span><span>= </span><span>"hey"</span><span>;
-</span></code></pre><p>The combination of constant-hoisting and constants-are-patterns allow you to write puzzling Rust code.</p><p>Realistically, the only reason this can be confusing is that you’re allowed to write <code>let UPPERCASE</code>, and <code>const lowercase</code>.</p><p>If creating a variable that started with a capital letter was a lint error, no confusion could happen; you could never accidentally bind something when trying to match an enum variant or constant.</p><p>But just to be clear, this is just a fun oddity of the language. Everyone writes constants with <code>UPPERCASE</code> names, and all of the footguns here are <strong>big compiler warnings</strong>.</p><p>Now Everybody –</p><pre data-lang="rs"><code data-lang="rs"><span>macro_rules! </span><span>f </span><span>{
-</span><span>  ($cond: expr) </span><span>=&gt; </span><span>{
-</span><span>    </span><span>if let </span><span>Some</span><span>(x) </span><span>= </span><span>$cond </span><span>{
-</span><span>      </span><span>println!</span><span>(</span><span>"i am some == </span><span>{x}</span><span>!"</span><span>);
-</span><span>    } </span><span>else </span><span>{
-</span><span>      </span><span>println!</span><span>(</span><span>"i am none"</span><span>);
-</span><span>    }
-</span><span>  }
-</span><span>}
-</span><span>
-</span><span>fn </span><span>main</span><span>() {
-</span><span>    </span><span>f!</span><span>(</span><span>Some</span><span>(</span><span>100</span><span>));
-</span><span>
-</span><span>    {
-</span><span>        </span><span>f!</span><span>(</span><span>Some</span><span>(</span><span>100</span><span>));
-</span><span>        </span><span>return</span><span>;
-</span><span>
-</span><span>        </span><span>const</span><span> x: </span><span>i32 </span><span>= </span><span>5</span><span>;
-</span><span>    }
-</span><span>}
-</span></code></pre></div></div>]]>
-            </description>
-            <link>https://zkrising.com/writing/rusts-most-subtle-syntax/</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42032065</guid>
-            <pubDate>Sun, 03 Nov 2024 09:32:13 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[A Golang pipeline abomination]]>
-            </title>
-            <description>
-<![CDATA[
-Score 21 | Comments 8 (<a href="https://news.ycombinator.com/item?id=42030949">thread link</a>) | @kermerlerper
-<br/>
-November 2, 2024 | https://poxate.com/blog/golang-pipeline-abomination | <a href="https://web.archive.org/web/*/https://poxate.com/blog/golang-pipeline-abomination">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
-            </description>
-            <link>https://poxate.com/blog/golang-pipeline-abomination</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42030949</guid>
-            <pubDate>Sun, 03 Nov 2024 03:22:16 GMT</pubDate>
         </item>
     </channel>
 </rss>
