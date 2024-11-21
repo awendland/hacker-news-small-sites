@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Thu, 21 Nov 2024 00:35:04 GMT</lastBuildDate>
+        <lastBuildDate>Thu, 21 Nov 2024 04:23:48 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-20.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Thu, 21 Nov 2024 00:35:04 GMT</pubDate>
+        <pubDate>Thu, 21 Nov 2024 04:23:48 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,183 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Building Databases over a Weekend]]>
+            </title>
+            <description>
+<![CDATA[
+Score 39 | Comments 3 (<a href="https://news.ycombinator.com/item?id=42200014">thread link</a>) | @ambrood
+<br/>
+November 20, 2024 | https://www.denormalized.io/blog/building-databases | <a href="https://web.archive.org/web/*/https://www.denormalized.io/blog/building-databases">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><article><div><p>Databases are some of the most complex pieces of software conceived
+since the advent of the computing age over half a century ago. [1]
+Nearly every piece of technology ends up touching the database in some
+way shape or form. Despite the ubiquity of Databases in the software
+stack, the vast majority of developers have been conditioned to treat
+databases as more or less a <em>black box</em> -- complex dense pieces of
+software conjured up by arch wizards and mavens ensconced in the
+rarified elite tiers of database companies or places like Google. The
+adage for the rest of us as it goes is <em>never attempt to write your own
+database</em>.</p>
+<p>That said, despite their longevity, we have seen continued innovation in
+the space that first started with Hadoop arriving on the scene about 2
+decades ago. The ClickBench website now lists over 50+ databases in its
+benchmark suite [2] . And that's just the analytics engines. With the
+recent trends of rewriting everything big data in Rust [3] not a month
+goes by without an interesting new project trending in the Hacker News.
+In this post we will take a look at how easy (or hard) it is to build
+Databases using Apache Datafusion and whether you <em>can in fact, as a
+mere mortal</em> realistically build a custom database and innovate around
+the developer experience.</p>
+<p>Most modern databases can be disaggregated into compute and storage
+layers, with sophisticated query engines responsible for the "compute"
+portion of the database. A query engine typically consists of a Query
+Parser, Logical Plan generation and then the Physical Plan generation to
+run the computations on the Execution Engine. A query generally goes
+through multiple optimization phases in the logical plan generation as
+well as physical plan generation. No matter what the target use-case of
+the end system is, the query engine more or less follows this model.</p>
+<p>Given decades of database research that has gone into each of these
+individual layers, the bar for writing a functional query engine with
+table stakes features remains strikingly high. And you need to nail <em>all
+that</em> before you can get around to writing your use-case specific
+features. While there are many projects that help you write some of
+these layers individually, Apache DataFusion remains the only game in
+town that helps you with the entire gamut.</p>
+<p>You can think of DataFusion extensible database development toolkit. At
+its most basic level, you can use it as a query engine a la DuckDB with
+its builtin SQL and Dataframe front ends, while at the same time you can
+extend or even wholesale replace different layers to build your own
+experience entirely.</p>
+<p>In the rest of this post we will walk through how to extend DataFusion
+to add your own operators to its execution engine and then weave it
+through the Physical and Logical planners and expose it to the frontend.</p>
+
+<p><img src="https://miro.medium.com/v2/resize:fit:1400/0*jjrNhgIlapa-Ih2P.png" alt="DataFusion architecture"></p>
+<p><strong>DataFusion architecture</strong></p>
+<p>At Denormalized, we are building a duck db like single node experience
+for stream processing applications. While DataFusion does have some
+support for unbounded computations, it doesn't have a streaming window
+operator. Windows are at the core of stream processing applications,
+they provide an easy way to bucket infinite data streams into finite
+buckets so that we can apply aggregations over them.</p>
+<p>For this tutorial we will implement a simple window operator for
+infinite streams. Our operator will have the following signature --</p>
+<pre><code>    pub fn window(
+			    self
+			    group_expr: Vec&lt;Expr&gt;,
+			    aggr_expr: Vec&lt;Expr&gt;,
+			    window_length: Duration,
+			    slide: Option&lt;Duration&gt;,
+			    ) -&gt; Result&lt;Self&gt; { ... }
+</code></pre>
+<h2>Writing the Execution Plan</h2>
+<p>An <a href="https://docs.rs/datafusion/latest/datafusion/physical_plan/execution_plan/trait.ExecutionPlan.html">ExecutionPlan represents</a> a node in the DataFusion Physical plan. This is where
+the actual code with our custom computations would go. DataFusions execution model
+is pull based, meaning that the execution starts at the sinks and works its
+way up the physical plan. Calling the <em>execute</em> method on this trait
+produces an asynchronous <a href="https://docs.rs/datafusion/latest/datafusion/physical_plan/type.SendableRecordBatchStream.html">SendableRecordBatchStream</a> of record batches
+by incrementally deriving a partition of the output by running
+computations over Execution Plan's input.</p>
+<p>In our use case, <a href="https://github.com/probably-nothing-labs/denormalized/blob/f65268972da3a6f21eac0ab4bf3e4ca9b558c6ed/crates/core/src/physical_plan/continuous/streaming_window.rs#L423-L427">ExecutionPlan's execute()</a> method returns a struct
+<a href="https://github.com/probably-nothing-labs/denormalized/blob/f65268972da3a6f21eac0ab4bf3e4ca9b558c6ed/crates/core/src/physical_plan/continuous/grouped_window_agg_stream.rs#L62">GroupedWindowAggStream</a> which implements a RecordBatchStream,  a wrapper around
+futures::Stream trait. The actual computations should be implemented
+within the <em>poll_next()</em> of the Stream implementation.</p>
+<pre><code>    impl RecordBatchStream for GroupedWindowAggStream {
+	    fn schema(&amp;self) -&gt; SchemaRef {
+		    self.schema.clone()
+	    }
+    }
+    
+    impl Stream for GroupedWindowAggStream {
+    
+	    type Item = Result&lt;RecordBatch&gt;;
+	    
+	    fn poll_next(mut self: Pin&lt;&amp;mut Self&gt;, cx: &amp;mut Context&lt;'_&gt;) -&gt;
+	    Poll&lt;Option&lt;Self::Item&gt;&gt; {
+	    
+		    let poll = self.poll_next_inner(cx); // Code to compute the record batch goes
+		    here.
+	    
+	    ...
+    
+    }
+</code></pre>
+<p>Here in our example, calling the <em>poll_next_inner</em> for a streaming
+window takes care of</p>
+<ol>
+<li>
+<p>Processing the incoming data.</p>
+</li>
+<li>
+<p>Accumulating rows into open windows.</p>
+</li>
+<li>
+<p>Updating the watermark (which is behind a mutex)</p>
+</li>
+<li>
+<p>Opening new windows if required.</p>
+</li>
+<li>
+<p>Closing any triggering windows and producing the output
+RecordBatches from them.</p>
+</li>
+</ol>
+<h2>Hooking into the Physical Planner</h2>
+<p>Having created our custom Execution Plan, we need to make the Physical
+Planner aware of its existence. <a href="https://github.com/probably-nothing-labs/denormalized/blob/f65268972da3a6f21eac0ab4bf3e4ca9b558c6ed/crates/core/src/planner/streaming_window.rs#L69-L173">Implementing the ExtensionPlanner</a> for our
+ExtensionPlan is all we need to do here.</p>
+<h2>Extending the Logical Plan</h2>
+<p>Now that we have the custom Execution Plan implemented along with
+ExtensionPlanner, we need to add a companion node to the Logical Plan.
+This not only allows us to expose this to the SQL/DataFrame frontends
+but also hook into the logical optimizers for optimizations such as the
+predicate pushdowns.</p>
+<p>In DataFusion we need to first implement a <a href="https://github.com/probably-nothing-labs/denormalized/blob/f65268972da3a6f21eac0ab4bf3e4ca9b558c6ed/crates/core/src/logical_plan/streaming_window.rs#L28">user defined Logical Plan
+Node</a> and then add a <a href="https://github.com/probably-nothing-labs/denormalized/blob/f65268972da3a6f21eac0ab4bf3e4ca9b558c6ed/crates/core/src/logical_plan/mod.rs#L47-L59">LogicalPlanExtension</a>
+to the logical plan builder which exposes this to SQL/DataFrame
+frontends.</p>
+<h2>Logical Plan to Physical Plan</h2>
+<p>The last piece of the puzzle is the touch point where the logical plan
+gets converted into the physical plan. For this, we will implement a
+<a href="https://github.com/probably-nothing-labs/denormalized/blob/f65268972da3a6f21eac0ab4bf3e4ca9b558c6ed/crates/core/src/query_planner.rs#L13-L30">custom QueryPlanner</a> that ensures that the physical planner is initialized with
+the custom extensions we wrote for our ExecutionPlan.</p>
+<h2>Custom Optimization Rules</h2>
+<p>Since our operator implemented a group by aggregation, we need to ensure
+that all the rows for a particular group end up in the same partition.
+To that end we will add a <a href="https://github.com/probably-nothing-labs/denormalized/blob/f65268972da3a6f21eac0ab4bf3e4ca9b558c6ed/crates/core/src/physical_optimizer/coalesce_before_streaming_window_aggregate.rs#L32">new physical optimization
+rule</a> to add a HashPartition operator on our group keys.</p>
+<h2>Putting it all together</h2>
+<p>Finally, all we need to do is construct a DataFusion session with the
+custom QueryPlanner we wrote above as well as the additional physical
+optimizer rule we added and voila, now we have our own extended version
+of DataFusion.</p>
+<pre><code>    let state = SessionStateBuilder::new()
+      .with_default_features()
+      .with_config(config)
+      .with_query_planner(Arc::new(StreamingQueryPlanner {}))
+      .with_optimizer_rules(get_default_optimizer_rules()).with_physical_optimizer_rule(Arc::new(EnsureHashPartititionOnGroupByForStreamingAggregates::new(),
+      ))
+      .build();
+</code></pre>
+<h3>Footnotes</h3>
+<ol>
+<li><a href="https://db.cs.cmu.edu/papers/2024/whatgoesaround-sigmodrec2024.pdf">https://db.cs.cmu.edu/papers/2024/whatgoesaround-sigmodrec2024.pdf</a></li>
+<li><a href="https://benchmark.clickhouse.com/">https://benchmark.clickhouse.com</a></li>
+<li><a href="https://github.com/rewrite-bigdata-in-rust/RBIR">https://github.com/rewrite-bigdata-in-rust/RBIR</a></li>
+<li><a href="https://dl.acm.org/doi/10.1145/3626246.3653368">https://dl.acm.org/doi/10.1145/3626246.3653368</a></li>
+</ol></div></article></div></div></div>]]>
+            </description>
+            <link>https://www.denormalized.io/blog/building-databases</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42200014</guid>
+            <pubDate>Thu, 21 Nov 2024 01:16:46 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Leaving Amazon (2023)]]>
             </title>
             <description>
 <![CDATA[
-Score 31 | Comments 2 (<a href="https://news.ycombinator.com/item?id=42196495">thread link</a>) | @lbrito
+Score 33 | Comments 5 (<a href="https://news.ycombinator.com/item?id=42196495">thread link</a>) | @lbrito
 <br/>
 November 20, 2024 | https://lbrito.ca/blog/2023/12/leaving-amazon.html | <a href="https://web.archive.org/web/*/https://lbrito.ca/blog/2023/12/leaving-amazon.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -83,7 +255,7 @@ November 20, 2024 | https://lbrito.ca/blog/2023/12/leaving-amazon.html | <a href
             </title>
             <description>
 <![CDATA[
-Score 22 | Comments 32 (<a href="https://news.ycombinator.com/item?id=42196381">thread link</a>) | @adchurch
+Score 22 | Comments 35 (<a href="https://news.ycombinator.com/item?id=42196381">thread link</a>) | @adchurch
 <br/>
 November 20, 2024 | https://app.workweave.ai/welcome | <a href="https://web.archive.org/web/*/https://app.workweave.ai/welcome">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>Trusted by world-class engineering teams at:</p><p><img alt="Causal logo" loading="lazy" width="1434" height="444" decoding="async" data-nimg="1" srcset="https://app.workweave.ai/_next/image?url=%2Flogos%2Fcausal.png&amp;w=1920&amp;q=75 1x, https://app.workweave.ai/_next/image?url=%2Flogos%2Fcausal.png&amp;w=3840&amp;q=75 2x" src="https://app.workweave.ai/_next/image?url=%2Flogos%2Fcausal.png&amp;w=3840&amp;q=75"><img alt="Birdseye logo" loading="lazy" width="1182" height="268" decoding="async" data-nimg="1" srcset="https://app.workweave.ai/_next/image?url=%2Flogos%2Fbirdseye.png&amp;w=1200&amp;q=75 1x, https://app.workweave.ai/_next/image?url=%2Flogos%2Fbirdseye.png&amp;w=3840&amp;q=75 2x" src="https://app.workweave.ai/_next/image?url=%2Flogos%2Fbirdseye.png&amp;w=3840&amp;q=75"><img alt="Mave logo" loading="lazy" width="1244" height="310" decoding="async" data-nimg="1" srcset="https://app.workweave.ai/_next/image?url=%2Flogos%2Fmave.png&amp;w=1920&amp;q=75 1x, https://app.workweave.ai/_next/image?url=%2Flogos%2Fmave.png&amp;w=3840&amp;q=75 2x" src="https://app.workweave.ai/_next/image?url=%2Flogos%2Fmave.png&amp;w=3840&amp;q=75"><img alt="Impacked logo" loading="lazy" width="652" height="310" decoding="async" data-nimg="1" srcset="https://app.workweave.ai/_next/image?url=%2Flogos%2Fimpacked.png&amp;w=750&amp;q=75 1x, https://app.workweave.ai/_next/image?url=%2Flogos%2Fimpacked.png&amp;w=1920&amp;q=75 2x" src="https://app.workweave.ai/_next/image?url=%2Flogos%2Fimpacked.png&amp;w=1920&amp;q=75"></p></div></div>]]>
@@ -98,7 +270,7 @@ November 20, 2024 | https://app.workweave.ai/welcome | <a href="https://web.arch
             </title>
             <description>
 <![CDATA[
-Score 45 | Comments 2 (<a href="https://news.ycombinator.com/item?id=42196226">thread link</a>) | @psychomugs
+Score 52 | Comments 4 (<a href="https://news.ycombinator.com/item?id=42196226">thread link</a>) | @psychomugs
 <br/>
 November 20, 2024 | https://msgtn.xyz/rebuild_of_blossom | <a href="https://web.archive.org/web/*/https://msgtn.xyz/rebuild_of_blossom">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -253,7 +425,7 @@ Next goals include:</p>
             </title>
             <description>
 <![CDATA[
-Score 104 | Comments 9 (<a href="https://news.ycombinator.com/item?id=42195994">thread link</a>) | @xlinux
+Score 118 | Comments 10 (<a href="https://news.ycombinator.com/item?id=42195994">thread link</a>) | @xlinux
 <br/>
 November 20, 2024 | https://www.philipzucker.com/sql_graph_csp/ | <a href="https://web.archive.org/web/*/https://www.philipzucker.com/sql_graph_csp/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div aria-label="Content">
@@ -893,7 +1065,7 @@ hyprgraph data structure</p>
             </title>
             <description>
 <![CDATA[
-Score 124 | Comments 50 (<a href="https://news.ycombinator.com/item?id=42194315">thread link</a>) | @nalaginrut
+Score 130 | Comments 51 (<a href="https://news.ycombinator.com/item?id=42194315">thread link</a>) | @nalaginrut
 <br/>
 November 20, 2024 | https://artanis.dev/blog/1.0.0-release.html | <a href="https://web.archive.org/web/*/https://artanis.dev/blog/1.0.0-release.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="text-org29e9361">
@@ -932,7 +1104,7 @@ GNU Artanis is both the official project of GNU operating system, and <a href="h
             </title>
             <description>
 <![CDATA[
-Score 179 | Comments 179 (<a href="https://news.ycombinator.com/item?id=42191805">thread link</a>) | @orkohunter
+Score 184 | Comments 181 (<a href="https://news.ycombinator.com/item?id=42191805">thread link</a>) | @orkohunter
 <br/>
 November 20, 2024 | https://orkohunter.net/blog/why-dont-you-move-abroad/ | <a href="https://web.archive.org/web/*/https://orkohunter.net/blog/why-dont-you-move-abroad/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p><img src="https://orkohunter.net/blog/why-dont-you-move-abroad/header.png" alt=""></p>
@@ -1034,7 +1206,7 @@ November 20, 2024 | https://orkohunter.net/blog/why-dont-you-move-abroad/ | <a h
             </title>
             <description>
 <![CDATA[
-Score 443 | Comments 58 (<a href="https://news.ycombinator.com/item?id=42191709">thread link</a>) | @todsacerdoti
+Score 477 | Comments 72 (<a href="https://news.ycombinator.com/item?id=42191709">thread link</a>) | @todsacerdoti
 <br/>
 November 20, 2024 | https://blog.frost.kiwi/analytical-anti-aliasing/ | <a href="https://web.archive.org/web/*/https://blog.frost.kiwi/analytical-anti-aliasing/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>Today’s journey is <a href="https://en.wikipedia.org/wiki/Spatial_anti-aliasing">Anti-Aliasing</a> and the destination is <strong>Analytical Anti-Aliasing</strong>. Getting rid of rasterization <a href="https://en.wikipedia.org/wiki/Jaggies">jaggies</a> is an art-form with decades upon decades of maths, creative techniques and non-stop innovation. With so many years of research and development, there are many flavors.</p><p>From the simple but resource intensive <a href="https://en.wikipedia.org/wiki/Supersampling"><strong>SSAA</strong></a>, over theory dense <a href="https://www.iryoku.com/smaa/"><strong>SMAA</strong></a>, to using machine learning with <a href="https://en.wikipedia.org/wiki/Deep_learning_anti-aliasing"><strong>DLAA</strong></a>. Same goal - <strong><em>vastly</em></strong> different approaches. We’ll take a look at how they work, before introducing a new way to look a the problem - the ✨<em><strong>analytical</strong></em>🌟 way. The perfect Anti-Aliasing exists and is simpler than you think.</p><blockquote><p>Having <a href="https://mirrorball.frost.kiwi/">implemented</a> it multiple times over the years, I'll also share some juicy secrets I have never read anywhere before.</p><img src="https://blog.frost.kiwi/assets/kiwis/book.svg"></blockquote><h2 id="the-setup" tabindex="-1">The Setup <a href="#the-setup">#</a></h2><p>To understand the Anti-Aliasing algorithms, we will implement them along the way! Following <a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API/Tutorial/Getting_started_with_WebGL">WebGL canvases</a> draw a moving circle. Anti-Aliasing <em>cannot</em> be fully understood with just images, movement is <em>essential</em>. The red box has 4x zoom. Rendering is done at <a href="https://en.wikipedia.org/wiki/1:1_pixel_mapping">native</a> resolution of your device, important to judge sharpness.</p><blockquote><p>Please pixel-peep to judge sharpness and aliasing closely. Resolution of your screen too high to see aliasing? Lower the resolution with the following buttons, which will <a href="https://tanalin.com/en/articles/integer-scaling/">integer-scale</a> the rendering.</p><img src="https://blog.frost.kiwi/assets/kiwis/detective.svg"></blockquote><div><p> <label for="native">Native<p>Resolution</p></label></p><p> <label for="half">½<p>Resolution</p></label></p><p> <label for="quarter">¼<p>Resolution</p></label></p><p> <label for="eight">⅛<p>Resolution</p></label></p></div><canvas id="canvasSimple" width="100%" height="400px"></canvas><blockquote><details><summary><a href="https://blog.frost.kiwi/analytical-anti-aliasing/screenshots/simple.png">Screenshot</a>, in case WebGL doesn't work</summary><p><img src="https://blog.frost.kiwi/analytical-anti-aliasing/screenshots/simple.png" alt="image"></p></details><details><summary>WebGL Vertex Shader <a href="https://blog.frost.kiwi/analytical-anti-aliasing/shader/circle.vs">circle.vs</a></summary><pre><code>
@@ -2268,7 +2440,7 @@ November 20, 2024 | https://blog.frost.kiwi/analytical-anti-aliasing/ | <a href=
             </title>
             <description>
 <![CDATA[
-Score 274 | Comments 53 (<a href="https://news.ycombinator.com/item?id=42190650">thread link</a>) | @rrampage
+Score 281 | Comments 54 (<a href="https://news.ycombinator.com/item?id=42190650">thread link</a>) | @rrampage
 <br/>
 November 19, 2024 | https://emschwartz.me/understanding-the-bm25-full-text-search-algorithm/ | <a href="https://web.archive.org/web/*/https://emschwartz.me/understanding-the-bm25-full-text-search-algorithm/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2467,7 +2639,7 @@ November 19, 2024 | https://www.tryparity.com/blog/how-meta-uses-llms-to-improve
             </title>
             <description>
 <![CDATA[
-Score 293 | Comments 215 (<a href="https://news.ycombinator.com/item?id=42187506">thread link</a>) | @alexzeitler
+Score 302 | Comments 216 (<a href="https://news.ycombinator.com/item?id=42187506">thread link</a>) | @alexzeitler
 <br/>
 November 19, 2024 | https://domainanalysis.io/p/architecture-modernization-execution | <a href="https://web.archive.org/web/*/https://domainanalysis.io/p/architecture-modernization-execution">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><article><div><div><div dir="auto"><p><strong>Can I please return to my vacation days in early October?&nbsp;</strong></p><p><span>After my unforgettable and fun vacation in </span><a href="https://english.visitseoul.net/" rel="">Seoul</a><span> and </span><a href="https://nomadicsamuel.com/city-guides/sokcho-travel-guide" rel="">Sokcho</a><span>, my original plan was to write about Systems Thinking and the book I read, "</span><a href="https://www.amazon.com/dp/0060839872" rel="">Zen and the Art of Motorcycle Maintenance</a><span>" by Robert Pirsig. </span></p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic" width="1290" height="1526" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:1526,&quot;width&quot;:1290,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:390657,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/heic&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:true,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic 1456w" sizes="100vw" fetchpriority="high"></picture></div></a><figcaption>The Great Buddha at Seoraksan National Park, South Korea</figcaption></figure></div><p>But all it takes is a moment, which has lasted more than two weeks, and I feel my life has turned upside down. The last two weeks have been quite literally a car wreck.&nbsp;</p><ul><li><p>First, the Sunday before the US elections, while pulling over for a paramedic, I got rear-ended by a monster pickup truck. I am fine, thankfully, but my car still is not.&nbsp;</p></li><li><p>Second, I really believed that the company I work for, the New York Times, would avoid the ULP strike by the tech workers by agreeing to a fair contract before the US elections. That did not happen. And I don't want to discuss the US election results because that hurt will not go away anytime soon. Meanwhile, my colleagues and I went on an 8-day ULP strike. Since the company refused to bargain with us while we were on strike, we decided to end the strike and return to work earlier this week. We would like to get the contract we deserve soon.</p></li><li><p>I am trying very hard to return back to functioning, I must be succeeding because here I am, able to write some words!&nbsp;</p></li></ul><p><strong>Estimates - Is it an Art or Science?&nbsp;</strong></p><p>My car has been in the auto body repair shop for the past two weeks, and I am still trying to get an estimate of its damages. I am learning that it's an interesting domain:&nbsp;</p><ul><li><p>First, the insurance adjuster submits what they think is the damage to the car to the repair shop. Let's say this is $15000</p></li><li><p>Next, the repair shop submits what they think is the damage back to the insurance company. Let's say it's $18000, and the shop estimates it would take 30 days to fix it.&nbsp;</p></li><li><p>Eventually, the insurance adjuster and the repair shop expert meet to assess the damage together. Let's say the insurance adjuster approves this new estimate from the repair shop. The repair shop then starts with the repair process. At least this is my understanding so far.&nbsp;</p></li></ul><p><strong>Unforeseen Issues</strong></p><p>But what if there is damage that can't be seen yet? Let's say the repair shop is in the process of doing the repairs they notice additional damage. Or they put the car on the frame machine to see if there is damage to the frame. In a unibody frame, it's not just the point of impact of the frame; some of the effects can also transfer to the back of the frame. So they'll have to inspect it to assess the full damage. They might start unassembling the car and notice more damage that was not originally on the estimate. Now what?&nbsp;</p><p><strong>Emergent Solutions&nbsp;</strong></p><p>Let's say, based on the new findings, it's going to cost an additional $20,000. They now need the approval of the insurance company to proceed. So they write up the new findings with the new cost and send a supplemental repair for approval. The insurance company will determine whether, at this point, it still makes sense to proceed with the repair or call it a total loss. And, of course, there are guidelines and rules to determine that. Let's assume it's not a total loss. The insurance company then approves the additional cost of repair.&nbsp;</p><p><strong>Real Talk or Crazy Talk?</strong></p><p>Can you imagine if the insurance company started arguing with the repair shop, asking them—no—telling them that they would only pay the $18,000 and not the additional $20,000 because that was the original estimate? Does that sound ridiculous to you? It does to me, too. Thank heavens, reality does not operate like this.&nbsp;</p><p><strong>Isn't Complex Software Architecture Modernization the same?&nbsp;</strong></p><p>When you are in the process of modernizing legacy software, you are in the realm of complex software. When you look at it from the outside, you see some obvious things, and based on experience and expertise, you come up with an initial estimate. This is the repair shop's original estimate of $18,000</p><p>As you are in the process, you start uncovering additional complexity. This complexity could be similar to some hidden damages the repair shop discovered after un-assembling the parts, or this could be significant frame damage that the repair shop discovered. What do you do? You need additional approvals to proceed at this point.&nbsp;</p><p><strong>Good Leaders Ask the Right Questions</strong></p><p>The right questions are asked if you are in a healthy software development environment when you bubble these problems up. How complex is this problem? What are the different ways of solving this? What are the tradeoffs? Are there workarounds or alternate solutions to this?&nbsp;</p><p>Suppose the questions start leading to how you did not see this complexity, how you missed this, why it is taking so long, and you are beholden to the original estimated dates? May the force be with you and your team to give you the strength to see this through. Hopefully, your modernization journey will be a short and successful one.&nbsp;</p><p><strong>To Proceed or call it a Total Loss?</strong></p><p>I have been involved in both types of modernization projects. Cases where the supplemental cost gets approved, and work proceeds until the next step,&nbsp; rinse and repeat until the project has come to completion. I've also seen total loss, i.e.&nbsp; the project got canned because it was too expensive to proceed, and it would cost more than it was worth. It's not easy deciding this, and there are frameworks and decision workshops to try and choose the direction.&nbsp;</p><p><strong>Is this a complex context or a complicated context?</strong></p><p><span>I urge you to read the excellent article from David J Snowden and Mary E Boone on,</span><a href="https://hbr.org/2007/11/a-leaders-framework-for-decision-making" rel=""> “A Leaders Framework for Decision Making”</a><span>. Using the Cynefin framework, motorcycle maintenance or auto repair might fall under the complicated context. In order to fix the car, the expert technician, after having listened to how the collision happened, also has to analyze and test multiple factors, such as unseen damage, frame damage, etc., to determine the best course of action for the car.&nbsp;</span></p><p>However, in a complex context, you can only decide whether or not it is right or wrong in hindsight, i.e. after you've tried the thing. Does this jive more and more with complex legacy modernization software projects? I.e. you try something and learn that the integration you thought would work doesn’t work or you uncover a completely new behavior you never knew existed and you now have to account for it?&nbsp; </p><p>There is no fixed path when modernizing a complex legacy system. There is no rulebook to follow. You try, experiment, discover, solve, and move on to the next piece until you're done.&nbsp;</p><p><strong>Denial - Anger - Bargaining - Depression - Acceptance??</strong></p><p>When modernizing applications, if we understand that this effort falls somewhere between Complex and Complicated Contexts, we can implement the right sort of gauges to see how to proceed and determine success. Applying the process of estimates for a complex context is wrong. It’s like trying to use a hammer as a solution for every screw or a lug nut!&nbsp;Sometimes you need a screwdriver and sometimes you need a wrench!</p><p>Curveballs in modernization projects are just a reality. You can't foresee every outcome ahead of time. No amount of upfront analysis would lead you to a perfect data model. There will be new learnings almost every step of the way. Data Models will have to change based on the complexity you have uncovered. So it's a matter of when, not if, for curveballs. When a curveball hits and the estimate changes, take a step forward instead of getting angry or blaming folks or trying to do a what-if analysis on how best to bring the schedule in. </p><p><span>When you’re dealing with curveballs, which </span><a href="https://continuousdelivery.com/implementing/culture/" rel="">Ron Westrum’s defined model of culture</a><span> does your organization adopt? Power-Oriented where messengers who inform about the curveballs are shot and failure leads to&nbsp; scapegoated, Rule-Oriented where the messengers who inform about the curveballs are ignored and failure leads to justice or Performance- Oriented where the messengers who inform about the curveballs are trained and failure leads to enquiry?&nbsp;</span></p><p>As long as the problem you're trying to solve is still relevant and still meets the business needs, take it one step at a time. Ultimately the software you are trying to modernize is for users.&nbsp;</p><p><strong>Tip for Leaders Leading Modernization Initiatives</strong></p><p><span>To quote from the same </span><a href="https://hbr.org/2007/11/a-leaders-framework-for-decision-making" rel="">article</a><span>, "Leaders who don't recognize that a complex domain requires a more experimental mode of management may become impatient when they don't seem to be achieving the results they were aiming for. They may also find it difficult to tolerate failure, an essential aspect of experimental understanding. If they try to overcontrol the organization, they will preempt the opportunity for informative patterns to emerge. Leaders who try to impose order in a complex context will fail. Still, those who set the stage, step back a bit, allow patterns to emerge, and determine which ones are desirable will succeed".&nbsp;</span></p><p><strong>A New Hope</strong></p><p>Either way I will be ok, whether the repair company is able to fix my car or the insurance company deems it a total loss. The system works. I wish I could say the same for modernization projects and the awful industry practice about how much ceremony we attribute to estimates, completely forgetting that an estimate means an approximate of the actual. I hope more and more software companies and leadership use the proper framework for measuring success. I hope this leaves you with some ideas on implementing changes or at least questioning the practices if they seem wrong.&nbsp;</p><p><em>"I've wondered why it took us so long to catch on. We saw it, and yet we didn't see it. Or rather we were trained not to see it. Conned perhaps into thinking that the real action was metropolitan and all this was just boring hinterland. It was a puzzling thing. The truth knocks on the door and you say, "Go away. I'm looking for the truth." And so it goes away. Puzzling."</em></p><p><em>― Robert Pirsig</em></p></div></div></div></article></div></div></div>]]>
@@ -3092,7 +3264,7 @@ because these languages weren’t designed with it in the …</p></article></div
             </title>
             <description>
 <![CDATA[
-Score 216 | Comments 49 (<a href="https://news.ycombinator.com/item?id=42185842">thread link</a>) | @wonger_
+Score 217 | Comments 49 (<a href="https://news.ycombinator.com/item?id=42185842">thread link</a>) | @wonger_
 <br/>
 November 19, 2024 | https://chernando.com/blog/2023/07/23/hand-tracking-for-mouse-input.html | <a href="https://web.archive.org/web/*/https://chernando.com/blog/2023/07/23/hand-tracking-for-mouse-input.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div aria-label="Content">
@@ -3393,7 +3565,7 @@ November 19, 2024 | https://likang.dev/posts/google-search-bug/ | <a href="https
             </title>
             <description>
 <![CDATA[
-Score 54 | Comments 81 (<a href="https://news.ycombinator.com/item?id=42183555">thread link</a>) | @lando2319
+Score 55 | Comments 81 (<a href="https://news.ycombinator.com/item?id=42183555">thread link</a>) | @lando2319
 <br/>
 November 19, 2024 | https://www3.nhk.or.jp/news/html/20241119/k10014642881000.html | <a href="https://web.archive.org/web/*/https://www3.nhk.or.jp/news/html/20241119/k10014642881000.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -3621,7 +3793,7 @@ Score 27 | Comments 0 (<a href="https://news.ycombinator.com/item?id=42180516">t
 <br/>
 November 18, 2024 | https://raw.sh/posts/easy_reward_model_inference | <a href="https://web.archive.org/web/*/https://raw.sh/posts/easy_reward_model_inference">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>Reward models have been a key part of reinforcement learning on top of LLMs, used broadly in techniques like RLHF and as LLM-as-a-judge critics in evals. They have also been used in the data preparation phase of preference optimization methods like SimPO, where a reward model was used to create the preference data used to train models like <code>princeton-nlp/gemma-2-9b-it-SimPO</code>.</p>
-<p>I recently had some trouble figuring out how to run high throughput reward model inference. Offline, you can just collect everything you need to score in advance and go through all of your data in batches. But for a lot of use cases, such as for search methods like tree search or MCTS, this is hard to do efficiently. Unfortunately, easy to set up inference servers like vllm and llama.cpp don't support sequence classification models<sup><a href="#user-content-fn-1" id="user-content-fnref-1" data-footnote-ref="true" aria-describedby="footnote-label">1</a></sup> out of the box (yet<sup><a href="#user-content-fn-2" id="user-content-fnref-2" data-footnote-ref="true" aria-describedby="footnote-label">2</a></sup>)</p>
+<p>I recently had some trouble figuring out how to run high throughput reward model inference. Offline, you can just collect everything you need to score in advance and go through all of your data in batches. But for a lot of use cases, such as for search methods like tree search or MCTS, this is hard to do efficiently. Unfortunately, easy to set up inference servers like vLLM and llama.cpp don't support sequence classification<sup><a href="#user-content-fn-1" id="user-content-fnref-1" data-footnote-ref="true" aria-describedby="footnote-label">1</a></sup> / reward models out of the box (yet<sup><a href="#user-content-fn-2" id="user-content-fnref-2" data-footnote-ref="true" aria-describedby="footnote-label">2</a></sup>)</p>
 <h2 id="dynamic-batching-with-batched">Dynamic batching with <code>batched</code></h2>
 <p>Thankfully, Mixedbread has a great generic dynamic batching library that makes it really easy to inference reward models<sup><a href="#user-content-fn-3" id="user-content-fnref-3" data-footnote-ref="true" aria-describedby="footnote-label">3</a></sup>.</p>
 <p>Here's how we can host an endpoint on Modal<sup><a href="#user-content-fn-4" id="user-content-fnref-4" data-footnote-ref="true" aria-describedby="footnote-label">4</a></sup>. First, let's add some helper functions and setup the image:</p>
@@ -3789,7 +3961,7 @@ November 18, 2024 | https://www.christianscheb.de/archives/893 | <a href="https:
             </title>
             <description>
 <![CDATA[
-Score 256 | Comments 372 (<a href="https://news.ycombinator.com/item?id=42175316">thread link</a>) | @abdisalan
+Score 256 | Comments 376 (<a href="https://news.ycombinator.com/item?id=42175316">thread link</a>) | @abdisalan
 <br/>
 November 18, 2024 | https://abdisalan.com/posts/tragedy-running-old-node-project/ | <a href="https://web.archive.org/web/*/https://abdisalan.com/posts/tragedy-running-old-node-project/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p><span>
@@ -3851,7 +4023,7 @@ npm remove_cv_t’ is not a member of ‘std’; did you mean ‘remove_cv’</c
             </title>
             <description>
 <![CDATA[
-Score 38 | Comments 48 (<a href="https://news.ycombinator.com/item?id=42175043">thread link</a>) | @shafyy
+Score 38 | Comments 49 (<a href="https://news.ycombinator.com/item?id=42175043">thread link</a>) | @shafyy
 <br/>
 November 18, 2024 | https://canolcer.com/post/thoughts-on-bluesky/ | <a href="https://web.archive.org/web/*/https://canolcer.com/post/thoughts-on-bluesky/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -3907,7 +4079,7 @@ November 18, 2024 | https://canolcer.com/post/thoughts-on-bluesky/ | <a href="ht
             </title>
             <description>
 <![CDATA[
-Score 293 | Comments 119 (<a href="https://news.ycombinator.com/item?id=42173233">thread link</a>) | @ulrischa
+Score 293 | Comments 120 (<a href="https://news.ycombinator.com/item?id=42173233">thread link</a>) | @ulrischa
 <br/>
 November 18, 2024 | https://www.joshtumath.uk/posts/2024-11-08-how-a-bbc-navigation-bar-component-broke-depending-on-which-external-monitor-it-was-on/ | <a href="https://web.archive.org/web/*/https://www.joshtumath.uk/posts/2024-11-08-how-a-bbc-navigation-bar-component-broke-depending-on-which-external-monitor-it-was-on/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>Recently, my team and I fixed an absolutely bizarre bug that only one person in the team could reproduce. And to make it even weirder, she was only able to reproduce the issue when using her work laptop at home; it worked fine with the same laptop in the office.</p><h2 id="heading-so-what-was-the-bug">So what was the bug?<a href="#heading-so-what-was-the-bug"><span> permalink</span></a></h2><p>The BBC's UK website uses a <code>click</code> event to respond to when a user activates the 'More' button. <code>click</code> events aren't just activated by the click of a mouse; they can also be activated by touch and the 'enter' or 'space' keys on a keyboard.</p><p><img src="https://www.joshtumath.uk/images/2024-11-08-bbc-global-nav.png" alt="Screenshot of BBC global navigation bar opened using the 'more' button." loading="lazy" width="792" height="280"></p><p>Our 'more' button should open a menu. However, when she was clicking on it at home, the <code>click</code> event didn't seem to do anything. Instead, the menu opened using our no-JavaScript fallback behaviour.</p><p><em>That's strange.</em> 💭</p><p>When we looked into it a bit more, we found out that the bug only happened when her web browser window was on one of her external monitors. She had two external monitors and it happened on both. But when she clicked the button on her laptop screen, the button worked as expected.</p><p><em>What?</em> 🤯</p><p>And to make it even stranger, the bug didn't happen in Safari.</p><p><em>What? What? What?</em> 🤯 🤯 🤯</p><p>So why on earth was something like a user's external monitor set up affecting <code>click</code> events on our website? And why was this bug not happening to everyone else in our team who used an external monitor? It was very strange indeed.</p><h2 id="heading-reproducing-the-issue">Reproducing the issue<a href="#heading-reproducing-the-issue"><span> permalink</span></a></h2><p>We wanted to be able to reproduce the bug to properly investigate it, so we needed to understand what it was in her home environment that triggered it.</p><p>Since the bug only occurred on her external monitors, we noticed that it stopped if she repositioned them in the OS settings. Her external monitors were positioned above her laptop, so once we replicated that arrangement in our OS settings, we were finally able to reproduce the bug, too.</p><p><em>Bingo!</em></p><p><img src="https://www.joshtumath.uk/images/2024-11-08-multi-monitor-negative.png" alt="Screenshot of macOS display settings. Second monitor is shown arranged top left of the built-in laptop monitor." loading="lazy" width="1516" height="916"></p><h2 id="heading-our-investigation">Our investigation<a href="#heading-our-investigation"><span> permalink</span></a></h2><p>We had two clues to begin our investigation:</p><ul><li><strong>1st clue:</strong> <mark>The bug didn't occur on Safari</mark>.</li><li><strong>2nd clue:</strong> <mark>The bug only happened when the external monitors were positioned above and left of the main monitor</mark>.</li></ul><p>Our next step was to investigate our 'more' button's <code>click</code> event handler function.</p><p>While reproducing the issue, a <code>console.log</code> of our 'more' button's click event showed our <strong>3rd clue:</strong> that, <mark>on Chrome and Firefox, the <code>screenX</code> and <code>screenY</code> properties were negative numbers</mark>.</p><blockquote><p><strong>Note:</strong><br>Even though they can be triggered by any kind of input, <code>click</code> events are a type of <code>PointerEvent</code>, so their <code>event</code> objects include information about the mouse or touch pointers that trigger the clicks. For example, the <code>screenX</code> and <code>screenY</code> properties show the coordinates (in pixels) for what point on the screen gets clicked on.</p></blockquote><p>That surprised me, because I didn't know those properties were allowed to have negative numbers. I checked the <a href="https://w3c.github.io/uievents/#dom-mouseevent-screenx">DOM UI Events spec</a> to see if that was correct, but there didn't seem to be any specific information about it.</p><p>With some <a href="https://www.youtube.com/watch?v=iwzOhHFGZKw">Ace Attorney Investigations-style logic</a>, when we put together the fact that <mark>the bug didn't occur on Safari</mark> and that, <mark>on Chrome and Firefox, the <code>screenX</code> and <code>screenY</code> properties were negative numbers</mark>, we could deduce that browsers have an interoperability issue in how they represent screen coordinates in multi-monitor set ups.</p><p><img src="https://www.joshtumath.uk/images/2024-11-08-aai-logic.gif" alt="Animation of the logic sequence in Ace Attorney Investigations. The player picks from clues to connect and the game shows if they successfully connected." loading="lazy" width="400" height="225"></p><blockquote><p><strong>Note:</strong><br>I ended up reporting the interoperability issue to the WebKit team on <a href="https://bugs.webkit.org/show_bug.cgi?id=281430">WebKit bug 281430</a>.</p></blockquote><p>That knowledge gave rise to our <strong>4th clue:</strong> <mark>the bug only occurred if <code>screenX</code> and <code>screenY</code> were negative</mark>.</p><p>With some more Ace Attorney Investigations-style deductions, when we combined that with our 2nd clue – that <mark>the bug only happened when the external monitors were positioned above and left of the main monitor</mark> – we could deduce our <strong>5th clue:</strong> <mark>on Chrome and Firefox, the <code>screenX</code> and <code>screenY</code>'s (0,0) coordinate is the top left of the main monitor</mark>.</p><p>On a multi-monitor set up, browsers' screen coordinate systems treat multiple monitors as if it were one big monitor. So two 800px wide monitors positioned horizontally would have <em>x</em> coordinates ranging of 0 to 1600. On Safari, that range is always a positive number starting from the top left most monitor, but it looks like, in Chrome and Firefox, they are relative to the main monitor instead and use negative coordinates.</p><p>We needed to find the <code>click</code> event handler in our code and see how it was reading the <code>screenX</code> and <code>screenY</code> coordinates from the <code>event</code> object.</p><p>This is what we found:</p><pre><code><span><span>const</span> <span>isInvokedByMouse</span> <span>=</span> <span>event</span> <span>=&gt;</span> event<span>.</span>screenX <span>&gt;</span> <span>0</span> <span>||</span> event<span>.</span>screenY <span>&gt;</span> <span>0</span><span>;</span></span><br><span><span>const</span> <span>isInvokedByKeyboard</span> <span>=</span> <span>event</span> <span>=&gt;</span> <span>isEnterKey</span><span>(</span>event<span>)</span> <span>||</span> <span>isSpaceKey</span><span>(</span>event<span>)</span><span>;</span></span><br><span></span><br><span></span><br><span></span><br><span><span>const</span> <span>toggleMenu</span> <span>=</span> <span>event</span> <span>=&gt;</span> <span>{</span></span><br><span>  </span><br><span></span><br><span>  <span>if</span> <span>(</span><span>isInvokedByMouse</span><span>(</span>event<span>)</span> <span>||</span> <span>isInvokedByKeyboard</span><span>(</span>event<span>)</span><span>)</span> <span>{</span></span><br><span>    event<span>.</span><span>preventDefault</span><span>(</span><span>)</span><span>;</span></span><br><span></span><br><span>    </span><br><span>  <span>}</span></span><br><span><span>}</span><span>;</span></span></code></pre><p>The <code>isInvokedByMouse</code> was checking whether the <code>click</code> event was invoked by a mouse or touch pointer – rather than a keyboard – by checking if the <code>screenX</code> or <code>screenY</code> coordinates were a positive number.</p><p>That gave us our <strong>final clue:</strong> <mark>the code assumes <code>click</code> events invoked by pointers have positive <code>screenX</code> and <code>screenY</code> coordinate numbers</mark>.</p><p>When a user clicked the 'more' button on a monitor with negative screen coordinates, the event handler wasn't acknowledging the click and instead falling back to the default behaviour of the 'more' link.</p><p>We could finally finish our investigation. We could deduce from our final two clues the solution: <strong>we need to check for negative numbers as well as positive numbers when checking the <code>screenX</code> and <code>screenY</code> coordinates.</strong></p><h2 id="heading-the-fix">The fix<a href="#heading-the-fix"><span> permalink</span></a></h2><p>As is often the case with bugs, the problem was very complex to figure out, but the solution was very simple.</p><p>All we had to do was change the <code>isInvokedByMouse</code> to check that <code>screenX</code> and <code>screenY</code> don't equal 0, rather than checking if they are greater than 0.</p><pre><code><span><span>const</span> <span>isInvokedByMouse</span> <span>=</span> <span>event</span> <span>=&gt;</span></span><br><span>  event<span>.</span>type <span>===</span> <span>'click'</span> <span>&amp;&amp;</span> <span>(</span>event<span>.</span>screenX <span>!==</span> <span>0</span> <span>||</span> event<span>.</span>screenY <span>!==</span> <span>0</span><span>)</span><span>;</span></span></code></pre><p>Now everyone with weird multi-monitor layouts can enjoy the BBC website's navigation bar in peace.</p><p>The code is still weird, though. We don't need to be checking for whether the <code>click</code> was triggered by a mouse or keyboard. We should probably do further refactoring of the event handler function, since it's complicated by the fact that it also handles <code>keydown</code> events. For now, though, this fix will do just fine.</p><p>It's a good lesson around being careful what assumptions you make around how an API works. Even the UI Events specification wasn't clear on whether there could be negative numbers in <code>screenX</code> and <code>screenY</code>. Though this code was rigorously tested both in unit tests, Puppeteer and with manual testing on various browsers, devices and assistive technology tools, the bug was never spotted.</p><p>So that was fun! Who would have thought web developers could break an experience for users because of which monitor they're viewing the page on?</p><p><strong>Edit on 2024-11-19:</strong> There's been a lot of responses to this blog post, including confusion around why we're checking something unreliable like <code>screenX</code> in the first place. That's understandable because it is, indeed, a bit odd and seems like bad practice. I've now refactored the navigation component and significantly changed the 'menu' button's event handler. <a href="https://www.joshtumath.uk/posts/2024-11-18-how-i-refactored-the-bbc-navigation-bar-and-a-follow-up-faq/">My next blog post explains how it was refactored and answers some common questions people have had.</a></p></div></div>]]>
@@ -4088,7 +4260,7 @@ hCaptcha Support
             </title>
             <description>
 <![CDATA[
-Score 353 | Comments 51 (<a href="https://news.ycombinator.com/item?id=42170740">thread link</a>) | @california-og
+Score 355 | Comments 51 (<a href="https://news.ycombinator.com/item?id=42170740">thread link</a>) | @california-og
 <br/>
 November 18, 2024 | https://maxbo.me/a-html-file-is-all-you-need.html | <a href="https://web.archive.org/web/*/https://maxbo.me/a-html-file-is-all-you-need.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><p>
@@ -4429,7 +4601,7 @@ November 17, 2024 | https://smoores.dev/post/phonetic_matching/ | <a href="https
             </title>
             <description>
 <![CDATA[
-Score 280 | Comments 295 (<a href="https://news.ycombinator.com/item?id=42167749">thread link</a>) | @bentocorp
+Score 280 | Comments 296 (<a href="https://news.ycombinator.com/item?id=42167749">thread link</a>) | @bentocorp
 <br/>
 November 17, 2024 | https://www.magiclasso.co/insights/is-chrome-the-new-ie/ | <a href="https://web.archive.org/web/*/https://www.magiclasso.co/insights/is-chrome-the-new-ie/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4877,7 +5049,7 @@ November 17, 2024 | https://www.japantimes.co.jp/business/2024/11/15/economy/jap
             </title>
             <description>
 <![CDATA[
-Score 247 | Comments 132 (<a href="https://news.ycombinator.com/item?id=42165397">thread link</a>) | @rishicomplex
+Score 248 | Comments 132 (<a href="https://news.ycombinator.com/item?id=42165397">thread link</a>) | @rishicomplex
 <br/>
 November 17, 2024 | https://rishimehta.xyz/2024/11/17/alphaproofs-greatest-hits.html | <a href="https://web.archive.org/web/*/https://rishimehta.xyz/2024/11/17/alphaproofs-greatest-hits.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -5053,7 +5225,7 @@ Next, it claims (and goes on to prove) that for all natural numbers $n$,</p><p>
             </title>
             <description>
 <![CDATA[
-Score 360 | Comments 186 (<a href="https://news.ycombinator.com/item?id=42165057">thread link</a>) | @mmphosis
+Score 360 | Comments 187 (<a href="https://news.ycombinator.com/item?id=42165057">thread link</a>) | @mmphosis
 <br/>
 November 17, 2024 | https://zarar.dev/good-software-development-habits/ | <a href="https://web.archive.org/web/*/https://zarar.dev/good-software-development-habits/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><p>This post is not advice, it's what's working for me.</p><p>It's easy to pick up bad habits and hard to create good ones. Writing down what's working for me helps me maintain any good habits I've worked hard to develop. Here's an unordered list of 10 things that have helped me increase speed and maintain a respectable level of quality in the product I'm currently developing.</p><div>
@@ -6746,7 +6918,7 @@ volumes:
             </title>
             <description>
 <![CDATA[
-Score 260 | Comments 31 (<a href="https://news.ycombinator.com/item?id=42162622">thread link</a>) | @fzliu
+Score 261 | Comments 31 (<a href="https://news.ycombinator.com/item?id=42162622">thread link</a>) | @fzliu
 <br/>
 November 16, 2024 | https://blog.voyageai.com/2024/11/12/voyage-multimodal-3/ | <a href="https://web.archive.org/web/*/https://blog.voyageai.com/2024/11/12/voyage-multimodal-3/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>

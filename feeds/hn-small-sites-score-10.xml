@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Thu, 21 Nov 2024 00:35:04 GMT</lastBuildDate>
+        <lastBuildDate>Thu, 21 Nov 2024 04:23:48 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-10.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Thu, 21 Nov 2024 00:35:04 GMT</pubDate>
+        <pubDate>Thu, 21 Nov 2024 04:23:48 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,183 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Building Databases over a Weekend]]>
+            </title>
+            <description>
+<![CDATA[
+Score 39 | Comments 3 (<a href="https://news.ycombinator.com/item?id=42200014">thread link</a>) | @ambrood
+<br/>
+November 20, 2024 | https://www.denormalized.io/blog/building-databases | <a href="https://web.archive.org/web/*/https://www.denormalized.io/blog/building-databases">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><article><div><p>Databases are some of the most complex pieces of software conceived
+since the advent of the computing age over half a century ago. [1]
+Nearly every piece of technology ends up touching the database in some
+way shape or form. Despite the ubiquity of Databases in the software
+stack, the vast majority of developers have been conditioned to treat
+databases as more or less a <em>black box</em> -- complex dense pieces of
+software conjured up by arch wizards and mavens ensconced in the
+rarified elite tiers of database companies or places like Google. The
+adage for the rest of us as it goes is <em>never attempt to write your own
+database</em>.</p>
+<p>That said, despite their longevity, we have seen continued innovation in
+the space that first started with Hadoop arriving on the scene about 2
+decades ago. The ClickBench website now lists over 50+ databases in its
+benchmark suite [2] . And that's just the analytics engines. With the
+recent trends of rewriting everything big data in Rust [3] not a month
+goes by without an interesting new project trending in the Hacker News.
+In this post we will take a look at how easy (or hard) it is to build
+Databases using Apache Datafusion and whether you <em>can in fact, as a
+mere mortal</em> realistically build a custom database and innovate around
+the developer experience.</p>
+<p>Most modern databases can be disaggregated into compute and storage
+layers, with sophisticated query engines responsible for the "compute"
+portion of the database. A query engine typically consists of a Query
+Parser, Logical Plan generation and then the Physical Plan generation to
+run the computations on the Execution Engine. A query generally goes
+through multiple optimization phases in the logical plan generation as
+well as physical plan generation. No matter what the target use-case of
+the end system is, the query engine more or less follows this model.</p>
+<p>Given decades of database research that has gone into each of these
+individual layers, the bar for writing a functional query engine with
+table stakes features remains strikingly high. And you need to nail <em>all
+that</em> before you can get around to writing your use-case specific
+features. While there are many projects that help you write some of
+these layers individually, Apache DataFusion remains the only game in
+town that helps you with the entire gamut.</p>
+<p>You can think of DataFusion extensible database development toolkit. At
+its most basic level, you can use it as a query engine a la DuckDB with
+its builtin SQL and Dataframe front ends, while at the same time you can
+extend or even wholesale replace different layers to build your own
+experience entirely.</p>
+<p>In the rest of this post we will walk through how to extend DataFusion
+to add your own operators to its execution engine and then weave it
+through the Physical and Logical planners and expose it to the frontend.</p>
+
+<p><img src="https://miro.medium.com/v2/resize:fit:1400/0*jjrNhgIlapa-Ih2P.png" alt="DataFusion architecture"></p>
+<p><strong>DataFusion architecture</strong></p>
+<p>At Denormalized, we are building a duck db like single node experience
+for stream processing applications. While DataFusion does have some
+support for unbounded computations, it doesn't have a streaming window
+operator. Windows are at the core of stream processing applications,
+they provide an easy way to bucket infinite data streams into finite
+buckets so that we can apply aggregations over them.</p>
+<p>For this tutorial we will implement a simple window operator for
+infinite streams. Our operator will have the following signature --</p>
+<pre><code>    pub fn window(
+			    self
+			    group_expr: Vec&lt;Expr&gt;,
+			    aggr_expr: Vec&lt;Expr&gt;,
+			    window_length: Duration,
+			    slide: Option&lt;Duration&gt;,
+			    ) -&gt; Result&lt;Self&gt; { ... }
+</code></pre>
+<h2>Writing the Execution Plan</h2>
+<p>An <a href="https://docs.rs/datafusion/latest/datafusion/physical_plan/execution_plan/trait.ExecutionPlan.html">ExecutionPlan represents</a> a node in the DataFusion Physical plan. This is where
+the actual code with our custom computations would go. DataFusions execution model
+is pull based, meaning that the execution starts at the sinks and works its
+way up the physical plan. Calling the <em>execute</em> method on this trait
+produces an asynchronous <a href="https://docs.rs/datafusion/latest/datafusion/physical_plan/type.SendableRecordBatchStream.html">SendableRecordBatchStream</a> of record batches
+by incrementally deriving a partition of the output by running
+computations over Execution Plan's input.</p>
+<p>In our use case, <a href="https://github.com/probably-nothing-labs/denormalized/blob/f65268972da3a6f21eac0ab4bf3e4ca9b558c6ed/crates/core/src/physical_plan/continuous/streaming_window.rs#L423-L427">ExecutionPlan's execute()</a> method returns a struct
+<a href="https://github.com/probably-nothing-labs/denormalized/blob/f65268972da3a6f21eac0ab4bf3e4ca9b558c6ed/crates/core/src/physical_plan/continuous/grouped_window_agg_stream.rs#L62">GroupedWindowAggStream</a> which implements a RecordBatchStream,  a wrapper around
+futures::Stream trait. The actual computations should be implemented
+within the <em>poll_next()</em> of the Stream implementation.</p>
+<pre><code>    impl RecordBatchStream for GroupedWindowAggStream {
+	    fn schema(&amp;self) -&gt; SchemaRef {
+		    self.schema.clone()
+	    }
+    }
+    
+    impl Stream for GroupedWindowAggStream {
+    
+	    type Item = Result&lt;RecordBatch&gt;;
+	    
+	    fn poll_next(mut self: Pin&lt;&amp;mut Self&gt;, cx: &amp;mut Context&lt;'_&gt;) -&gt;
+	    Poll&lt;Option&lt;Self::Item&gt;&gt; {
+	    
+		    let poll = self.poll_next_inner(cx); // Code to compute the record batch goes
+		    here.
+	    
+	    ...
+    
+    }
+</code></pre>
+<p>Here in our example, calling the <em>poll_next_inner</em> for a streaming
+window takes care of</p>
+<ol>
+<li>
+<p>Processing the incoming data.</p>
+</li>
+<li>
+<p>Accumulating rows into open windows.</p>
+</li>
+<li>
+<p>Updating the watermark (which is behind a mutex)</p>
+</li>
+<li>
+<p>Opening new windows if required.</p>
+</li>
+<li>
+<p>Closing any triggering windows and producing the output
+RecordBatches from them.</p>
+</li>
+</ol>
+<h2>Hooking into the Physical Planner</h2>
+<p>Having created our custom Execution Plan, we need to make the Physical
+Planner aware of its existence. <a href="https://github.com/probably-nothing-labs/denormalized/blob/f65268972da3a6f21eac0ab4bf3e4ca9b558c6ed/crates/core/src/planner/streaming_window.rs#L69-L173">Implementing the ExtensionPlanner</a> for our
+ExtensionPlan is all we need to do here.</p>
+<h2>Extending the Logical Plan</h2>
+<p>Now that we have the custom Execution Plan implemented along with
+ExtensionPlanner, we need to add a companion node to the Logical Plan.
+This not only allows us to expose this to the SQL/DataFrame frontends
+but also hook into the logical optimizers for optimizations such as the
+predicate pushdowns.</p>
+<p>In DataFusion we need to first implement a <a href="https://github.com/probably-nothing-labs/denormalized/blob/f65268972da3a6f21eac0ab4bf3e4ca9b558c6ed/crates/core/src/logical_plan/streaming_window.rs#L28">user defined Logical Plan
+Node</a> and then add a <a href="https://github.com/probably-nothing-labs/denormalized/blob/f65268972da3a6f21eac0ab4bf3e4ca9b558c6ed/crates/core/src/logical_plan/mod.rs#L47-L59">LogicalPlanExtension</a>
+to the logical plan builder which exposes this to SQL/DataFrame
+frontends.</p>
+<h2>Logical Plan to Physical Plan</h2>
+<p>The last piece of the puzzle is the touch point where the logical plan
+gets converted into the physical plan. For this, we will implement a
+<a href="https://github.com/probably-nothing-labs/denormalized/blob/f65268972da3a6f21eac0ab4bf3e4ca9b558c6ed/crates/core/src/query_planner.rs#L13-L30">custom QueryPlanner</a> that ensures that the physical planner is initialized with
+the custom extensions we wrote for our ExecutionPlan.</p>
+<h2>Custom Optimization Rules</h2>
+<p>Since our operator implemented a group by aggregation, we need to ensure
+that all the rows for a particular group end up in the same partition.
+To that end we will add a <a href="https://github.com/probably-nothing-labs/denormalized/blob/f65268972da3a6f21eac0ab4bf3e4ca9b558c6ed/crates/core/src/physical_optimizer/coalesce_before_streaming_window_aggregate.rs#L32">new physical optimization
+rule</a> to add a HashPartition operator on our group keys.</p>
+<h2>Putting it all together</h2>
+<p>Finally, all we need to do is construct a DataFusion session with the
+custom QueryPlanner we wrote above as well as the additional physical
+optimizer rule we added and voila, now we have our own extended version
+of DataFusion.</p>
+<pre><code>    let state = SessionStateBuilder::new()
+      .with_default_features()
+      .with_config(config)
+      .with_query_planner(Arc::new(StreamingQueryPlanner {}))
+      .with_optimizer_rules(get_default_optimizer_rules()).with_physical_optimizer_rule(Arc::new(EnsureHashPartititionOnGroupByForStreamingAggregates::new(),
+      ))
+      .build();
+</code></pre>
+<h3>Footnotes</h3>
+<ol>
+<li><a href="https://db.cs.cmu.edu/papers/2024/whatgoesaround-sigmodrec2024.pdf">https://db.cs.cmu.edu/papers/2024/whatgoesaround-sigmodrec2024.pdf</a></li>
+<li><a href="https://benchmark.clickhouse.com/">https://benchmark.clickhouse.com</a></li>
+<li><a href="https://github.com/rewrite-bigdata-in-rust/RBIR">https://github.com/rewrite-bigdata-in-rust/RBIR</a></li>
+<li><a href="https://dl.acm.org/doi/10.1145/3626246.3653368">https://dl.acm.org/doi/10.1145/3626246.3653368</a></li>
+</ol></div></article></div></div></div>]]>
+            </description>
+            <link>https://www.denormalized.io/blog/building-databases</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42200014</guid>
+            <pubDate>Thu, 21 Nov 2024 01:16:46 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Leaving Amazon (2023)]]>
             </title>
             <description>
 <![CDATA[
-Score 31 | Comments 2 (<a href="https://news.ycombinator.com/item?id=42196495">thread link</a>) | @lbrito
+Score 33 | Comments 5 (<a href="https://news.ycombinator.com/item?id=42196495">thread link</a>) | @lbrito
 <br/>
 November 20, 2024 | https://lbrito.ca/blog/2023/12/leaving-amazon.html | <a href="https://web.archive.org/web/*/https://lbrito.ca/blog/2023/12/leaving-amazon.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -83,7 +255,7 @@ November 20, 2024 | https://lbrito.ca/blog/2023/12/leaving-amazon.html | <a href
             </title>
             <description>
 <![CDATA[
-Score 22 | Comments 32 (<a href="https://news.ycombinator.com/item?id=42196381">thread link</a>) | @adchurch
+Score 22 | Comments 35 (<a href="https://news.ycombinator.com/item?id=42196381">thread link</a>) | @adchurch
 <br/>
 November 20, 2024 | https://app.workweave.ai/welcome | <a href="https://web.archive.org/web/*/https://app.workweave.ai/welcome">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>Trusted by world-class engineering teams at:</p><p><img alt="Causal logo" loading="lazy" width="1434" height="444" decoding="async" data-nimg="1" srcset="https://app.workweave.ai/_next/image?url=%2Flogos%2Fcausal.png&amp;w=1920&amp;q=75 1x, https://app.workweave.ai/_next/image?url=%2Flogos%2Fcausal.png&amp;w=3840&amp;q=75 2x" src="https://app.workweave.ai/_next/image?url=%2Flogos%2Fcausal.png&amp;w=3840&amp;q=75"><img alt="Birdseye logo" loading="lazy" width="1182" height="268" decoding="async" data-nimg="1" srcset="https://app.workweave.ai/_next/image?url=%2Flogos%2Fbirdseye.png&amp;w=1200&amp;q=75 1x, https://app.workweave.ai/_next/image?url=%2Flogos%2Fbirdseye.png&amp;w=3840&amp;q=75 2x" src="https://app.workweave.ai/_next/image?url=%2Flogos%2Fbirdseye.png&amp;w=3840&amp;q=75"><img alt="Mave logo" loading="lazy" width="1244" height="310" decoding="async" data-nimg="1" srcset="https://app.workweave.ai/_next/image?url=%2Flogos%2Fmave.png&amp;w=1920&amp;q=75 1x, https://app.workweave.ai/_next/image?url=%2Flogos%2Fmave.png&amp;w=3840&amp;q=75 2x" src="https://app.workweave.ai/_next/image?url=%2Flogos%2Fmave.png&amp;w=3840&amp;q=75"><img alt="Impacked logo" loading="lazy" width="652" height="310" decoding="async" data-nimg="1" srcset="https://app.workweave.ai/_next/image?url=%2Flogos%2Fimpacked.png&amp;w=750&amp;q=75 1x, https://app.workweave.ai/_next/image?url=%2Flogos%2Fimpacked.png&amp;w=1920&amp;q=75 2x" src="https://app.workweave.ai/_next/image?url=%2Flogos%2Fimpacked.png&amp;w=1920&amp;q=75"></p></div></div>]]>
@@ -98,7 +270,7 @@ November 20, 2024 | https://app.workweave.ai/welcome | <a href="https://web.arch
             </title>
             <description>
 <![CDATA[
-Score 45 | Comments 2 (<a href="https://news.ycombinator.com/item?id=42196226">thread link</a>) | @psychomugs
+Score 52 | Comments 4 (<a href="https://news.ycombinator.com/item?id=42196226">thread link</a>) | @psychomugs
 <br/>
 November 20, 2024 | https://msgtn.xyz/rebuild_of_blossom | <a href="https://web.archive.org/web/*/https://msgtn.xyz/rebuild_of_blossom">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -253,7 +425,7 @@ Next goals include:</p>
             </title>
             <description>
 <![CDATA[
-Score 104 | Comments 9 (<a href="https://news.ycombinator.com/item?id=42195994">thread link</a>) | @xlinux
+Score 118 | Comments 10 (<a href="https://news.ycombinator.com/item?id=42195994">thread link</a>) | @xlinux
 <br/>
 November 20, 2024 | https://www.philipzucker.com/sql_graph_csp/ | <a href="https://web.archive.org/web/*/https://www.philipzucker.com/sql_graph_csp/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div aria-label="Content">
@@ -889,11 +1061,191 @@ hyprgraph data structure</p>
         </item>
         <item>
             <title>
+<![CDATA[Show HN: Payload, P2P file transfer app, goes online]]>
+            </title>
+            <description>
+<![CDATA[
+Score 11 | Comments 0 (<a href="https://news.ycombinator.com/item?id=42194971">thread link</a>) | @klabb3
+<br/>
+November 20, 2024 | https://payload.app/blog/payload-goes-online | <a href="https://web.archive.org/web/*/https://payload.app/blog/payload-goes-online">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><!--[!--><picture><!--[--><source srcset="https://payload.app/_app/immutable/assets/didrik.Ch3dgqo-.avif 70w, https://payload.app/_app/immutable/assets/didrik.3QyJI-CN.avif 140w" type="image/avif"><source srcset="https://payload.app/_app/immutable/assets/didrik.CuV0Trg8.webp 70w, https://payload.app/_app/immutable/assets/didrik.DA9mSVDG.webp 140w" type="image/webp"><source srcset="https://payload.app/_app/immutable/assets/didrik.Bv-lyRv9.jpeg 70w, https://payload.app/_app/immutable/assets/didrik.BbOz1n-l.jpeg 140w" type="image/jpeg"><!--]--> <img src="https://payload.app/_app/immutable/assets/didrik.BbOz1n-l.jpeg" alt="Portrait of Didrik" width="140" height="140"></picture><!--]--> <p>Didrik Nordström <br> 2024-11-19</p> <p>Announcement</p></div><article><!----><p>In 2022, Payload launched as an app to transfer files between nearby devices, on the same local network. Since then, thousands of people around the world have used it to send documents, videos, photos, <a href="https://www.pcworld.com/article/1501480/master-your-steam-deck-with-these-22-tips-and-tricks.html#transfer-files-with-ease">and even games</a> — typically between their own computers over home WiFi.</p> <p><picture><source srcset="https://payload.app/_app/immutable/assets/device-online.DfJHAZYu.avif 581w, https://payload.app/_app/immutable/assets/device-online.CWjbfaKz.avif 1162w" type="image/avif"><source srcset="https://payload.app/_app/immutable/assets/device-online.FwFPL7L3.webp 581w, https://payload.app/_app/immutable/assets/device-online.ByjAhgWR.webp 1162w" type="image/webp"><source srcset="https://payload.app/_app/immutable/assets/device-online.F86BcUKX.jpeg 581w, https://payload.app/_app/immutable/assets/device-online.B9BFhx3c.jpeg 1162w" type="image/jpeg"><img src="https://payload.app/_app/immutable/assets/device-online.B9BFhx3c.jpeg" alt="Screenshot - a device with a green dot reading &quot;online&quot;" width="1162" height="448"></picture></p> <p>Today, we’re launching online transfers, in beta. That means you can transfer over the internet, with anyone in the world. Devices with a <strong>green dot</strong> are online, and those with a <strong>blue dot</strong> are nearby. It’s that simple.</p> <!----> <h2>Connect with a link</h2> <p>To onboard friends and collaborators, copy your device link in the app and share it over chat or email. This link includes all the details they need to connect with you. After that, you can drag and drop files as usual.</p> <p><picture><source srcset="https://payload.app/_app/immutable/assets/add-device-button.u9mjq5WN.avif 599w, https://payload.app/_app/immutable/assets/add-device-button.BgZLI_Wj.avif 1198w" type="image/avif"><source srcset="https://payload.app/_app/immutable/assets/add-device-button.BYl8JStT.webp 599w, https://payload.app/_app/immutable/assets/add-device-button.CXySTgSw.webp 1198w" type="image/webp"><source srcset="https://payload.app/_app/immutable/assets/add-device-button.2dKVX5Mi.jpeg 599w, https://payload.app/_app/immutable/assets/add-device-button.DROWFKxM.jpeg 1198w" type="image/jpeg"><img src="https://payload.app/_app/immutable/assets/add-device-button.DROWFKxM.jpeg" alt="Screenshot - a button reading &quot;add device&quot;" width="1198" height="482"></picture></p> <p>Whether a device was initially discovered nearby or added through a link, they’ll remain in your contact list for future transfers. Payload always prefers nearby transfers, if available.</p> <h2>Data plans, with guest access</h2> <p>Nearby transfers remain free and unlimited, but to transfer online you’ll need a data plan. Sign up with your email in the app, and we’ll give you plenty of free monthly data. If you have bigger needs you can upgrade anytime — no pressure.</p> <p>So… Does everyone need an account? No — if you have data, you can transfer with anyone else — they don’t need to sign up. New users can start as guests and sign up later, if they want to.</p> <div><!--[--><p>🎉</p><!--]--> <div><!--[--><p><strong>Unlimited beta</strong> —</p><!--]--> <p><span><!---->While we're sorting out the details, all data is free. Just sign up in the app.<!----></span></p></div></div><!----> <h2>What makes Payload different</h2> <p>Unlike most products, Payload is purpose-built for file transfers. If you work with large media — like photography, video editing, podcasting, or music production — or handle sensitive documents, you may have already hit the limits of other tools. File sharing is typically shoehorned into products built for other purposes, like chat, email and cloud storage. Even <em>file hosting</em> products aren’t made for <em>transfers</em> (but more on that in a different post).</p> <p>So what makes Payload so special? For starters, all transfers are end-to-end encrypted, which means your files stay private and can’t be accessed by us or anyone else. Secondly, there are no file size limits, and we’re obsessed with getting you the highest possible speeds. But it’s also the “little things”, like resuming after a hard drive is unplugged, or you close your laptop lid.</p> <h2>You be the judge</h2> <p>We have lots of opinions about file transfers, but to build the best file transfer app, we need to hear from <em>you</em> — what we’re doing right, and where we can improve. Are you getting the speeds you expect? Do you need an Android version? Or maybe you want Payload in French? Let us know!</p> <!----><!----></article></div>]]>
+            </description>
+            <link>https://payload.app/blog/payload-goes-online</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42194971</guid>
+            <pubDate>Wed, 20 Nov 2024 15:48:06 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Show HN: deploying a website just to transfer a file]]>
+            </title>
+            <description>
+<![CDATA[
+Score 11 | Comments 9 (<a href="https://news.ycombinator.com/item?id=42194483">thread link</a>) | @lionello
+<br/>
+November 20, 2024 | https://www.lunesu.com/2024/11/19/Nailed-it-with-Defang.html | <a href="https://web.archive.org/web/*/https://www.lunesu.com/2024/11/19/Nailed-it-with-Defang.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+      <div>
+        <div>
+
+  
+
+  <article>
+    <p>You can find the code for this post <a href="https://gist.github.com/lionello/d1f9d5c198f12590fb70997a93f06edd">here</a> and install the CLI with <code>winget install defang</code> or <code>eval "$(curl -fsSL s.defang.io/install)"</code>.</p>
+
+<p><img src="https://www.lunesu.com/images/1418fc22c430809baab5f1165ed297db/image.png" alt="The Greek god Hephaestus striking a USB thumb drive with his hammer in the Cloud" width="350"></p>
+
+<p>Christmas is nearing, and this year I’m once again spending time in the <a href="http://vanhack.ca/">Vancouver Hack Space</a> to work on a silly Christmas project to turn a human-sized<sup id="fnref:1" role="doc-noteref"><a href="#fn:1" rel="footnote">1</a></sup> acrylic sphere into a snow globe. I haven’t finished it in the last few years, and I likely won’t finish it this winter either, but it’s still a fun project to tinker on.</p>
+
+<blockquote>
+  <p><a href="https://theinfosphere.org/Transcript:I,_Roommate#time-07-51">“We’ve got room for a-whole-nother two-thirds of a person.” - Bender (Futurama S1E3)</a><sup id="fnref:1:1" role="doc-noteref"><a href="#fn:1" rel="footnote">1</a></sup></p>
+</blockquote>
+
+<p>The project was inspired by <a href="https://en.wikipedia.org/wiki/Knick_Knack">Knick Knack</a>, one of Pixar’s earliest 3D shorts. My plan was to fill the globe with a 2D cut-out of Knick Knack the Snowman and his igloo, along with fake snow. Then, I’d add an Arduino and an accelerometer to detect a “shake” and in turn trigger the snow.</p>
+
+<p>The most challenging part of this project is figuring out how to make the fake snow particles flow around the sphere.  Making the snow fly around nicely involves the strategic placement of a fan. On this particular day, I figured I’d use the laser cutter to cut holes out of a wooden disc that would become the floor of the globe and snuggly fit the back of a fan that I had found lying around.</p>
+
+<p><img src="https://www.lunesu.com/images/1418fc22c430809baab5f1165ed297db/IMG_1673_lio_globe.jpg" alt="Lio struggling to fetch the snow globe" width="250"></p>
+
+<p>I didn’t bring my laptop, so I used <a href="https://inkscape.org/">Inkscape</a> on one of the publicly available computers to draw the outline of the disc as well as the circle shaped hole in the middle that would fit the back of the fan (and its power cable).</p>
+
+<p>Having finished the drawing and exported it to a file, I now had to find a way to transfer the file to the computer with the laser cutter software. The hackerspace has Wi-Fi but I did not feel like digging into networking or dealing with account and file permissions on these public Windows machines. I looked around the space for USB thumb drives, but didn’t find any. I did bring my phone, and perhaps could find a lightning cable, but I also wasn’t particularly eager to connect my phone to this public PC. If I could just upload my file somewhere, then I could easily download it on my phone and, later, on the laser cutter’s PC.</p>
+
+<blockquote>
+  <p><a href="https://en.wikipedia.org/wiki/Law_of_the_instrument">“Give a boy a hammer and everything he meets has to be pounded.” - Abraham Kaplan</a> (not Mark Twain)</p>
+</blockquote>
+
+<p>I’ve spent the last year building <a href="https://defang.io/">Defang</a>. <code>defang</code> is a tool which deploys Docker compose-based projects to the cloud using <code>defang compose up</code>. To lower the barrier to adoption, we added a gen-AI command (<code>defang generate</code>) to help you get started with a project outline. We also provide a <a href="https://docs.defang.io/docs/concepts/defang-playground">Defang Playground</a> to temporarily deploy your project before you’re ready to <a href="https://docs.defang.io/docs/concepts/defang-byoc">bring-your-own-cloud</a>. Fully aware I was now “a boy with a hammer” staring at a file-shaped nail, I realized I could build an app without needing to install any other dependencies like Docker/Python/NodeJS on this PC, since Defang would build the app in the cloud for me. Being in a <a href="https://hackerspaces.org/">hackerspace</a>, it’s quite fitting to be using tools and materials in ways they were not initially intended to be used.</p>
+
+<p>As I was on a Windows machine, my first try was to use the newish <code>winget</code> command on the command prompt:</p>
+
+<div><div><pre><code>C:\Users\Administrator&gt; winget install defang
+Found Defang [DefangLabs.Defang] Version 0.6.4
+This application is licensed to you by its owner.
+Microsoft is not responsible for, nor does it grant any licenses to, third-party packages.
+Downloading [https://s.defang.io/defang_0.6.4_windows_amd64.zip?x-defang-source=winget](https://s.defang.io/defang_0.6.4_windows_amd64.zip?x-defang-source=winget)
+  ██████████████████████████████  11.0 MB / 11.0 MB
+Successfully verified installer hash
+Extracting archive...
+Successfully extracted archive
+Starting package install...
+**Command line alias added: "defang"
+Path environment variable modified; restart your shell to use the new value.**
+Successfully installed
+</code></pre></div></div>
+
+<p>That worked like a charm!</p>
+
+<p>I then used <code>defang generate</code> to generate all the code I need for a website to upload/download my file:</p>
+
+<div><div><pre><code>C:\Users\Administrator&gt; defang generate
+ * Using Defang Playground; consider using BYOC ([https://s.defang.io/byoc](https://s.defang.io/byoc))
+**? Choose a sample service:** *Generate with AI*
+**? Choose the language you'd like to use:** *Nodejs*
+**? Please describe the service you'd like to build:** *app that on / shows an HTML with file upload form and and list of previously uploaded files you can click on to download*
+**? What folder would you like to create the project in?** *project1*
+Our latest terms of service can be found at [https://defang.io/terms-service.html](https://defang.io/terms-service.html)
+**? Do you agree to the Defang terms of service?** *Yes*
+ * Working on it. This may take 1 or 2 minutes...
+ * Writing files to disk...
+   - Dockerfile
+   - compose.yaml
+   - main.js
+   - package.json
+ * Code generated successfully in folder project1
+
+Check the files in your favorite editor.
+To deploy the service, do `cd project1` and
+
+  defang compose up
+</code></pre></div></div>
+
+<p>OK, so <code>defang</code> generated <a href="https://gist.github.com/lionello/d1f9d5c198f12590fb70997a93f06edd">these 4 files</a>:</p>
+
+
+
+<ul>
+  <li><code>Dockerfile</code> was pretty standard for a NodeJS app, based off of Ubuntu-slim
+  
+    
+  </li>
+  <li><code>compose.yaml</code> again, pretty standard with only a single service, built from source in <code>.</code> and exposing port 3000
+  
+    
+  </li>
+  <li><code>main.js</code> ExpressJS listening on port 3000, with <code>GET</code> on <code>/</code> returning an HTML form, like I had asked
+  
+    
+  </li>
+  <li><code>package.json</code> with <code>express</code> and <code>multer</code> dependencies
+  
+    
+  </li>
+</ul>
+
+<p>On a quick inspection all files looked great so I was ready to deploy to the Playground with <code>defang compose up</code>:</p>
+
+<div><div><pre><code>C:\Users\Administrator&gt; cd project1
+
+C:\Users\Administrator\project1&gt; defang compose up
+ * Using Defang Playground; consider using BYOC ([https://s.defang.io/byoc](https://s.defang.io/byoc))
+ ! Please log in to continue.
+Please visit http://127.0.0.1:59734 and log in. (Right click the URL or press ENTER to open browser)
+</code></pre></div></div>
+
+<p>This was the first time I was prompted to log in. Defang relies on a GitHub account for login. I was on a public computer and didn’t want to log in with my own GitHub account, so I quickly signed up for a new account during the login process and the deployment proceeded:</p>
+
+<div><div><pre><code> * Successfully logged in to fabric-prod1.defang.dev:443 (default tenant)
+ * Using Defang Playground; consider using BYOC ([https://s.defang.io/byoc](https://s.defang.io/byoc))
+ ! service "service1": missing memory reservation; using provider-specific defaults. Specify deploy.resources.reservations.memory to avoid out-of-memory errors
+ * Packaging the project files for service1 at /Users/llunesu/dev/defang/project1
+ * Uploading the project files for service1
+ * Monitor your services' status in the defang portal
+   - https://portal.defang.dev/service/service1
+ * Tailing logs for deployment ID j4lw4g9gofik ; press Ctrl+C to detach:
+ * Showing only build logs and runtime errors. Press V to toggle verbose mode.
+2024-11-02T15:13:59.616-07:00 cd Update started for stack lionello-prod1
+2024-11-02T15:14:04.037-07:00 cd  ** Building image for "service1"...
+…
+2024-11-02T15:15:14.832-07:00 cd  ** Build succeeded for "service1"
+2024-11-02T15:15:15.410-07:00 cd  ** Updated service "service1" to revision 147
+2024-11-02T15:15:24.192-07:00 cd Update succeeded in 1m24.609245342s ; provisioning...
+2024-11-02T15:15:58.246-07:00 service1 Server started on port 3000
+ * Service service1 is in state DEPLOYMENT_COMPLETED and will be available at:
+   - https://lionello-service1--3000.prod1a.defang.dev
+ * Done.
+For help with warnings, check our FAQ at [https://docs.defang.io/docs/faq](https://docs.defang.io/docs/faq)
+</code></pre></div></div>
+
+<p>After 2 minutes<sup id="fnref:2" role="doc-noteref"><a href="#fn:2" rel="footnote">2</a></sup> Defang reserved a URL for my service and printed it to my shell. When I opened the link, I saw the HTML upload form I expected. I pressed “Choose File”, selected the SVG file I had exported form Inkscape, and uploaded it:</p>
+
+<p><img src="https://www.lunesu.com/images/1418fc22c430809baab5f1165ed297db/image%201.png" alt="image.png" width="250"></p>
+
+<p>If my experience building <a href="https://noun.ly/">Nounly</a> taught me anything, it was that it would only be a matter of seconds before bots started submitting spam and other junk to open HTML forms. So, I decided to deprovision the site immediately using <code>defang compose down</code>.</p>
+
+<p>By no means do I claim that this was a sensible way to get a file off a computer. Considering I was using a GitHub account for login, I might as well have created a <a href="https://gist.github.com/">gist</a>. Even so, it was very satisfying to be able to use a tool I had built to solve a problem it wasn’t particularly built for.</p>
+
+<p>If you give Defang a try, let me know what you think! The CLI currently supports AWS, but there’s limited support for DigitalOcean and we’re working to have GCP hooked up in a few weeks.</p>
+
+
+
+  </article>
+
+</div>
+
+      </div>
+    </div></div>]]>
+            </description>
+            <link>https://www.lunesu.com/2024/11/19/Nailed-it-with-Defang.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42194483</guid>
+            <pubDate>Wed, 20 Nov 2024 15:02:42 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[GNU Artanis 1.0.0 Released]]>
             </title>
             <description>
 <![CDATA[
-Score 124 | Comments 50 (<a href="https://news.ycombinator.com/item?id=42194315">thread link</a>) | @nalaginrut
+Score 130 | Comments 51 (<a href="https://news.ycombinator.com/item?id=42194315">thread link</a>) | @nalaginrut
 <br/>
 November 20, 2024 | https://artanis.dev/blog/1.0.0-release.html | <a href="https://web.archive.org/web/*/https://artanis.dev/blog/1.0.0-release.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="text-org29e9361">
@@ -928,11 +1280,160 @@ GNU Artanis is both the official project of GNU operating system, and <a href="h
         </item>
         <item>
             <title>
+<![CDATA[Show HN: I made a calendar where every month is also a crossword]]>
+            </title>
+            <description>
+<![CDATA[
+Score 12 | Comments 0 (<a href="https://news.ycombinator.com/item?id=42194239">thread link</a>) | @aaaronson
+<br/>
+November 20, 2024 | https://aaronson.org/blog/crossword-calendar | <a href="https://web.archive.org/web/*/https://aaronson.org/blog/crossword-calendar">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+        <p>Ever heard of the Tetris effect? It’s where you play so much Tetris that the game starts to seep into your thoughts, your dreams, your half-waking hallucinations, and pretty much every part of your reality that has nothing to do with Tetris. Well, I do a lot of crosswords—by “do” I mean both “solve” and “make”—and it turns out the “crossword effect” is also a very real thing.</p>
+
+<p>Once you spend enough time with grids and clues in front of your face, everything becomes crosswords. You’ll hear a new phrase and think, “is that in my wordlist?”, you’ll see two words on a sign and think “these would stack well in a grid!”, you’ll start dreaming of theme ideas that seem <em>genius</em> while you’re asleep only to wake up and realize they make no sense. But every now and then these intrusive thoughts will yield a coherent idea for a puzzle.</p>
+
+<p>One night this March, crosswords must have been permeating my consciousness as I was half-asleep, because I had a thought so intrusive that it catapulted me out of bed and onto my phone. At 12:57 am, I messaged my friends:</p>
+
+<blockquote>
+  <p>💭 Crossword calendar (each month’s calendar is a crossword grid where each day is a square)</p>
+</blockquote>
+
+<blockquote>
+  <p>Ok back to bed now</p>
+</blockquote>
+
+<p>Eight months later, that idea has become a real thing—a physical object!—that you can buy right now and hold in your hands before the holidays. Introducing the 2025 Crossword Calendar:</p>
+
+<p><a href="https://crosswordcal.com/products/2025-crossword-calendar" rel="noreferrer noopener" target="_blank">
+    <img src="https://aaronson.org/assets/images/crossword-calendar-icon.jpg">
+    <span>
+        2025 Crossword Calendar
+    </span>
+</a></p>
+
+<p><img src="https://aaronson.org/assets/images/crossword-calendar-mockup-1.jpg" alt="Crossword calendar mockup">
+    <img src="https://aaronson.org/assets/images/crossword-calendar-mockup-2.jpg" alt="Crossword calendar mockup">
+</p>
+
+<p>It’s a folding wall calendar where each month is a crossword to solve, the grid taking the shape of the month’s calendar grid, with one letter to write in each day’s square. The grid squares are numbered like a regular calendar, with each clue enumerated by the day of the month its answer starts on.</p>
+
+<p>The road from half-waking idea to physical object was a winding one, especially considering this was the first time I’d ever tried to create a real product that people can buy. Here’s how it went down (and across).</p>
+
+<h2 id="on-the-grid">On the grid</h2>
+
+<p>The concept of a crossword shaped like a monthly calendar immediately poses a few questions.</p>
+
+<h3 id="1-what-about-the-two-letter-words">1. What about the two-letter words?</h3>
+
+<p>In typical American-style crosswords, the minimum word length is three letters, because inaugural <em>New York Times</em> crossword editor Margaret Farrar <a href="https://www.theguardian.com/crosswords/crossword-blog/2012/dec/03/1">said so</a>. But some months start on a Friday or end on a Monday (like March, June, and August 2025), requiring two-letter words going across at the beginning or end of the month. So with regrets to Margaret, two-letter words are here to stay, treated no differently in the calendar from any other length word.</p>
+
+<h3 id="2-what-about-the-unchecked-squares">2. What about the unchecked squares?</h3>
+
+<p><img src="https://aaronson.org/assets/images/august.png" alt="Unchecked square"></p>
+
+<p>Similarly, American-style crosswords don’t allow “unchecked squares”—squares that are only part of a word going in one direction and not the other. This means every square in a crossword is part of two words, so if you don’t know a clue going one way, you always have the crossing clues to help figure out each letter. This is also a <a href="https://time.com/5811396/crossword-history/">Farrar-established rule</a>, and it’s one of the key differences between American- and British-style crosswords.</p>
+
+<p>Well, some months start on a Saturday or end on a Sunday (or both, in the case of November 2025), leaving an unchecked square in the first or last day of the grid. Rather than cluing these as one-letter words, which I think would have been a little confusing, I just made sure the words crossing the unchecked squares were both common (no names or obscure words that people might not know the unchecked letter of) and unambiguous (no clues like “Some Greek letters” for the entry _ETAS).</p>
+
+<h3 id="3-isnt-that-pretty-hard-to-fill-with-words">3. Isn’t that pretty hard to fill with words?</h3>
+
+<p>Pretty hard, but not impossible. My prevailing theory as to why seemingly no one has made a crossword calendar before is that filling a wide open 7x4-ish grid American-crossword-style is kind of a pain, and doing it 12 times is kind of 12 pains. With <a href="https://ingrid.cx/">computer assistance</a>, it’s pretty easy to fill a monthly grid with crappy words, but to fill one cleanly, with regular words that normal people know, it takes a lot of trial and error and/or an immaculately scored crossword wordlist.</p>
+
+<p><img src="https://aaronson.org/assets/images/7xwords.png" alt="Some 7xwords grids"></p>
+
+<p>Luckily, I’ve <a href="https://aaronson.org/crosswords/">made enough crosswords</a> at this point that my wordlist scores are refined enough and, crucially, I’ve become numb enough to the trial-and-error process, that making a grid for each of the 12 months didn’t strike me as too daunting of a challenge. The wide-openness of the grids wasn’t too dissimilar to <a href="https://www.7xwords.com/daily/09/09-15.html">some</a> of the <a href="https://www.7xwords.com/daily/12/12-29.html">grids</a> I filled for 7xwords, the project by Malaika Handa that enumerated every possible symmetrical 7x7 crossword grid.</p>
+
+<p>So I just went ahead and did it. And yeah, it was kind of a pain, but after a few weeks I had 12 grids, one for each month, collectively filled with 365 letters, one for each day of 2025.</p>
+
+<h2 id="really-important-calendar-facts">Really important calendar facts</h2>
+
+<p>Working on this project has given me a newfound appreciation for the shapes of calendar months. It’s pretty neat that every month has a unique shape—like a fingerprint—that defines the form its crossword must take. And since the number of days of the year isn’t divisible by 7, the starting day of each month changes every year, which means each month’s crossword grid is completely different depending on what year it’s for.</p>
+
+<p>Calendarheads, tap in. Here are some facts about calendar shapes that are sure to go over well at parties:</p>
+
+<ul>
+  <li>Monthly calendar grids usually have 5 rows, because most months have 30 or 31 days, which is a little more than 4 weeks. But if a 30-day month starts on a Saturday or a 31-day month starts on a Friday or Saturday, you’ll get an extra day or two at the end of the month, which necessitates a 6th row. It feels wrong that a month, which we think of as 4-ish weeks, could require 6 rows, but sometimes that’s just the way the cookie crumbles.</li>
+</ul>
+
+<p><img src="https://aaronson.org/assets/images/november.png" alt="November 2025 calendar">
+<br></p>
+
+<ul>
+  <li>Very rarely, a February will start on a Sunday, allowing it to squeeze onto 4 rows if it’s not a leap year. But it won’t be long—in 2026, the shape of February will be a perfect 4x7 rectangle. It’s gonna be a movie.</li>
+</ul>
+
+<p><img src="https://aaronson.org/assets/images/february-2026.png" alt="February 2026">
+<br></p>
+
+<ul>
+  <li>I was curious if each month in a given year had a unique shape, or if there were any repeated shapes throughout the year. As it turns out, January and October are the only pair of months in 2025 with the same shape, since they start on the same day of the week and both have 31 days. This holds true every year, except for leap years, when January and July are the only twin months. This information feels a little bit cursed, since it’s always been true, but no one talks about it.</li>
+</ul>
+
+<p><img src="https://aaronson.org/assets/images/january.png" alt="January 2025 calendar">
+    <img src="https://aaronson.org/assets/images/october.png" alt="October 2025 calendar">
+</p>
+
+<h2 id="putting-it-out-there">Putting it out there</h2>
+
+<p>Well now I had 12 little crosswords shaped like the 12 months of 2025, but the question still stood: what do I do with them? I basically made an ultimatum to myself: if I can’t find someone to publish the calendars for me, I’ll figure out how to do it myself.</p>
+
+<p>My first thought was to pitch it to an existing calendar company, or maybe an existing crossword book company, and see if they’re interested in branching out to make my weird thing a reality. So back in March and April I tried floating the idea to a few places, but no one was biting.</p>
+
+<p>Then I had a really silly second thought, which was to put all twelve months into one giant crossword grid and <a href="https://www.nytimes.com/article/submit-crossword-puzzles-the-new-york-times.html">submit it</a> to <em>The New York Times</em> as a Sunday crossword. Yeah, I was kind of sick and twisted for this, but if you put all twelve months together and pad them with black squares, they make this garish 23x25 grid with 142 words, which just so happens to barely exceed the typical Sunday size of 21x21 with 140 words.</p>
+
+<p><img src="https://aaronson.org/assets/images/crossword-calendar-grid.png" alt="Cursed crossword calendar grid"></p>
+
+<p>Filled with words and clued with clues, it was a fully functional crossword, so in May, I went ahead and submitted it to the NYT just like any other puzzle. But you might be thinking this grid seems a bit unconventional for a NYT crossword, and you could not be more right—the NYT crossword submission specs list five “basic rules” for crossword grids, and this grid breaks <em>all five</em> of them:</p>
+
+<p><img src="https://aaronson.org/assets/images/nyt-specs.png" alt="New York Times crossword submission specs"></p>
+
+<ul>
+  <li>The grid has no symmetry.</li>
+  <li>The white space of the grid is segmented into 12 disconnected sections, which means it does not have “all-over interlock” (side note: I’ve always thought “all-over interlock” was a super unintuitive term that requires clarification every time it’s said, but crossword people love to casually throw it around as if it makes perfect sense).</li>
+  <li>The grid has five unchecked squares.</li>
+  <li>The grid has three two-letter words.</li>
+  <li>The typical Sunday grid has about 80 black squares, while this grid has uhhhh 210. But who’s counting!</li>
+</ul>
+
+<p>For what it’s worth, any of these rules are allowed to be “broken with extreme rarity” if a theme calls for it—and I thought, hey, the theme calls for it. But suffice to say, a few months later, an email from the NYT crossword editors hit my inbox with regrets, concluding that “this would seem too much like solving 12 mini puzzles.” Can’t argue with that—12 mini puzzles is literally what this is, so they kinda nailed it. Maybe I should be the one sending my regrets to them for making them spend time reviewing the puzzle.</p>
+
+<p>I could have tried shipping this Franken-grid to other crossword outlets, but I figured the NYT is generally the most flexible of the major outlets when it comes to funky rule-breaking grids, and it was go big or go home. So go home it was.</p>
+
+<h2 id="bringing-it-home">Bringing it home</h2>
+
+<p>With all my reasonable choices for external publishers exhausted, I pretty much had one choice left, which was to make the calendars myself. The obvious perk of doing it this way is that I have full control over the calendars’ design and editorial process, and the obvious drawback is that when it comes to publishing a physical product, I had no idea what I was doing.</p>
+
+<p><img src="https://aaronson.org/assets/images/crossword-calendar-on-wall.jpg" alt="Crossword calendar on a wall"></p>
+
+<p>So I asked some friends who do have experience making physical products (shoutouts to Parker Higgins, Taylor Tabb, Alice Getmanchuk, Matthew Sisson, and Leia Chang for their suggestions), discovered that <a href="https://en.wikipedia.org/wiki/Print_on_demand">print on demand</a> is an industry that exists, found a provider that makes fully customizable wall calendars (<a href="https://printify.com/">Printify</a>, which handles manufacturing and fulfillment), and finally made an online store with <a href="https://www.shopify.com/">Shopify</a> that integrates directly with Printify. I designed the calendars in good old-fashioned <a href="https://www.adobe.com/products/photoshop.html">Photoshop</a>, hand-placing every square and number and manually typesetting every clue.</p>
+
+<p>And that brings us to today, when <a href="https://crosswordcal.com/">crosswordcal.com</a> is a website on the internet where you can buy the 2025 Crossword Calendar for $20.25 USD. Many have been asking me, “Is next year’s gonna be $20.26? Isn’t that cheaper than inflation?” And to them I say, “I’m a man of the people!”</p>
+
+<p>I might be biased, but I’d say the calendar makes an excellent gift for a word enjoyer—the puzzles are medium difficulty and designed to be beginner-friendly, so you don’t have to be a crossword expert to enjoy them. And again, biased, but I think it looks pretty neat on a wall.</p>
+
+<p>Should you solve all the puzzles at the beginning of the year? Should you solve each one at the beginning of each month? Should you write in one letter a day? Should you just solve the one for your birthday month so you can see what letter your birthday is? Do whatever you want—I don’t make the rules, I just write the clues.</p>
+
+<p><a href="https://crosswordcal.com/products/2025-crossword-calendar" rel="noreferrer noopener" target="_blank">
+    <img src="https://aaronson.org/assets/images/crossword-calendar-icon.jpg">
+    <span>
+        2025 Crossword Calendar
+    </span>
+</a></p>
+
+        
+    </div></div>]]>
+            </description>
+            <link>https://aaronson.org/blog/crossword-calendar</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42194239</guid>
+            <pubDate>Wed, 20 Nov 2024 14:36:19 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Why don't you move abroad?]]>
             </title>
             <description>
 <![CDATA[
-Score 179 | Comments 179 (<a href="https://news.ycombinator.com/item?id=42191805">thread link</a>) | @orkohunter
+Score 184 | Comments 181 (<a href="https://news.ycombinator.com/item?id=42191805">thread link</a>) | @orkohunter
 <br/>
 November 20, 2024 | https://orkohunter.net/blog/why-dont-you-move-abroad/ | <a href="https://web.archive.org/web/*/https://orkohunter.net/blog/why-dont-you-move-abroad/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p><img src="https://orkohunter.net/blog/why-dont-you-move-abroad/header.png" alt=""></p>
@@ -1034,7 +1535,7 @@ November 20, 2024 | https://orkohunter.net/blog/why-dont-you-move-abroad/ | <a h
             </title>
             <description>
 <![CDATA[
-Score 443 | Comments 58 (<a href="https://news.ycombinator.com/item?id=42191709">thread link</a>) | @todsacerdoti
+Score 477 | Comments 72 (<a href="https://news.ycombinator.com/item?id=42191709">thread link</a>) | @todsacerdoti
 <br/>
 November 20, 2024 | https://blog.frost.kiwi/analytical-anti-aliasing/ | <a href="https://web.archive.org/web/*/https://blog.frost.kiwi/analytical-anti-aliasing/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>Today’s journey is <a href="https://en.wikipedia.org/wiki/Spatial_anti-aliasing">Anti-Aliasing</a> and the destination is <strong>Analytical Anti-Aliasing</strong>. Getting rid of rasterization <a href="https://en.wikipedia.org/wiki/Jaggies">jaggies</a> is an art-form with decades upon decades of maths, creative techniques and non-stop innovation. With so many years of research and development, there are many flavors.</p><p>From the simple but resource intensive <a href="https://en.wikipedia.org/wiki/Supersampling"><strong>SSAA</strong></a>, over theory dense <a href="https://www.iryoku.com/smaa/"><strong>SMAA</strong></a>, to using machine learning with <a href="https://en.wikipedia.org/wiki/Deep_learning_anti-aliasing"><strong>DLAA</strong></a>. Same goal - <strong><em>vastly</em></strong> different approaches. We’ll take a look at how they work, before introducing a new way to look a the problem - the ✨<em><strong>analytical</strong></em>🌟 way. The perfect Anti-Aliasing exists and is simpler than you think.</p><blockquote><p>Having <a href="https://mirrorball.frost.kiwi/">implemented</a> it multiple times over the years, I'll also share some juicy secrets I have never read anywhere before.</p><img src="https://blog.frost.kiwi/assets/kiwis/book.svg"></blockquote><h2 id="the-setup" tabindex="-1">The Setup <a href="#the-setup">#</a></h2><p>To understand the Anti-Aliasing algorithms, we will implement them along the way! Following <a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API/Tutorial/Getting_started_with_WebGL">WebGL canvases</a> draw a moving circle. Anti-Aliasing <em>cannot</em> be fully understood with just images, movement is <em>essential</em>. The red box has 4x zoom. Rendering is done at <a href="https://en.wikipedia.org/wiki/1:1_pixel_mapping">native</a> resolution of your device, important to judge sharpness.</p><blockquote><p>Please pixel-peep to judge sharpness and aliasing closely. Resolution of your screen too high to see aliasing? Lower the resolution with the following buttons, which will <a href="https://tanalin.com/en/articles/integer-scaling/">integer-scale</a> the rendering.</p><img src="https://blog.frost.kiwi/assets/kiwis/detective.svg"></blockquote><div><p> <label for="native">Native<p>Resolution</p></label></p><p> <label for="half">½<p>Resolution</p></label></p><p> <label for="quarter">¼<p>Resolution</p></label></p><p> <label for="eight">⅛<p>Resolution</p></label></p></div><canvas id="canvasSimple" width="100%" height="400px"></canvas><blockquote><details><summary><a href="https://blog.frost.kiwi/analytical-anti-aliasing/screenshots/simple.png">Screenshot</a>, in case WebGL doesn't work</summary><p><img src="https://blog.frost.kiwi/analytical-anti-aliasing/screenshots/simple.png" alt="image"></p></details><details><summary>WebGL Vertex Shader <a href="https://blog.frost.kiwi/analytical-anti-aliasing/shader/circle.vs">circle.vs</a></summary><pre><code>
@@ -2268,7 +2769,7 @@ November 20, 2024 | https://blog.frost.kiwi/analytical-anti-aliasing/ | <a href=
             </title>
             <description>
 <![CDATA[
-Score 274 | Comments 53 (<a href="https://news.ycombinator.com/item?id=42190650">thread link</a>) | @rrampage
+Score 281 | Comments 54 (<a href="https://news.ycombinator.com/item?id=42190650">thread link</a>) | @rrampage
 <br/>
 November 19, 2024 | https://emschwartz.me/understanding-the-bm25-full-text-search-algorithm/ | <a href="https://web.archive.org/web/*/https://emschwartz.me/understanding-the-bm25-full-text-search-algorithm/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -3471,7 +3972,7 @@ November 19, 2024 | https://www.tryparity.com/blog/how-meta-uses-llms-to-improve
             </title>
             <description>
 <![CDATA[
-Score 293 | Comments 215 (<a href="https://news.ycombinator.com/item?id=42187506">thread link</a>) | @alexzeitler
+Score 302 | Comments 216 (<a href="https://news.ycombinator.com/item?id=42187506">thread link</a>) | @alexzeitler
 <br/>
 November 19, 2024 | https://domainanalysis.io/p/architecture-modernization-execution | <a href="https://web.archive.org/web/*/https://domainanalysis.io/p/architecture-modernization-execution">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><article><div><div><div dir="auto"><p><strong>Can I please return to my vacation days in early October?&nbsp;</strong></p><p><span>After my unforgettable and fun vacation in </span><a href="https://english.visitseoul.net/" rel="">Seoul</a><span> and </span><a href="https://nomadicsamuel.com/city-guides/sokcho-travel-guide" rel="">Sokcho</a><span>, my original plan was to write about Systems Thinking and the book I read, "</span><a href="https://www.amazon.com/dp/0060839872" rel="">Zen and the Art of Motorcycle Maintenance</a><span>" by Robert Pirsig. </span></p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic" width="1290" height="1526" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:1526,&quot;width&quot;:1290,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:390657,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/heic&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:true,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic 1456w" sizes="100vw" fetchpriority="high"></picture></div></a><figcaption>The Great Buddha at Seoraksan National Park, South Korea</figcaption></figure></div><p>But all it takes is a moment, which has lasted more than two weeks, and I feel my life has turned upside down. The last two weeks have been quite literally a car wreck.&nbsp;</p><ul><li><p>First, the Sunday before the US elections, while pulling over for a paramedic, I got rear-ended by a monster pickup truck. I am fine, thankfully, but my car still is not.&nbsp;</p></li><li><p>Second, I really believed that the company I work for, the New York Times, would avoid the ULP strike by the tech workers by agreeing to a fair contract before the US elections. That did not happen. And I don't want to discuss the US election results because that hurt will not go away anytime soon. Meanwhile, my colleagues and I went on an 8-day ULP strike. Since the company refused to bargain with us while we were on strike, we decided to end the strike and return to work earlier this week. We would like to get the contract we deserve soon.</p></li><li><p>I am trying very hard to return back to functioning, I must be succeeding because here I am, able to write some words!&nbsp;</p></li></ul><p><strong>Estimates - Is it an Art or Science?&nbsp;</strong></p><p>My car has been in the auto body repair shop for the past two weeks, and I am still trying to get an estimate of its damages. I am learning that it's an interesting domain:&nbsp;</p><ul><li><p>First, the insurance adjuster submits what they think is the damage to the car to the repair shop. Let's say this is $15000</p></li><li><p>Next, the repair shop submits what they think is the damage back to the insurance company. Let's say it's $18000, and the shop estimates it would take 30 days to fix it.&nbsp;</p></li><li><p>Eventually, the insurance adjuster and the repair shop expert meet to assess the damage together. Let's say the insurance adjuster approves this new estimate from the repair shop. The repair shop then starts with the repair process. At least this is my understanding so far.&nbsp;</p></li></ul><p><strong>Unforeseen Issues</strong></p><p>But what if there is damage that can't be seen yet? Let's say the repair shop is in the process of doing the repairs they notice additional damage. Or they put the car on the frame machine to see if there is damage to the frame. In a unibody frame, it's not just the point of impact of the frame; some of the effects can also transfer to the back of the frame. So they'll have to inspect it to assess the full damage. They might start unassembling the car and notice more damage that was not originally on the estimate. Now what?&nbsp;</p><p><strong>Emergent Solutions&nbsp;</strong></p><p>Let's say, based on the new findings, it's going to cost an additional $20,000. They now need the approval of the insurance company to proceed. So they write up the new findings with the new cost and send a supplemental repair for approval. The insurance company will determine whether, at this point, it still makes sense to proceed with the repair or call it a total loss. And, of course, there are guidelines and rules to determine that. Let's assume it's not a total loss. The insurance company then approves the additional cost of repair.&nbsp;</p><p><strong>Real Talk or Crazy Talk?</strong></p><p>Can you imagine if the insurance company started arguing with the repair shop, asking them—no—telling them that they would only pay the $18,000 and not the additional $20,000 because that was the original estimate? Does that sound ridiculous to you? It does to me, too. Thank heavens, reality does not operate like this.&nbsp;</p><p><strong>Isn't Complex Software Architecture Modernization the same?&nbsp;</strong></p><p>When you are in the process of modernizing legacy software, you are in the realm of complex software. When you look at it from the outside, you see some obvious things, and based on experience and expertise, you come up with an initial estimate. This is the repair shop's original estimate of $18,000</p><p>As you are in the process, you start uncovering additional complexity. This complexity could be similar to some hidden damages the repair shop discovered after un-assembling the parts, or this could be significant frame damage that the repair shop discovered. What do you do? You need additional approvals to proceed at this point.&nbsp;</p><p><strong>Good Leaders Ask the Right Questions</strong></p><p>The right questions are asked if you are in a healthy software development environment when you bubble these problems up. How complex is this problem? What are the different ways of solving this? What are the tradeoffs? Are there workarounds or alternate solutions to this?&nbsp;</p><p>Suppose the questions start leading to how you did not see this complexity, how you missed this, why it is taking so long, and you are beholden to the original estimated dates? May the force be with you and your team to give you the strength to see this through. Hopefully, your modernization journey will be a short and successful one.&nbsp;</p><p><strong>To Proceed or call it a Total Loss?</strong></p><p>I have been involved in both types of modernization projects. Cases where the supplemental cost gets approved, and work proceeds until the next step,&nbsp; rinse and repeat until the project has come to completion. I've also seen total loss, i.e.&nbsp; the project got canned because it was too expensive to proceed, and it would cost more than it was worth. It's not easy deciding this, and there are frameworks and decision workshops to try and choose the direction.&nbsp;</p><p><strong>Is this a complex context or a complicated context?</strong></p><p><span>I urge you to read the excellent article from David J Snowden and Mary E Boone on,</span><a href="https://hbr.org/2007/11/a-leaders-framework-for-decision-making" rel=""> “A Leaders Framework for Decision Making”</a><span>. Using the Cynefin framework, motorcycle maintenance or auto repair might fall under the complicated context. In order to fix the car, the expert technician, after having listened to how the collision happened, also has to analyze and test multiple factors, such as unseen damage, frame damage, etc., to determine the best course of action for the car.&nbsp;</span></p><p>However, in a complex context, you can only decide whether or not it is right or wrong in hindsight, i.e. after you've tried the thing. Does this jive more and more with complex legacy modernization software projects? I.e. you try something and learn that the integration you thought would work doesn’t work or you uncover a completely new behavior you never knew existed and you now have to account for it?&nbsp; </p><p>There is no fixed path when modernizing a complex legacy system. There is no rulebook to follow. You try, experiment, discover, solve, and move on to the next piece until you're done.&nbsp;</p><p><strong>Denial - Anger - Bargaining - Depression - Acceptance??</strong></p><p>When modernizing applications, if we understand that this effort falls somewhere between Complex and Complicated Contexts, we can implement the right sort of gauges to see how to proceed and determine success. Applying the process of estimates for a complex context is wrong. It’s like trying to use a hammer as a solution for every screw or a lug nut!&nbsp;Sometimes you need a screwdriver and sometimes you need a wrench!</p><p>Curveballs in modernization projects are just a reality. You can't foresee every outcome ahead of time. No amount of upfront analysis would lead you to a perfect data model. There will be new learnings almost every step of the way. Data Models will have to change based on the complexity you have uncovered. So it's a matter of when, not if, for curveballs. When a curveball hits and the estimate changes, take a step forward instead of getting angry or blaming folks or trying to do a what-if analysis on how best to bring the schedule in. </p><p><span>When you’re dealing with curveballs, which </span><a href="https://continuousdelivery.com/implementing/culture/" rel="">Ron Westrum’s defined model of culture</a><span> does your organization adopt? Power-Oriented where messengers who inform about the curveballs are shot and failure leads to&nbsp; scapegoated, Rule-Oriented where the messengers who inform about the curveballs are ignored and failure leads to justice or Performance- Oriented where the messengers who inform about the curveballs are trained and failure leads to enquiry?&nbsp;</span></p><p>As long as the problem you're trying to solve is still relevant and still meets the business needs, take it one step at a time. Ultimately the software you are trying to modernize is for users.&nbsp;</p><p><strong>Tip for Leaders Leading Modernization Initiatives</strong></p><p><span>To quote from the same </span><a href="https://hbr.org/2007/11/a-leaders-framework-for-decision-making" rel="">article</a><span>, "Leaders who don't recognize that a complex domain requires a more experimental mode of management may become impatient when they don't seem to be achieving the results they were aiming for. They may also find it difficult to tolerate failure, an essential aspect of experimental understanding. If they try to overcontrol the organization, they will preempt the opportunity for informative patterns to emerge. Leaders who try to impose order in a complex context will fail. Still, those who set the stage, step back a bit, allow patterns to emerge, and determine which ones are desirable will succeed".&nbsp;</span></p><p><strong>A New Hope</strong></p><p>Either way I will be ok, whether the repair company is able to fix my car or the insurance company deems it a total loss. The system works. I wish I could say the same for modernization projects and the awful industry practice about how much ceremony we attribute to estimates, completely forgetting that an estimate means an approximate of the actual. I hope more and more software companies and leadership use the proper framework for measuring success. I hope this leaves you with some ideas on implementing changes or at least questioning the practices if they seem wrong.&nbsp;</p><p><em>"I've wondered why it took us so long to catch on. We saw it, and yet we didn't see it. Or rather we were trained not to see it. Conned perhaps into thinking that the real action was metropolitan and all this was just boring hinterland. It was a puzzling thing. The truth knocks on the door and you say, "Go away. I'm looking for the truth." And so it goes away. Puzzling."</em></p><p><em>― Robert Pirsig</em></p></div></div></div></article></div></div></div>]]>
@@ -4096,7 +4597,7 @@ because these languages weren’t designed with it in the …</p></article></div
             </title>
             <description>
 <![CDATA[
-Score 216 | Comments 49 (<a href="https://news.ycombinator.com/item?id=42185842">thread link</a>) | @wonger_
+Score 217 | Comments 49 (<a href="https://news.ycombinator.com/item?id=42185842">thread link</a>) | @wonger_
 <br/>
 November 19, 2024 | https://chernando.com/blog/2023/07/23/hand-tracking-for-mouse-input.html | <a href="https://web.archive.org/web/*/https://chernando.com/blog/2023/07/23/hand-tracking-for-mouse-input.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div aria-label="Content">
@@ -4397,7 +4898,7 @@ November 19, 2024 | https://likang.dev/posts/google-search-bug/ | <a href="https
             </title>
             <description>
 <![CDATA[
-Score 54 | Comments 81 (<a href="https://news.ycombinator.com/item?id=42183555">thread link</a>) | @lando2319
+Score 55 | Comments 81 (<a href="https://news.ycombinator.com/item?id=42183555">thread link</a>) | @lando2319
 <br/>
 November 19, 2024 | https://www3.nhk.or.jp/news/html/20241119/k10014642881000.html | <a href="https://web.archive.org/web/*/https://www3.nhk.or.jp/news/html/20241119/k10014642881000.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -4640,7 +5141,7 @@ Score 27 | Comments 0 (<a href="https://news.ycombinator.com/item?id=42180516">t
 <br/>
 November 18, 2024 | https://raw.sh/posts/easy_reward_model_inference | <a href="https://web.archive.org/web/*/https://raw.sh/posts/easy_reward_model_inference">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>Reward models have been a key part of reinforcement learning on top of LLMs, used broadly in techniques like RLHF and as LLM-as-a-judge critics in evals. They have also been used in the data preparation phase of preference optimization methods like SimPO, where a reward model was used to create the preference data used to train models like <code>princeton-nlp/gemma-2-9b-it-SimPO</code>.</p>
-<p>I recently had some trouble figuring out how to run high throughput reward model inference. Offline, you can just collect everything you need to score in advance and go through all of your data in batches. But for a lot of use cases, such as for search methods like tree search or MCTS, this is hard to do efficiently. Unfortunately, easy to set up inference servers like vllm and llama.cpp don't support sequence classification models<sup><a href="#user-content-fn-1" id="user-content-fnref-1" data-footnote-ref="true" aria-describedby="footnote-label">1</a></sup> out of the box (yet<sup><a href="#user-content-fn-2" id="user-content-fnref-2" data-footnote-ref="true" aria-describedby="footnote-label">2</a></sup>)</p>
+<p>I recently had some trouble figuring out how to run high throughput reward model inference. Offline, you can just collect everything you need to score in advance and go through all of your data in batches. But for a lot of use cases, such as for search methods like tree search or MCTS, this is hard to do efficiently. Unfortunately, easy to set up inference servers like vLLM and llama.cpp don't support sequence classification<sup><a href="#user-content-fn-1" id="user-content-fnref-1" data-footnote-ref="true" aria-describedby="footnote-label">1</a></sup> / reward models out of the box (yet<sup><a href="#user-content-fn-2" id="user-content-fnref-2" data-footnote-ref="true" aria-describedby="footnote-label">2</a></sup>)</p>
 <h2 id="dynamic-batching-with-batched">Dynamic batching with <code>batched</code></h2>
 <p>Thankfully, Mixedbread has a great generic dynamic batching library that makes it really easy to inference reward models<sup><a href="#user-content-fn-3" id="user-content-fnref-3" data-footnote-ref="true" aria-describedby="footnote-label">3</a></sup>.</p>
 <p>Here's how we can host an endpoint on Modal<sup><a href="#user-content-fn-4" id="user-content-fnref-4" data-footnote-ref="true" aria-describedby="footnote-label">4</a></sup>. First, let's add some helper functions and setup the image:</p>
@@ -5418,7 +5919,7 @@ November 18, 2024 | https://www.christianscheb.de/archives/893 | <a href="https:
             </title>
             <description>
 <![CDATA[
-Score 256 | Comments 372 (<a href="https://news.ycombinator.com/item?id=42175316">thread link</a>) | @abdisalan
+Score 256 | Comments 376 (<a href="https://news.ycombinator.com/item?id=42175316">thread link</a>) | @abdisalan
 <br/>
 November 18, 2024 | https://abdisalan.com/posts/tragedy-running-old-node-project/ | <a href="https://web.archive.org/web/*/https://abdisalan.com/posts/tragedy-running-old-node-project/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p><span>
@@ -5480,7 +5981,7 @@ npm remove_cv_t’ is not a member of ‘std’; did you mean ‘remove_cv’</c
             </title>
             <description>
 <![CDATA[
-Score 38 | Comments 48 (<a href="https://news.ycombinator.com/item?id=42175043">thread link</a>) | @shafyy
+Score 38 | Comments 49 (<a href="https://news.ycombinator.com/item?id=42175043">thread link</a>) | @shafyy
 <br/>
 November 18, 2024 | https://canolcer.com/post/thoughts-on-bluesky/ | <a href="https://web.archive.org/web/*/https://canolcer.com/post/thoughts-on-bluesky/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -5536,7 +6037,7 @@ November 18, 2024 | https://canolcer.com/post/thoughts-on-bluesky/ | <a href="ht
             </title>
             <description>
 <![CDATA[
-Score 293 | Comments 119 (<a href="https://news.ycombinator.com/item?id=42173233">thread link</a>) | @ulrischa
+Score 293 | Comments 120 (<a href="https://news.ycombinator.com/item?id=42173233">thread link</a>) | @ulrischa
 <br/>
 November 18, 2024 | https://www.joshtumath.uk/posts/2024-11-08-how-a-bbc-navigation-bar-component-broke-depending-on-which-external-monitor-it-was-on/ | <a href="https://web.archive.org/web/*/https://www.joshtumath.uk/posts/2024-11-08-how-a-bbc-navigation-bar-component-broke-depending-on-which-external-monitor-it-was-on/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>Recently, my team and I fixed an absolutely bizarre bug that only one person in the team could reproduce. And to make it even weirder, she was only able to reproduce the issue when using her work laptop at home; it worked fine with the same laptop in the office.</p><h2 id="heading-so-what-was-the-bug">So what was the bug?<a href="#heading-so-what-was-the-bug"><span> permalink</span></a></h2><p>The BBC's UK website uses a <code>click</code> event to respond to when a user activates the 'More' button. <code>click</code> events aren't just activated by the click of a mouse; they can also be activated by touch and the 'enter' or 'space' keys on a keyboard.</p><p><img src="https://www.joshtumath.uk/images/2024-11-08-bbc-global-nav.png" alt="Screenshot of BBC global navigation bar opened using the 'more' button." loading="lazy" width="792" height="280"></p><p>Our 'more' button should open a menu. However, when she was clicking on it at home, the <code>click</code> event didn't seem to do anything. Instead, the menu opened using our no-JavaScript fallback behaviour.</p><p><em>That's strange.</em> 💭</p><p>When we looked into it a bit more, we found out that the bug only happened when her web browser window was on one of her external monitors. She had two external monitors and it happened on both. But when she clicked the button on her laptop screen, the button worked as expected.</p><p><em>What?</em> 🤯</p><p>And to make it even stranger, the bug didn't happen in Safari.</p><p><em>What? What? What?</em> 🤯 🤯 🤯</p><p>So why on earth was something like a user's external monitor set up affecting <code>click</code> events on our website? And why was this bug not happening to everyone else in our team who used an external monitor? It was very strange indeed.</p><h2 id="heading-reproducing-the-issue">Reproducing the issue<a href="#heading-reproducing-the-issue"><span> permalink</span></a></h2><p>We wanted to be able to reproduce the bug to properly investigate it, so we needed to understand what it was in her home environment that triggered it.</p><p>Since the bug only occurred on her external monitors, we noticed that it stopped if she repositioned them in the OS settings. Her external monitors were positioned above her laptop, so once we replicated that arrangement in our OS settings, we were finally able to reproduce the bug, too.</p><p><em>Bingo!</em></p><p><img src="https://www.joshtumath.uk/images/2024-11-08-multi-monitor-negative.png" alt="Screenshot of macOS display settings. Second monitor is shown arranged top left of the built-in laptop monitor." loading="lazy" width="1516" height="916"></p><h2 id="heading-our-investigation">Our investigation<a href="#heading-our-investigation"><span> permalink</span></a></h2><p>We had two clues to begin our investigation:</p><ul><li><strong>1st clue:</strong> <mark>The bug didn't occur on Safari</mark>.</li><li><strong>2nd clue:</strong> <mark>The bug only happened when the external monitors were positioned above and left of the main monitor</mark>.</li></ul><p>Our next step was to investigate our 'more' button's <code>click</code> event handler function.</p><p>While reproducing the issue, a <code>console.log</code> of our 'more' button's click event showed our <strong>3rd clue:</strong> that, <mark>on Chrome and Firefox, the <code>screenX</code> and <code>screenY</code> properties were negative numbers</mark>.</p><blockquote><p><strong>Note:</strong><br>Even though they can be triggered by any kind of input, <code>click</code> events are a type of <code>PointerEvent</code>, so their <code>event</code> objects include information about the mouse or touch pointers that trigger the clicks. For example, the <code>screenX</code> and <code>screenY</code> properties show the coordinates (in pixels) for what point on the screen gets clicked on.</p></blockquote><p>That surprised me, because I didn't know those properties were allowed to have negative numbers. I checked the <a href="https://w3c.github.io/uievents/#dom-mouseevent-screenx">DOM UI Events spec</a> to see if that was correct, but there didn't seem to be any specific information about it.</p><p>With some <a href="https://www.youtube.com/watch?v=iwzOhHFGZKw">Ace Attorney Investigations-style logic</a>, when we put together the fact that <mark>the bug didn't occur on Safari</mark> and that, <mark>on Chrome and Firefox, the <code>screenX</code> and <code>screenY</code> properties were negative numbers</mark>, we could deduce that browsers have an interoperability issue in how they represent screen coordinates in multi-monitor set ups.</p><p><img src="https://www.joshtumath.uk/images/2024-11-08-aai-logic.gif" alt="Animation of the logic sequence in Ace Attorney Investigations. The player picks from clues to connect and the game shows if they successfully connected." loading="lazy" width="400" height="225"></p><blockquote><p><strong>Note:</strong><br>I ended up reporting the interoperability issue to the WebKit team on <a href="https://bugs.webkit.org/show_bug.cgi?id=281430">WebKit bug 281430</a>.</p></blockquote><p>That knowledge gave rise to our <strong>4th clue:</strong> <mark>the bug only occurred if <code>screenX</code> and <code>screenY</code> were negative</mark>.</p><p>With some more Ace Attorney Investigations-style deductions, when we combined that with our 2nd clue – that <mark>the bug only happened when the external monitors were positioned above and left of the main monitor</mark> – we could deduce our <strong>5th clue:</strong> <mark>on Chrome and Firefox, the <code>screenX</code> and <code>screenY</code>'s (0,0) coordinate is the top left of the main monitor</mark>.</p><p>On a multi-monitor set up, browsers' screen coordinate systems treat multiple monitors as if it were one big monitor. So two 800px wide monitors positioned horizontally would have <em>x</em> coordinates ranging of 0 to 1600. On Safari, that range is always a positive number starting from the top left most monitor, but it looks like, in Chrome and Firefox, they are relative to the main monitor instead and use negative coordinates.</p><p>We needed to find the <code>click</code> event handler in our code and see how it was reading the <code>screenX</code> and <code>screenY</code> coordinates from the <code>event</code> object.</p><p>This is what we found:</p><pre><code><span><span>const</span> <span>isInvokedByMouse</span> <span>=</span> <span>event</span> <span>=&gt;</span> event<span>.</span>screenX <span>&gt;</span> <span>0</span> <span>||</span> event<span>.</span>screenY <span>&gt;</span> <span>0</span><span>;</span></span><br><span><span>const</span> <span>isInvokedByKeyboard</span> <span>=</span> <span>event</span> <span>=&gt;</span> <span>isEnterKey</span><span>(</span>event<span>)</span> <span>||</span> <span>isSpaceKey</span><span>(</span>event<span>)</span><span>;</span></span><br><span></span><br><span></span><br><span></span><br><span><span>const</span> <span>toggleMenu</span> <span>=</span> <span>event</span> <span>=&gt;</span> <span>{</span></span><br><span>  </span><br><span></span><br><span>  <span>if</span> <span>(</span><span>isInvokedByMouse</span><span>(</span>event<span>)</span> <span>||</span> <span>isInvokedByKeyboard</span><span>(</span>event<span>)</span><span>)</span> <span>{</span></span><br><span>    event<span>.</span><span>preventDefault</span><span>(</span><span>)</span><span>;</span></span><br><span></span><br><span>    </span><br><span>  <span>}</span></span><br><span><span>}</span><span>;</span></span></code></pre><p>The <code>isInvokedByMouse</code> was checking whether the <code>click</code> event was invoked by a mouse or touch pointer – rather than a keyboard – by checking if the <code>screenX</code> or <code>screenY</code> coordinates were a positive number.</p><p>That gave us our <strong>final clue:</strong> <mark>the code assumes <code>click</code> events invoked by pointers have positive <code>screenX</code> and <code>screenY</code> coordinate numbers</mark>.</p><p>When a user clicked the 'more' button on a monitor with negative screen coordinates, the event handler wasn't acknowledging the click and instead falling back to the default behaviour of the 'more' link.</p><p>We could finally finish our investigation. We could deduce from our final two clues the solution: <strong>we need to check for negative numbers as well as positive numbers when checking the <code>screenX</code> and <code>screenY</code> coordinates.</strong></p><h2 id="heading-the-fix">The fix<a href="#heading-the-fix"><span> permalink</span></a></h2><p>As is often the case with bugs, the problem was very complex to figure out, but the solution was very simple.</p><p>All we had to do was change the <code>isInvokedByMouse</code> to check that <code>screenX</code> and <code>screenY</code> don't equal 0, rather than checking if they are greater than 0.</p><pre><code><span><span>const</span> <span>isInvokedByMouse</span> <span>=</span> <span>event</span> <span>=&gt;</span></span><br><span>  event<span>.</span>type <span>===</span> <span>'click'</span> <span>&amp;&amp;</span> <span>(</span>event<span>.</span>screenX <span>!==</span> <span>0</span> <span>||</span> event<span>.</span>screenY <span>!==</span> <span>0</span><span>)</span><span>;</span></span></code></pre><p>Now everyone with weird multi-monitor layouts can enjoy the BBC website's navigation bar in peace.</p><p>The code is still weird, though. We don't need to be checking for whether the <code>click</code> was triggered by a mouse or keyboard. We should probably do further refactoring of the event handler function, since it's complicated by the fact that it also handles <code>keydown</code> events. For now, though, this fix will do just fine.</p><p>It's a good lesson around being careful what assumptions you make around how an API works. Even the UI Events specification wasn't clear on whether there could be negative numbers in <code>screenX</code> and <code>screenY</code>. Though this code was rigorously tested both in unit tests, Puppeteer and with manual testing on various browsers, devices and assistive technology tools, the bug was never spotted.</p><p>So that was fun! Who would have thought web developers could break an experience for users because of which monitor they're viewing the page on?</p><p><strong>Edit on 2024-11-19:</strong> There's been a lot of responses to this blog post, including confusion around why we're checking something unreliable like <code>screenX</code> in the first place. That's understandable because it is, indeed, a bit odd and seems like bad practice. I've now refactored the navigation component and significantly changed the 'menu' button's event handler. <a href="https://www.joshtumath.uk/posts/2024-11-18-how-i-refactored-the-bbc-navigation-bar-and-a-follow-up-faq/">My next blog post explains how it was refactored and answers some common questions people have had.</a></p></div></div>]]>
@@ -5611,29 +6112,7 @@ November 18, 2024 | https://www.cam.ac.uk/stories/roots-of-bird-intelligence | <
 Score 15 | Comments 0 (<a href="https://news.ycombinator.com/item?id=42173174">thread link</a>) | @ulrischa
 <br/>
 November 18, 2024 | https://graysky.app/blog/2024-02-05-adding-blog-comments | <a href="https://web.archive.org/web/*/https://graysky.app/blog/2024-02-05-adding-blog-comments">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
-<p>That might not sound particularly impressive, since I think most people would consider "comments on blogs" to be a Solved Problem. But I decided to go about it in a bit of a different way - <strong>all the comments are fetched directly from Bluesky</strong>. And I think the ease with which I did that goes a long way to demonstrating the power of Bluesky's Open Network, and is possibly worth talking about a little bit.</p>
-<h2 id="bluesky-is-completely-open">Bluesky is completely open</h2>
-<p>When I say "Bluesky is completely open", I really mean it. You don't even need an API key to query the <a href="https://www.docs.bsky.app/docs/advanced-guides/federation-architecture">AppView</a>. Combined with the excellent tooling that Bluesky provides meant that implementating this feature took about hour, from scratch. Granted, I've been working with the API for a while now, but I think that's still pretty impressive.</p>
-<p>Here's the code I used to fetch the comments (slightly simplified for clarity):</p>
-<div data-bright-theme="github-dark"><pre><code><p><span><span data-bright-ln="1">1</span><span>// pass it the URI of the post you want to fetch replies for</span><br></span></p><p><span><span data-bright-ln="2">2</span><span>export const </span><span>CommentSection </span><span>= async</span><span> ({ </span><span>uri</span><span> }</span><span>:</span><span> { </span><span>uri</span><span>: </span><span>string</span><span> }) </span><span>=&gt;</span><span> {</span><br></span></p><p><span><span data-bright-ln="3">3</span><span>  if</span><span> (</span><span>!</span><span>uri) </span><span>return</span><span> &lt;</span><span>p </span><span>className</span><span>=</span><span>"text-center"</span><span>&gt;No comments&lt;/</span><span>p</span><span>&gt;;</span><br></span></p><p><span><span data-bright-ln="4">4</span><span></span><br></span></p><p><span><span data-bright-ln="5">5</span><span>  const </span><span>agent </span><span>= new </span><span>BskyAgent</span><span>({ service: </span><span>"https://public.api.bsky.app"</span><span> });</span><br></span></p><p><span><span data-bright-ln="6">6</span><span>  const </span><span>response </span><span>=</span><span> agent.</span><span>getPostThread</span><span>({ uri });</span><br></span></p><p><span><span data-bright-ln="7">7</span><span></span><br></span></p><p><span><span data-bright-ln="8">8</span><span>  const </span><span>thread </span><span>=</span><span> response.data.thread;</span><br></span></p><p><span><span data-bright-ln="9">9</span><span></span><br></span></p><p><span><span data-bright-ln="10">10</span><span>  if</span><span> (</span><span>!</span><span>AppBskyFeedDefs.</span><span>isThreadViewPost</span><span>(data.thread)) {</span><br></span></p><p><span><span data-bright-ln="11">11</span><span>    return</span><span> &lt;</span><span>p </span><span>className</span><span>=</span><span>"text-center"</span><span>&gt;Could not find thread&lt;/</span><span>p</span><span>&gt;;</span><br></span></p><p><span><span data-bright-ln="12">12</span><span>  }</span><br></span></p><p><span><span data-bright-ln="13">13</span><span></span><br></span></p><p><span><span data-bright-ln="14">14</span><span>  if</span><span> (</span><span>!</span><span>thread.replies </span><span>||</span><span> thread.replies.</span><span>length </span><span>=== </span><span>0</span><span>) {</span><br></span></p><p><span><span data-bright-ln="15">15</span><span>    return</span><span> &lt;</span><span>p </span><span>className</span><span>=</span><span>"text-center"</span><span>&gt;No comments yet&lt;/</span><span>p</span><span>&gt;;</span><br></span></p><p><span><span data-bright-ln="16">16</span><span>  }</span><br></span></p><p><span><span data-bright-ln="17">17</span><span></span><br></span></p><p><span><span data-bright-ln="18">18</span><span>  return</span><span> (</span><br></span></p><p><span><span data-bright-ln="19">19</span><span>    &lt;</span><span>div </span><span>className</span><span>=</span><span>"space-y-8"</span><span>&gt;</span><br></span></p><p><span><span data-bright-ln="20">20</span><span>      {</span><span>thread.replies.</span><span>map</span><span>((</span><span>reply</span><span>) </span><span>=&gt;</span><span> {</span><br></span></p><p><span><span data-bright-ln="21">21</span><span>        // if the reply is blocked/deleted, skip it</span><br></span></p><p><span><span data-bright-ln="22">22</span><span>        if</span><span> (</span><span>!</span><span>AppBskyFeedDefs.</span><span>isThreadViewPost</span><span>(reply)) </span><span>return </span><span>null</span><span>;</span><br></span></p><p><span><span data-bright-ln="23">23</span><span>        return</span><span> &lt;</span><span>Comment </span><span>key</span><span>={</span><span>reply.post.uri</span><span>} </span><span>comment</span><span>={</span><span>reply</span><span>}</span><span> /&gt;;</span><br></span></p><p><span><span data-bright-ln="24">24</span><span>      })</span><span>}</span><br></span></p><p><span><span data-bright-ln="25">25</span><span>    &lt;/</span><span>div</span><span>&gt;</span><br></span></p><p><span><span data-bright-ln="26">26</span><span>  );</span><br></span></p><p><span><span data-bright-ln="27">27</span><span>};</span><br></span></p></code></pre></div>
-<blockquote>
-<p>In the actual implementation, I don't use <code>BskyAgent</code> in favour of using <code>fetch</code> directly, due to Next.js overriding the <code>fetch</code> function, but this version is a bit more readable and typesafe. And it's basically the same under the hood.</p>
-</blockquote>
-<p>Simply make a <code>&lt;Comment /&gt;</code> component that renders a Bluesky post, and you're done! It's really that simple.</p>
-<p>See <a href="https://graysky.app/blog/2023-10-17-getting-started-atproto">my other blog post for a step-by-step guide on how to render a Bluesky post</a>. My blog comments take it one step futher by rendering the replies recursively, to make a threaded comment section.</p>
-<h2 id="what-this-means">What this means</h2>
-<blockquote>
-<p>"The organization is a future adversary"<br>
-- <a href="https://news.ycombinator.com/item?id=35012757">Paul Frazee</a></p>
-</blockquote>
-<p>Bluesky talks a lot about being "Billionaire-proof", and I think the open API is a critical part of that. Due to it's decentralised nature, it's not just open, it's "locked open" - Bluesky (the company) couldn't start locking off access even if they wanted to. This is in harsh contrast to X (formerly Twitter) <a href="https://www.engadget.com/twitter-shut-off-its-free-api-and-its-breaking-a-lot-of-apps-222011637.html">turning off the free API, and making the paid API much more expensive</a>, and Reddit <a href="https://www.theverge.com/2023/6/8/23754183/apollo-reddit-app-shutting-down-api">suddenly charging 3rd party apps like Apollo $20 million a year for it's previously free API</a> (instantly killing the 3rd party ecosystem).</p>
-<p>This is critical to building trust in the platform among the developer community that Bluesky is trying to foster, and I think it's a big part of why Bluesky has <a href="https://atproto.com/community/projects">seen an explosion of community projects</a>. It's also a big part of why I'm so excited to be building on it. I don't have to worry that Bluesky will get bought out and "pull a Reddit" on me, because they literally can't. This matters, whether you want to add a little comment section to your blog, all the way up to building a full-fledged client.</p>
-<p>I think this is also great for non-developers too. I completely stopped using Reddit when they killed Apollo, because the official app is garbage. <em>That's not something you have to worry about with Bluesky</em>, and it goes so much deeper than just the app. Every part of the platform can be swapped out, and that's a really powerful thing. We've watched platform after platform succumb to <a href="https://www.wired.com/story/plaintext-twitter-alternatives-enshittification-trap/">enshittification</a>, and even if Bluesky (the company) follows suit, Bluesky (the community) doesn't have to.</p>
-<p>This little comments section project - sure, it's pretty frivolous, but I <em>love</em> that Bluesky doesn't shy away from creativity. <em>They want you to build cool things with what they've built</em>. I think that's great.</p>
-<p>Overall, I'm really optimistic about the future of Bluesky, and I'm excited to see what else is possible.</p>
-<p>Let me know what you think in the all-new comments!</p>
-<p>- Samuel (<a href="https://bsky.app/profile/mozzius.dev">@mozzius.dev</a>)</p><hr><!--$?--><template id="B:0"></template><!--/$--></div></div>]]>
+<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
             </description>
             <link>https://graysky.app/blog/2024-02-05-adding-blog-comments</link>
             <guid isPermaLink="false">hacker-news-small-sites-42173174</guid>
@@ -5653,6 +6132,941 @@ November 18, 2024 | https://jvernay.fr/en/blog/skyline-2d-packer/implementation/
             <link>https://jvernay.fr/en/blog/skyline-2d-packer/implementation/</link>
             <guid isPermaLink="false">hacker-news-small-sites-42173114</guid>
             <pubDate>Mon, 18 Nov 2024 15:19:05 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[A Second Search for Bash Scripting Alternatives]]>
+            </title>
+            <description>
+<![CDATA[
+Score 20 | Comments 40 (<a href="https://news.ycombinator.com/item?id=42172978">thread link</a>) | @thunderbong
+<br/>
+November 18, 2024 | https://monzool.net/blog/2024/07/14/a-second-search-for-bash-scripting-alternatives/ | <a href="https://web.archive.org/web/*/https://monzool.net/blog/2024/07/14/a-second-search-for-bash-scripting-alternatives/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+
+<p><strong>SHELL SCRIPTING IS</strong> something most programmers will encounter often – especially if doing dev-ops, automation and general Linux work. Unfortunately we are mostly stuck with bash. There surely must be better alternatives…</p>
+<p>I have been in search for a bash replacement <a href="https://monzool.net/blog/2017/07/04/a-search-for-bash-scripting-alternatives/#finalists">before</a>. My conclusions was that I would try out: <a href="https://scsh.net/">scsh</a>, <a href="https://github.com/zserge/luash">luash</a> and <a href="https://mruby.org/">mruby</a>. I’m addressing that experience in Addendum <a href="#addendum-take-1-anchor">Take 1</a>,</p>
+<p>Since my last endeavor into finding a bash alternative, I’ve seen my work-life distance myself more and more from the small embedded devices, and move into higher level domains of JavaScript, Python and C#. In the environments where these run, the restrictions that apply to small embedded devices are not really applicable, and the options for scripting is much more open. Now I find myself back in the embedded world, and thus I figured it was time for another round of looking at bash alternatives. A lot of interesting stuff has happened in the programming language world these last years. That also include the scripting languages, where there seem to be a consensus that we might deserve more modern alternatives.</p>
+<p>This post is available in two places</p>
+<ul>
+<li><p>On the monzool.net <a href="https://monzool.net/blog/2024/07/14/a-second-search-for-bash-scripting-alternatives/">blog</a>, for a pretty viewing.</p></li>
+<li><p>On <a href="https://github.com/monzool/A-Search-for-BASH-Scripting-Alternatives">github</a> where the source code is also available. This post is the <em>Take2</em> part of this series (direct preview link here: <a href="https://github.com/monzool/A-Search-for-BASH-Scripting-Alternatives/blob/master/Take2/Take2.md">preview</a>)</p></li>
+</ul>
+<hr>
+
+<p>In this post I will not sprinkle code examples to exemplify how each and individual language look, feel and have of specialties. Nor will I do a deep dive into each of them. I therefore encourage visiting each individual homepage of each language to make you own opinion.</p>
+<p>What I <strong>will</strong> do, is to actually try out the language, instead of just do assumptions about them. For each language I will implement the same sample, that do the following:</p>
+<ol type="1">
+<li><strong>Change current directory to that of the script</strong>. With bash scripts I sometimes change the current directory, to be the directory of the script. It depends, if this improves the user experience, or makes it worse. When the user have to provide paths as program arguments, is a bad idea. If the script requires to know the location of a lot of external files, is makes thing easier…</li>
+<li><strong>Get program arguments from command-line</strong>. I rarely do fancy stuff with options, but is a feature I use often. Basic support is fine</li>
+<li><strong>Find files and get a list of found files</strong>. Searching for files is paramount – but resorting to plain old <code>find</code> is perfectly fine, if the output is easy to grab.</li>
+<li><strong>Split path, file name and file extension</strong>. This requires string manipulation.</li>
+<li><strong>Group files by extension</strong>. This is best solved with dictionaries.</li>
+<li><strong>Get a random number</strong>. Not an essential feature (the operating system I use, have <em>/dev/urandom</em>)</li>
+<li><strong>Search a file for some text string</strong>. This is probably my bread on butter use-case. It would actually benefit if this could be a call to <code>grep</code> (or <code>rg</code>) as these tools work perfectly for what they do.</li>
+<li><strong>Pretty print in colors</strong>. I am a heavy user of color printing. Its an easy way to bring focus on the essential parts.</li>
+</ol>
+<p>A little introduction to this exercise. I first made a small sample script in bash. It takes to optional arguments. One that points to a directory of files, and another argument to possible disable color output</p>
+<p>This is how the output looks in color</p>
+<figure>
+<img decoding="async" src="https://monzool.net/blog/wp-content/uploads/2024/07/sample_bash.png" alt="bash sample output">
+
+</figure>
+<p>And with color suppression</p>
+<figure>
+<img decoding="async" src="https://monzool.net/blog/wp-content/uploads/2024/07/sample_bash_no_color.png" alt="bash sample output">
+
+</figure>
+<p>The exercise is then to implement the equivalent in the other scripting languages, while <strong>learning the language is I go</strong>. I will be writing my thoughts and findings during the exercise, <strong>including any doubts, misunderstandings and stupid mistakes</strong>. I’m sure many will laugh of my struggles, but I think it will be a good exercise to get some indication on the difficulties learning the language for the average programmer. The eventual struggles I had, would probably also be the struggles of my colleagues. The friction of introducing a new language should be as little as possible.</p>
+<p>Disclaimer: I will critique things here that someone or someones put their heart and soul into. This surely entail a risk that I unintentionally offend your favorite language, or even worse, a language that <strong>you</strong> created. Please be assured that I am not criticizing you personally or your work directly. In fact I am most likely just another idiot on the internet, ranting about stuff that I do not understand 😅. I for sure do not own the abilities to create such exiting stuff, so I salute you for your efforts and work 🙏</p>
+<hr>
+
+<p>I am searching for a scripting language, that</p>
+<ul>
+<li>Have proper arrays and dictionaries</li>
+<li>Have versatile return values</li>
+<li>Do not have “everything is a string” syndrome</li>
+<li>Can call external programs and grab values and exit code from it</li>
+<li>Is low on cruft and boilerplate, but still readable</li>
+<li>Do not use dynamic scoping</li>
+<li>Is production ready</li>
+<li>Is not abandonware</li>
+<li>Is an actual interpreted language, where scripts can be edited on a remote target</li>
+</ul>
+<p>Some of the languages also provide a shell. For the intended purpose, this is not important and bares no positive or negative impact, as long as the language can be used with another shell.</p>
+<p>Documentation and examples weight in hard as a requirement, as otherwise guessing and confusion would entail and make the experience frustrating and unproductive – both for the writer and reviewer/reader.</p>
+<p>Below is a list of languages in the pool for trying out. Each is marked with the following icons to indicate the level of application</p>
+<p>📬 – have an implementation of the sample code<br>
+📫 – attempted sample implementation<br>
+📪 – no sample consdered<br>
+🗑️ – not considered</p>
+<h2>
+Shells
+</h2>
+<ul>
+<li><a href="#bash-anchor">bash</a> 📬</li>
+<li><a href="#elvish-anchor">elvish</a> 📫</li>
+<li><a href="#murex-anchor">murex</a> 📫</li>
+<li><a href="#ion-anchor">ion</a> 📫</li>
+<li><a href="#nushell-anchor">nushell</a> 📬</li>
+</ul>
+<h2>
+Shell scripting languages
+</h2>
+<ul>
+<li><a href="#hush-anchor">hush</a> 📬</li>
+<li><a href="#koi-anchor">koi</a> 📬</li>
+<li><a href="#abs-anchor">abs</a> 📬</li>
+<li><a href="#ysh-anchor">ysh</a> 📬</li>
+</ul>
+<h2>
+Clojures
+</h2>
+<ul>
+<li><a href="#babashka-anchor">Babashka</a> 📪</li>
+<li><a href="#planck-anchor">Planck</a> 📪</li>
+<li><a href="#joker-anchor">Joker</a> 📪</li>
+</ul>
+<h2>
+Lisps
+</h2>
+<ul>
+<li><a href="#fennel-anchor">Fennel</a> 📪</li>
+<li><a href="#janet-anchor">Janet</a> 📬</li>
+</ul>
+<h2>
+Rejected contenders
+</h2>
+<p>There are some really interesting languages out there that unfortunately do not fit within all parameters, regarding being applicable for a small embedded system.</p>
+<ul>
+<li><p><a href="https://elk.strct.net/">elk</a> 🗑️</p>
+<p>This is a tremendously interesting project. It looks very complete, versatile and pretty much check-marking all the <a href="https://elk.strct.net/other/bash-literals.html">boxes</a> . There is just that issue that its a .NET 8 application and requires several hundreds of megabyte in memory and storage. There are some efforts in progress getting NativeAOT to cross-compile to <a href="https://github.com/dotnet/runtime/issues/97729">arm32</a>, but for now I do not consider it a viable contender</p></li>
+<li><p><a href="https://dart.dev/">dart</a> with <a href="https://dcli.onepub.dev/">dlic</a> 🗑️</p>
+<p>dlic looks very interesting, and dart has a rumour of being very approachable. There is unfortunately a relatively high size and memory use if to be used as non-compiled scripts. <a href="https://www.nequalsonelifestyle.com/2021/12/13/dart-minimum-file-mem-and-run-time/">Hank G</a> have some interesting measurements indicating up to 100 MB of memory usage for the runtime. If abandoning script interpretation and settle for complied programs, the resource usage can approach about a tenth of that.</p></li>
+<li><p><a href="https://gleam.run/">gleam</a> or <a href="https://elixir-lang.org/">elixir</a> on <a href="https://www.atomvm.net/">AtomVM</a> 🗑️</p>
+<p>I’ve been making a few small projects in gleam. Its a interesting language and a very well driven project overall. The BEAM ecosystem is probably a bit on the bigger side. There is the AtomVM alternative, but it is unclear if gleam or elixir is able to run on that. Both are compiled languages, so they don’t really fit the agenda anyway.<br>
+(P.S. consider doing like me, and <a href="https://github.com/sponsors/lpil">sponsor</a> the amazing gleam project).</p></li>
+<li><p><a href="https://github.com/sekiguchi-nagisa/arsh">arsh</a> 🗑️</p>
+<p><a href="https://github.com/sekiguchi-nagisa/arsh/blob/master/sample/todo.ds">Appears</a> to be bash with types? The documentation is sadly pretty much non-existing.</p></li>
+</ul>
+<h2>
+Future contenders
+</h2>
+<p>For sure I have not depleted the realm of bash alternatives, so I am going to survey additional languages, either in this post or another. The addendum <a href="https://monzool.net/blog/2024/07/14/a-second-search-for-bash-scripting-alternatives/addendum-future-candidates">Future candidates</a> has more details.</p>
+<hr>
+
+
+<h2>
+Sample
+</h2>
+<p>The sample task is obvious to solve with a dictionary, where the key is the extension, and the values are a list of files that have that extension. Bash do have associative arrays, but do not support arrays of arrays. This puts on some limitations on how to construct the solution.</p>
+<p>For each key (file extension) I serialize the list of files associated to that extension.</p>
+<pre><code>file_list["${extension}"]+=$'\n'"${filename}"</code></pre>
+<p>When printing, I then deserialize to get the filenames back in entity form.</p>
+<pre><code>deserialize_array() {
+    local serialized="${1}"
+    IFS=$'\n' read -r -d '' -a file_category &lt;&lt;&lt; "${serialized}" || :
+}</code></pre>
+<p>The implemented solution actually have a limitation, in that it does not support filenames with newlines, as <code>\n</code> is used as serializing separator (I did attempt to use <code>\0</code> as that is not a valid character in filenames, but I could not get that to work).</p>
+<p>For getting the file list, I’ve resorted to just use <code>find</code>. Now, bash could glob the files</p>
+<pre><code>for file in "${dir}"/**; do
+    if [[ ! -f "${file}" ]]; then
+        continue
+    fi
+    file_list+=( "${file}" )
+done</code></pre>
+<p>but for this to work, then you need to remember to poke the shell options <code>shopt -p globstar</code> – and possibly remember to restore them again…. it gets complicated.</p>
+<p>The sharp observer will notice that the <code>IFS</code> is temporarily poked for find files.</p>
+<pre><code>while IFS= read -r -d '' file; do
+    file_list_all+=("${file}")
+done &lt; &lt;(find "${dir}" -type f -print0)</code></pre>
+<p>Its a common technique prevent word splitting and pathname expansion… <code>IFS</code> is complicated</p>
+<h2>
+Parsing program arguments
+</h2>
+<p>Bash have <a href="https://man7.org/linux/man-pages/man1/getopts.1p.html"><code>getopts</code></a> builtin for parsing program argument. There is also <a href="https://www.man7.org/linux/man-pages/man1/getopt.1.html">getpopt</a> for some additional features. I rarely use ’em. They both kinda suck, are both complicated and I can never remember how they work. A simple loop of case matching, is far sufficient for most of my situations</p>
+<pre><code>while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --list-dir)
+            option_list_dir="${2}"
+            shift 2
+            ;;</code></pre>
+<h2>
+Passing arguments to functions
+</h2>
+<p>Passing arguments to bash functions are kind of old school. There are no parameter list, instead arguments are passed in to be referenced by a numeric index variable. First argument is <code>${1}</code>, second argument is <code>${2}</code> and so on. I’m used to it, but its kind of odd, come to think of it. There are various gotcha’s when having values with spaces, but otherwise it works as expected… Except for associative arrays – then it gets complicated. Therefor I resorted to pass them as references</p>
+<pre><code>present_results() {
+    declare -n extension_count_ref="${2}"
+    declare -n file_list_ref="${3}"</code></pre>
+<p>It might come as a surprise that bash supports this kind of indirection, but bash is fully dynamic and quite powerful in that domain; but yeah, it gets complicated pretty fast. The terse syntax also does not make it easier to read later on 😅</p>
+<h2>
+Returning values from functions
+</h2>
+<p>Why even mention such a trivial matter as returning values from? Well in bash its… limited. We either return integer values or echo strings. Using <code>echo</code> to return strings, makes other printing complicated which, among other things, can make debugging hard. The basic string return, do let you set your own rules when in a script. It is for example possible to fake tuple like return values</p>
+<pre><code>get_tuple() {
+    echo "Year|2024"
+}
+
+IFS='|' read -r message value &lt;&lt;&lt; "$(get_tuple)"</code></pre>
+<p>But using such tricks, quite quickly make things get… complicated. Being bash there’s lots of hacks to return other ways, but most have some footgun or another… it gets complicated.</p>
+<p>I do use the above mentioned trick sometimes, but over time I’ve mostly settled on a simpler principle: return zero or non-zero if to indicate success or fail, and if returning a value, put it in a global variable. This might sound chocking, but in practice it works quite fine.</p>
+<pre><code>return_value=
+get_return_value() {
+    return_value="magic"
+}</code></pre>
+<p>It do have its limitation in some corner cases (its a global variable after all), but its not much worse that bash’s dynamic scoping anyway. What it certainly does is reducing complexity instead of loops and tricks and hacks to simulate proper return values. One key principal to limit the “pollution” of global variables, is then to never use the variable directly, except as arguments to other functions</p>
+<pre><code>use_return_value() {
+    local value="${1}"
+    echo "${value}"
+}
+
+use_return_value "${return_value}"</code></pre>
+<p>Theres a “How I Learned to <em>Stop</em> Worrying and Love the <em>global return value</em>” blog post material lingering there. I’ll probably never get there, so just keep calm and carry on 🫡</p>
+<p>On an interesting note, then its possible to simulate named parameters in bash. However, I can testify its a submachine gun of a footgun, so I never do that anymore 😄 Speaking of footguns…</p>
+<h3 id="footguns">Footguns</h3>
+<p>What does this snippet print?</p>
+<pre><code>get() {
+    return false
+}
+get &amp;&amp; echo success || echo fail</code></pre>
+<blockquote>
+<p>return: false: numeric argument required</p>
+</blockquote>
+<p>Below is how it is actually supposed to be:</p>
+<pre><code>get() {
+    false
+}
+get &amp;&amp; echo success || echo fail</code></pre>
+<p>That’s just one footgun that I got hit by in the sample script.</p>
+<p>In an early incarnation of the sample script, this was how the line to increment the extension count looked like</p>
+<pre><code>(( extension_count["${extension}"]++ ))</code></pre>
+<p>At first glance this seems fine, but in fact it is not. It can be very puzzling, as the script will exit on that line. No error, just exit.</p>
+<p>Inspecting the exit code, gives some indication</p>
+<pre><code>❱ echo $?
+1</code></pre>
+<p>What happens is that lookup returns 0, then incrementing causes the overall expression to return non-zero, which then triggers <code>errexit</code> 🤦‍♀️</p>
+<p>Lets just bypass <code>errexit</code> and override the non-zero with a NOP</p>
+<pre><code>(( extension_count["${extension}"]++ )) || :</code></pre>
+<p>Similar issue is the reason why the deserializer looks like this</p>
+<pre><code>deserialize_array() {
+    local serialized="${1}"
+    IFS=$'\n' read -r -d '' -a deserialized &lt;&lt;&lt; "${serialized}" || :
+}</code></pre>
+<p>In this configuration, <code>read</code> returns non-zero on EOF – which we will inevitable reach</p>
+<p>The unofficial bash “safe” mode is not without its issues ❗</p>
+
+
+<p><a href="https://elv.sh/">elvish</a></p>
+<h2>
+tl;dr
+</h2>
+<p>Elvish is an amazing effort that just continues to improve, commit after commit, year after year. Unfortunately I decided to cut the sample short before completing it. I would have loved to say the documentation was awesome, but I spent way too much time on every single thing that I wanted to do.</p>
+<p>vscode plugin: https://marketplace.visualstudio.com/items?itemName=elves.elvish</p>
+<p>Shell: ✅<br>
+Approachable for a bash’er: ⭐☆☆☆☆<br>
+Enjoyment: ⭐☆☆☆☆</p>
+<h2>
+Returning values from functions
+</h2>
+<p>I browsed the entire <a href="https://elv.sh/learn/">learn</a>section with no hint of how to return something from a function. I had to visit the reference to find an <a href="https://elv.sh/ref/language.html#function">example</a> that used <code>echo</code> to return a string.</p>
+<p>In fact, the first thing that looks like a function was <a href="https://elv.sh/learn/scripting-case-studies.html#update-servers-in-parallel.elv">this</a> example:</p>
+<pre><code>var hosts = [[&amp;name=a &amp;cmd='apt update']
+             [&amp;name=b &amp;cmd='pacman -Syu']]
+peach {|h| ssh root@$h[name] $h[cmd] } $hosts</code></pre>
+<p>The explanation was clear enough, so rolled my own edition</p>
+<pre><code>say {|message| put $message} "Hello, world!"</code></pre>
+<p>But got this back</p>
+<pre><code>Exception: exec: "say": executable file not found in $PATH</code></pre>
+<p>Oh. Not a function definition, but instead a command. Lots of reading later I was able to put this together</p>
+<pre><code>fn say {|message| put $message }
+say "Hello, world!"
+▶ 'Hello, world!'</code></pre>
+<p>As mentioned, a frustrating lot of reading was then required to figure out, how to make a function return stuff. Eventually I tumbled upon a tiny example that used <code>put</code> to return a value. It might be that I had some preconceived ideas on things, but I didn’t expect elvish to rely on capturing printed stuff as return values.</p>
+<p>Finding the <code>put</code> documentation was not easy, but eventually I found a mention <a href="https://elv.sh/learn/tour.html#value-output">here</a>.</p>
+<table>
+<colgroup>
+<col>
+<col>
+</colgroup>
+<thead>
+<tr>
+<th>Command</th>
+<th>Functionality</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="https://elv.sh/ref/builtin.html#put"><code>put</code></a></td>
+<td>Writes arguments as value outputs</td>
+</tr>
+</tbody>
+</table>
+<p>which then lead to the <a href="https://elv.sh/ref/builtin.html#put">actual documentation</a></p>
+<p><code>put</code> – <em>Takes arbitrary arguments and write them to the structured stdout.</em></p>
+<p>Interesting with the <em>structured stdout</em>, because <code>printf</code> outputs to something else</p>
+<p><code>printf</code> – <em>Prints values to the byte stream according to a template.</em></p>
+<p>So from deduction, I could reason that elvish in fact use <code>put</code> for returning values from functions, but have different “channels” of returning them 🤔</p>
+<p>After quite some searching, I found an <a href="https://elv.sh/learn/effective-elvish.html#returning-values-with-structured-output">example</a> of how to capture the return values. It appears to work, and even for lists</p>
+<pre><code>fn get-url {
+    put ["monzool" "." "net"]
+}
+
+var url = (get-url)
+echo $url
+
+▶ [monzool . net]</code></pre>
+<p>That naturally made me curious. What if you have more that one <code>put</code> or <code>printf</code>?</p>
+<pre><code>fn get-url {
+    printf "Debug: calling get-url"
+    put ["monzool" "." "net"]
+}
+
+var url = (get-url)</code></pre>
+<p>This gives a compile error:</p>
+<pre><code>Exception: arity mismatch: assignment right-hand-side must be 1 value, but is 2 values</code></pre>
+<p>Sweet 🏆</p>
+<p>I then tested <code>echo</code>, <code>printf</code> and <code>put</code>. None print directly to stdout, but are all captured, with <strong>the compiler forcing a receiving variable for all</strong>.</p>
+<p><em>sample.elv</em></p>
+<pre><code>fn get-values {
+    echo "first"
+    printf "second"
+    put "third"
+}
+
+var first second third = (get-values)
+printf "first = %s\n" $first
+printf "second = %s\n" $second
+printf "third = %s\n" $third</code></pre>
+<p>The above sample lead to much confusion. On first run I thought I had the order wrong.</p>
+<pre><code>❱ ./sample.elv
+first = third
+second = second
+third = first</code></pre>
+<p>Running it a few more times showed that, that was not the issue. Its arbitrary which variable receives which value from the function</p>
+<pre><code>❱ ./sample.elv
+first = first
+second = second
+third = third</code></pre>
+<pre><code>❱ ./sample.elv
+first = second
+second = third
+third = first</code></pre>
+<p>First thought was that tings were running in parallel, but it’s actually is a documented <a href="https://elv.sh/ref/language.html#output-capture">“feature”</a></p>
+<p><em>If the chunk outputs both values and bytes, the values of output capture will contain both value outputs and lines. However, the ordering between value output and byte output might not agree with the order in which they happened</em></p>
+<p>Sure enough, switching to same print function, make the return values predictable</p>
+<pre><code>fn get-values {
+    put "first"
+    put "second"
+    put "third"
+}</code></pre>
+<p>Interesting footgun 🧨</p>
+<p>I sort of got fatigued here. At first glance, the documentation looks very elaborate, but I found it very very difficult to get started with just the basic things. I even (desperately) tried to find some inspiration in sample code or unit-tests in the elvish repo. The few things I found was primarily in the implementation language Go.</p>
+<h2>
+Error handling
+</h2>
+<p>The thing that turns me interest away from elvish, is its use of <a href="https://elv.sh/learn/tour.html#exceptions">exceptions</a></p>
+<p><em>[snip] non-zero exits from external commands are also turned into exceptions:</em></p>
+<p>IMO exceptions should be for the <em>exceptional</em> case. An external command returning non-zero is not an exceptional case – it might not even be an error situation</p>
+<pre><code>grep ERROR run_with_no_error.log</code></pre>
+<p>I suspect I’ll be required to add a lot of <code>try/catch</code> in most scripts then. One might argue that this is much like when setting <code>set -e</code> in bash. That flag will cause script termination of first non-zero exit code. It also requires using a lot of tricks <code>false || :</code> to circumvent for a line – but that is also not what it is intended for. The flag is more a special operation mode, where only success is expected, and failure should stop all processing immediately.</p>
+<p>A situation like “command not found” would probably be a situation I could live with, being an exception. Instead of general exception use, I would have preferred a result type, that I would then have to inspect if I cared about the exit code. Alternatively, do like <a href="#murex-error-handling-anchor">murex</a> and make it up to the user if an exit code or an exception is desired</p>
+
+
+<p><a href="https://murex.rocks/">murex</a></p>
+<h2>
+tl;dr
+</h2>
+<p>I stopped the murex sample short. I ended up spending way to much time getting no where. The documentation do have some minimal usage examples for most components, but I found it difficult to figure out how to combine the individual pieces. The <a href="#nushell-anchor">nushell</a> which shares much spirit with murex, have better examples that made that language more approachable</p>
+<p>Shell: ✅<br>
+Approachable for a bash’er: ⭐☆☆☆☆<br>
+Enjoyment: ⭐☆☆☆☆</p>
+<h2>
+Special features
+</h2>
+<p>Murex has an pretty neat features backed in. One is <a href="https://murex.rocks/events/">events</a>. This allows to do stuff on e.g.&nbsp;file system changes</p>
+<pre><code>event onFileSystemChange example=. {
+    -&gt; set event
+    if { $event.Interrupt.Operation =~ "create" } then {
+        git add $event.Interrupt.Path
+    }
+}</code></pre>
+<p>(source: https://murex.rocks/events/onfilesystemchange.html)</p>
+<p>It also have baked-in <a href="https://murex.rocks/commands/test.html">unit-testing</a>, <a href="https://murex.rocks/commands/pretty.html">pretty</a> json printing, <a href="https://murex.rocks/commands/struct-keys.html">parsing</a> of json, yaml and toml, and many other nice features Sadly it also have some complications build in. The description of <a href="https://murex.rocks/commands/runmode.html">runmode</a> looks like an advanced topic. Hoping its for special corner cases</p>
+<h2>
+Error handling
+</h2>
+<p>Error handling in murex is dual paradigm. You either choose to get success/fail, or you opt in to get an exception on failure. This is a brilliant idea, and makes so much sense.</p>
+<p>For most situations you really on care if a specific command succeeds or not</p>
+<pre><code>if { code-block } then {
+    # true
+} else {
+    # false
+}</code></pre>
+<p>(source: https://murex.rocks/commands/if.html)</p>
+<p>If you care about the exit-code, murex have a similar concepts as bash, by providing an <a href="https://murex.rocks/commands/exitnum.html">exitnum</a> variable.</p>
+<p>Other times, you just need to run a batch of commands, and if any of them fails, then just bail.</p>
+<pre><code>try {
+    out "Hello, World!" -&gt; grep: "non-existent string"
+    out "This command will be ignored"
+}
+catch {
+    out "An error was caught"
+}</code></pre>
+<p>(<em>source: https://murex.rocks/commands/catch.html</em>)</p>
+<h2>
+Command names
+</h2>
+<p>Question. What does this do?</p>
+<pre><code>if { g /dev/null } then {
+    out "true"
+}</code></pre>
+<p>Apparently <a href="https://murex.rocks/commands/g.html"><code>g</code></a> is a globbing command. The above example check if the file exists. What could the <a href="https://murex.rocks/commands/f.html"><code>f</code></a> command do? That would be the file object filter function. Other examples are <a href="https://murex.rocks/commands/ja.html"><code>ja</code></a>, <a href="https://murex.rocks/commands/ta.html"><code>ta</code></a> <a href="https://murex.rocks/commands/pt.html"><code>pt</code></a> and <a href="https://murex.rocks/commands/mtac.html"><code>mtac</code></a>… I guess when you know them, the brevity is nice. It also follow the old-hat unix tradition of short abbreviated names, but I am a little worried that too many abbreviation makes writable code, not <em>readable</em> code</p>
+<h2>
+Returning values from functions
+</h2>
+<p>Just like with the elvish documentation, it is frustratingly difficult to find any documentation on how to return values from a function. There is a tiny indirect example, in the <a href="https://murex.rocks/commands/return.html#examples"><code>return</code></a> documentation, which empathizes on <code>exitnum</code>… What I deduced is that murex also uses stdout for returning data from functions. I then looked at the <a href="https://murex.rocks/commands/out.html"><code>out</code></a> documentation, which then suggests using <a href="https://murex.rocks/commands/tout.html"><code>tout</code></a>, <a href="https://murex.rocks/commands/cast.html"><code>cast</code></a> and <a href="https://murex.rocks/commands/format.html"><code>format</code></a> for data-type return vales. All examples shows json or yaml as return structures. So if wanting something other that text returns, one has to use json, yaml or toml? Some digging around, I later found a data-type <a href="https://murex.rocks/types/">reference</a>. It contains a list of builtin datatypes like bool, int, string, the mentioned structured data and more. The murex repo, actually have some <a href="https://github.com/lmorg/murex/blob/master/examples">examples</a>. Unfortunately none of the examples showed how to use a function… but at least they showed that murex files are suffixed with a ‘.mx’ type name 🙃. Eventually I found an example in the <a href="https://murex.rocks/user-guide/code-block.html">code block parsing</a> section… although that did not show how to pick up the return value</p>
+<h2>
+Sample
+</h2>
+<h3 id="listing-files">Listing files</h3>
+<p>I found no immediate candidates for file listing tools like <code>find</code>. Instead murex provide a globbing tool to do <a href="https://murex.rocks/tour.html#filesystem-wildcards-globbing">filesystem wildcards</a>. I found an example in the rosetta stone <a href="https://murex.rocks/user-guide/rosetta-stone.html#common-one-liners">page</a>.</p>
+<pre><code>❱ f +d | foreach $dir { out $i }</code></pre>
+<pre><code>Error in `out` (1,14): variable 'i' does not exist
+                     &gt; Expression: out $i
+                     &gt;           :      ^
+                     &gt; Character : 5
+Error in `out` (1,14): variable 'i' does not exist
+                     &gt; Expression: out $i
+                     &gt;           :      ^
+                     &gt; Character : 5
+Error in `out` (1,14): variable 'i' does not exist
+                     &gt; Expression: out $i
+                     &gt;           :      ^
+                     &gt; Character : 5</code></pre>
+<p>Well, it sure is eager to tell you where you went wrong 😅😅😅 But the error message is actually quite informative, so it was easy to fix the official example</p>
+<pre><code>f +d | foreach $dir { out $dir }
+.git
+test</code></pre>
+<p>Where <a href="https://murex.rocks/commands/f.html"><code>f</code></a> is filtering, <a href="https://murex.rocks/commands/g.html"><code>g</code></a> is for doing the globbing, but it appears that there is no way to recursively list all sub-directories?</p>
+<pre><code>❱ g test/**
+[
+    "test/ untrimmed .doc",
+    "test/A filename with spaces.doc",
+    "test/monzool.net",
+    "test/subdir",
+    "test/ᛗᛟᚾᛉᛟᛟᛚ.net",
+    "test/🄼🄾🄽🅉🄾🄾🄻.net"
+]
+
+❱ g test/**/*
+[
+    "test/subdir/1.dat",
+    "test/subdir/2.dat",
+    "test/subdir/3.dat"
+]</code></pre>
+<p>I guess its possible to build a command from the building blocks provided, but using the external <code>find</code> command is quite fine</p>
+<h3 id="function-arguments">Function arguments</h3>
+<p>One would think calling a function with some arguments would be simple. None the less, then I can’t make it work. The <a href="https://murex.rocks/commands/function.html"><code>function</code></a> documentation has <strong>zero</strong> examples of how to do this</p>
+<p>Objective: call this function with a path</p>
+<pre><code>function get_file_list (dir: path) {
+    file_list = ${ find $dir -type f }
+    out $file_list
+}</code></pre>
+<p>Like bash?</p>
+<pre><code>get_file_list "test"</code></pre>
+<p>No ❌</p>
+<pre><code>unexpected closing bracket '}'
+Expression: }  get_file_list "test"
+          :  ^
+Character : 1
+Error in `./sample.mx` (0,1): exit status 1</code></pre>
+<p>Use parentheses?</p>
+<pre><code>get_file_list ("test")</code></pre>
+<p>No ❌ (<a href="https://murex.rocks/parser/single-quote.html">single quoting</a> gave same result)</p>
+<pre><code>find: "test": No such file or directory
+Error in `find` (./sample.mx 1,102):
+      Command: find $dir -type f 
+      Error: exit status 1</code></pre>
+<p>Placing the value in a variable before calling?</p>
+<pre><code>set list_dir = 'test'
+get_file_list ($list_dir)</code></pre>
+<p>Yes 😐</p>
+<p>Calling with no space between function and argument? …</p>
+<pre><code>get_file_list('test')</code></pre>
+<p>Yes</p>
+<figure>
+<img decoding="async" src="https://monzool.net/blog/wp-content/uploads/2024/07/Jackie-Chan-WTF.jpg" alt="Jackie-Chan-WTF">
+
+</figure>
+<h3 id="split-a-filename">Split a filename</h3>
+<p>I need to split the file extension and name from a file path. In great frustration I can cannot locate any documentation on how to split a string, do substrings, match on things or anything that sounds remotely like something I need.</p>
+<p>Could not find a native way to do the splitting, so resorted to use <code>sed</code></p>
+<h3 id="data-types">Data types</h3>
+<p>How do I create a a variable of a type? I first went to <a href="https://murex.rocks/types/">Data Types</a> section, but that instead appears to be <a href="https://murex.rocks/types/#definitions">describing</a> types that murex can use to interchange data between functions? Okay, found <em>some</em> enlightenment in the section of <a href="https://murex.rocks/parser/">Operators and Tokens</a>. That section lists these options:</p>
+<ul>
+<li><a href="https://murex.rocks/parser/create-array.html">%[] Create Array</a>: Quickly generate arrays</li>
+<li><a href="https://murex.rocks/parser/create-object.html"><code>%{}</code> Create Map</a>: Quickly generate objects and maps</li>
+</ul>
+<p>(are there slow editions of these then? 😅)</p>
+<h3 id="maps">Maps</h3>
+<p>I cannot figure out how to add to a map. There are documented examples where a map magically has manifested and <strong>then</strong> you do <a href="https://murex.rocks/tour.html#using-foreach-loops"><code>formap</code></a> on the data in it – but how do you add to an existing map?</p>
+<p>Lets create a map <code>m</code></p>
+<pre><code>❱ m = %{ "net": ["a", "b"]}</code></pre>
+<p>Use a key and value to add an entry</p>
+<pre><code>❱ m["txt"] = ["c"]</code></pre>
+<p>No ❌</p>
+<pre><code>unexpected symbol '[' (91)
+Expression: m1["txt"] = ["c"]
+          :   ^
+Character : 2</code></pre>
+<p><a href="https://murex.rocks/commands/append.html"><code>append</code></a> is only for arrays, but lets try</p>
+<pre><code>❱ $m | append %{ "txt" : ["c"]}</code></pre>
+<p>No ❌</p>
+<pre><code>[
+    "{\"net\":[\"a\",\"b\"]}",
+    "{\"txt\":[\"c\"]}"
+]</code></pre>
+<p>Using <a href="https://murex.rocks/commands/map.html"><code>map</code></a> gives me some kind of mutant result 🧌</p>
+<pre><code>❱ map { $m1 } { %{ "txt": ["c"] } }</code></pre>
+<p>No ❌</p>
+<pre><code>{
+    "net: [\"a\",\"b\"]": "txt: [\"c\"]"
+}</code></pre>
+<p>Oh well. I decided to throw in the towel here, and abandon the murex sample 🤷‍♀️</p>
+
+
+<p><a href="https://hush-shell.github.io/">hush</a></p>
+<h2>
+tl;dr
+</h2>
+<p>Using hush was an absolute pleasure. The language is simple, but I consider that a good thing. It does everything that is needed for scripting. There is perhaps a few lacking features in the standard library, but overall it gets the job done. A stellar feature of hush is command blocks, which allow to run shell commands with capturing output and errors</p>
+<p>Documentation is great with complete and precise examples. I had no real issues or frustrations, implementing the sample in hush. Interestingly the bash and hush samples are almost identical, the Hush edition just had much less friction</p>
+<p>vscode: https://marketplace.visualstudio.com/items?itemName=hush-vscode.hush</p>
+<p>Approachable for a bash’er: ⭐⭐⭐⭐⭐<br>
+Enjoyment: ⭐⭐⭐⭐☆</p>
+<h2>
+About hush
+</h2>
+<p>Sadly hush appears to be borderline abandonware</p>
+<pre><code>❱ git log --date=format:'%Y' --pretty=format:'%ad' | sort | uniq -c | awk '{print $2 ": " $1}'
+2020: 4
+2021: 211
+2022: 75
+2023: 6
+2024: 3</code></pre>
+<h2>
+Installation
+</h2>
+<p>I installed from cargo <code>cargo install hush</code>, but when parsing arguments using regex I was blocked on this error</p>
+<pre><code>error: "invalid regex" ("regex parse error:\n    --(\\w+)=?(\\w+)?\n       ^^\nerror: Unicode-aware Perl class not found (make sure the unicode-perl feature is enabled)")</code></pre>
+<p>That matches an <a href="https://github.com/hush-shell/hush/issues/38">issue</a> on the hush issue tracker, with a <a href="https://github.com/hush-shell/hush/pull/39">fix</a> merged in May 2023. I then looked at the <a href="https://crates.io/crates/hush">crate</a> and it was last updated in May 14th of 2022. So I cloned the source and build and installed with cargo.</p>
+<p>The regex now worked; however, now all my <code>std.print</code> would no longer end with printing a newline, making everything print on one long line. The documentation on the <a href="https://hush-shell.github.io/std.html">standard library</a> did not mention <code>std.println</code>… but it worked. That <a href="https://github.com/hush-shell/hush/issues/22">feature</a> was added May 24th of 2022. I got a bit curious here, on how much had changed in the last two years. In the <em>issues closed</em> section there is only a limited amount of stuff added. Primarily <code>std.println</code> and <code>elseif</code>. In the <em>open issues</em> section there was not a whole lot either. There was this thing though: hush [cannot do filesystem queries] yet. Reported in May 2022, is that hush lacks features like checking if a file exist, if a file is a directory etc.</p>
+<p>From the issue responses its clear that the author do not have time to maintain the project – but its not abandonware. Just recently, a <a href="https://github.com/hush-shell/hush/pull/48">pull request</a> was merged. Anyway, the missing file operations is not a deal breaker. Hush have <a href="https://github.com/hush-shell/hush/issues/20"><em>command blocks</em></a> where we can execute shell code.</p>
+<h2>
+Conditions
+</h2>
+<p>As far as I understand, hush only accepts single bool expressions as conditions. This means that this is not possible</p>
+<pre><code>if value == 1 or value == 42 then</code></pre>
+<p>This could a bit lacking if comparing range values, but for most cases this is an okay limitation.</p>
+<h2>
+Command blocks
+</h2>
+<p>I mentioned that hush do not have any file I/O built-in, but <a href="https://hush-shell.github.io/cmd/basic.html">command blocks</a> can be used as a fallback. The ability to just “switch” a section to shell scripting is incredible flexible. Got that magic bash one-liner that generates rainbows 🌈 and unicorns 🦄? Just put it in a command block and enjoy</p>
+<pre><code>function get_file_list(dir)
+    let file_list = ${
+        find "${dir}" -type f -print0
+    }.stdout
+
+    return std.split(file_list, "\0")
+end</code></pre>
+<p>If did found one thing I could not get to work with command blocks, and that was to access program arguments. Hush will crash if trying to access any bash <code>$</code> variables. I discovered this, when having failed to find a native way to get the script directory.</p>
+<pre><code>let script_dir = { dirname "$0" }
+std.cd(script_dir)</code></pre>
+<p>This crashes hush with a rust error. I find it not to be an unreasonable limitation. Other convenient bash features like arithmetic expansion <code>$(( expression ))</code> is not supported either in command blocks.</p>
+<h2>
+Dictionaries
+</h2>
+<p>Dictionaries access is a bit inconsistent on the keys. Initialization do not accept string type as keys, so any key with space or dash is not possible</p>
+<pre><code>let dict = @[
+    "key 1": nil,
+    "key-2": nil
+]</code></pre>
+<p>Both key/value pairs above give compile errors.</p>
+<pre><code>Error: (line 9, column 4) - unexpected '"key 1"', expected identifier
+Error: (line 10, column 4) - unexpected '"key-2"', expected identifier</code></pre>
+<p>However assign and access is possible with both spaces and dashes</p>
+<pre><code>dict["key 1"] = "space"
+dict["key-2"] = "dash"</code></pre>
+<p>Speaking of dictionaries, how do you remove an entry from it? Don’t think its possible. Setting as <code>nil</code> value is only option, as far as I could find.</p>
+<h2>
+Program arguments
+</h2>
+<p>Hush can give you a list of arguments with <code>std.args</code>, but otherwise it offers no argument parsing features. I then set in motion to do a generic argument parser with validation and value extraction. It was fun and hush was quite capable. Then it dawned on me, that this was a false approach. If hush have had a parsing library, I would have used that, but I didn’t implement an argument parser in bash, so I shouldn’t do that in any of the other languages. That would also make them look unfair larger that the bash edition. When I scrapped the parser, I found that handling only the specific arguments, made the hush code look very similar to the original bash code.</p>
+<h2>
+Printing
+</h2>
+<p>Color printing using ansi codes did not work. I could not get <code>std.print</code> to handle escape sequences for setting colors, so I had to fallback to command blocks to make this work. That lead to another issue. Mixing the native <code>std.print</code> and <code>echo</code>/<code>printf</code> in command blocks do not work well together, due to output stream flushing issues. That is perhaps not unexpected.</p>
+<h2>
+Error handling
+</h2>
+<p>Printing dictionaries gives a pretty good idea on what is in it, however when printing an error, it will give output like this</p>
+<pre><code>error: "command returned non-zero" (@[ "stderr": "", "stdout": "", "error": @[ "pos": "\u{1b}[38;5;2m./sample.hsh\u{1b}[39m (line 109, column 8)", "status": 1 ] ])</code></pre>
+<p>There are actually two hidden keys in the dictionary. The value <em>“command returned non-zero”</em> , which is a textual message of the error, is in a key <code>description</code>. The rest of the printed content is in a key <code>context</code></p>
+<pre><code>if (std.has_error(search_result)) then
+    std.println("Description: " ++ search_result.description)
+    std.println("Status: " ++ std.to_string(search_result.context.error.status)))</code></pre>
+<p>It is <a href="https://hush-shell.github.io/cmd/basic.html#errors">documented</a>, just not very obvious</p>
+<h2>
+Compiler
+</h2>
+<p>Compile errors was pretty good and its reasonable easy to find the culprits from its messages. A lot better that bash</p>
+<pre><code>if std.contains(arg, "--list-dir=") then</code></pre>
+<pre><code>Panic in ./sample.hsh (line 28, column 23): value ("--list-dir=") has unexpected type, expected character</code></pre>
+<h2>
+Sample
+</h2>
+<p>I didn’t make any notes during development of the Hush sample, as there wasn’t really any issues to write about</p>
+<p>I only had these obstacles during the process 1) I could not find a way to change the current directory to that of the script 2) I could not find a easy way to do generate random numbers 3) Ansi escape codes do not work for setting color. Had to use <code>tput</code> 4) How to extract error context values is not obvious</p>
+
+
+<p><a href="https://koi-lang.dev/">koi</a></p>
+<h2>
+tl;dr
+</h2>
+<p>Writing Koi code was pretty much just like writing Hush. It was quite straight forward to write the sample as the language is simple and intuitive. The simple interop with external commands is excellent. There are sadly three significant pain points, that will make me not pick up Koi</p>
+<ol type="1">
+<li>Program options are not supported</li>
+<li>On coding mistakes, the compiler generally prints a completely generic message</li>
+<li>Appears abandonware</li>
+</ol>
+<p>Documentation was fine, but for the most part implicit from examples</p>
+<p>Approachable for a bash’er: ⭐⭐⭐⭐☆<br>
+Enjoyment: ⭐⭐⭐☆☆</p>
+<h2>
+About Koi
+</h2>
+<p>Where most other script languages use <code>$</code> for referencing variables (<code>$var</code>), in Koi variables are just referenced by there name (<code>var</code>). For string interpolation variables are referenced in <code>{}</code> (<code>{var}</code>).</p>
+<p>Koi also takes a more object oriented approach where variables have methods.</p>
+<pre><code>print('koi'.upper().split('o'))</code></pre>
+<p>Sadly it appears to be abandonware</p>
+<pre><code>❱ git log --date=format:'%Y' --pretty=format:'%ad' | sort | uniq -c | awk '{print $2 ": " $1}'
+2020: 134
+2021: 181
+2022: 11
+2023: 1</code></pre>
+<h2>
+Sample
+</h2>
+<h3 id="no-script-arguments">No script arguments</h3>
+<p>It is not documented, and I found no way to do it… Koi scripts cannot receive program arguments ❗</p>
+<p>Instead of the script receiving arguments, the Koi interpreter itself would hijack the arguments</p>
+<pre><code>❱ ./sample.koi --list-dir=test
+error: Found argument '--list-dir' which wasn't expected, or isn't valid in this context
+
+USAGE:
+    koi [FLAGS] [OPTIONS] [PATH]
+
+For more information try --help</code></pre>
+<p>That is somewhat of a major bummer ☹️</p>
+<h3 id="no-errors">No errors</h3>
+<p>Made a mistake, and referenced an non-existing variable</p>
+<pre><code>fn get_file_list(dir) {
+    let files = $(
+        find {dir} -type f -print0
+    ).split('\0')
+-   return file_list
++   return files
+}</code></pre>
+<p>This gives <strong>no</strong> indication of error ❗</p>
+<h3 id="get-list-of-files">Get list of files</h3>
+<p>Koi will not split on <code>\0</code> so had to change the <code>find</code> command to separate by newlines</p>
+<pre><code>fn get_file_list(dir) {
+    let files = $(
+-       find {dir} -type f -print0
++       find {dir} -type f
+-   ).strip().split('\0')
++   ).strip().split('\n')
+    return files
+}</code></pre>
+<h3 id="append-to-array">Append to array</h3>
+<p>How to append values to an array is not documented. Figured out this would work</p>
+<pre><code>let a = [1]
+a += [2]
+
+#=&gt; [1, 2]</code></pre>
+<h3 id="color-printing">Color printing</h3>
+<p>I could not get any color printing to work with Koi’s built in <code>print</code> function. Neither would <code>printf</code> or echo work with ansi codes, however just like Hush, <code>tput</code> would work 🎨</p>
+<h2 id="error-messages">Error messages</h2>
+
+<p>As mentioned, Koi do not always detect mistakes, but when it does, the errors messages are lacking detail</p>
+<pre><code>thread 'main' panicked at src/parser/stmt.rs:163:13:
+expected right brace
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace</code></pre>
+<p>(adding <code>RUST_BACKTRACE=1</code> only reveal details of Koi internals, and nothing of the script generating the error)</p>
+<p>This is the extend of message from pretty much any mistake you can make in Koi (non-existing variable or function, syntax mistake etc). This makes mistakes pretty hard to locate ❗</p>
+<pre><code>fn blue() { tput setaf 4 }</code></pre>
+<pre><code>thread 'main' panicked at src/parser/stmt.rs:61:30:
+only assignment, call and command expressions are allowed as statements
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace</code></pre>
+<p>This is not helpful – especially when you have added many lines since last run.</p>
+<p>Btw the fix is this</p>
+<pre><code>fn blue() {
+    tput setaf 4
+}</code></pre>
+
+
+<p><a href="https://www.abs-lang.org/">abs</a></p>
+<h2>
+tl;dr
+</h2>
+<p>Creating the sample was very easy. As I made the Koi sample before this, the abs edition was more or less a copy paste. Compared to Koi, the abs language have a few more features and makes for a more complete language. The printing was the weakest point of abs, but otherwise the experience was very good. It’s a shame it appears to be abandonware</p>
+<p>vscode: https://marketplace.visualstudio.com/items?itemName=abs-lang.vscode-abs</p>
+<p>Repl: ✅<br>
+Approachable for a bash’er: ⭐⭐⭐⭐☆<br>
+Enjoyment: ⭐⭐⭐⭐☆</p>
+<h2>
+Returning values from functions
+</h2>
+<p>Let me praise abs here. It actually documents, in plain sight, <a href="https://www.abs-lang.org/syntax/return/">how to return values from functions</a> 🏆</p>
+<h2>
+Sample
+</h2>
+<h3 id="program-arguments">Program arguments</h3>
+<p>abs have a nice <a href="https://www.abs-lang.org/stdlib/cli/">cli library</a> for making it easier to make cli tools that take arguments. Unfortunately it seems to be in the format <code>script &lt;command&gt; [option]</code> only. I need <code>script [option]</code>. For convenience, I decided to use it anyway as <code>./sample.abs run [option]</code></p>
+<h3 id="listing-files-1">Listing files</h3>
+<p>Like most of the other languages (bash and hush being the exceptions), abs would not split on null terminations</p>
+<pre><code>-files = `find $dir -type f -print0`.split('\0')
++files = `find $dir -type f`.lines()</code></pre>
+<p>The <a href="https://www.abs-lang.org/types/string/#lines">lines</a> was convenient. Then I also didn’t have to pop the last empty item from a split 🏆</p>
+<h3 id="printing-without-newline">Printing without newline</h3>
+<p>I cannot make <code>echo</code> <strong>not</strong> add a newline. It seems not to be a feature. This is especially annoying when having to print background colors… Discovered in https://github.com/abs-lang/abs/issues/374 that I could see that <code>echo</code> has more options, but the non-newline printing appears to be still on the wish list</p>
+<h3 id="color-printing-1">Color printing</h3>
+<p>I cannot find any way to make color printing work properly</p>
+<p><code>echo</code> with ansi codes just print the uninterpreted text</p>
+<pre><code>echo("$prefix \e[34m $text \e[0m")</code></pre>
+<p>An all bash command do the same</p>
+<pre><code>`printf "$prefix \e[34m %s \e[0m" "$text"`</code></pre>
+<p>What <em>sorta</em> work is using <code>tput</code>, however as I could not find any way to print without newline, lines with background color will color the background until next line could reset the color. Mixing bash <code>printf</code> and abs <code>echo</code> do not (unsurprising) go well, so had to settle for fully colored lines or no colors at all 🤷‍♀️</p>
+<h2>
+Error messages
+</h2>
+<p>I accidentally did <code>.[</code> instead of <code>[</code> and got a parsing fail stack back</p>
+<pre><code>if categorized_files.[extension] == null {</code></pre>
+<pre><code> parser errors:
+        expected next token to be [, got IDENT instead
+        [46:30]         if categorized_files.[extension] == null {
+        no prefix parse function for ']' found
+        [46:40]         if categorized_files.[extension] == null {
+        no prefix parse function for '==' found
+        [46:42]         if categorized_files.[extension] == null {
+        expected next token to be ), got IDENT instead
+</code></pre>
+<p>I guess the error message could have been more precise, but it was perfectly easy to figure out what the mistake was. So served its purpose 🏆</p>
+<p>However more than once I ended up with something like this, which could be somewhat hard to locate</p>
+<pre><code>bash: -c: line 1: unexpected EOF while looking for matching ``'</code></pre>
+
+
+<p><a href="https://www.nushell.sh/">nushell</a></p>
+<h2>
+tl;dr
+</h2>
+<p>Diving into nushell was quite a thrilling and enjoyable experience. Nushell is quite different from bash, and I learned a lot from my small encounter.</p>
+<p>Documentation is very good. There is an official book <a href="https://www.nushell.sh/book/thinking_in_nu.html">Thinking in Nushell</a>, <a href="http://www.nushell.sh/cookbook/">cookbook</a> a great <a href="https://www.nushell.sh/commands/">command overview</a> and a <a href="https://www.nushell.sh/lang-guide/">language reference guide</a>. What sets nushell apart from perhaps elvis and murex, is that nushell appears relatively broadly adopted, and it is possible to find a reasonable amount of blog posts and articles to get one started or find inspiration.</p>
+<p>Nushell can be a little perplexing initially. When coming from bash, nushell can do so very much more. One thing that was especially mystifying to me, was how the data exchange between commands worked. Then found the <a href="https://www.nushell.sh/contributor-book/commands.html">commands</a> section in the <a href="https://www.nushell.sh/contributor-book/">contributor book</a>. Commands communicate using a data structure <a href="https://docs.rs/nu-protocol/latest/nu_protocol/enum.PipelineData.html">PipelineData</a>. That really made it click for how nushell can operate as it do.</p>
+<p>There is lots to learn when switching from bash to nushell, but I think nushell is tremendously powerful when it comes to data manipulation. I see a lot of of situations where my toolbox of grep, sed, awk and other old-hat tools could be replaced by nushell.</p>
+<p>vscode language plugin: https://marketplace.visualstudio.com/items?itemName=TheNuProjectContributors.vscode-nushell-lang</p>
+<p>Shell: ✅<br>
+Approachable for a bash’er: ⭐☆☆☆☆<br>
+Enjoyment: ⭐⭐⭐⭐☆</p>
+<h2>
+Function return values
+</h2>
+<p>“Funny” enough, just like for the other shell-first languages elvish, murex and ion, I found no documentation on how to return values from a <a href="https://www.nushell.sh/book/custom_commands.html">nushell function</a>. There is documented something about function [type signatures](https://www.nushell.sh/book/command_signature.html that also covers function return types. Actually functions in nushell are called <em>commands</em> and appear more to resemble, calling a subscript in bash. It seems that commands stream output (to stdout and/or stderr) and can then be picked up by the next command. Like murex (and perhaps also elvish?) this steam can be formatted to different types</p>
+<p>I think what makes these “shell first, scripting second” projects a little difficult to consume from a scripting angle, is that most commands are documented like they would be used in a shell.</p>
+<p>One example is the <a href="https://www.nushell.sh/commands/docs/complete.html"><code>complete</code></a> command. I stumbled upon <code>complete</code> when reading about capturing <a href="https://www.nushell.sh/book/stdout_stderr_exit_codes.html#using-the-complete-command">exit-codes</a>.</p>
+<pre><code>&gt; cat unknown.txt | complete
+╭───────────┬─────────────────────────────────────────────╮
+│ stdout    │                                             │
+│ stderr    │ cat: unknown.txt: No such file or directory │
+│ exit_code │ 1                                           │
+╰───────────┴─────────────────────────────────────────────╯</code></pre>
+<p>It wasn’t immediate clear to me how that transitioned to be used in a script, but I was lucky to find an example on an external site, a <a href="https://jpospisil.com/2023/05/25/writing-shell-scripts-in-nushell">blogpost</a> by <a href="https://jpospisil.com/">Jiri Pospisil</a>:</p>
+<pre><code>let response = (curl --fail -s $url | complete)
+
+match $response.exit_code {
+  0 =&gt; {
+    $response.stdout | jq ...
+  },
+  22 =&gt; {
+    print -e $"Project \"($name)\" not found or server error!"
+    exit 1
+  },
+  - =&gt; {
+    print -e "It's all broken."
+    exit 1
+  }
+}</code></pre>
+<p>This example shows how to:</p>
+<ul>
+<li>call an external program</li>
+<li>capture the response</li>
+<li>evaluate the exit code</li>
+</ul>
+<p>🏆</p>
+<p>Documentation for nushell is otherwise quite good. Nushell have an incredible amount of features, but it is very well presented. Nushell even support <a href="https://www.nushell.sh/book/working_with_strings.html#coloring-strings">colors</a> 🌈</p>
+<p>The nushell introduction have this quote, which I think it true. Nushell is very different from bash</p>
+<p><em><strong>Thinking in Nushell</strong>: If you’re used to using mutable variables for different tasks, it will take some time to learn how to do each task in a more functional style.</em></p>
+<h2>
+Sample
+</h2>
+<h3 id="types">Types</h3>
+<p>I wondered why I got a type error when attempting to filter <code>file_list</code>. Found the <a href="https://www.nushell.sh/commands/docs/describe.html"><code>describe</code></a> function for revealing the underlying type</p>
+<pre><code>let file_list = (ls "./test" | where type == file)
+$file_list | describe
+
+=&gt; table&lt;name: string, type: string, size: filesize, modified: date&gt;</code></pre>
+<p>Oh. I was attempting to stream a table into something that expected a list. So how to convert the table to a list?</p>
+<p>This is one way to do it</p>
+<pre><code>let file_paths = $file_list | get name
+$file_paths | group-by { path parse | get extension }</code></pre>
+<h3 id="getting-a-list-of-files">Getting a list of files</h3>
+<p>I am not getting files from sub-directories from my <code>ls ./test</code>. Nushell <code>find</code> is something else, so it is not really clear how to find a three of files? It required a visit to stack-overflow to find out that globbing can be used. <code>ls ./test/**/*</code>. I kind of like it 👍</p>
+<p>Update: found the documentation in the <a href="https://www.nushell.sh/book/coming_from_bash.html">bash comparison sheet</a></p>
+<h3 id="iterating-a-record">Iterating a record</h3>
+<p>I have a record of the file categories. I cannot figure out how to extract key value pairs from this</p>
+<pre><code>let file_categories = $file_list | group-by { path parse | get extension }
+$file_categories | describe
+
+#=&gt; record&lt;doc: list&lt;string&gt;, net: list&lt;string&gt;, dat: list&lt;string&gt;&gt;</code></pre>
+<p>Lots of reading later: records should be <a href="https://www.nushell.sh/book/types_of_data.html#records">transposed to tables</a>, before iterating them.</p>
+<h3 id="functions">Functions</h3>
+<p>Functions in nushell are called <em>commands</em>.</p>
+<p>nushell is a typed language, so function parameters can optionally be annotated with types. For the printing functions I want to pass in another function to do color handling. From the <a href="https://www.nushell.sh/book/custom_commands.html#parameter-types">parameter types list</a> I guess <code>closure</code> is the best fit. I could however not find any documentation on that type directly.</p>
+<p>I am a little confused on how commands work. This example do not act like I would expect</p>
+<pre><code>def print_category [extension: string, filenames: list] {
+    echo "Category: ($extension)"
+}
+print_category "dat" ["1", "2"]
+
+#=&gt; Category: ($extension)</code></pre>
+<p>The parameter value is not expanding? I noticed the command examples all use string interpolation.</p>
+<pre><code>def greet [name] {
+  $"hello ($name)"
+}
+greet nushell
+
+#=&gt; hello nushell</code></pre>
+<p>Using <code>echo</code> or <code>print</code> appears not to work in commands, while interpolation do?</p>
+<pre><code>def print_category [extension: string, filenames: list] {
+    print "Category: ($extension)"
+    $"Category: ($extension)"
+}
+print_category "dat" ["1", "2"]
+
+#=&gt; Category: ($extension)
+    Category: dat</code></pre>
+<p><code>print</code> do not return anything, but <code>echo</code> acts more like an identity function, so I would have thought <code>echo</code> would have worked?</p>
+<p>Aha! This worked</p>
+<pre><code>```nushell
+def print_category [extension: string, filenames: list] {
+-   print "Category: ($extension)"
++   $extension | print
+    $"Category: ($extension)"
+}</code></pre>
+<p>Ohh. Maybe I understood nothing in regard to printing. This also works</p>
+<pre><code>print $"Category: ($extension)"</code></pre>
+<p>At this point, I am not entirely sure how things work. Its nothing like anything that I am familiar with. Learning nushell feels a lot like being educated 😅</p>
+<h3 id="filter-to-filename-only">Filter to filename only</h3>
+<p>From the categorizing, I got files with full path and extension, but should on have filename for each extension</p>
+<pre><code>-let file_categories = $file_list | group-by { path parse | get extension }
++let file_categories = $file_list | path basename | group-by { path parse | get extension }</code></pre>
+<p>This makes data change from (e.g.) <em>path/filename.ext</em> to <em>filename.ext</em> Now how do I cut the extension from the data, but still be able to do grouping by the same cut data?</p>
+<p>Opted to just split it in two operations. First group by extension, and then <code>get stem</code> when needing the filename only.</p>
+<h3 id="passing-in-a-printing-function">Passing in a printing function</h3>
+<p>Was okay easy to find out that <a href="https://www.nushell.sh/commands/docs/do.html"><code>do</code></a> is required, just by browsing the command list</p>
+<h3 id="random-value">Random value</h3>
+<p>Nushell have native support for several <a href="https://www.nushell.sh/commands/categories/random.html">random number generators</a>. The integer random generator fit perfectly here. Only this is that the examples are all inclusive ranges</p>
+<pre><code>random int 1..10</code></pre>
+<p>First attempt was just to do <code>random int 1..(10-1)</code>, but that gave syntax error. The command documentation of <a href="https://www.nushell.sh/commands/docs/range.html">range</a> is quite sparse. After some digging around, I found a chapter in the nushell book about <a href="https://www.nushell.sh/book/types_of_data.html#inclusive-and-non-inclusive-ranges">ranges</a> which offered some details</p>
+<pre><code>random int 1..&lt;10</code></pre>
+<p>Thats actually amazing 🤩</p>
+<p>I also figured out that my attempt of subtracting (<code>random int 1..(10-1)</code>) actually was possible if using proper syntax <code>random int 1..(10 - 1)</code>. That was a <strong>me</strong> error, not nushell 😅</p>
+<h3 id="handling-grep-errors">Handling grep errors</h3>
+<p>It was relatively easy to find out how to handle errors from called external programs. Seems that I have two options.</p>
+<p>Use exceptions</p>
+<pre><code>try { 
+    grep $text $filename
+    true
+} catch { 
+    false 
+}</code></pre>
+<p>Or, better to my preference, check the exit code</p>
+<pre><code>let result = grep $text $filename | complete
+return ($result.exit_code == 0)</code></pre>
+<p>That could then be rewritten to</p>
+<pre><code>(grep $text $filename | complete | get exit_code) == 0</code></pre>
+<h3 id="program-arguments-1">Program arguments</h3>
+<p>Took me a while to figure out how to get arguments. It wasn’t until <a href="https://github.com/nushell/nushell/issues/11035">this</a> bug report, that I realized you just make a <code>main</code> function. You then combine that with command <a href="https://www.nushell.sh/book/custom_commands.html#flags">flags</a>.</p>
+<p>Update: scripts with <code>main</code> is documented <a href="https://www.nushell.sh/book/scripts.html#parameterizing-scripts">here</a></p>
+<p>Really weird. I cannot get <code>main</code> to work. It is never called. I have put this at the top of my sample file, but it never prints</p>
+<pre><code>#!/usr/bin/env nu
+
+def main [input: string] {
+    $"Ere I am, J.H." | print
+    print $input
+}</code></pre>
+<p>The second weird thing is, that if I put the same code in another file, then it works fine!</p>
+<p>Figured it out, when I put a print on the top level also</p>
+<pre><code>#!/usr/bin/env nu
+
+def main [input: string] {
+    $"Ere I am, J.H." | print
+    print $input
+}
+
+"He's got away from us, Jack" | print</code></pre>
+<p>When run, it gives this output</p>
+<pre><code>❱ ./brazil.nu "And this is my receipt for your receipt"
+
+He's got away from us, Jack
+Ere I am, J.H.
+And this is my receipt for your receipt</code></pre>
+<p>So it runs all top level code before running main. That explain why it looked like it never worked in my sample code. To test out <code>main</code> and not needing to comment out all code, I just put a <code>return</code> after <code>main</code>.</p>
+<pre><code>def main [] {
+}
+return</code></pre>
+<p>Hence, the first thing the script will do is to return (and then exit) 🃏</p>
+<h3 id="builtin-usage-help">Builtin usage help</h3>
+<p>It is very clever how the command arguments can auto-generate a help message. For nushell I then did not have to do this myself – its baked in 🧁🏆</p>
+<pre><code>./sample.nu -h
+Usage:
+  &gt; main {flags} 
+
+Flags:
+  --list-dir &lt;String&gt; - Directory to list (default: 'test')
+  --no-color - Disable color output. (default: false)
+  -h, --help - Display the help message for this command</code></pre>
+<p>Though its a shame that it is listing the command name, and not the script name</p>
+<pre><code>Usage:
+  &gt; main {flags} </code></pre>
+<p>This should have said <code>sample.nu</code> instead, as <code>main</code> make no sense outside the script. I found no way to change this 🤷‍♀️</p>
+<p>I also wished that the description texts were aligned… but thats a nitpick</p>
+<h3 id="getting-a-list-of-files-take-2">Getting a list of files, take 2</h3>
+<p>After getting program arguments working, I wanted to pass in the user specified path to <code>ls</code> instead of the hardcoded value.</p>
+<pre><code>-let file_list = (ls ./test/**/* | where type == file) | get name
++let file_list = (ls ./$list_dir/**/* | where type == file) | get name</code></pre>
+<p>This do now work</p>
+<pre><code>let file_list = (ls ./$list_dir/**/* | where type == file) | get name
+                     ─────────┬────────
+                              ╰── Pattern, file or folder not found</code></pre>
+<p>I couldn’t figure out a way to format this input to ls in a way that would not generate that error, as <code>ls</code> do not support string input. I tried <a href="https://www.nushell.sh/commands/docs/glob.html"><code>glob</code></a> also, but that returned an empty list when using a variable argument</p>
+<p>I was unable to find any combination of <code>ls</code>, <code>glob</code> <code>path parse</code> and would compile or give the expected answer. I’m sure the is one, but I was just not able to find it 👎</p>
+<p>After a lot of trail and error, I …</p></div></div>
+<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://monzool.net/blog/2024/07/14/a-second-search-for-bash-scripting-alternatives/">https://monzool.net/blog/2024/07/14/a-second-search-for-bash-scripting-alternatives/</a></em></p>]]>
+            </description>
+            <link>https://monzool.net/blog/2024/07/14/a-second-search-for-bash-scripting-alternatives/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42172978</guid>
+            <pubDate>Mon, 18 Nov 2024 15:08:25 GMT</pubDate>
         </item>
         <item>
             <title>
@@ -5803,7 +7217,7 @@ hCaptcha Support
             </title>
             <description>
 <![CDATA[
-Score 353 | Comments 51 (<a href="https://news.ycombinator.com/item?id=42170740">thread link</a>) | @california-og
+Score 355 | Comments 51 (<a href="https://news.ycombinator.com/item?id=42170740">thread link</a>) | @california-og
 <br/>
 November 18, 2024 | https://maxbo.me/a-html-file-is-all-you-need.html | <a href="https://web.archive.org/web/*/https://maxbo.me/a-html-file-is-all-you-need.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><p>
@@ -6159,7 +7573,7 @@ November 17, 2024 | https://interfacinglinux.com/2024/11/13/radxa-x4-pi-sized-x8
             </title>
             <description>
 <![CDATA[
-Score 280 | Comments 295 (<a href="https://news.ycombinator.com/item?id=42167749">thread link</a>) | @bentocorp
+Score 280 | Comments 296 (<a href="https://news.ycombinator.com/item?id=42167749">thread link</a>) | @bentocorp
 <br/>
 November 17, 2024 | https://www.magiclasso.co/insights/is-chrome-the-new-ie/ | <a href="https://web.archive.org/web/*/https://www.magiclasso.co/insights/is-chrome-the-new-ie/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -6607,7 +8021,7 @@ November 17, 2024 | https://www.japantimes.co.jp/business/2024/11/15/economy/jap
             </title>
             <description>
 <![CDATA[
-Score 247 | Comments 132 (<a href="https://news.ycombinator.com/item?id=42165397">thread link</a>) | @rishicomplex
+Score 248 | Comments 132 (<a href="https://news.ycombinator.com/item?id=42165397">thread link</a>) | @rishicomplex
 <br/>
 November 17, 2024 | https://rishimehta.xyz/2024/11/17/alphaproofs-greatest-hits.html | <a href="https://web.archive.org/web/*/https://rishimehta.xyz/2024/11/17/alphaproofs-greatest-hits.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -6783,7 +8197,7 @@ Next, it claims (and goes on to prove) that for all natural numbers $n$,</p><p>
             </title>
             <description>
 <![CDATA[
-Score 360 | Comments 186 (<a href="https://news.ycombinator.com/item?id=42165057">thread link</a>) | @mmphosis
+Score 360 | Comments 187 (<a href="https://news.ycombinator.com/item?id=42165057">thread link</a>) | @mmphosis
 <br/>
 November 17, 2024 | https://zarar.dev/good-software-development-habits/ | <a href="https://web.archive.org/web/*/https://zarar.dev/good-software-development-habits/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><p>This post is not advice, it's what's working for me.</p><p>It's easy to pick up bad habits and hard to create good ones. Writing down what's working for me helps me maintain any good habits I've worked hard to develop. Here's an unordered list of 10 things that have helped me increase speed and maintain a respectable level of quality in the product I'm currently developing.</p><div>
@@ -8664,7 +10078,7 @@ volumes:
             </title>
             <description>
 <![CDATA[
-Score 260 | Comments 31 (<a href="https://news.ycombinator.com/item?id=42162622">thread link</a>) | @fzliu
+Score 261 | Comments 31 (<a href="https://news.ycombinator.com/item?id=42162622">thread link</a>) | @fzliu
 <br/>
 November 16, 2024 | https://blog.voyageai.com/2024/11/12/voyage-multimodal-3/ | <a href="https://web.archive.org/web/*/https://blog.voyageai.com/2024/11/12/voyage-multimodal-3/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
