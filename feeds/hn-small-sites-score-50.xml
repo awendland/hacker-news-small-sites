@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Thu, 21 Nov 2024 04:23:48 GMT</lastBuildDate>
+        <lastBuildDate>Thu, 21 Nov 2024 08:23:18 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-50.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Thu, 21 Nov 2024 04:23:48 GMT</pubDate>
+        <pubDate>Thu, 21 Nov 2024 08:23:18 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,183 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Building Databases over a Weekend]]>
+            </title>
+            <description>
+<![CDATA[
+Score 75 | Comments 10 (<a href="https://news.ycombinator.com/item?id=42200014">thread link</a>) | @ambrood
+<br/>
+November 20, 2024 | https://www.denormalized.io/blog/building-databases | <a href="https://web.archive.org/web/*/https://www.denormalized.io/blog/building-databases">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><article><div><p>Databases are some of the most complex pieces of software conceived
+since the advent of the computing age over half a century ago. [1]
+Nearly every piece of technology ends up touching the database in some
+way shape or form. Despite the ubiquity of Databases in the software
+stack, the vast majority of developers have been conditioned to treat
+databases as more or less a <em>black box</em> -- complex dense pieces of
+software conjured up by arch wizards and mavens ensconced in the
+rarified elite tiers of database companies or places like Google. The
+adage for the rest of us as it goes is <em>never attempt to write your own
+database</em>.</p>
+<p>That said, despite their longevity, we have seen continued innovation in
+the space that first started with Hadoop arriving on the scene about 2
+decades ago. The ClickBench website now lists over 50+ databases in its
+benchmark suite [2] . And that's just the analytics engines. With the
+recent trends of rewriting everything big data in Rust [3] not a month
+goes by without an interesting new project trending in the Hacker News.
+In this post we will take a look at how easy (or hard) it is to build
+Databases using Apache Datafusion and whether you <em>can in fact, as a
+mere mortal</em> realistically build a custom database and innovate around
+the developer experience.</p>
+<p>Most modern databases can be disaggregated into compute and storage
+layers, with sophisticated query engines responsible for the "compute"
+portion of the database. A query engine typically consists of a Query
+Parser, Logical Plan generation and then the Physical Plan generation to
+run the computations on the Execution Engine. A query generally goes
+through multiple optimization phases in the logical plan generation as
+well as physical plan generation. No matter what the target use-case of
+the end system is, the query engine more or less follows this model.</p>
+<p>Given decades of database research that has gone into each of these
+individual layers, the bar for writing a functional query engine with
+table stakes features remains strikingly high. And you need to nail <em>all
+that</em> before you can get around to writing your use-case specific
+features. While there are many projects that help you write some of
+these layers individually, Apache DataFusion remains the only game in
+town that helps you with the entire gamut.</p>
+<p>You can think of DataFusion extensible database development toolkit. At
+its most basic level, you can use it as a query engine a la DuckDB with
+its builtin SQL and Dataframe front ends, while at the same time you can
+extend or even wholesale replace different layers to build your own
+experience entirely.</p>
+<p>In the rest of this post we will walk through how to extend DataFusion
+to add your own operators to its execution engine and then weave it
+through the Physical and Logical planners and expose it to the frontend.</p>
+
+<p><img src="https://miro.medium.com/v2/resize:fit:1400/0*jjrNhgIlapa-Ih2P.png" alt="DataFusion architecture"></p>
+<p><strong>DataFusion architecture</strong></p>
+<p>At Denormalized, we are building a duck db like single node experience
+for stream processing applications. While DataFusion does have some
+support for unbounded computations, it doesn't have a streaming window
+operator. Windows are at the core of stream processing applications,
+they provide an easy way to bucket infinite data streams into finite
+buckets so that we can apply aggregations over them.</p>
+<p>For this tutorial we will implement a simple window operator for
+infinite streams. Our operator will have the following signature --</p>
+<pre><code>    pub fn window(
+			    self
+			    group_expr: Vec&lt;Expr&gt;,
+			    aggr_expr: Vec&lt;Expr&gt;,
+			    window_length: Duration,
+			    slide: Option&lt;Duration&gt;,
+			    ) -&gt; Result&lt;Self&gt; { ... }
+</code></pre>
+<h2>Writing the Execution Plan</h2>
+<p>An <a href="https://docs.rs/datafusion/latest/datafusion/physical_plan/execution_plan/trait.ExecutionPlan.html">ExecutionPlan represents</a> a node in the DataFusion Physical plan. This is where
+the actual code with our custom computations would go. DataFusions execution model
+is pull based, meaning that the execution starts at the sinks and works its
+way up the physical plan. Calling the <em>execute</em> method on this trait
+produces an asynchronous <a href="https://docs.rs/datafusion/latest/datafusion/physical_plan/type.SendableRecordBatchStream.html">SendableRecordBatchStream</a> of record batches
+by incrementally deriving a partition of the output by running
+computations over Execution Plan's input.</p>
+<p>In our use case, <a href="https://github.com/probably-nothing-labs/denormalized/blob/f65268972da3a6f21eac0ab4bf3e4ca9b558c6ed/crates/core/src/physical_plan/continuous/streaming_window.rs#L423-L427">ExecutionPlan's execute()</a> method returns a struct
+<a href="https://github.com/probably-nothing-labs/denormalized/blob/f65268972da3a6f21eac0ab4bf3e4ca9b558c6ed/crates/core/src/physical_plan/continuous/grouped_window_agg_stream.rs#L62">GroupedWindowAggStream</a> which implements a RecordBatchStream,  a wrapper around
+futures::Stream trait. The actual computations should be implemented
+within the <em>poll_next()</em> of the Stream implementation.</p>
+<pre><code>    impl RecordBatchStream for GroupedWindowAggStream {
+	    fn schema(&amp;self) -&gt; SchemaRef {
+		    self.schema.clone()
+	    }
+    }
+    
+    impl Stream for GroupedWindowAggStream {
+    
+	    type Item = Result&lt;RecordBatch&gt;;
+	    
+	    fn poll_next(mut self: Pin&lt;&amp;mut Self&gt;, cx: &amp;mut Context&lt;'_&gt;) -&gt;
+	    Poll&lt;Option&lt;Self::Item&gt;&gt; {
+	    
+		    let poll = self.poll_next_inner(cx); // Code to compute the record batch goes
+		    here.
+	    
+	    ...
+    
+    }
+</code></pre>
+<p>Here in our example, calling the <em>poll_next_inner</em> for a streaming
+window takes care of</p>
+<ol>
+<li>
+<p>Processing the incoming data.</p>
+</li>
+<li>
+<p>Accumulating rows into open windows.</p>
+</li>
+<li>
+<p>Updating the watermark (which is behind a mutex)</p>
+</li>
+<li>
+<p>Opening new windows if required.</p>
+</li>
+<li>
+<p>Closing any triggering windows and producing the output
+RecordBatches from them.</p>
+</li>
+</ol>
+<h2>Hooking into the Physical Planner</h2>
+<p>Having created our custom Execution Plan, we need to make the Physical
+Planner aware of its existence. <a href="https://github.com/probably-nothing-labs/denormalized/blob/f65268972da3a6f21eac0ab4bf3e4ca9b558c6ed/crates/core/src/planner/streaming_window.rs#L69-L173">Implementing the ExtensionPlanner</a> for our
+ExtensionPlan is all we need to do here.</p>
+<h2>Extending the Logical Plan</h2>
+<p>Now that we have the custom Execution Plan implemented along with
+ExtensionPlanner, we need to add a companion node to the Logical Plan.
+This not only allows us to expose this to the SQL/DataFrame frontends
+but also hook into the logical optimizers for optimizations such as the
+predicate pushdowns.</p>
+<p>In DataFusion we need to first implement a <a href="https://github.com/probably-nothing-labs/denormalized/blob/f65268972da3a6f21eac0ab4bf3e4ca9b558c6ed/crates/core/src/logical_plan/streaming_window.rs#L28">user defined Logical Plan
+Node</a> and then add a <a href="https://github.com/probably-nothing-labs/denormalized/blob/f65268972da3a6f21eac0ab4bf3e4ca9b558c6ed/crates/core/src/logical_plan/mod.rs#L47-L59">LogicalPlanExtension</a>
+to the logical plan builder which exposes this to SQL/DataFrame
+frontends.</p>
+<h2>Logical Plan to Physical Plan</h2>
+<p>The last piece of the puzzle is the touch point where the logical plan
+gets converted into the physical plan. For this, we will implement a
+<a href="https://github.com/probably-nothing-labs/denormalized/blob/f65268972da3a6f21eac0ab4bf3e4ca9b558c6ed/crates/core/src/query_planner.rs#L13-L30">custom QueryPlanner</a> that ensures that the physical planner is initialized with
+the custom extensions we wrote for our ExecutionPlan.</p>
+<h2>Custom Optimization Rules</h2>
+<p>Since our operator implemented a group by aggregation, we need to ensure
+that all the rows for a particular group end up in the same partition.
+To that end we will add a <a href="https://github.com/probably-nothing-labs/denormalized/blob/f65268972da3a6f21eac0ab4bf3e4ca9b558c6ed/crates/core/src/physical_optimizer/coalesce_before_streaming_window_aggregate.rs#L32">new physical optimization
+rule</a> to add a HashPartition operator on our group keys.</p>
+<h2>Putting it all together</h2>
+<p>Finally, all we need to do is construct a DataFusion session with the
+custom QueryPlanner we wrote above as well as the additional physical
+optimizer rule we added and voila, now we have our own extended version
+of DataFusion.</p>
+<pre><code>    let state = SessionStateBuilder::new()
+      .with_default_features()
+      .with_config(config)
+      .with_query_planner(Arc::new(StreamingQueryPlanner {}))
+      .with_optimizer_rules(get_default_optimizer_rules()).with_physical_optimizer_rule(Arc::new(EnsureHashPartititionOnGroupByForStreamingAggregates::new(),
+      ))
+      .build();
+</code></pre>
+<h3>Footnotes</h3>
+<ol>
+<li><a href="https://db.cs.cmu.edu/papers/2024/whatgoesaround-sigmodrec2024.pdf">https://db.cs.cmu.edu/papers/2024/whatgoesaround-sigmodrec2024.pdf</a></li>
+<li><a href="https://benchmark.clickhouse.com/">https://benchmark.clickhouse.com</a></li>
+<li><a href="https://github.com/rewrite-bigdata-in-rust/RBIR">https://github.com/rewrite-bigdata-in-rust/RBIR</a></li>
+<li><a href="https://dl.acm.org/doi/10.1145/3626246.3653368">https://dl.acm.org/doi/10.1145/3626246.3653368</a></li>
+</ol></div></article></div></div></div>]]>
+            </description>
+            <link>https://www.denormalized.io/blog/building-databases</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42200014</guid>
+            <pubDate>Thu, 21 Nov 2024 01:16:46 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Show HN: Rebuild of Blossom, an open-source social robot]]>
             </title>
             <description>
 <![CDATA[
-Score 52 | Comments 4 (<a href="https://news.ycombinator.com/item?id=42196226">thread link</a>) | @psychomugs
+Score 56 | Comments 4 (<a href="https://news.ycombinator.com/item?id=42196226">thread link</a>) | @psychomugs
 <br/>
 November 20, 2024 | https://msgtn.xyz/rebuild_of_blossom | <a href="https://web.archive.org/web/*/https://msgtn.xyz/rebuild_of_blossom">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -179,7 +351,7 @@ Next goals include:</p>
             </title>
             <description>
 <![CDATA[
-Score 118 | Comments 10 (<a href="https://news.ycombinator.com/item?id=42195994">thread link</a>) | @xlinux
+Score 127 | Comments 13 (<a href="https://news.ycombinator.com/item?id=42195994">thread link</a>) | @xlinux
 <br/>
 November 20, 2024 | https://www.philipzucker.com/sql_graph_csp/ | <a href="https://web.archive.org/web/*/https://www.philipzucker.com/sql_graph_csp/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div aria-label="Content">
@@ -819,16 +991,16 @@ hyprgraph data structure</p>
             </title>
             <description>
 <![CDATA[
-Score 130 | Comments 51 (<a href="https://news.ycombinator.com/item?id=42194315">thread link</a>) | @nalaginrut
+Score 133 | Comments 51 (<a href="https://news.ycombinator.com/item?id=42194315">thread link</a>) | @nalaginrut
 <br/>
 November 20, 2024 | https://artanis.dev/blog/1.0.0-release.html | <a href="https://web.archive.org/web/*/https://artanis.dev/blog/1.0.0-release.html">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="text-org29e9361">
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="text-org9e9facd">
 <p>
 GNU Artanis was born in 2013, and it's a web application framework written in Guile Scheme. It's designed to be simple and easy to use, and it's suitable for small to medium web applications. It's licensed under GPLv3+ and LGPLv3.
 </p>
 
 <p>
-In the beginning, Artanis was largely inspired by Ruby on Rails to generate the scaffold code as possible. And the URL remapping API was inspired by Sinatra, another web framework of Ruby. That's why it's named "Artanis", since it's the revserse of "Sinatra".
+In the beginning, Artanis was largely inspired by Ruby on Rails to generate the scaffold code as possible. And the URL remapping API was inspired by Sinatra, another web framework of Ruby. That's why it's named "Artanis", since it's a reversed "Sinatra".
 </p>
 
 <p>
@@ -960,7 +1132,7 @@ November 20, 2024 | https://orkohunter.net/blog/why-dont-you-move-abroad/ | <a h
             </title>
             <description>
 <![CDATA[
-Score 477 | Comments 72 (<a href="https://news.ycombinator.com/item?id=42191709">thread link</a>) | @todsacerdoti
+Score 508 | Comments 77 (<a href="https://news.ycombinator.com/item?id=42191709">thread link</a>) | @todsacerdoti
 <br/>
 November 20, 2024 | https://blog.frost.kiwi/analytical-anti-aliasing/ | <a href="https://web.archive.org/web/*/https://blog.frost.kiwi/analytical-anti-aliasing/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>Today’s journey is <a href="https://en.wikipedia.org/wiki/Spatial_anti-aliasing">Anti-Aliasing</a> and the destination is <strong>Analytical Anti-Aliasing</strong>. Getting rid of rasterization <a href="https://en.wikipedia.org/wiki/Jaggies">jaggies</a> is an art-form with decades upon decades of maths, creative techniques and non-stop innovation. With so many years of research and development, there are many flavors.</p><p>From the simple but resource intensive <a href="https://en.wikipedia.org/wiki/Supersampling"><strong>SSAA</strong></a>, over theory dense <a href="https://www.iryoku.com/smaa/"><strong>SMAA</strong></a>, to using machine learning with <a href="https://en.wikipedia.org/wiki/Deep_learning_anti-aliasing"><strong>DLAA</strong></a>. Same goal - <strong><em>vastly</em></strong> different approaches. We’ll take a look at how they work, before introducing a new way to look a the problem - the ✨<em><strong>analytical</strong></em>🌟 way. The perfect Anti-Aliasing exists and is simpler than you think.</p><blockquote><p>Having <a href="https://mirrorball.frost.kiwi/">implemented</a> it multiple times over the years, I'll also share some juicy secrets I have never read anywhere before.</p><img src="https://blog.frost.kiwi/assets/kiwis/book.svg"></blockquote><h2 id="the-setup" tabindex="-1">The Setup <a href="#the-setup">#</a></h2><p>To understand the Anti-Aliasing algorithms, we will implement them along the way! Following <a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API/Tutorial/Getting_started_with_WebGL">WebGL canvases</a> draw a moving circle. Anti-Aliasing <em>cannot</em> be fully understood with just images, movement is <em>essential</em>. The red box has 4x zoom. Rendering is done at <a href="https://en.wikipedia.org/wiki/1:1_pixel_mapping">native</a> resolution of your device, important to judge sharpness.</p><blockquote><p>Please pixel-peep to judge sharpness and aliasing closely. Resolution of your screen too high to see aliasing? Lower the resolution with the following buttons, which will <a href="https://tanalin.com/en/articles/integer-scaling/">integer-scale</a> the rendering.</p><img src="https://blog.frost.kiwi/assets/kiwis/detective.svg"></blockquote><div><p> <label for="native">Native<p>Resolution</p></label></p><p> <label for="half">½<p>Resolution</p></label></p><p> <label for="quarter">¼<p>Resolution</p></label></p><p> <label for="eight">⅛<p>Resolution</p></label></p></div><canvas id="canvasSimple" width="100%" height="400px"></canvas><blockquote><details><summary><a href="https://blog.frost.kiwi/analytical-anti-aliasing/screenshots/simple.png">Screenshot</a>, in case WebGL doesn't work</summary><p><img src="https://blog.frost.kiwi/analytical-anti-aliasing/screenshots/simple.png" alt="image"></p></details><details><summary>WebGL Vertex Shader <a href="https://blog.frost.kiwi/analytical-anti-aliasing/shader/circle.vs">circle.vs</a></summary><pre><code>
@@ -2194,7 +2366,7 @@ November 20, 2024 | https://blog.frost.kiwi/analytical-anti-aliasing/ | <a href=
             </title>
             <description>
 <![CDATA[
-Score 281 | Comments 54 (<a href="https://news.ycombinator.com/item?id=42190650">thread link</a>) | @rrampage
+Score 283 | Comments 54 (<a href="https://news.ycombinator.com/item?id=42190650">thread link</a>) | @rrampage
 <br/>
 November 19, 2024 | https://emschwartz.me/understanding-the-bm25-full-text-search-algorithm/ | <a href="https://web.archive.org/web/*/https://emschwartz.me/understanding-the-bm25-full-text-search-algorithm/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2378,7 +2550,7 @@ November 19, 2024 | https://emschwartz.me/understanding-the-bm25-full-text-searc
             </title>
             <description>
 <![CDATA[
-Score 138 | Comments 20 (<a href="https://news.ycombinator.com/item?id=42189991">thread link</a>) | @wilson090
+Score 138 | Comments 21 (<a href="https://news.ycombinator.com/item?id=42189991">thread link</a>) | @wilson090
 <br/>
 November 19, 2024 | https://www.tryparity.com/blog/how-meta-uses-llms-to-improve-incident-response | <a href="https://web.archive.org/web/*/https://www.tryparity.com/blog/how-meta-uses-llms-to-improve-incident-response">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-framer-name="Content" data-framer-component-type="RichTextContainer"><p>In June, Meta released an article titled <!--$--><a href="https://engineering.fb.com/2024/06/24/data-infrastructure/leveraging-ai-for-efficient-incident-response/" rel="noopener">Leveraging AI for efficient incident response</a><!--/$--> on their engineering blog. In this article, engineers outline how they leveraged large language models to improve Meta's incident response capabilities. The headline metric from this report: <strong>Meta was able to use LLMs to successfully root cause incidents with 42% accuracy</strong> in their web monorepo. This means that nearly half the time, the <strong>mean time to resolution (MTTR) can potentially be reduced from hours to seconds</strong>. Seeing one of the largest and most complex engineering organizations in the world use generative AI for incident response so successfully gives us hope that we can bring the same benefit to all engineering teams with <!--$--><a href="https://tryparity.com/" rel="noopener">Parity</a><!--/$-->. Let's dive into how Meta accomplished these results and what we can learn from it.</p><h2>Meta's Incident Management at Scale</h2><p>It can be hard to appreciate the scale and velocity of code changes at a company the size of Meta. They are shipping thousands of changes per day almost entirely within a <!--$--><a href="https://blog.3d-logic.com/2024/09/02/what-it-is-like-to-work-in-metas-facebooks-monorepo/" rel="noopener">single monorepo</a><!--/$-->. Meta literally <!--$--><a href="https://graphite.dev/blog/why-facebook-doesnt-use-git" rel="noopener">re-engineered Mercurial</a><!--/$--> to keep up with the speed at which their codebase was growing (really fun read and nugget of open source history). At this scale, investigating outages becomes a massive undertaking. "Hey did anyone ship anything recently" in #engineering probably doesn't cut it as a response process.</p><p>Meta has invested in sophisticated incident response tools to make the life of on-call engineers easier. All of that tooling is built to solve the same problem any engineer at any organization aims to solve: <strong>what's going wrong, why is it going wrong, and how do we fix it</strong>. Generative AI has clear potential to improve MTTR and incident management processes across the board, and Meta charts one of the potential paths to doing so.</p><h2>Meta's Approach to LLMs for Incident Response</h2><p>Meta's approach to LLMs for incident response enhances the speed and accuracy of RCA by surfacing likely root causes to engineers at the start of their investigation. To handle the complexity of investigating issues within their massive monolithic codebase, they first use heuristic-based retrieval methods to select a subset of code changes and then use LLM-based ranking to narrow in. The retrieval phase reduces the overwhelming number of potential changes by using heuristics like code ownership, directory structures, and runtime code graphs. Once the search space is narrowed down, only the most relevant changes are passed along for deeper analysis by LLMs.</p><p><img alt="How Meta scopes down code changes with heuristics and LLMs" data-framer-asset="data:framer/asset-reference,NZp9ysyAbkYwFzYyzMEyCwlCmc.png" data-framer-height="682" data-framer-width="1536" height="341" src="https://framerusercontent.com/images/NZp9ysyAbkYwFzYyzMEyCwlCmc.png" srcset="https://framerusercontent.com/images/NZp9ysyAbkYwFzYyzMEyCwlCmc.png?scale-down-to=512 512w,https://framerusercontent.com/images/NZp9ysyAbkYwFzYyzMEyCwlCmc.png?scale-down-to=1024 1024w,https://framerusercontent.com/images/NZp9ysyAbkYwFzYyzMEyCwlCmc.png 1536w" width="768" data-framer-original-sizes="" sizes="(min-width: 1200px) 100vw, (min-width: 810px) and (max-width: 1199px) 100vw, (max-width: 809px) 100vw"></p><p><em>How Meta scopes down code changes with heuristics and LLMs</em></p><p>The tool fits right into Meta’s existing incident management processes. Engineers investigate issues just as they normally would, but now, the AI results are surfaced at the start of an investigation, automatically pulling in and ranking the most likely causes of the issue in real time. This means they can quickly focus on the most relevant code changes without spending time digging through thousands of possibilities. Instead of replacing the engineers' expertise, the AI acts as a helpful assistant, focusing them in on the most likely causes of the issue sooner.</p><h2>Fine Tuning Llama 2 7B to Identify Culprit Code Changes</h2><p>One of the particularly interesting innovations behind Meta's AI incident response is the use of a fine-tuned Llama 2 7B model. The model was tuned specifically for root cause analysis by training it on historical incident investigations, which allowed it to learn from past scenarios where the underlying cause was already known. They used a two-phase approach for fine-tuning: starting with continued pre-training (CPT) and followed by a supervised fine-tuning (SFT) phase. During CPT, the model was exposed to internal Meta artifacts such as wikis, code repositories, and Q&amp;A documents, giving it a contextual foundation. In the SFT phase, Meta mixed the original training data of Llama 2 with its own root cause analysis dataset, which focused on instruction-tuning examples, enabling the model to follow RCA-related prompts effectively.</p><p><img alt="The fine-tuning process used for Llama 2 7B" data-framer-asset="data:framer/asset-reference,PXBwLHWp7U7VsAwRG3rVAdjcwOQ.png" data-framer-height="407" data-framer-width="896" height="203" src="https://framerusercontent.com/images/PXBwLHWp7U7VsAwRG3rVAdjcwOQ.png" srcset="https://framerusercontent.com/images/PXBwLHWp7U7VsAwRG3rVAdjcwOQ.png?scale-down-to=512 512w,https://framerusercontent.com/images/PXBwLHWp7U7VsAwRG3rVAdjcwOQ.png 896w" width="448" data-framer-original-sizes="" sizes="(min-width: 1200px) 100vw, (min-width: 810px) and (max-width: 1199px) 100vw, (max-width: 809px) 100vw"></p><p><em>The fine-tuning process used for Llama 2 7B</em></p><p>The fine-tuning dataset was constructed with the constraints of a real-world investigation in mind. Each example involved 2 to 20 potential code changes, with minimal information known at the time of investigation initiation. By training the model this way, Meta equipped it to handle scenarios where data is scarce, making it more applicable to actual investigations. The fine-tuning process enabled the model to generate ranked lists of potential causes, ordered by relevance. The ranking system is built around log probabilities, where the model evaluates how likely each change is to be the root cause based on historical patterns. This fine-tuning process, combined with the aggregation of new datasets, allows Meta's LLM to significantly improve the accuracy of its root cause predictions, achieving a 42% success rate in identifying the culprit code changes during investigations.</p><h2>LLM Agents for Incident Response Are Next (Probably)</h2><p>Meta's use of additional pre-training and fine-tuning on internal documentation and RCA datasets point to another avenue worth exploring: LLM agents for incident response. Agents can actively gather additional relevant context from a larger number of data sources to improve their results. They can also begin to handle more of the incident response process and workflow (find and follow runbooks, measure impact, take mitigation steps, create code changes, write initial post-mortems). Agents are a natural next step, and I'd be surprised if the team isn't already exploring it.</p><h2>42% Accuracy: Good or Bad?</h2><p>The biggest question I had when I read the Meta article was how should I interpret the 42% accuracy result? On the surface, this feels like a disappointing result. While there's no great benchmark for human performance, it still seems quite far from what an engineer could achieve. But when you consider that nearly half the time that an investigation began, an engineer had the root cause handed directly to them, it's an incredible result. As long as the engineer has the context and information to quickly rule out incorrect results, this would likely lead to massive improvements in MTTR. It's also an impressive result for the scale of changes that are being shipped at Meta. At a smaller organization, it's likely that finding culprit commits is a much easier task.</p><h2>Making AI Accessible to All Engineering Teams</h2><p>The way Meta has integrated AI into their incident response process offers a blueprint for other organizations. By using LLMs to prioritize probable root causes, teams can drastically cut down on investigation time, allowing engineers to jump straight into remediation. AI can help by parsing through logs, tracking recent code changes, and correlating potential issues across different environments. Starting with the investigation</p><h2>How Parity Can Bring AI to Your Team's Incident Response</h2><p>Meta is one of the best-resourced engineering teams in the world, and most teams simply don't have armies of researchers with the resources to fine-tune models and experiment with AI technologies. So how does the average team benefit from these insights from Meta? Surely if LLMs can help root cause incidents in one of the most complex infra stacks in the world nearly half the time, they should be helpful for every other engineering organization, right?</p><p>That's exactly our goal at Parity. We've built the world's first AI SRE for incident response to bring these benefits to teams everywhere. We use LLM agents to investigate and root cause issues the same way an engineer would. When an alert from PagerDuty or DataDog triggers, Parity's agent begins to investigate the issue, gather context, and presents its findings to the engineer. This means before an on-call engineer has even opened their laptop, Parity has already done an investigation and engineers can move to remediation faster. We're personally pretty excited about Parity's performance, and the fact that Meta is built a similar tool gives us a lot of confidence that other teams can benefit from these solutions!</p><h2>The Future of Incident Response and AI</h2><p>The exploration of AI's role in incident response is just getting started, and the potential is clear. Humans aren't great at incident response, and we all hate waking up at 2am to resolve an issue. It's not hard to imagine we'll soon be at super-human performance in this problem space. Underlying improvements in model reasoning ability seem well suited to improving performance in the incident response space (we're particularly excited by the potential of <!--$--><a href="https://openai.com/index/introducing-openai-o1-preview/" rel="noopener">OpenAI's o1</a><!--/$-->). And we believe agents will play an important role in moving accuracy even higher. A world where engineers no longer have to deal with alerts and can get back to building isn't too far away.</p><p>There is also massive potential in adjacent areas like cybersecurity incidents. It's not too hard to imagine that LLMs will be used to respond to cyber threats or by security analysts to explore new attack vectors and prevent potential threats (check out our friends from YC over at <!--$--><a href="https://asterisk.so/" rel="noopener">Asterisk</a><!--/$--> who are working in this space!)</p><p><em>Note: I would like to acknowledge the great work by the team at Meta that worked on this, and I highly recommend reading the original article from Meta Engineering!</em></p></div></div>]]>
@@ -2393,7 +2565,7 @@ November 19, 2024 | https://www.tryparity.com/blog/how-meta-uses-llms-to-improve
             </title>
             <description>
 <![CDATA[
-Score 302 | Comments 216 (<a href="https://news.ycombinator.com/item?id=42187506">thread link</a>) | @alexzeitler
+Score 305 | Comments 217 (<a href="https://news.ycombinator.com/item?id=42187506">thread link</a>) | @alexzeitler
 <br/>
 November 19, 2024 | https://domainanalysis.io/p/architecture-modernization-execution | <a href="https://web.archive.org/web/*/https://domainanalysis.io/p/architecture-modernization-execution">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><article><div><div><div dir="auto"><p><strong>Can I please return to my vacation days in early October?&nbsp;</strong></p><p><span>After my unforgettable and fun vacation in </span><a href="https://english.visitseoul.net/" rel="">Seoul</a><span> and </span><a href="https://nomadicsamuel.com/city-guides/sokcho-travel-guide" rel="">Sokcho</a><span>, my original plan was to write about Systems Thinking and the book I read, "</span><a href="https://www.amazon.com/dp/0060839872" rel="">Zen and the Art of Motorcycle Maintenance</a><span>" by Robert Pirsig. </span></p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic" width="1290" height="1526" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:1526,&quot;width&quot;:1290,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:390657,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/heic&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:true,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F567f5889-d0b7-4149-8ed4-d225e33674dc_1290x1526.heic 1456w" sizes="100vw" fetchpriority="high"></picture></div></a><figcaption>The Great Buddha at Seoraksan National Park, South Korea</figcaption></figure></div><p>But all it takes is a moment, which has lasted more than two weeks, and I feel my life has turned upside down. The last two weeks have been quite literally a car wreck.&nbsp;</p><ul><li><p>First, the Sunday before the US elections, while pulling over for a paramedic, I got rear-ended by a monster pickup truck. I am fine, thankfully, but my car still is not.&nbsp;</p></li><li><p>Second, I really believed that the company I work for, the New York Times, would avoid the ULP strike by the tech workers by agreeing to a fair contract before the US elections. That did not happen. And I don't want to discuss the US election results because that hurt will not go away anytime soon. Meanwhile, my colleagues and I went on an 8-day ULP strike. Since the company refused to bargain with us while we were on strike, we decided to end the strike and return to work earlier this week. We would like to get the contract we deserve soon.</p></li><li><p>I am trying very hard to return back to functioning, I must be succeeding because here I am, able to write some words!&nbsp;</p></li></ul><p><strong>Estimates - Is it an Art or Science?&nbsp;</strong></p><p>My car has been in the auto body repair shop for the past two weeks, and I am still trying to get an estimate of its damages. I am learning that it's an interesting domain:&nbsp;</p><ul><li><p>First, the insurance adjuster submits what they think is the damage to the car to the repair shop. Let's say this is $15000</p></li><li><p>Next, the repair shop submits what they think is the damage back to the insurance company. Let's say it's $18000, and the shop estimates it would take 30 days to fix it.&nbsp;</p></li><li><p>Eventually, the insurance adjuster and the repair shop expert meet to assess the damage together. Let's say the insurance adjuster approves this new estimate from the repair shop. The repair shop then starts with the repair process. At least this is my understanding so far.&nbsp;</p></li></ul><p><strong>Unforeseen Issues</strong></p><p>But what if there is damage that can't be seen yet? Let's say the repair shop is in the process of doing the repairs they notice additional damage. Or they put the car on the frame machine to see if there is damage to the frame. In a unibody frame, it's not just the point of impact of the frame; some of the effects can also transfer to the back of the frame. So they'll have to inspect it to assess the full damage. They might start unassembling the car and notice more damage that was not originally on the estimate. Now what?&nbsp;</p><p><strong>Emergent Solutions&nbsp;</strong></p><p>Let's say, based on the new findings, it's going to cost an additional $20,000. They now need the approval of the insurance company to proceed. So they write up the new findings with the new cost and send a supplemental repair for approval. The insurance company will determine whether, at this point, it still makes sense to proceed with the repair or call it a total loss. And, of course, there are guidelines and rules to determine that. Let's assume it's not a total loss. The insurance company then approves the additional cost of repair.&nbsp;</p><p><strong>Real Talk or Crazy Talk?</strong></p><p>Can you imagine if the insurance company started arguing with the repair shop, asking them—no—telling them that they would only pay the $18,000 and not the additional $20,000 because that was the original estimate? Does that sound ridiculous to you? It does to me, too. Thank heavens, reality does not operate like this.&nbsp;</p><p><strong>Isn't Complex Software Architecture Modernization the same?&nbsp;</strong></p><p>When you are in the process of modernizing legacy software, you are in the realm of complex software. When you look at it from the outside, you see some obvious things, and based on experience and expertise, you come up with an initial estimate. This is the repair shop's original estimate of $18,000</p><p>As you are in the process, you start uncovering additional complexity. This complexity could be similar to some hidden damages the repair shop discovered after un-assembling the parts, or this could be significant frame damage that the repair shop discovered. What do you do? You need additional approvals to proceed at this point.&nbsp;</p><p><strong>Good Leaders Ask the Right Questions</strong></p><p>The right questions are asked if you are in a healthy software development environment when you bubble these problems up. How complex is this problem? What are the different ways of solving this? What are the tradeoffs? Are there workarounds or alternate solutions to this?&nbsp;</p><p>Suppose the questions start leading to how you did not see this complexity, how you missed this, why it is taking so long, and you are beholden to the original estimated dates? May the force be with you and your team to give you the strength to see this through. Hopefully, your modernization journey will be a short and successful one.&nbsp;</p><p><strong>To Proceed or call it a Total Loss?</strong></p><p>I have been involved in both types of modernization projects. Cases where the supplemental cost gets approved, and work proceeds until the next step,&nbsp; rinse and repeat until the project has come to completion. I've also seen total loss, i.e.&nbsp; the project got canned because it was too expensive to proceed, and it would cost more than it was worth. It's not easy deciding this, and there are frameworks and decision workshops to try and choose the direction.&nbsp;</p><p><strong>Is this a complex context or a complicated context?</strong></p><p><span>I urge you to read the excellent article from David J Snowden and Mary E Boone on,</span><a href="https://hbr.org/2007/11/a-leaders-framework-for-decision-making" rel=""> “A Leaders Framework for Decision Making”</a><span>. Using the Cynefin framework, motorcycle maintenance or auto repair might fall under the complicated context. In order to fix the car, the expert technician, after having listened to how the collision happened, also has to analyze and test multiple factors, such as unseen damage, frame damage, etc., to determine the best course of action for the car.&nbsp;</span></p><p>However, in a complex context, you can only decide whether or not it is right or wrong in hindsight, i.e. after you've tried the thing. Does this jive more and more with complex legacy modernization software projects? I.e. you try something and learn that the integration you thought would work doesn’t work or you uncover a completely new behavior you never knew existed and you now have to account for it?&nbsp; </p><p>There is no fixed path when modernizing a complex legacy system. There is no rulebook to follow. You try, experiment, discover, solve, and move on to the next piece until you're done.&nbsp;</p><p><strong>Denial - Anger - Bargaining - Depression - Acceptance??</strong></p><p>When modernizing applications, if we understand that this effort falls somewhere between Complex and Complicated Contexts, we can implement the right sort of gauges to see how to proceed and determine success. Applying the process of estimates for a complex context is wrong. It’s like trying to use a hammer as a solution for every screw or a lug nut!&nbsp;Sometimes you need a screwdriver and sometimes you need a wrench!</p><p>Curveballs in modernization projects are just a reality. You can't foresee every outcome ahead of time. No amount of upfront analysis would lead you to a perfect data model. There will be new learnings almost every step of the way. Data Models will have to change based on the complexity you have uncovered. So it's a matter of when, not if, for curveballs. When a curveball hits and the estimate changes, take a step forward instead of getting angry or blaming folks or trying to do a what-if analysis on how best to bring the schedule in. </p><p><span>When you’re dealing with curveballs, which </span><a href="https://continuousdelivery.com/implementing/culture/" rel="">Ron Westrum’s defined model of culture</a><span> does your organization adopt? Power-Oriented where messengers who inform about the curveballs are shot and failure leads to&nbsp; scapegoated, Rule-Oriented where the messengers who inform about the curveballs are ignored and failure leads to justice or Performance- Oriented where the messengers who inform about the curveballs are trained and failure leads to enquiry?&nbsp;</span></p><p>As long as the problem you're trying to solve is still relevant and still meets the business needs, take it one step at a time. Ultimately the software you are trying to modernize is for users.&nbsp;</p><p><strong>Tip for Leaders Leading Modernization Initiatives</strong></p><p><span>To quote from the same </span><a href="https://hbr.org/2007/11/a-leaders-framework-for-decision-making" rel="">article</a><span>, "Leaders who don't recognize that a complex domain requires a more experimental mode of management may become impatient when they don't seem to be achieving the results they were aiming for. They may also find it difficult to tolerate failure, an essential aspect of experimental understanding. If they try to overcontrol the organization, they will preempt the opportunity for informative patterns to emerge. Leaders who try to impose order in a complex context will fail. Still, those who set the stage, step back a bit, allow patterns to emerge, and determine which ones are desirable will succeed".&nbsp;</span></p><p><strong>A New Hope</strong></p><p>Either way I will be ok, whether the repair company is able to fix my car or the insurance company deems it a total loss. The system works. I wish I could say the same for modernization projects and the awful industry practice about how much ceremony we attribute to estimates, completely forgetting that an estimate means an approximate of the actual. I hope more and more software companies and leadership use the proper framework for measuring success. I hope this leaves you with some ideas on implementing changes or at least questioning the practices if they seem wrong.&nbsp;</p><p><em>"I've wondered why it took us so long to catch on. We saw it, and yet we didn't see it. Or rather we were trained not to see it. Conned perhaps into thinking that the real action was metropolitan and all this was just boring hinterland. It was a puzzling thing. The truth knocks on the door and you say, "Go away. I'm looking for the truth." And so it goes away. Puzzling."</em></p><p><em>― Robert Pirsig</em></p></div></div></div></article></div></div></div>]]>
@@ -2709,7 +2881,7 @@ November 19, 2024 | https://likang.dev/posts/google-search-bug/ | <a href="https
             </title>
             <description>
 <![CDATA[
-Score 55 | Comments 81 (<a href="https://news.ycombinator.com/item?id=42183555">thread link</a>) | @lando2319
+Score 55 | Comments 82 (<a href="https://news.ycombinator.com/item?id=42183555">thread link</a>) | @lando2319
 <br/>
 November 19, 2024 | https://www3.nhk.or.jp/news/html/20241119/k10014642881000.html | <a href="https://web.archive.org/web/*/https://www3.nhk.or.jp/news/html/20241119/k10014642881000.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
@@ -2933,7 +3105,7 @@ November 18, 2024 | https://obrhubr.org/chess-engine | <a href="https://web.arch
             </title>
             <description>
 <![CDATA[
-Score 256 | Comments 376 (<a href="https://news.ycombinator.com/item?id=42175316">thread link</a>) | @abdisalan
+Score 257 | Comments 378 (<a href="https://news.ycombinator.com/item?id=42175316">thread link</a>) | @abdisalan
 <br/>
 November 18, 2024 | https://abdisalan.com/posts/tragedy-running-old-node-project/ | <a href="https://web.archive.org/web/*/https://abdisalan.com/posts/tragedy-running-old-node-project/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p><span>
@@ -3510,1279 +3682,6 @@ November 17, 2024 | https://smoores.dev/post/phonetic_matching/ | <a href="https
             <link>https://smoores.dev/post/phonetic_matching/</link>
             <guid isPermaLink="false">hacker-news-small-sites-42169363</guid>
             <pubDate>Mon, 18 Nov 2024 03:02:11 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[Is Chrome the New IE? (2023)]]>
-            </title>
-            <description>
-<![CDATA[
-Score 280 | Comments 296 (<a href="https://news.ycombinator.com/item?id=42167749">thread link</a>) | @bentocorp
-<br/>
-November 17, 2024 | https://www.magiclasso.co/insights/is-chrome-the-new-ie/ | <a href="https://web.archive.org/web/*/https://www.magiclasso.co/insights/is-chrome-the-new-ie/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
-	    <!-- Article content -->
-	    <div>
-		    <div>
-			    	<p>With a global browser market share of over 65%, Google’s Chrome has become the target of criticism and disdain, much like Microsoft’s Internet Explorer once was. Is Chrome facing similar challenges to Internet Explorer (IE) and will this lead to its downfall?</p>
-
-<h2 id="dominance">Dominance</h2>
-<p>Over many years commentators have proposed that Chrome is the new IE; but why?</p>
-
-<p><a href="https://erik.itland.no/chrome-is-the-new-internet-explorer-4-stages">Erik Itland</a> (Erik I, 2020):</p>
-
-<blockquote>
-  <p>the quote [“Chrome is the new Internet Explorer”] tends to be misunderstood to mean that Chrome is like Internet Explorer was in 2009: most people were using it even though it was technically inferior … What we saw in 2009 [with Internet Explorer] was only the latest stage of something that had been going on for a while</p>
-</blockquote>
-
-<p><a href="https://www.reddit.com/r/firefox/comments/8n1daj/google_chrome_is_the_new_ie_6/">Reddit</a> (2018):</p>
-
-<blockquote>
-  <p>I can’t stand when many of Google’s services have the view it with Google Chrome, install Google Chrome to use this service, and Google Chrome works best with our search engine. I feel like I’m going back to the ages of when Windows 98 would keep giving me text that would say “Use Internet Explorer to experience the most rewarding way to use the web.”</p>
-</blockquote>
-
-<p><a href="https://www.theverge.com/2018/1/4/16805216/google-chrome-only-sites-internet-explorer-6-web-standards">Tom Warren</a> (The Verge, 2018):</p>
-
-<blockquote>
-  <p>Chrome, is being used in the same way that Internet Explorer 6 was back in the day — with web developers primarily optimizing for Chrome and tweaking for rivals later … the results have been particularly evident throughout 2017. Google has been at the center of a lot of “works best with Chrome” messages we’re starting to see appear on the web.</p>
-</blockquote>
-
-<p><a href="https://twitter.com/gruber/status/941861327345201152">John Gruber</a> (Daring Fireball, 2017):</p>
-
-<blockquote>
-  <p>There is so much Chrome-only stuff right now… If you think Google isn’t building a proprietary Chrome platform, your head is in the sand.</p>
-</blockquote>
-
-<p>So Chrome becomes dominant – much like IE was back in its day – and web developers start focusing on building for Chrome and not open web standards.</p>
-
-<p>They are validated by Google encouraging Chrome usage on their popular web properties, pushing their dominance further.</p>
-
-<p>Vocal pushback begins from the broader tech community, leading to Google to pull back. Web developers however still grumble about other non-Chrome web browsers. All the while, they encourage an unhealthy monoculture.</p>
-
-<h2 id="complacency">Complacency</h2>
-<p>A key issue with a dominant product is that it can become complacent. As the internet evolved past the 1990s, the limitations of IE became increasingly apparent, leading to slow performance, lack of support for modern web standards, and security vulnerabilities.</p>
-
-<p>Launched in 2008, Chrome promised to be fast, simple, and secure, utilizing the latest web technologies and designed from the ground up with speed and efficiency in mind.</p>
-
-<p>Is that still the case? Is there evidence of Chrome following IE down the slow, bloated, security ignorant path?</p>
-
-<p><a href="https://www.forbes.com/sites/zakdoffman/2021/03/20/stop-using-google-chrome-on-apple-iphone-12-pro-max-ipad-and-macbook-pro/?sh=6a9f85124d08">Zak Hoffman</a> (Forbes, 2021):</p>
-
-<blockquote>
-  <p>… when Apple said that it would force app developers to disclose the scale of data collected and linked to its users, all eyes turned to Google … The fact is that Chrome collects more data than any of the other browsers, yet is the only one that doesn’t appear to collect any data that isn’t linked to user identities.</p>
-</blockquote>
-
-<p><a href="https://www.macrumors.com/how-to/reduce-chrome-memory-cpu-usage/">Tim Hardwick</a> (MacRumors, 2023):</p>
-
-<blockquote>
-  <p>Google’s Chrome browser has long been criticized for being a system resource hog, which is why Chromium developers have been busy working on ways to free up memory and keep things running smoothly when users have multiple windows and tabs open.</p>
-</blockquote>
-
-<p><a href="https://www.magiclasso.co/insights/triumph-of-safari/">Magic Lasso</a> (2023):</p>
-
-<blockquote>
-  <p>In the latest Interop 2022 dashboard, Safari has emerged as the top performer among web browsers, with a leading 96% compliance score in the experimental category. On the same test, Chrome Dev scores 92%</p>
-
-  <p>[On] the Speedometer 2.0 benchmark … Safari scored 122, outpacing its competitors Firefox and Chrome, which scored 88 and 111 respectively.</p>
-</blockquote>
-
-<p>Despite being the market share leader, there is significant evidence that Chrome is trailing in speed, efficiency and standards interoperability.</p>
-
-<p>Google has also used Chrome to put roadblocks in front of industry-wide privacy initiatives. Extensive delays in the removal of cross-site cookie tracking and <a href="https://www.magiclasso.co/insights/google-undermines-adblock/">attempts to undermine ad blockers</a> being two primary examples.</p>
-
-<h2 id="disruption">Disruption</h2>
-<p>Will Chrome be disrupted as the leading web browser? Perhaps, but there needs to be viable alternative candidates.</p>
-
-<p>Both Firefox and Safari are unlikely disruptors.</p>
-
-<p>Since as least 2013, Firefox’s market share has declined. Aside from a major platform shift, such as the one that occurred with the introduction of mobile browsers, its market share is unlikely to improve.</p>
-
-<p>On the other hand, Safari has seen slow but steady success. Market share has grown, it has a dedicated and passionate user base and the backing of a powerful well funded owner in Apple. However, Safari can’t reach a dominant position without full cross-platform support. That means supporting both Windows and Android.</p>
-
-<p>Often forgotten is that Apple did try. In 2007, Safari was made available on Windows. It didn’t get much traction or acclaim. Five years later in 2012, the browser was withdrawn. The unsuccessful foray will likely stop Apple from ever attempting again.</p>
-
-<p>Perhaps the browser with the most disruptive potential is from Microsoft with Edge. Microsoft has the credentials. It owns the most used desktop operating system, is the enterprise leader and has an alternative (though maligned) search engine to act as an acquisition and distribution channel. With Edge, Microsoft has a chance to claim the position of the disruptive alternate browser.</p>
-
-<p>Though, despite these advantages, Edge hasn’t set the world alight. Its marketshare is higher, though similar to Firefox. But it is available on all major platforms. It has also avoided alternative-browser compatibility issues by being based upon Chromium. It may also be able to successfully leverage Microsoft’s vast channels to reach new users.</p>
-
-<p>Microsoft would love the schadenfreude of toppling Chrome. Doing to Google, what Google did to Internet Explorer. The positive response to Bing and Edge integrating ChatGPT may indicate glimmers of market share growth.</p>
-
-<p>At the moment though, there is no single likely alternative to Chrome’s dominance. But perhaps that’s for the better.</p>
-
-<p>Maybe a collection of browsers, all supporting open web standards, with substantial, though not dominant marketshare is the answer. If these alternatives continue to be supported and flourish, collectively it may be enough to reduce Chrome’s dominance.</p>
-
-<p>And perhaps that’s exactly how the web should be.</p>
-
-
-		    </div>
-		</div>
-	</div></div>]]>
-            </description>
-            <link>https://www.magiclasso.co/insights/is-chrome-the-new-ie/</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42167749</guid>
-            <pubDate>Sun, 17 Nov 2024 22:05:11 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[You could have designed state of the art positional encoding]]>
-            </title>
-            <description>
-<![CDATA[
-Score 210 | Comments 44 (<a href="https://news.ycombinator.com/item?id=42166948">thread link</a>) | @Philpax
-<br/>
-November 17, 2024 | https://fleetwood.dev/posts/you-could-have-designed-SOTA-positional-encoding | <a href="https://web.archive.org/web/*/https://fleetwood.dev/posts/you-could-have-designed-SOTA-positional-encoding">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article><div><blockquote>
-<p><strong>Gall's Law</strong> <br>
-<!-- -->A complex system that works is invariably found to have evolved from a simple
-system that worked <br>
-<!-- -->John Gall</p>
-</blockquote>
-<p>This post walks you through the step-by-step discovery of state-of-the-art positional encoding in transformer models. We will achieve
-this by iteratively improving our approach to encoding position, arriving at <strong>Ro</strong>tary <strong>P</strong>ostional <strong>E</strong>ncoding (RoPE) used in the latest <a href="https://ai.meta.com/blog/llama-3-2-connect-2024-vision-edge-mobile-devices/" rel="nofollow" target="_blank">LLama 3.2</a> release and most modern transformers. This post intends to limit the mathematical knowledge required to follow along, but some basic linear algebra, trigonometry and understanding of self attention is expected.</p>
-<h2>Problem Statement</h2>
-<blockquote>
-<p>You shall know a word by the company it keeps <br>
-<!-- -->John Rupert Firth</p>
-</blockquote>
-<p>As with all problems, it is best to first start with understanding <strong>exactly</strong> what we are trying to achieve. The self attention mechanism in transformers is utilized to understand relationships
-between tokens in a sequence. Self attention is a <strong>set</strong> operation, which
-means it is <strong>permutation equivariant</strong>. If we do not
-enrich self attention with positional information, many important relationships are
-<strong>incapable of being determined</strong>.</p>
-<p>This is best demonstrated by example.</p>
-<h2>Motivating Example</h2>
-<p>Consider this sentence with the same word in different positions:</p>
-<p><span><span><span><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><mtext>The&nbsp;dog&nbsp;chased&nbsp;another&nbsp;dog</mtext></mrow><annotation encoding="application/x-tex">\text{The dog chased another dog}</annotation></semantics></math></span></span></span></p><p>Intuitively, "dog" refers to two different entities. Let's see what happens if we first tokenize them, map to the real token embeddings of <strong>Llama 3.2 1B</strong> and pass them through <a href="https://pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html" rel="nofollow" target="_blank">torch.nn.MultiheadAttention</a>.</p>
-<pre><code><span line="1"><span>import</span> torch
-</span><span line="2"><span>import</span> torch<span>.</span>nn <span>as</span> nn
-</span><span line="3"><span>from</span> transformers <span>import</span> AutoTokenizer<span>,</span> AutoModel
-</span><span line="4">
-</span><span line="5">model_id <span>=</span> <span>"meta-llama/Llama-3.2-1B"</span>
-</span><span line="6">tok <span>=</span> AutoTokenizer<span>.</span>from_pretrained<span>(</span>model_id<span>)</span>
-</span><span line="7">model <span>=</span> AutoModel<span>.</span>from_pretrained<span>(</span>model_id<span>)</span>
-</span><span line="8">
-</span><span line="9">text <span>=</span> <span>"The dog chased another dog"</span>
-</span><span line="10">tokens <span>=</span> tok<span>(</span>text<span>,</span> return_tensors<span>=</span><span>"pt"</span><span>)</span><span>[</span><span>"input_ids"</span><span>]</span>
-</span><span line="11">embeddings <span>=</span> model<span>.</span>embed_tokens<span>(</span>tokens<span>)</span>
-</span><span line="12">hdim <span>=</span> embeddings<span>.</span>shape<span>[</span><span>-</span><span>1</span><span>]</span>
-</span><span line="13">
-</span><span line="14">W_q <span>=</span> nn<span>.</span>Linear<span>(</span>hdim<span>,</span> hdim<span>,</span> bias<span>=</span><span>False</span><span>)</span>
-</span><span line="15">W_k <span>=</span> nn<span>.</span>Linear<span>(</span>hdim<span>,</span> hdim<span>,</span> bias<span>=</span><span>False</span><span>)</span>
-</span><span line="16">W_v <span>=</span> nn<span>.</span>Linear<span>(</span>hdim<span>,</span> hdim<span>,</span> bias<span>=</span><span>False</span><span>)</span>
-</span><span line="17">mha <span>=</span> nn<span>.</span>MultiheadAttention<span>(</span>embed_dim<span>=</span>hdim<span>,</span> num_heads<span>=</span><span>4</span><span>,</span> batch_first<span>=</span><span>True</span><span>)</span>
-</span><span line="18">
-</span><span line="19"><span>with</span> torch<span>.</span>no_grad<span>(</span><span>)</span><span>:</span>
-</span><span line="20">    <span>for</span> param <span>in</span> mha<span>.</span>parameters<span>(</span><span>)</span><span>:</span>
-</span><span line="21">        nn<span>.</span>init<span>.</span>normal_<span>(</span>param<span>,</span> std<span>=</span><span>0.1</span><span>)</span> 
-</span><span line="22">
-</span><span line="23">output<span>,</span> _ <span>=</span> mha<span>(</span>W_q<span>(</span>embeddings<span>)</span><span>,</span> W_k<span>(</span>embeddings<span>)</span><span>,</span> W_v<span>(</span>embeddings<span>)</span><span>)</span>
-</span><span line="24">
-</span><span line="25">dog1_out <span>=</span> output<span>[</span><span>0</span><span>,</span> <span>2</span><span>]</span>
-</span><span line="26">dog2_out <span>=</span> output<span>[</span><span>0</span><span>,</span> <span>5</span><span>]</span>
-</span><span line="27"><span>print</span><span>(</span><span><span>f"Dog output identical?: </span><span><span>{</span>torch<span>.</span>allclose<span>(</span>dog1_out<span>,</span> dog2_out<span>,</span> atol<span>=</span><span>1e-6</span><span>)</span><span>}</span></span><span>"</span></span><span>)</span> 
-</span></code></pre>
-<p>As we can see, without any positional information, the output of a (multi
-headed) self attention operation is <strong>identical for the same token in
-different positions</strong>, despite the tokens clearly representing distinct entities. Let's begin designing a method of enhancing self attention with positional information, such that it can determine relationships between words encoded by
-their positions.</p>
-<p>To understand and design an optimal encoding scheme, let's explore some desirable properties such a scheme should have.</p>
-<h2>Desirable Properties</h2>
-<p>Let's try and define some desirable properties that will make the optimization
-process as easy as possible.</p>
-<h4>Property 1 - Unique encoding for each position (across sequences)</h4>
-<p>Each position needs a unique encoding that remains consistent regardless of sequence length - a token at position 5 should have the same encoding whether the current sequence is of length 10 or 10,000.</p>
-<h4>Property 2 - Linear relation between two encoded positions</h4>
-<p>The relationship between positions should be mathematically simple. If we know the encoding for position <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>p</mi></mrow><annotation encoding="application/x-tex">p</annotation></semantics></math></span></span>, it should be straightforward to compute the encoding for position <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>p</mi><mo>+</mo><mi>k</mi></mrow><annotation encoding="application/x-tex">p+k</annotation></semantics></math></span></span>, making it easier for the model to learn positional patterns.</p>
-<p>If you think about how we represent numbers on a number line, it's easy to understand that 5 is 2 steps away from 3, or that 10 is 5 steps from 15. The same intuitive relationship should exist in our encodings.</p>
-<h4>Property 3 - Generalizes to longer sequences than those encountered in training</h4>
-<p>To increase our models' utility in the real world, they should generalize outside
-their training distribution. Therefore, our encoding scheme needs to be
-adaptable enough to handle unexpected input lengths, without
-violating any of our other desirable properties.</p>
-<h4>Property 4 - Generated by a deterministic process the model can learn</h4>
-<p>It would be ideal if our positional encodings could be drawn from a
-deterministic process. This should allow the model to learn the mechanism
-behind our encoding scheme efficiently.</p>
-<h4>Property 5 - Extensible to multiple dimensions</h4>
-<p>With multimodal models becoming the norm, it is crucial that our positional
-encoding scheme can naturally extend from <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mi>D</mi></mrow><annotation encoding="application/x-tex">1D</annotation></semantics></math></span></span> to <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>n</mi><mi>D</mi></mrow><annotation encoding="application/x-tex">nD</annotation></semantics></math></span></span>. This will allow models to consume data like images or brain scans, which are <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mi>D</mi></mrow><annotation encoding="application/x-tex">2D</annotation></semantics></math></span></span> and <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>4</mn><mi>D</mi></mrow><annotation encoding="application/x-tex">4D</annotation></semantics></math></span></span>
-respectively.</p>
-<p>Now we know the ideal properties (henceforth referred to as <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>P</mi><msub><mi>r</mi><mi>n</mi></msub></mrow><annotation encoding="application/x-tex">Pr_n</annotation></semantics></math></span></span>), let's start designing and iterating on our encoding scheme.</p>
-<h2>Integer Position Encoding</h2>
-<p>The first approach that may jump to mind is simply to add the integer value of the token position to each component of the token embedding, with values ranging from <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>0</mn><mo>→</mo><mi>L</mi></mrow><annotation encoding="application/x-tex">0 \rightarrow L</annotation></semantics></math></span></span> where <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>L</mi></mrow><annotation encoding="application/x-tex">L</annotation></semantics></math></span></span> is the
-length of our current sequence.</p>
-<div><p><video autoplay="" muted="" loop="" playsinline=""><source src="https://fleetwood.dev/positional-encoding/IntegerEncoding.mp4" type="video/mp4">Your browser does not support the video tag.</video></p></div>
-<p>In the above animation, we create our positional encoding vector for the token <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mstyle mathcolor="#699C52"><mtext>chased</mtext></mstyle></mrow><annotation encoding="application/x-tex">\color{#699C52}\text{chased}</annotation></semantics></math></span></span> from the index and add it to our token embedding. The embedding values here are a subset of the real values from <strong>Llama 3.2 1B</strong>. We can observe that they're clustered around 0. This
-is desirable to avoid <a href="https://www.cs.toronto.edu/~rgrosse/courses/csc321_2017/readings/L15%20Exploding%20and%20Vanishing%20Gradients.pdf" rel="nofollow" target="_blank">vanishing or exploding gradients</a> during training and therefore is something we'd like to maintain throughout the model.</p>
-<p>It's clear that our current naïve approach is going to cause problems. The magnitude of the position value
-vastly exceeds the actual values of our input. This means the signal-to-noise
-ratio is very low, and it's hard for the model to separate the semantic
-information from the positional information.</p>
-<p>With this new knowledge, a natural follow on might be to normalize the position value by <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mfrac><mn>1</mn><mi>N</mi></mfrac></mrow><annotation encoding="application/x-tex">\frac{1}{N}</annotation></semantics></math></span></span>. This constrains the values between 0 and 1, but introduces another problem. If we choose <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi></mrow><annotation encoding="application/x-tex">N</annotation></semantics></math></span></span> to be the length of the current sequence, then the position values will be completely different for each sequence of differing lengths, violating <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>P</mi><msub><mi>r</mi><mn>1</mn></msub></mrow><annotation encoding="application/x-tex">Pr_1</annotation></semantics></math></span></span>.</p>
-<p>Is there a better way to ensure our numbers are between 0 and 1?
-If we thought really hard about this for a while, we might come up with switching
-from decimal to binary numbers.</p>
-<h2>Binary Position Encoding</h2>
-<p>Instead of adding our (potentially normalized) integer position to each
-component of the embedding, we could instead convert it into its binary
-representation and <em>s t r e t c h</em> our value out to match our embedding dimension, as demonstrated below.</p>
-<div><p><video autoplay="" muted="" loop="" playsinline=""><source src="https://fleetwood.dev/positional-encoding/BinaryEncoding.mp4" type="video/mp4">Your browser does not support the video tag.</video></p></div>
-<p>We've converted the position of interest (252) into its binary representation
-(11111100) and added each bit to the corresponding component of the
-token embedding. The least significant bit (LSB) will cycle between 0 and 1 for every
-subsequent token, whilst the most significant bit (MSB) will cycle every
-<span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mn>2</mn><mrow><mi>n</mi><mo>−</mo><mn>1</mn></mrow></msup></mrow><annotation encoding="application/x-tex">2^{n-1}</annotation></semantics></math></span></span> tokens where <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>n</mi></mrow><annotation encoding="application/x-tex">n</annotation></semantics></math></span></span> is the number of bits.
-You can see the positional encoding vector for different indices in the animation below <sup><a href="#user-content-fn-1" id="user-content-fnref-1" data-footnote-ref="true" aria-describedby="footnote-label">1</a></sup>.</p>
-<div><p><video autoplay="" muted="" loop="" playsinline=""><source src="https://fleetwood.dev/positional-encoding/BinaryPositionalEncodingPlot.mp4" type="video/mp4">Your browser does not support the video tag.</video></p></div>
-<p>We've solved the value range problem, and we now have unique encodings that are
-consistent across different sequence lengths. What happens if we plot a low dimensional version of our token embedding and visualize the addition of our binary positional vector for different values.</p>
-<div><p><video autoplay="" muted="" loop="" playsinline=""><source src="https://fleetwood.dev/positional-encoding/BinaryVector3D.mp4" type="video/mp4">Your browser does not support the video tag.</video></p></div>
-<p>We can see that the result is very "jumpy" (as we might expect from the
-discrete nature of binary). The optimization process likes smooth, continuous and
-predictable changes. Do we know any functions with similar value ranges that are smooth and continuous?</p>
-<p>If we looked around a little, we might notice that both <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>sin</mi><mo>⁡</mo></mrow><annotation encoding="application/x-tex">\sin</annotation></semantics></math></span></span> and <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>cos</mi><mo>⁡</mo></mrow><annotation encoding="application/x-tex">\cos</annotation></semantics></math></span></span> fit the bill!</p>
-<h2>Sinusoidal positional encoding</h2>
-<div><p><video autoplay="" muted="" loop="" playsinline=""><source src="https://fleetwood.dev/positional-encoding/SteppedPositionalEncodingPlot.mp4" type="video/mp4">Your browser does not support the video tag.</video></p></div>
-<p>The above animation visualizes our position embedding if each component is
-alternatively drawn from <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>sin</mi><mo>⁡</mo></mrow><annotation encoding="application/x-tex">\sin</annotation></semantics></math></span></span> and <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>cos</mi><mo>⁡</mo></mrow><annotation encoding="application/x-tex">\cos</annotation></semantics></math></span></span> with gradually increasing
-wavelengths. If you compare it with the previous animation, you'll notice a striking similarity!</p>
-<p>We've now arrived at Sinusoidal embeddings; originally defined in the <a href="https://arxiv.org/abs/1706.03762" rel="nofollow" target="_blank">Attention is all you need</a> paper.
-Let's look at the equations:</p>
-<p><span><span><span><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><mi>P</mi><msub><mi>E</mi><mrow><mo stretchy="false">(</mo><mi>p</mi><mi>o</mi><mi>s</mi><mo separator="true">,</mo><mn>2</mn><mi>i</mi><mo stretchy="false">)</mo></mrow></msub><mo>=</mo><mstyle mathcolor="#58C4DD"><mi>sin</mi><mo>⁡</mo><mrow><mo fence="true">(</mo><mstyle mathcolor="black"><mfrac><mrow><mi>p</mi><mi>o</mi><mi>s</mi></mrow><mrow><mn>1000</mn><msup><mn>0</mn><mrow><mn>2</mn><mi>i</mi><mi mathvariant="normal">/</mi><mi>d</mi></mrow></msup></mrow></mfrac><mstyle mathcolor="#58C4DD"></mstyle></mstyle><mo fence="true" mathcolor="#58C4DD">)</mo></mrow><mstyle mathcolor="black"><mspace linebreak="newline"></mspace><mspace width="1em"></mspace><mspace linebreak="newline"></mspace><mi>P</mi><msub><mi>E</mi><mrow><mo stretchy="false">(</mo><mi>p</mi><mi>o</mi><mi>s</mi><mo separator="true">,</mo><mn>2</mn><mi>i</mi><mo>+</mo><mn>1</mn><mo stretchy="false">)</mo></mrow></msub><mo>=</mo><mstyle mathcolor="#FC6255"><mi>cos</mi><mo>⁡</mo><mrow><mo fence="true">(</mo><mstyle mathcolor="black"><mfrac><mrow><mi>p</mi><mi>o</mi><mi>s</mi></mrow><mrow><mn>1000</mn><msup><mn>0</mn><mrow><mn>2</mn><mi>i</mi><mi mathvariant="normal">/</mi><mi>d</mi></mrow></msup></mrow></mfrac><mstyle mathcolor="#FC6255"></mstyle></mstyle><mo fence="true" mathcolor="#FC6255">)</mo></mrow><mstyle mathcolor="black"><mspace linebreak="newline"></mspace></mstyle></mstyle></mstyle></mstyle></mrow><annotation encoding="application/x-tex">PE_{(pos,2i)} = \color{#58C4DD}\sin\left(\color{black}\frac{pos}{10000^{2i/d}}\color{#58C4DD}\right)\color{black} \\ 
-\quad \\
-PE_{(pos,2i+1)} = \color{#FC6255}\cos\left(\color{black}\frac{pos}{10000^{2i/d}}\color{#FC6255}\right)\color{black} \\ </annotation></semantics></math></span></span></span></p><p>where <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>p</mi><mi>o</mi><mi>s</mi></mrow><annotation encoding="application/x-tex">pos</annotation></semantics></math></span></span> is the tokens position index, <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>i</mi></mrow><annotation encoding="application/x-tex">i</annotation></semantics></math></span></span> is the component index
-in the positional encoding vector, and <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>d</mi></mrow><annotation encoding="application/x-tex">d</annotation></semantics></math></span></span> is the model dimension. <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>10</mn><mo separator="true">,</mo><mn>000</mn></mrow><annotation encoding="application/x-tex">10,000</annotation></semantics></math></span></span> is the <strong>base wavelength</strong> (henceforth referred to as
-<span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>θ</mi></mrow><annotation encoding="application/x-tex">\theta</annotation></semantics></math></span></span>), which we stretch or compress as a function of the component index. I encourage you to plug in some realistic values to get a feel for this
-geometric progression.</p>
-<p>There's a few parts of this equation that are confusing at first glance. How did the
-authors choose <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>10</mn><mo separator="true">,</mo><mn>000</mn></mrow><annotation encoding="application/x-tex">10,000</annotation></semantics></math></span></span>? Why are we using <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>sin</mi><mo>⁡</mo></mrow><annotation encoding="application/x-tex">\sin</annotation></semantics></math></span></span> <strong>and</strong> <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>cos</mi><mo>⁡</mo></mrow><annotation encoding="application/x-tex">\cos</annotation></semantics></math></span></span> for even and odd positions respectively?</p>
-<p>It seems that using <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>10</mn><mo separator="true">,</mo><mn>000</mn></mrow><annotation encoding="application/x-tex">10,000</annotation></semantics></math></span></span> for the base wavelength was determined experimentally <sup><a href="#user-content-fn-2" id="user-content-fnref-2" data-footnote-ref="true" aria-describedby="footnote-label">2</a></sup>. Deciphering the usage of both <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>sin</mi><mo>⁡</mo></mrow><annotation encoding="application/x-tex">\sin</annotation></semantics></math></span></span> and <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>cos</mi><mo>⁡</mo></mrow><annotation encoding="application/x-tex">\cos</annotation></semantics></math></span></span> is more involved, but crucial
-for our iterative approach to understanding. The key here is our desire for a linear relation between two encoded positions (<span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>P</mi><msub><mi>r</mi><mn>2</mn></msub></mrow><annotation encoding="application/x-tex">Pr_2</annotation></semantics></math></span></span>). To understand how using <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>sin</mi><mo>⁡</mo></mrow><annotation encoding="application/x-tex">\sin</annotation></semantics></math></span></span> and <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>cos</mi><mo>⁡</mo></mrow><annotation encoding="application/x-tex">\cos</annotation></semantics></math></span></span> in tandem produce this linear relation, we will have to dive into some trigonometry.</p>
-<p>Consider a sequence of sine and cosine pairs, each associated with a frequency <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>ω</mi><mi>i</mi></msub></mrow><annotation encoding="application/x-tex">\omega_i</annotation></semantics></math></span></span>. Our goal is to find a linear transformation matrix <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi mathvariant="bold">M</mi></mrow><annotation encoding="application/x-tex">\mathbf{M}</annotation></semantics></math></span></span> that can shift these sinusoidal functions by a fixed offset <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>k</mi></mrow><annotation encoding="application/x-tex">k</annotation></semantics></math></span></span>:</p>
-<p><span><span><span><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><mi mathvariant="bold">M</mi><mo>⋅</mo><mrow><mo fence="true">[</mo><mtable rowspacing="0.16em" columnalign="center" columnspacing="1em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>sin</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>p</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>cos</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>p</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd></mtr></mtable><mo fence="true">]</mo></mrow><mo>=</mo><mrow><mo fence="true">[</mo><mtable rowspacing="0.16em" columnalign="center" columnspacing="1em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>sin</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mo stretchy="false">(</mo><mi>p</mi><mo>+</mo><mi>k</mi><mo stretchy="false">)</mo><mo stretchy="false">)</mo></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>cos</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mo stretchy="false">(</mo><mi>p</mi><mo>+</mo><mi>k</mi><mo stretchy="false">)</mo><mo stretchy="false">)</mo></mrow></mstyle></mtd></mtr></mtable><mo fence="true">]</mo></mrow></mrow><annotation encoding="application/x-tex">\mathbf{M} \cdot \begin{bmatrix} \sin(\omega_i p) \\ \cos(\omega_i p) \end{bmatrix} = \begin{bmatrix} \sin(\omega_i(p + k)) \\ \cos(\omega_i(p + k)) \end{bmatrix}</annotation></semantics></math></span></span></span></p><p>The frequencies <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>ω</mi><mi>i</mi></msub></mrow><annotation encoding="application/x-tex">\omega_i</annotation></semantics></math></span></span> follow a geometric progression that decreases with dimension index <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>i</mi></mrow><annotation encoding="application/x-tex">i</annotation></semantics></math></span></span>, defined as:</p>
-<p><span><span><span><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><msub><mi>ω</mi><mi>i</mi></msub><mo>=</mo><mfrac><mn>1</mn><mrow><mn>1000</mn><msup><mn>0</mn><mrow><mn>2</mn><mi>i</mi><mi mathvariant="normal">/</mi><mi>d</mi></mrow></msup></mrow></mfrac></mrow><annotation encoding="application/x-tex">\omega_i = \frac{1}{10000^{2i/d}}</annotation></semantics></math></span></span></span></p><p>To find this transformation matrix, we can express it as a general 2×2 matrix with unknown coefficients <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>u</mi><mn>1</mn></msub></mrow><annotation encoding="application/x-tex">u_1</annotation></semantics></math></span></span>, <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>v</mi><mn>1</mn></msub></mrow><annotation encoding="application/x-tex">v_1</annotation></semantics></math></span></span>, <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>u</mi><mn>2</mn></msub></mrow><annotation encoding="application/x-tex">u_2</annotation></semantics></math></span></span>, and <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>v</mi><mn>2</mn></msub></mrow><annotation encoding="application/x-tex">v_2</annotation></semantics></math></span></span>:</p>
-<p><span><span><span><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><mrow><mo fence="true">[</mo><mtable rowspacing="0.16em" columnalign="center center" columnspacing="1em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>u</mi><mn>1</mn></msub></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>v</mi><mn>1</mn></msub></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>u</mi><mn>2</mn></msub></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>v</mi><mn>2</mn></msub></mstyle></mtd></mtr></mtable><mo fence="true">]</mo></mrow><mo>⋅</mo><mrow><mo fence="true">[</mo><mtable rowspacing="0.16em" columnalign="center" columnspacing="1em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>sin</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>p</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>cos</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>p</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd></mtr></mtable><mo fence="true">]</mo></mrow><mo>=</mo><mrow><mo fence="true">[</mo><mtable rowspacing="0.16em" columnalign="center" columnspacing="1em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>sin</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mo stretchy="false">(</mo><mi>p</mi><mo>+</mo><mi>k</mi><mo stretchy="false">)</mo><mo stretchy="false">)</mo></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>cos</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mo stretchy="false">(</mo><mi>p</mi><mo>+</mo><mi>k</mi><mo stretchy="false">)</mo><mo stretchy="false">)</mo></mrow></mstyle></mtd></mtr></mtable><mo fence="true">]</mo></mrow></mrow><annotation encoding="application/x-tex">\begin{bmatrix} u_1 &amp; v_1 \\ u_2 &amp; v_2 \end{bmatrix} \cdot \begin{bmatrix} \sin(\omega_i p) \\ \cos(\omega_i p) \end{bmatrix} = \begin{bmatrix} \sin(\omega_i(p+k)) \\ \cos(\omega_i(p+k)) \end{bmatrix}</annotation></semantics></math></span></span></span></p><p>By applying the trigonometric addition theorem to the right-hand side, we can expand this into:</p>
-<p><span><span><span><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><mrow><mo fence="true">[</mo><mtable rowspacing="0.16em" columnalign="center center" columnspacing="1em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>u</mi><mn>1</mn></msub></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>v</mi><mn>1</mn></msub></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>u</mi><mn>2</mn></msub></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>v</mi><mn>2</mn></msub></mstyle></mtd></mtr></mtable><mo fence="true">]</mo></mrow><mo>⋅</mo><mrow><mo fence="true">[</mo><mtable rowspacing="0.16em" columnalign="center" columnspacing="1em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>sin</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>p</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>cos</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>p</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd></mtr></mtable><mo fence="true">]</mo></mrow><mo>=</mo><mrow><mo fence="true">[</mo><mtable rowspacing="0.16em" columnalign="center" columnspacing="1em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>sin</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>p</mi><mo stretchy="false">)</mo><mi>cos</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>k</mi><mo stretchy="false">)</mo><mo>+</mo><mi>cos</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>p</mi><mo stretchy="false">)</mo><mi>sin</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>k</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>cos</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>p</mi><mo stretchy="false">)</mo><mi>cos</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>k</mi><mo stretchy="false">)</mo><mo>−</mo><mi>sin</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>p</mi><mo stretchy="false">)</mo><mi>sin</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>k</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd></mtr></mtable><mo fence="true">]</mo></mrow></mrow><annotation encoding="application/x-tex">\begin{bmatrix} u_1 &amp; v_1 \\ u_2 &amp; v_2 \end{bmatrix} \cdot \begin{bmatrix} \sin(\omega_i p) \\ \cos(\omega_i p) \end{bmatrix} = \begin{bmatrix} \sin(\omega_i p)\cos(\omega_i k) + \cos(\omega_i p)\sin(\omega_i k) \\ \cos(\omega_i p)\cos(\omega_i k) - \sin(\omega_i p)\sin(\omega_i k) \end{bmatrix}</annotation></semantics></math></span></span></span></p><p>This expansion gives us a system of two equations by matching coefficients:</p>
-<p><span><span><span><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mtable rowspacing="0.25em" columnalign="right left" columnspacing="0em"><mtr><mtd></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><msub><mi>u</mi><mn>1</mn></msub><mi>sin</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>p</mi><mo stretchy="false">)</mo><mo>+</mo><msub><mi>v</mi><mn>1</mn></msub><mi>cos</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>p</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mo>=</mo><mi>cos</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>k</mi><mo stretchy="false">)</mo><mi>sin</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>p</mi><mo stretchy="false">)</mo><mo>+</mo><mi>sin</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>k</mi><mo stretchy="false">)</mo><mi>cos</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>p</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd><mtd></mtd><mtd></mtd></mtr><mtr><mtd></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><msub><mi>u</mi><mn>2</mn></msub><mi>sin</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>p</mi><mo stretchy="false">)</mo><mo>+</mo><msub><mi>v</mi><mn>2</mn></msub><mi>cos</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>p</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mo>=</mo><mo>−</mo><mi>sin</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>k</mi><mo stretchy="false">)</mo><mi>sin</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>p</mi><mo stretchy="false">)</mo><mo>+</mo><mi>cos</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>k</mi><mo stretchy="false">)</mo><mi>cos</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>p</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd><mtd></mtd><mtd></mtd></mtr></mtable><annotation encoding="application/x-tex">\begin{align}
-u_1\sin(\omega_i p) + v_1\cos(\omega_i p) &amp;= \cos(\omega_i k)\sin(\omega_i p) + \sin(\omega_i k)\cos(\omega_i p) \\
-u_2\sin(\omega_i p) + v_2\cos(\omega_i p) &amp;= -\sin(\omega_i k)\sin(\omega_i p) + \cos(\omega_i k)\cos(\omega_i p)
-\end{align}</annotation></semantics></math></span></span></span></p><p>By comparing terms with <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>sin</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>p</mi><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">\sin(\omega_i p)</annotation></semantics></math></span></span> and <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>cos</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>p</mi><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">\cos(\omega_i p)</annotation></semantics></math></span></span> on both sides, we can solve for the unknown coefficients:</p>
-<p><span><span><span><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mtable rowspacing="0.25em" columnalign="right left right left" columnspacing="0em 1em 0em"><mtr><mtd></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><msub><mi>u</mi><mn>1</mn></msub></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mo>=</mo><mi>cos</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>k</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><msub><mi>v</mi><mn>1</mn></msub></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mo>=</mo><mi>sin</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>k</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd><mtd></mtd><mtd></mtd></mtr><mtr><mtd></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><msub><mi>u</mi><mn>2</mn></msub></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mo>=</mo><mo>−</mo><mi>sin</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>k</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><msub><mi>v</mi><mn>2</mn></msub></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mo>=</mo><mi>cos</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>k</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd><mtd></mtd><mtd></mtd></mtr></mtable><annotation encoding="application/x-tex">\begin{align}
-u_1 &amp;= \cos(\omega_i k) &amp; v_1 &amp;= \sin(\omega_i k) \\
-u_2 &amp;= -\sin(\omega_i k) &amp; v_2 &amp;= \cos(\omega_i k)
-\end{align}</annotation></semantics></math></span></span></span></p><p>These solutions give us our final transformation matrix <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi mathvariant="bold">M</mi><mi mathvariant="bold">k</mi></msub></mrow><annotation encoding="application/x-tex">\mathbf{M_k}</annotation></semantics></math></span></span>:</p>
-<p><span><span><span><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><msub><mi mathvariant="bold">M</mi><mi mathvariant="bold">k</mi></msub><mo>=</mo><mrow><mo fence="true">[</mo><mtable rowspacing="0.16em" columnalign="center center" columnspacing="1em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>cos</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>k</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>sin</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>k</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mo>−</mo><mi>sin</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>k</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>cos</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>k</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd></mtr></mtable><mo fence="true">]</mo></mrow></mrow><annotation encoding="application/x-tex">\mathbf{M_k} = \begin{bmatrix} \cos(\omega_i k) &amp; \sin(\omega_i k) \\ -\sin(\omega_i k) &amp; \cos(\omega_i k) \end{bmatrix}</annotation></semantics></math></span></span></span></p><p>If you've done any game programming before, you might notice that the
-result of our derivation is oddly familiar. That's right, it's the <a href="https://en.wikipedia.org/wiki/Rotation_matrix" rel="nofollow" target="_blank">Rotation Matrix!</a> <sup><a href="#user-content-fn-3" id="user-content-fnref-3" data-footnote-ref="true" aria-describedby="footnote-label">3</a></sup>.</p>
-<p>So the encoding scheme designed by <a href="https://en.wikipedia.org/wiki/Noam_Shazeer" rel="nofollow" target="_blank">Noam Shazeer</a> in <a href="https://arxiv.org/abs/1706.03762" rel="nofollow" target="_blank">Attention is all you need</a> was already encoding relative position as a rotation back in 2017! It took another <strong>4 years</strong> to go from Sinusoidal Encoding to RoPE, despite rotations already being on the table...</p>
-<h2>Absolute vs Relative Position Encoding</h2>
-<p>With the knowledge in hand that rotations are important here, let's
-return to our motivating example and try to discover some intuitions for our next iteration.</p>
-<p><span><span><span><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mtable rowspacing="0.25em" columnalign="right left" columnspacing="0em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mspace width="0.7em"></mspace><mn>0</mn><mspace width="1.4em"></mspace><mn>1</mn><mspace width="2em"></mspace><mn>2</mn><mspace width="2.6em"></mspace><mn>3</mn><mspace width="2.4em"></mspace><mn>4</mn></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mtext>The&nbsp;dog&nbsp;chased&nbsp;another&nbsp;dog</mtext></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mspace width="0.3em"></mspace><mtext>-2</mtext><mspace width="1.4em"></mspace><mtext>-1</mtext><mspace width="1.7em"></mspace><mn>0</mn><mspace width="2.6em"></mspace><mn>1</mn><mspace width="2.4em"></mspace><mn>2</mn></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mrow><mtext>The&nbsp;dog&nbsp;</mtext><mstyle mathcolor="#699C52"><mtext>chased&nbsp;</mtext><mstyle mathcolor="black"><mtext>another&nbsp;dog</mtext></mstyle></mstyle></mrow></mrow></mstyle></mtd></mtr></mtable><annotation encoding="application/x-tex">\begin{align*}
-&amp;\hspace{0.7em}0 \hspace{1.4em} 1 \hspace{2em} 2 \hspace{2.6em} 3 \hspace{2.4em} 4\\
-&amp;\text{The dog chased another dog} \\
-\\
-&amp;\hspace{0.3em}\text{-2} \hspace{1.4em} \text{-1} \hspace{1.7em} 0 \hspace{2.6em} 1 \hspace{2.4em} 2\\
-&amp;\text{The dog \color{#699C52}chased \color{black}another dog}
-\end{align*}</annotation></semantics></math></span></span></span></p><p>Above we can see the absolute positions of our tokens, and the relative
-positions from <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mstyle mathcolor="#699C52"><mtext>chased</mtext></mstyle></mrow><annotation encoding="application/x-tex">\color{#699C52}\text{chased}</annotation></semantics></math></span></span> to every other token. With Sinusoidal Encoding, we
-generated a separate vector which represents the absolute position,
-and using some trigonometric trickery we were able to encode relative positions.</p>
-<p>When we're trying to understand these sentences, does it matter that <em>this</em> word is the 2149th word in this blog post? Or do we care about its relationship to the words around it? The absolute position of a word rarely matters for meaning - what matters is how words relate to each other.</p>
-<h2>Positional encoding in context</h2>
-<p>From this point on, it's key to consider positional encoding <strong>in the context of</strong>
-self attention. To reiterate, the self-attention mechanism enables the model to weigh the importance of different elements in an input sequence and dynamically adjust their influence on the output.</p>
-<p><span><span><span><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><mtext>Attn</mtext><mo stretchy="false">(</mo><mi>Q</mi><mo separator="true">,</mo><mi>K</mi><mo separator="true">,</mo><mi>V</mi><mo stretchy="false">)</mo><mo>=</mo><mtext>softmax</mtext><mrow><mo fence="true">(</mo><mfrac><mrow><mi>Q</mi><msup><mi>K</mi><mi>T</mi></msup></mrow><msqrt><msub><mi>d</mi><mi>k</mi></msub></msqrt></mfrac><mo fence="true">)</mo></mrow><mi>V</mi></mrow><annotation encoding="application/x-tex">\text{Attn}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V</annotation></semantics></math></span></span></span></p><p>In all our previous iterations, we've generated a separate positional encoding
-vector and <strong>added</strong> it to our token embedding prior to our <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>Q</mi></mrow><annotation encoding="application/x-tex">Q</annotation></semantics></math></span></span>, <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi></mrow><annotation encoding="application/x-tex">K</annotation></semantics></math></span></span> and <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>V</mi></mrow><annotation encoding="application/x-tex">V</annotation></semantics></math></span></span> projections.
-By adding the positional information directly to our token embedding, we are
-<strong>polluting</strong> the semantic information with the positional information. We should
-be attempting to encode the information without modifying the norm. Shifting to multiplicative is the
-key.</p>
-<p>Using the dictionary analogy, when looking up a word (query) in our dictionary (keys), nearby words should have more influence than distant ones. The influence of one token upon another is determined by the <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>Q</mi><msup><mi>K</mi><mi>T</mi></msup></mrow><annotation encoding="application/x-tex">QK^T</annotation></semantics></math></span></span> dot product - so that's exactly where we should focus our positional encoding!</p>
-<p><span><span><span><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><mover accent="true"><mi>a</mi><mo>⃗</mo></mover><mo>⋅</mo><mover accent="true"><mi>b</mi><mo>⃗</mo></mover><mo>=</mo><mi mathvariant="normal">∣</mi><mover accent="true"><mi>a</mi><mo>⃗</mo></mover><mi mathvariant="normal">∣</mi><mi mathvariant="normal">∣</mi><mover accent="true"><mi>b</mi><mo>⃗</mo></mover><mi mathvariant="normal">∣</mi><mi>cos</mi><mo>⁡</mo><mi>θ</mi></mrow><annotation encoding="application/x-tex">\vec{a} \cdot \vec{b} = |\vec{a}| |\vec{b}| \cos \theta</annotation></semantics></math></span></span></span></p><p>The geometric interpretation of the dot product shown above gives us a magnificent insight.
-We can modulate the result of our dot product of two vectors purely by
-increasing or decreasing the angle between them. Furthermore, by rotating the
-vector, we have absolutely zero impact on the norm of the vector, which encodes
-the semantic information of our token.</p>
-<p>So now we know where to focus our <em>attention</em>, and have seen from another <em>angle</em> why a
-rotation might be a sensible "channel" in which to encode our positional
-information, let's put it all together!</p>
-<h2><strong>Ro</strong>tary <strong>P</strong>ostional <strong>E</strong>ncoding</h2>
-<p><strong>Ro</strong>tary <strong>P</strong>ostional <strong>E</strong>ncoding or RoPE was defined in the
-<a href="https://arxiv.org/pdf/2104.09864" rel="nofollow" target="_blank">RoFormer paper</a> (<a href="https://x.com/bojone1993" rel="nofollow" target="_blank">Jianlin Su</a> designed it independently on his blog <a href="https://kexue.fm/archives/8130" rel="nofollow" target="_blank">here</a> and <a href="https://kexue.fm/archives/8265" rel="nofollow" target="_blank">here</a>).
-While it may seem like voodoo if you skip to the end result, by thinking about Sinusoidal Encoding in the
-context of self attention (and more specifically dot products), we can see how
-it all comes together.</p>
-<p>Much like in Sinusoidal Encoding, we decompose our vectors (<span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi mathvariant="bold">q</mi></mrow><annotation encoding="application/x-tex">\mathbf{q}</annotation></semantics></math></span></span> or <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi mathvariant="bold">k</mi></mrow><annotation encoding="application/x-tex">\mathbf{k}</annotation></semantics></math></span></span>, instead of pre-projection <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi mathvariant="bold">x</mi></mrow><annotation encoding="application/x-tex">\mathbf{x}</annotation></semantics></math></span></span>) into 2D pairs/chunks. Rather than encoding <em>absolute</em> position directly by adding a vector we drew from sinusoidal functions of slowly decreasing frequencies, we cut to the chase and encode <em>relative</em> position by <strong>multiplying each pair with the rotation matrix</strong>.</p>
-<p>Let <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi mathvariant="bold">q</mi></mrow><annotation encoding="application/x-tex">\mathbf{q}</annotation></semantics></math></span></span> or <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi mathvariant="bold">k</mi></mrow><annotation encoding="application/x-tex">\mathbf{k}</annotation></semantics></math></span></span> be our input vector at position <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>p</mi></mrow><annotation encoding="application/x-tex">p</annotation></semantics></math></span></span>. We create a block diagonal matrix
-where <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi mathvariant="bold">M</mi><mi mathvariant="bold">i</mi></msub></mrow><annotation encoding="application/x-tex">\mathbf{M_i}</annotation></semantics></math></span></span> is the corresponding rotation matrix for that component
-pairs desired rotation:</p>
-<p><span><span><span><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><mi>R</mi><mo stretchy="false">(</mo><mi mathvariant="bold">q</mi><mo separator="true">,</mo><mi>p</mi><mo stretchy="false">)</mo><mo>=</mo><mrow><mo fence="true">(</mo><mtable rowspacing="0.16em" columnalign="center center center center" columnspacing="1em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi mathvariant="bold">M</mi><mn mathvariant="bold">1</mn></msub></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi mathvariant="bold">M</mi><mn mathvariant="bold">2</mn></msub></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mo lspace="0em" rspace="0em">⋱</mo></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi mathvariant="bold">M</mi><mrow><mi mathvariant="bold">d</mi><mi mathvariant="bold">/</mi><mn mathvariant="bold">2</mn></mrow></msub></mstyle></mtd></mtr></mtable><mo fence="true">)</mo></mrow><mrow><mo fence="true">(</mo><mtable rowspacing="0.16em" columnalign="center" columnspacing="1em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>q</mi><mn>1</mn></msub></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>q</mi><mn>2</mn></msub></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mi><mi mathvariant="normal">⋮</mi><mpadded height="0em" voffset="0em"><mspace mathbackground="black" width="0em" height="1.5em"></mspace></mpadded></mi></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>q</mi><mi>d</mi></msub></mstyle></mtd></mtr></mtable><mo fence="true">)</mo></mrow></mrow><annotation encoding="application/x-tex">R(\mathbf{q}, p) = \begin{pmatrix} \mathbf{M_1} &amp; &amp; &amp; \\ &amp; \mathbf{M_2} &amp; &amp; \\ &amp; &amp; \ddots &amp; \\ &amp; &amp; &amp; \mathbf{M_{d/2}} \end{pmatrix} \begin{pmatrix} q_1 \\ q_2 \\ \vdots \\ q_d \end{pmatrix} </annotation></semantics></math></span></span></span></p><p>Much the same as Sinusoidal Encoding, <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi mathvariant="bold">M</mi><mi mathvariant="bold">i</mi></msub></mrow><annotation encoding="application/x-tex">\mathbf{M_i}</annotation></semantics></math></span></span> is simply:</p>
-<p><span><span><span><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><msub><mi mathvariant="bold">M</mi><mi mathvariant="bold">i</mi></msub><mo>=</mo><mrow><mo fence="true">[</mo><mtable rowspacing="0.16em" columnalign="center center" columnspacing="1em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>cos</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>p</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>sin</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>p</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mo>−</mo><mi>sin</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>p</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>cos</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>ω</mi><mi>i</mi></msub><mi>p</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd></mtr></mtable><mo fence="true">]</mo></mrow></mrow><annotation encoding="application/x-tex">\mathbf{M_i} = \begin{bmatrix} \cos(\omega_i p) &amp; \sin(\omega_i p) \\ -\sin(\omega_i p) &amp; \cos(\omega_i p) \end{bmatrix}</annotation></semantics></math></span></span></span></p><div><p><video autoplay="" muted="" loop="" playsinline=""><source src="https://fleetwood.dev/positional-encoding/RopeEncoding.mp4" type="video/mp4">Your browser does not support the video tag.</video></p></div>
-<p>In practice, we don't use a matrix multiplication to compute RoPE as it would be
-computationally inefficient with such a sparse matrix. Instead, we can directly apply the rotations to pairs of elements independently, taking advantage of the regular pattern in the computation:</p>
-<p><span><span><span><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><msubsup><mi>R</mi><mrow><mi mathvariant="normal">Θ</mi><mo separator="true">,</mo><mi>p</mi></mrow><mi>d</mi></msubsup><mi>q</mi><mo>=</mo><mrow><mo fence="true">(</mo><mtable rowspacing="0.16em" columnalign="center" columnspacing="1em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>q</mi><mn>1</mn></msub></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>q</mi><mn>2</mn></msub></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>q</mi><mn>3</mn></msub></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>q</mi><mn>4</mn></msub></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mi><mi mathvariant="normal">⋮</mi><mpadded height="0em" voffset="0em"><mspace mathbackground="black" width="0em" height="1.5em"></mspace></mpadded></mi></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>q</mi><mrow><mi>d</mi><mo>−</mo><mn>1</mn></mrow></msub></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>q</mi><mi>d</mi></msub></mstyle></mtd></mtr></mtable><mo fence="true">)</mo></mrow><mo>⊗</mo><mrow><mo fence="true">(</mo><mtable rowspacing="0.16em" columnalign="center" columnspacing="1em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>cos</mi><mo>⁡</mo><mi>p</mi><msub><mi>θ</mi><mn>1</mn></msub></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>cos</mi><mo>⁡</mo><mi>p</mi><msub><mi>θ</mi><mn>1</mn></msub></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>cos</mi><mo>⁡</mo><mi>p</mi><msub><mi>θ</mi><mn>2</mn></msub></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>cos</mi><mo>⁡</mo><mi>p</mi><msub><mi>θ</mi><mn>2</mn></msub></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mi><mi mathvariant="normal">⋮</mi><mpadded height="0em" voffset="0em"><mspace mathbackground="black" width="0em" height="1.5em"></mspace></mpadded></mi></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>cos</mi><mo>⁡</mo><mi>p</mi><msub><mi>θ</mi><mrow><mi>d</mi><mi mathvariant="normal">/</mi><mn>2</mn></mrow></msub></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>cos</mi><mo>⁡</mo><mi>p</mi><msub><mi>θ</mi><mrow><mi>d</mi><mi mathvariant="normal">/</mi><mn>2</mn></mrow></msub></mrow></mstyle></mtd></mtr></mtable><mo fence="true">)</mo></mrow><mo>+</mo><mrow><mo fence="true">(</mo><mtable rowspacing="0.16em" columnalign="center" columnspacing="1em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mo>−</mo><msub><mi>q</mi><mn>2</mn></msub></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>q</mi><mn>1</mn></msub></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mo>−</mo><msub><mi>q</mi><mn>4</mn></msub></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>q</mi><mn>3</mn></msub></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mi><mi mathvariant="normal">⋮</mi><mpadded height="0em" voffset="0em"><mspace mathbackground="black" width="0em" height="1.5em"></mspace></mpadded></mi></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mo>−</mo><msub><mi>q</mi><mi>d</mi></msub></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>q</mi><mrow><mi>d</mi><mo>−</mo><mn>1</mn></mrow></msub></mstyle></mtd></mtr></mtable><mo fence="true">)</mo></mrow><mo>⊗</mo><mrow><mo fence="true">(</mo><mtable rowspacing="0.16em" columnalign="center" columnspacing="1em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>sin</mi><mo>⁡</mo><mi>p</mi><msub><mi>θ</mi><mn>1</mn></msub></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>sin</mi><mo>⁡</mo><mi>p</mi><msub><mi>θ</mi><mn>1</mn></msub></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>sin</mi><mo>⁡</mo><mi>p</mi><msub><mi>θ</mi><mn>2</mn></msub></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>sin</mi><mo>⁡</mo><mi>p</mi><msub><mi>θ</mi><mn>2</mn></msub></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mi><mi mathvariant="normal">⋮</mi><mpadded height="0em" voffset="0em"><mspace mathbackground="black" width="0em" height="1.5em"></mspace></mpadded></mi></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>sin</mi><mo>⁡</mo><mi>p</mi><msub><mi>θ</mi><mrow><mi>d</mi><mi mathvariant="normal">/</mi><mn>2</mn></mrow></msub></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mi>sin</mi><mo>⁡</mo><mi>p</mi><msub><mi>θ</mi><mrow><mi>d</mi><mi mathvariant="normal">/</mi><mn>2</mn></mrow></msub></mrow></mstyle></mtd></mtr></mtable><mo fence="true">)</mo></mrow></mrow><annotation encoding="application/x-tex">R_{\Theta,p}^d q = \begin{pmatrix} 
-q_1 \\
-q_2 \\
-q_3 \\
-q_4 \\
-\vdots \\
-q_{d-1} \\
-q_d
-\end{pmatrix} \otimes \begin{pmatrix}
-\cos p\theta_1 \\
-\cos p\theta_1 \\
-\cos p\theta_2 \\
-\cos p\theta_2 \\
-\vdots \\
-\cos p\theta_{d/2} \\
-\cos p\theta_{d/2}
-\end{pmatrix} + \begin{pmatrix}
--q_2 \\
-q_1 \\
--q_4 \\
-q_3 \\
-\vdots \\
--q_d \\
-q_{d-1}
-\end{pmatrix} \otimes \begin{pmatrix}
-\sin p\theta_1 \\
-\sin p\theta_1 \\
-\sin p\theta_2 \\
-\sin p\theta_2 \\
-\vdots \\
-\sin p\theta_{d/2} \\
-\sin p\theta_{d/2}
-\end{pmatrix}</annotation></semantics></math></span></span></span></p><p>That's all there is to it! By artfully applying our rotations to 2D chunks of <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi mathvariant="bold">q</mi></mrow><annotation encoding="application/x-tex">\mathbf{q}</annotation></semantics></math></span></span> and
-<span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi mathvariant="bold">k</mi></mrow><annotation encoding="application/x-tex">\mathbf{k}</annotation></semantics></math></span></span> prior to their dot product, and switching from additive to
-multiplicative, we can gain a big performance boost in evaluations <sup><a href="#user-content-fn-4" id="user-content-fnref-4" data-footnote-ref="true" aria-describedby="footnote-label">4</a></sup>.</p>
-<h2>Extending RoPE to <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>n</mi></mrow><annotation encoding="application/x-tex">n</annotation></semantics></math></span></span>-Dimensions</h2>
-<p>We've explored the <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mi>D</mi></mrow><annotation encoding="application/x-tex">1D</annotation></semantics></math></span></span> case for RoPE and by this point I hope you've gained an
-intuitive understanding of an admittedly unintuitive component of transformers.
-Finally, let's explore extending it to higher dimensions, such as images.</p>
-<p>A natural first intuition could be to directly use the <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo fence="true">[</mo><mtable rowspacing="0.16em" columnalign="center" columnspacing="1em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mi>x</mi></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mi>y</mi></mstyle></mtd></mtr></mtable><mo fence="true">]</mo></mrow><annotation encoding="application/x-tex"> \begin{bmatrix} x \\ y \end{bmatrix}</annotation></semantics></math></span></span> coordinate pairs from the image. This might seem intuitive, after all, we were almost arbitrarily pairing up our components previously. However, this would be a mistake!</p>
-<p>In the <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mi>D</mi></mrow><annotation encoding="application/x-tex">1D</annotation></semantics></math></span></span> case, we encode the relative position <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>m</mi><mo>−</mo><mi>n</mi></mrow><annotation encoding="application/x-tex">m - n</annotation></semantics></math></span></span> through a rotation of pairs
-of values from our input vector. For <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mi>D</mi></mrow><annotation encoding="application/x-tex">2D</annotation></semantics></math></span></span> data, we need to encode both horizontal and vertical relative positions, say <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>m</mi><mo>−</mo><mi>n</mi></mrow><annotation encoding="application/x-tex">m - n</annotation></semantics></math></span></span> and <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>i</mi><mo>−</mo><mi>j</mi></mrow><annotation encoding="application/x-tex">i - j</annotation></semantics></math></span></span> independently. RoPE's brilliance lies in how it handles multiple dimensions. Instead of trying to encode all positional information in a single rotation, we pair components <strong>within the same dimension</strong> and rotate those, otherwise we would be intermixing the <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>x</mi></mrow><annotation encoding="application/x-tex">x</annotation></semantics></math></span></span> and <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>y</mi></mrow><annotation encoding="application/x-tex">y</annotation></semantics></math></span></span> offset information. By handling each dimension independently, we maintain the natural structure of the space. This can generalize to as many dimensions as required!</p>
-<h2>The future of positional encoding</h2>
-<p>Is RoPE the final incarnation of positional encoding? This <a href="https://arxiv.org/pdf/2410.06205" rel="nofollow" target="_blank">recent paper</a> from DeepMind deeply analyses RoPE and highlights some fundamental problems.</p>
-<p>I anticipate some future breakthroughs, perhaps taking inspiration from
-signal processing with ideas like wavelets or hierarchical implementations. As models
-are increasingly quantized for deployment, I'd also expect to see some
-innovation in encoding schemes that remain robust under low-precision arithmetic.</p>
-<h2>Conclusion</h2>
-<p>Positional encoding has and continues to be treated as an after thought in
-transformers. I believe we should view it differently - self attention has an
-Achilles heel that has been repeatedly patched.</p>
-<p>I hope this blog post showed you that you too could have discovered state of the
-art positional encoding, despite it being unintuitive at first. In a follow up
-post I'd love to explore practical implementation details for RoPE in order to
-maximise performance.</p>
-<p>Thanks to Madeline Ephgrave for proof reading this.</p>
-<h2>References</h2>
-<ul>
-<li><a href="https://kazemnejad.com/blog/transformer_architecture_positional_encoding/" rel="nofollow" target="_blank">https://kazemnejad.com/blog/transformer_architecture_positional_encoding/</a></li>
-<li><a href="https://blog.eleuther.ai/rotary-embeddings/" rel="nofollow" target="_blank">https://blog.eleuther.ai/rotary-embeddings/</a></li>
-<li><a href="https://www.youtube.com/watch?v=T3OT8kqoqjc" rel="nofollow" target="_blank">https://www.youtube.com/watch?v=T3OT8kqoqjc</a></li>
-<li><a href="https://arxiv.org/pdf/1706.03762" rel="nofollow" target="_blank">https://arxiv.org/pdf/1706.03762</a></li>
-<li><a href="https://arxiv.org/pdf/2410.06205" rel="nofollow" target="_blank">https://arxiv.org/pdf/2410.06205</a></li>
-<li><a href="https://arxiv.org/pdf/2104.09864" rel="nofollow" target="_blank">https://arxiv.org/pdf/2104.09864</a></li>
-</ul>
-<section data-footnotes="true">
-<ol>
-<li id="user-content-fn-1">
-<p>Binary and Sinusoidal animations are reproductions of animations contained
-in <a href="https://www.youtube.com/watch?v=T3OT8kqoqjc0" rel="nofollow" target="_blank">this</a> video. <a href="#user-content-fnref-1" data-footnote-backref="" aria-label="Back to reference 1">↩</a></p>
-</li>
-<li id="user-content-fn-2">
-<p>Using <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>θ</mi><mo>=</mo><mn>10000</mn></mrow><annotation encoding="application/x-tex">\theta = 10000</annotation></semantics></math></span></span> gives us <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mi>π</mi><mo>⋅</mo><mn>10000</mn></mrow><annotation encoding="application/x-tex"> 2 \pi \cdot 10000</annotation></semantics></math></span></span> unique positions, or a
-theoretical upper bound on the context length at ~63,000. <a href="#user-content-fnref-2" data-footnote-backref="" aria-label="Back to reference 2">↩</a></p>
-</li>
-<li id="user-content-fn-3">
-<p>Pieces of this post are based on <a href="https://kazemnejad.com/blog/transformer_architecture_positional_encoding/" rel="nofollow" target="_blank">this fantastic
-post</a>
-by <a href="https://kazemnejad.com/" rel="nofollow" target="_blank">Amirhossein Kazemnejad</a>. <a href="#user-content-fnref-3" data-footnote-backref="" aria-label="Back to reference 3">↩</a></p>
-</li>
-<li id="user-content-fn-4">
-<p>For empirical evidence, see <a href="https://blog.eleuther.ai/rotary-embeddings/" rel="nofollow" target="_blank">this</a> great post by EleutherAI. <a href="#user-content-fnref-4" data-footnote-backref="" aria-label="Back to reference 4">↩</a></p>
-</li>
-</ol>
-</section></div></article></div>]]>
-            </description>
-            <link>https://fleetwood.dev/posts/you-could-have-designed-SOTA-positional-encoding</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42166948</guid>
-            <pubDate>Sun, 17 Nov 2024 20:31:26 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[Humans have caused 1.5 °C of long-term global warming according to new estimates]]>
-            </title>
-            <description>
-<![CDATA[
-Score 395 | Comments 548 (<a href="https://news.ycombinator.com/item?id=42166030">thread link</a>) | @gmays
-<br/>
-November 17, 2024 | https://www.lancaster.ac.uk/news/humans-have-already-caused-15-c-of-long-term-global-warming-according-to-new-estimates | <a href="https://web.archive.org/web/*/https://www.lancaster.ac.uk/news/humans-have-already-caused-15-c-of-long-term-global-warming-according-to-new-estimates">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section>
-                    <img src="https://cisweb.lancaster.ac.uk/img/cwip/cisweb.lancaster.ac.uk/EventsMedia/earth-adobestock242647178-smaller-638669192826825152.jpg?mode=crop&amp;width=874&amp;height=492&amp;center=0.50%2c0.50" alt="Earth from space" loading="lazy">
-                                        <p>A new study published today in Nature Geoscience by Dr Andrew Jarvis at Lancaster University and Professor Piers Forster at the University of Leeds shows that humans may have already caused 1.5 °C of global warming when measured from a time genuinely before the industrial revolution and the start of large-scale carbon emissions.</p><p>The Paris Climate Agreement from 2016 established a long-term temperature goal of “limiting global temperature increase well below 2 degrees Celsius, while pursuing efforts to limit the increase to 1.5 degrees.” The 1.5 °C of warming figure has since become the yardstick to judge progress, or the lack of it, on climate change.</p><p>The human-induced contribution to global warming is currently put at 1.31 °C, but with an uncertainty range of 1.10 to 1.60 °C, according to the Intergovernmental Panel on Climate Change (IPCC’s) preferred methods. This means it is unclear, from the IPCC’s adopted estimates, whether the 1.5 °C boundary has been breached or not. </p><p>Crucially, the IPCC’s preferred methods use temperature records from 1850-1900 as their ‘pre-industrial’ baseline for their calculations. They do this because this is when the first temperature records were taken, although the exact way to measure global temperature increases has never been defined within the climate negotiations. </p><p>Using this same 1850-1900 baseline, Dr Jarvis and Professor Forster’s method more than halves the uncertainty in the current human-caused warming estimate, thereby showing human-caused global warming currently remains below 1.5 °C if measured this way. On this measure, crossing the 1.5 °C Paris guardrail is under 10 years away at current warming rates. </p><p>However, Dr Jarvis and Professor Forster go further. Their method makes a more accurate estimate of the true long-term human contribution to global warming by pushing the base period from which the global temperature change is measured back to before 1700.</p><p>The authors find that when measured from this earlier more accurate definition of pre-industrial time, the long-term human contribution to warming was 1.49 °C ± 0.11 °C in 2023 and is now above 1.5 °C. This reveals that there is almost 0.2 °C of warming within the 1850-1900 baseline currently being used to define the warming.</p><p>Dr Jarvis, lead author of the study, said: “Measuring human-caused global warming is a difficult task because it forces us to compare today’s temperature with what it was in pre-industrial times – we call this the pre-industrial baseline. The closest we come to pre-industrial global temperature measurements are from the middle of the 1800’s, and unsurprisingly, these data are somewhat patchy and the Industrial Revolution was well underway by then. So using these early temperature data as a baseline as previous methods do not only ignores the warming that was already underway, it also bakes significant uncertainty into warming estimates.”</p><p>This new study instead uses CO<sub>2</sub> records from air bubbles trapped in ice-cores to establish a pre-1700 baseline for temperature. These records stretch back thousands of years, well before the Industrial Revolution and the effects of human-derived carbon emissions. The scientists are able to use the CO<sub>2</sub> record to anchor global warming estimates because of what they say is an overlooked relationship between the two.</p><p>“If you plot global temperatures against the concentration of CO<sub>2</sub> in the atmosphere, they both fall on a remarkably straight line, much straighter than current theory would predict,” said Dr Jarvis. “That line tells you not only how much the Earth has warmed since pre-industrial times, but also how much of that warming can be blamed on human activity.</p><p>“The climate is unimaginably complex, so perhaps it isn’t so surprising that such a direct method for accurately measuring the warming humans are responsible for has been overlooked,” Dr Jarvis added.</p><p>The scientists believe their new method is a strong candidate for measuring progress against the 1.5 and 2.0 degree Paris yardsticks.</p><p>Dr Jarvis said: “Our method has a number of strengths. Firstly, it directly tackles the problem of how to establish a robust pre-industrial baseline, although it functions equally well with the 1850-1900 baseline. Secondly, it produces estimates of human-caused warming that are at least 30 percent more certain than current methods. Finally, it is easy and quick to apply, meaning that we can produce warming estimates as soon as the CO<sub>2</sub> and temperature data become available without having to re-run complex climate models. This also means the results are transparent, making them far easier to communicate to non-specialists.”</p><p>Professor Forster, co-author of the study, said: “Our study shows that human societies have caused more than 1.5 degrees of long-term global warming. However, this does not necessarily mean that the Paris Agreement’s 1.5 temperature guardrail is breached, as we find that 0.18 °C of warming happened before global temperature records began, and this baked-in warming would not have been factored into the Paris Agreement.</p><p>“Policy makers set the Paris temperature goal to limit the devasting climate impacts many around the world are already experiencing. It was set to push countries to higher national ambition. It is clear we need to do more. The ambition set out in the goal for “pursuing efforts to limit the increase to 1.5 degrees” was not vainglorious when set, rather countries did not match it with their efforts. Urgent actions can slow warming rates and push back the time of breaching the Paris 1.5 degree limit. Although breaching the limit is now inevitable, delivering action commensurate with the noble Paris goal is more important than ever.” he added.</p><p>Although useful for measuring current levels of human-induced global warming, the researchers caution against using their method for making predictions on future warming.</p><p>Dr Jarvis, said: “Although atmospheric CO<sub>2</sub> is responsible for the bulk of human-induced warming so far, it is not solely responsible, and we know other factors such as methane could become increasingly important in the future, especially if we encounter climate tipping points. This means we need to keep an eye on our analysis. Fortunately, departures from the current linear regime could provide valuable early warning of such a change.”</p><p>The study is outlined in the paper ‘<a href="https://www.nature.com/articles/s41561-024-01580-5" rel="noopener noreferrer" target="_blank">Estimated human-induced warming from a linear temperature and atmospheric CO<sub>2</sub> relationship</a>’ published in Nature Geoscience.</p><p>DOI:<a href="https://www.nature.com/articles/s41561-024-01580-5" rel="noopener noreferrer" target="_blank">10.1038/s41561-024-01580-5</a></p>          <a href="https://www.lancaster.ac.uk/news/">Back to News</a>
-    </section></div>]]>
-            </description>
-            <link>https://www.lancaster.ac.uk/news/humans-have-already-caused-15-c-of-long-term-global-warming-according-to-new-estimates</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42166030</guid>
-            <pubDate>Sun, 17 Nov 2024 18:49:25 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[Japan ranked 31st in digital competitiveness, 92nd for English skills]]>
-            </title>
-            <description>
-<![CDATA[
-Score 84 | Comments 82 (<a href="https://news.ycombinator.com/item?id=42165447">thread link</a>) | @mikhael
-<br/>
-November 17, 2024 | https://www.japantimes.co.jp/business/2024/11/15/economy/japan-digital-competitiveness-english-ranking/ | <a href="https://web.archive.org/web/*/https://www.japantimes.co.jp/business/2024/11/15/economy/japan-digital-competitiveness-english-ranking/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
-            </description>
-            <link>https://www.japantimes.co.jp/business/2024/11/15/economy/japan-digital-competitiveness-english-ranking/</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42165447</guid>
-            <pubDate>Sun, 17 Nov 2024 17:26:37 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[AlphaProof's Greatest Hits]]>
-            </title>
-            <description>
-<![CDATA[
-Score 248 | Comments 132 (<a href="https://news.ycombinator.com/item?id=42165397">thread link</a>) | @rishicomplex
-<br/>
-November 17, 2024 | https://rishimehta.xyz/2024/11/17/alphaproofs-greatest-hits.html | <a href="https://web.archive.org/web/*/https://rishimehta.xyz/2024/11/17/alphaproofs-greatest-hits.html">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
-      
-
-      <main aria-label="Content">
-        <div>
-          <article itemscope="" itemtype="http://schema.org/BlogPosting">
-
-  
-
-  <div itemprop="articleBody">
-    
-
-
-
-<p>Here I’ll try to explain the coolest ideas in each of <a href="https://deepmind.google/discover/blog/ai-solves-imo-problems-at-silver-medal-level/">AlphaProof</a>’s IMO 2024 solutions. AlphaProof produces proofs in <a href="https://leanprover.github.io/">Lean</a>, and each Lean proof is composed of a series of tactics. So I’ll pick out the tactics that correspond to these ideas in the proofs for problems 1, 2 and 6 (the three problems that AlphaProof solved). AlphaProof has developed its own proving style, so figuring out what it’s doing can involve some detective work.</p>
-
-<!--more-->
-
-<p>If you’re not familiar with the problems already, I recommend trying them yourself, and then maybe reading <a href="https://web.evanchen.cc/exams/IMO-2024-notes.pdf">Evan Chen’s solution notes</a>, or watching these <a href="https://youtube.com/playlist?list=PLSa4NIW1yxdg7xoEL2x8wGzci0t8h51nN&amp;si=-GB9q9hreFBD7eOI">videos</a> that give an intuition for some of the human solutions. The full AlphaProof solutions, annotated by <a href="https://deepmind.google/discover/blog/ai-solves-imo-problems-at-silver-medal-level/#:~:text=Oliver%20Nash%2C%20Bhavik%20Mehta%2C%20Paul%20Lezeau%2C%20Salvatore%20Mercuri%2C%20Lawrence%20Wu%2C%20Calle%20Soenne%2C%20Thomas%20Murrills%2C%20Luigi%20Massacci%20and%20Andrew%20Yang%20advised%20and%20contributed%20as%20Lean%20experts">Lean experts</a>, are available <a href="https://storage.googleapis.com/deepmind-media/DeepMind.com/Blog/imo-2024-solutions/index.html">here</a> - I will only include snippets of the proofs in this post.</p>
-
-<ul id="markdown-toc">
-  <li><a href="#problem-1" id="markdown-toc-problem-1">Problem 1</a>    <ul>
-      <li><a href="#problem" id="markdown-toc-problem">Problem</a></li>
-      <li><a href="#solution" id="markdown-toc-solution">Solution</a></li>
-    </ul>
-  </li>
-  <li><a href="#problem-2" id="markdown-toc-problem-2">Problem 2</a>    <ul>
-      <li><a href="#problem-1" id="markdown-toc-problem-1">Problem</a></li>
-      <li><a href="#solution-1" id="markdown-toc-solution-1">Solution</a></li>
-    </ul>
-  </li>
-  <li><a href="#problem-6" id="markdown-toc-problem-6">Problem 6</a>    <ul>
-      <li><a href="#problem-2" id="markdown-toc-problem-2">Problem</a></li>
-      <li><a href="#solution-2" id="markdown-toc-solution-2">Solution</a></li>
-    </ul>
-  </li>
-  <li><a href="#postscript" id="markdown-toc-postscript">Postscript</a></li>
-</ul>
-
-<h2 id="problem-1">Problem 1</h2>
-
-<h3 id="problem">Problem</h3>
-<p>Determine all real numbers $\alpha$ such that, for every positive integer $n$, the integer</p><p>
-
-\[\lfloor \alpha \rfloor + \lfloor 2\alpha \rfloor + \dots +\lfloor n\alpha \rfloor\]
-
-</p><p>is a multiple of $n$. (Note that $\lfloor z \rfloor$ denotes the greatest integer less than or equal to $z$. For example, $\lfloor -\pi \rfloor = -4$ and $\lfloor 2 \rfloor = \lfloor 2.9 \rfloor = 2$.)</p>
-
-<h3 id="solution">Solution</h3>
-
-<p>The answer turns out to be the set of even integers. Reminder that the way AlphaProof solves these problems is by proposing many solution candidates, attempting to prove and disprove each of them, and then eventually finding a proof only for the correct answer. The proof we’re looking at here is the one that proves that the answer is the set of even integers.</p>
-
-<p>Showing that the even integers satisfy the given property is trivial, the hard part of this proof is to show that no $\alpha$ except the even integers can satisfy it. AlphaProof does this in an interesting (if convoluted) way. It first sets up an integer $\ell$ such that $2\ell = \lfloor\alpha\rfloor + \lfloor2\alpha\rfloor$. This is possible because we know the RHS is even by substituting $n=2$ into the given property.</p>
-
-<figure><pre><code data-lang="lean"><span>exists</span><span>λ</span><span>x</span> <span>L</span><span>=&gt;</span>(<span>L</span> <span>2</span> <span>two_pos</span>)<span>.</span><span>rec</span> <span>λ</span><span>l</span> <span>Y</span><span>=&gt;</span><span>?</span><span>_</span></code></pre></figure>
-
-<p><code>L 2</code> is where the given property is used with $n=2$. As an aside, AlphaProof often mashes several tactics together in a single line like this. A more comprehensible version that accomplishes the same thing is</p>
-
-<figure><pre><code data-lang="lean"><span>constructor</span>
-<span>·</span> <span>intro</span> <span>x</span> <span>L</span>
-  <span>obtain</span> <span>⟨</span><span>l</span>, <span>Y</span><span>⟩</span> := <span>L</span> <span>2</span> (<span>by</span> <span>exact</span> <span>two_pos</span>)</code></pre></figure>
-
-<p>Note that we’ve also renamed $\alpha$ to <code>x</code>.
-Next, it claims (and goes on to prove) that for all natural numbers $n$,</p><p>
-
-\[\lfloor (n + 1)\:\alpha \rfloor = \lfloor \alpha \rfloor + 2n\:(\ell - \lfloor \alpha \rfloor) \tag{1} \label{eq:claim}\]
-
-</p><figure><pre><code data-lang="lean"><span>suffices</span>: <span>∀</span> (<span>n</span> : <span>ℕ</span>),<span>⌊</span>(<span>n</span><span>+</span><span>1</span>)<span>*</span><span>x</span><span>⌋</span> <span>=</span><span>⌊</span> <span>x</span><span>⌋</span><span>+</span><span>2</span> <span>*</span> <span>↑</span> (<span>n</span> : <span>ℕ</span>) <span>*</span> (<span>l</span><span>-</span>(<span>⌊</span>(<span>x</span>)<span>⌋</span>))</code></pre></figure>
-
-<p>From this, it is able to show that $\alpha = 2\,(\ell-\lfloor\alpha\rfloor)$.</p>
-
-<figure><pre><code data-lang="lean"><span>use</span>(<span>l</span><span>-</span><span>⌊</span><span>x</span><span>⌋</span>)<span>*</span><span>2</span></code></pre></figure>
-
-<p>which has to be an even integer (since it’s 2 multiplied by an integer).</p>
-
-<p>The way in which it proves these things involves some rather elaborate simplifications. But setting up the claim in \eqref{eq:claim} is the impressive bit that makes the rest of the proof work. To my eyes, the motivation for this claim is rather unintuitive, and the fact that it all works out is almost magical.</p>
-
-<p>AlphaProof’s full solution is <a href="https://storage.googleapis.com/deepmind-media/DeepMind.com/Blog/imo-2024-solutions/P1/index.html">here</a>.</p>
-
-<h2 id="problem-2">Problem 2</h2>
-
-<h3 id="problem-1">Problem</h3>
-
-<p>Find all positive integer pairs $(a,b)$ such that there exist positive integers $g$ and $N$ where</p><p>
-
-\[\gcd\,(a^n + b, b^n + a) = g\]
-
-</p><p>holds for all integers $n \geq N$.</p>
-
-<h3 id="solution-1">Solution</h3>
-
-<p>AlphaProof correctly proposes that $(1, 1)$ is the only solution. To show that no other solution can work, it asks us to consider the number $ab + 1$. It claims (and later proves) that $ab + 1$ must divide $g$.</p>
-
-<figure><pre><code data-lang="lean"><span>suffices</span>:<span>b</span><span>.1*</span><span>b</span><span>.2+</span><span>1</span><span>∣</span><span>Y</span></code></pre></figure>
-
-<p>Note that in its infinite wisdom, AlphaProof decides to rename pairs $(a, b)$ to <code>b</code>, so that it must reference the elements as <code>b.1</code> and <code>b.2</code>. It has also chosen, for reasons best known to itself, to rename the variable $g$ to <code>Y</code>.</p>
-
-<p>Now, selecting $n=N \phi(ab+1)$, we get</p><p>
-
-\[(ab + 1) \mid (a^{N\phi(ab + 1)} + b) \text{ and } (ab + 1) \mid (b^{N\phi(ab + 1)} + a)\]
-
-</p><p>The fact that $ab + 1$ is coprime to $a$ and $b$ makes it so that we can apply <a href="https://en.wikipedia.org/wiki/Euler%27s_theorem">Euler’s theorem</a>, ie</p><p>
-
-\[a^{\phi(ab+1)} \equiv 1 \pmod{ab+1}\]
-
-\[b^{\phi(ab+1)} \equiv 1 \pmod{ab+1}\]
-
-</p><p>So we have $ab + 1 \mid 1 + b$ and $ab + 1 \mid 1 + a$, from which it follows that $a = b = 1$.</p>
-
-<p>This strategy closely follows human proofs to this problem. The choice to consider $ab + 1$ is the clever idea that sets up the proof.</p>
-
-<p>AlphaProof’s full solution is <a href="https://storage.googleapis.com/deepmind-media/DeepMind.com/Blog/imo-2024-solutions/P2/index.html">here</a>.</p>
-
-<h2 id="problem-6">Problem 6</h2>
-
-<h3 id="problem-2">Problem</h3>
-<p>Let $\mathbb{Q}$ be the set of rational numbers. A function $f: \mathbb{Q} \to \mathbb{Q}$ is called <em>aquaesulian</em> if the following property holds: for every $x,y \in \mathbb{Q}$,</p><p>
-
-\[f(x+f(y)) = f(x) + y \quad \text{or} \quad f(f(x)+y) = x + f(y).\]
-
-</p><p>Show that there exists an integer $c$ such that for any aquaesulian function $f$ there are at most $c$ different rational numbers of the form $f(r) + f(-r)$ for some rational number $r$, and find the smallest possible value of $c$.</p>
-
-<h3 id="solution-2">Solution</h3>
-
-<p>AlphaProof finds the answer $c=2$. It breaks the proof into two parts. First, it shows that $c \leq 2$, by showing that $f(r) + f(-r)$ can either be $0$ or some singular other value. This part of the proof is quite elaborate, and makes clever use of the given aquaesulian properties.</p>
-
-<p>Once this is done, $c$ can be either $1$ or $2$. To show that $c=2$, AlphaProof proposes an aquaesulian function $f$ that takes on two different values for  $f(r) + f(-r)$.</p><p>
-
-\[f(x) = -x + 2⌈x⌉\]
-
-</p><figure><pre><code data-lang="lean"><span>specialize</span> <span>V</span> <span>$</span> <span>λ</span> <span>N</span><span>=&gt;-</span><span>N</span><span>+</span><span>2</span> <span>*</span><span>Int</span><span>.</span><span>ceil</span> <span>N</span></code></pre></figure>
-
-<p>It then shows that $f(-1) + f(1) = 0$ and $f(1/2) + f(-1/2) = 2$, which gives us the two distinct values we need.</p>
-
-<figure><pre><code data-lang="lean"><span>use</span> <span>Finset</span><span>.</span><span>one_lt_card</span><span>.2</span><span>$</span> <span>by</span> <span>exists</span><span>@</span><span>0</span>,<span>V</span><span>.1.</span><span>mem_toFinset</span><span>.2</span> (<span>by</span> <span>exists</span><span>-</span><span>1</span>),<span>2</span>,<span>V</span><span>.1.</span><span>mem_toFinset</span><span>.2</span> (<span>by</span> <span>exists</span> <span>1</span><span>/</span><span>2</span>)</code></pre></figure>
-
-<p>Again, lots of stuff mashed into one line, but <code>by exists -1</code> and <code>by exists 1/2</code> are where it shows the two distinct values.</p>
-
-<p>This is a remarkable function to have constructed! And it’s pretty hard to find. Only 5/509 participants solved P6, and notably Tim Gowers gave it a bit of a shot while judging this solution and didn’t find a function that gave two distinct values.</p>
-
-<p>AlphaProof’s full solution is <a href="https://storage.googleapis.com/deepmind-media/DeepMind.com/Blog/imo-2024-solutions/P6/index.html">here</a>.</p>
-
-<h2 id="postscript">Postscript</h2>
-
-<p>Having now digested several AlphaProof solutions, I still find it remarkable that a machine is able to find proofs like this. Finding these mathematical ideas is hard enough, and having to prove them in Lean makes things even harder.</p>
-
-<p>At an IMO afterparty, some of us from the AlphaProof team had fun with signing the best tactic from each proof.</p>
-
-<p><img src="https://rishimehta.xyz/assets/p1_tactic.jpg" alt="p1 tactic">
-<img src="https://rishimehta.xyz/assets/p2_tactic.jpg" alt="p2 tactic">
-<img src="https://rishimehta.xyz/assets/p6_tactic.jpg" alt="p6 tactic"></p>
-
-<p>I discussed the P6 solution in some more detail on the <a href="https://youtu.be/uX6ceY1vcUg?si=d9LY1QvdQ-yeppPK&amp;t=1845">No Priors podcast</a>.</p>
-
-<p>Thanks to the <a href="https://deepmind.google/discover/blog/ai-solves-imo-problems-at-silver-medal-level/#:~:text=Oliver%20Nash%2C%20Bhavik%20Mehta%2C%20Paul%20Lezeau%2C%20Salvatore%20Mercuri%2C%20Lawrence%20Wu%2C%20Calle%20Soenne%2C%20Thomas%20Murrills%2C%20Luigi%20Massacci%20and%20Andrew%20Yang%20advised%20and%20contributed%20as%20Lean%20experts">Lean experts</a> who translated the cryptic Lean proofs into English, and Bhavik, Oliver and Paul in particular for suggesting impressive lines in the proofs.</p>
-
-  </div>
-</article>
-
-        </div>
-      </main>
-    </div></div>]]>
-            </description>
-            <link>https://rishimehta.xyz/2024/11/17/alphaproofs-greatest-hits.html</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42165397</guid>
-            <pubDate>Sun, 17 Nov 2024 17:20:45 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[Good Software Development Habits]]>
-            </title>
-            <description>
-<![CDATA[
-Score 360 | Comments 187 (<a href="https://news.ycombinator.com/item?id=42165057">thread link</a>) | @mmphosis
-<br/>
-November 17, 2024 | https://zarar.dev/good-software-development-habits/ | <a href="https://web.archive.org/web/*/https://zarar.dev/good-software-development-habits/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><p>This post is not advice, it's what's working for me.</p><p>It's easy to pick up bad habits and hard to create good ones. Writing down what's working for me helps me maintain any good habits I've worked hard to develop. Here's an unordered list of 10 things that have helped me increase speed and maintain a respectable level of quality in the product I'm currently developing.</p><div>
-<li><p>Keep commits small enough that you wonder if you're taking this "keep commits small" thing a little too far. You just never know when you have to revert a particular change and there's a sense of bliss knowing where you introduced a bug six days ago and only reverting that commit without going through the savagery of merge conflicts. My rule of thumb: compiling software should be commitable.</p>
-</li>
-<li><p>Live Kent Beck's <a href="https://x.com/KentBeck/status/250733358307500032?lang=en">holy words of wisdom</a>: "for each desired change, make the change easy (warning: this may be hard), then make the easy change". Aim for at least half of all commits to be refactorings. Continuous refactoring is thinking of changes I can make in under 10 minutes that improve something. Doing this pays off whenever a bigger requirement comes in and you find yourself making a small change to satisfy it only because of those smaller improvements. Big refactorings are a bad idea.</p>
-</li>
-<li><p>All code is a liability. Undeployed code is the grim reaper of liabilities. I need to know if it works or at least doesn't break anything. Tests give you confidence, production gives you approval. The hosting costs might rack up a little with so many deploys but it's a small price to pay for knowing the last thing you did was a true sign of progression. <em>Working software is the primary measure of progress</em>, says one of the <a href="https://agilemanifesto.org/principles.html">agile principles</a>. Working and progress are doing a lot of heavy lifting in that sentence, so I've defined them for myself. Working is something being working enough to be deployed, and if it's code that's contributing to a capability, that's progress.</p>
-</li>
-<li><p>Know when you're testing the framework's capability. If you are, don't do it. The framework is already tested by people who know a lot more than you, and you have to trust them that the <code>useState()</code> hook does what it's supposed to do. If you keep components small, then you reduce the need for a lot of tests as the framework will be doing most of the heavy lifting in the component. If the component is big, then you introduce more complexity and now you need to write a lot of tests.</p>
-</li>
-<li><p>If a particular function doesn't fit anywhere, create a new module (or class or component) for it and you'll find a home for it later. It's better to create a new independent construct than to jam it into an existing module where you know deep down it doesn't make sense. Worst comes to worst, it lives as an independent module which isn't too bad anyway.</p>
-</li>
-<li><p>If you don't know what an API should look like, write the tests first as it'll force you to think of the "customer" which in this case is you. You'll invariably discover cases that you would not have thought of if you had just written the code first and tests after. You don't have to be religious about TDD and it's OK to work in larger batches (e.g., write more than just a couple lines of code before making it pass).  The amount of code to write in a red/failing state doesn't always have to be small. You know what you're doing, don't let dogma get in the way of productivity.</p>
-</li>
-<li><p>Copy-paste is OK once. The second time you're introducing duplication (i.e., three copies), don't. You should have enough data points to create a good enough abstraction. The risk of diverging implementations of the same thing is too high at this point, and consolidation is needed.  It's better to have some wonky parameterization than it is to have multiple implementations of nearly the same thing. Improving the parameters will be easier than to consolidate four different implementations if this situation comes up again.</p>
-</li>
-<li><p>Designs get stale. You can slow the rate at which they get stale by refactoring, but ultimately you'll need to change how things work. Don't feel too bad about moving away from something that was dear to you a while ago and something you felt proud about at the time.  You did the right thing then and shouldn't beat yourself up for not getting it right enough that you wouldn't need to change anything. Most of the time writing software is changing software. Just accept it and move on. There's no such thing as the perfect design, and change is at the core of software development. How good you are at changing things is how good you are at software development.</p>
-</li>
-<li><p>Technical debt can be classified into three main types: 1) things that are preventing you from doing stuff now, 2) things that will prevent you from doing stuff later, and 3) things that <em>might</em> prevent you from doing stuff later. Every other classification is a subset of these three. Minimize having lots of stuff in #1 and try to focus on #2. Ignore #3.</p>
-</li>
-<li><p>Testability is correlated with good design. Something not being easily testable hints that the design needs to be changed. Sometimes that design is your test design. As an example, if you find yourself finding it difficult to mock <code>em.getRepository(User).findOneOrFail({id})</code>, then chances are you either need to put that call into its own function that can be mocked, or write a test utility which allows for easier mocking of the entity manager methods. Tests go unwritten when it's hard to test, not because you don't want to test.</p>
-</li>
-</div><p>There's probably a lot more, but 10 is a nice number.</p></div>]]>
-            </description>
-            <link>https://zarar.dev/good-software-development-habits/</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42165057</guid>
-            <pubDate>Sun, 17 Nov 2024 16:34:26 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[How to setup self hosted wiki for your startup]]>
-            </title>
-            <description>
-<![CDATA[
-Score 122 | Comments 81 (<a href="https://news.ycombinator.com/item?id=42162751">thread link</a>) | @sks147
-<br/>
-November 17, 2024 | https://themythicalengineer.com/how-to-setup-self-hosted-wiki-for-your-startup.html | <a href="https://web.archive.org/web/*/https://themythicalengineer.com/how-to-setup-self-hosted-wiki-for-your-startup.html">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div aria-label="Content">
-      <div>
-        
-
-<p>
-  
-    <a href="https://themythicalengineer.com/authors/themythicalengineer">The Mythical Engineer</a> <br>
-    <span>Nov 17, 2024</span>
-  
-</p>
-
-
-<p><img src="https://themythicalengineer.com/assets/images/setup-self-hosted-wiki/wiki_js.webp" alt="wiki_js_banner"></p>
-
-<p>When it comes to setting up a wiki for your startup, you’ve probably looked at popular options like Confluence and Notion. While these tools are feature-rich, there’s one major drawback: they can get expensive really fast.</p>
-
-<p>Most of these services charge per user per month (typically around $5), and even with enterprise negotiations, the costs can add up quickly as your team grows. Sure, they offer advanced features and granular access controls, but let’s be honest - most startups don’t need all those fancy features.</p>
-
-<p>This is where self-hosted solutions shine. Your costs stay fixed regardless of how many employees join your company. After running a self-hosted wiki in production for over 3 years, I can confidently recommend <a href="https://js.wiki/">Wiki.js</a> as an excellent alternative to paid softwares.</p>
-
-<h2 id="why-wikijs">Why Wiki.js?</h2>
-
-<p>Setting up Wiki.js is surprisingly simple - you can have it running in minutes using Docker Compose. The basic setup (Wiki.js + PostgreSQL) is quite lightweight and can run smoothly on a modest server with:</p>
-<ul>
-  <li>4GB RAM</li>
-  <li>2 vCPU</li>
-</ul>
-
-<p>If you want better search capabilities, you can add Elasticsearch as well, but you’ll need to increase the resources to atleast:</p>
-<ul>
-  <li>8GB RAM</li>
-  <li>2 vCPU</li>
-</ul>
-
-<p>In our case, we’ve grown to over <strong>1,000 pages</strong> and nearly <strong>400 users</strong>, and our setup is still going strong. The only maintenance I’ve had to do was adding Elasticsearch for improved search functionality.</p>
-
-<p><img src="https://themythicalengineer.com/assets/images/setup-self-hosted-wiki/elasticsearch_setup.webp" alt="elasticsearch_setup"></p>
-
-<h2 id="cost-comparison">Cost Comparison</h2>
-
-<p>Let’s talk numbers. Here’s what you might pay running this on AWS EC2:</p>
-
-<table>
-  <thead>
-    <tr>
-      <th>Instance Type</th>
-      <th>vCPU</th>
-      <th>RAM (GiB)</th>
-      <th>On-Demand ($/hr)</th>
-      <th>Monthly On-Demand</th>
-      <th>Reserved 1-year ($/hr)</th>
-      <th>Monthly Reserved</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>t4g.medium</td>
-      <td>2</td>
-      <td>4</td>
-      <td>$0.0224</td>
-      <td>$16.35</td>
-      <td>$0.0142</td>
-      <td>$10.37</td>
-    </tr>
-    <tr>
-      <td>t4g.large</td>
-      <td>2</td>
-      <td>8</td>
-      <td>$0.0448</td>
-      <td>$32.70</td>
-      <td>$0.0283</td>
-      <td>$20.66</td>
-    </tr>
-  </tbody>
-</table>
-
-<p>To put this in perspective: if you had <strong>400</strong> users on a typical paid wiki platform charging $5 per user, you’d be looking at a <strong>$2,000+ monthly bill</strong>.</p>
-
-<p>With a self-hosted solution, you will be paying less than <strong>$33/month</strong> even with the larger instance!</p>
-
-<p>If you do need to scale up later, you can take small maintenance downtime to increase the instance size, or you can split the elasticsearch to a different instance.</p>
-
-<h2 id="making-it-production-ready">Making It Production-Ready</h2>
-
-<p>To transform this into a production-ready setup, I recommend implementing the following things:</p>
-
-<ol>
-  <li>Set up a custom domain like <code>wiki.yourcompany.com</code></li>
-  <li>Configure DNS and a Load Balancer to handle traffic</li>
-  <li>Implement <a href="https://docs.requarks.io/auth/google">SSO with Google</a></li>
-  <li>Restrict self-registration to your company domain (e.g., yourcompany.com)</li>
-  <li>Set up hourly AMI backups of your EC2 instance</li>
-</ol>
-
-<h2 id="the-setup">The Setup</h2>
-
-<p>Here’s the Docker Compose file you can use to do the complete setup:</p>
-
-<pre><code>services:
-  db:
-    image: postgres:16.4
-    expose:
-      - 5432
-    ports:
-      - 5432:5432
-    restart: unless-stopped
-    volumes:
-      - db-data:/var/lib/postgresql/data
-    environment:
-      POSTGRES_DB: wiki
-      POSTGRES_PASSWORD: pass # Change this to a strong password
-      POSTGRES_USER: root
-
-  wiki:
-    image: requarks/wiki:2.5
-    depends_on:
-      - db
-    environment:
-      DB_TYPE: postgres
-      DB_HOST: db
-      DB_PORT: 5432
-      DB_USER: root
-      DB_PASS: pass # Change this to a strong password
-      DB_NAME: wiki
-    restart: unless-stopped
-    ports:
-      - "80:3000"
-
-  elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.23
-    container_name: elasticsearch
-    restart: unless-stopped
-    ports:
-      - 127.0.0.1:9200:9200
-    environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - xpack.security.http.ssl.enabled=false
-      - xpack.license.self_generated.type=basic
-
-volumes:
-  db-data:
-</code></pre>
-
-<br>
-<hr>
-<p>P.S. My friend is actively seeking opportunities in Product Management, Marketing Operations, or Data Analytics.</p>
-
-<p>He brings strong expertise in data analytics, mathematics, and finance. Currently based in Bangalore, India, he is open to both remote and in-office opportunities.</p>
-
-<p>If you're looking for a driven professional with strong analytical skills and quick learning ability, please reach out to him directly:</p>
-<ul>
-    <li>Email: <a href="mailto:sachin.23@dmsiitd.org">sachin.23@dmsiitd.org</a></li>
-    <li>LinkedIn: <a href="https://linkedin.com/in/sachiniit">linkedin.com/in/sachiniit</a></li>
-    <li>Resume: <a href="https://drive.google.com/file/d/1PCDza6rQQ3Ecp_a8gyYEmneNGeL-snTD/view?usp=sharing">View Resume</a></li>
-</ul>
-
-
-  <p><span>
-    
-      
-      <a href="https://themythicalengineer.com/tag/wiki"><code><nobr>#wiki</nobr></code>&nbsp;</a>
-    
-      
-      <a href="https://themythicalengineer.com/tag/documentation"><code><nobr>#documentation</nobr></code>&nbsp;</a>
-    
-      
-      <a href="https://themythicalengineer.com/tag/postgres"><code><nobr>#postgres</nobr></code>&nbsp;</a>
-    
-      
-      <a href="https://themythicalengineer.com/tag/elasticsearch"><code><nobr>#elasticsearch</nobr></code>&nbsp;</a>
-    
-      
-      <a href="https://themythicalengineer.com/tag/docker"><code><nobr>#docker</nobr></code>&nbsp;</a>
-    
-      
-      <a href="https://themythicalengineer.com/tag/startup"><code><nobr>#startup</nobr></code>&nbsp;</a>
-    
-      
-      <a href="https://themythicalengineer.com/tag/aws"><code><nobr>#aws</nobr></code>&nbsp;</a>
-    
-      
-      <a href="https://themythicalengineer.com/tag/ec2"><code><nobr>#ec2</nobr></code>&nbsp;</a>
-    
-  </span></p>
-<li>
-
-
-	
-	
-
-	
-
-	
-
-
-
-	
-	
-
-	
-
-	
-
-
-
-	
-	
-
-	
-
-	
-
-
-
-	
-	
-
-	
-
-	
-	
-	
-	
-	
-	
-
-
-
-	
-	
-
-	
-
-	
-
-
-
-	
-	
-
-	
-
-	
-
-
-
-	
-	
-
-	
-
-	
-	
-	
-	
-	
-	
-
-
-
-	
-	
-
-	
-
-	
-
-
-
-	
-	
-
-	
-
-	
-
-
-
-	
-	
-
-	
-
-	
-	
-	
-	
-	
-	
-
-
-
-	
-	
-
-	
-
-	
-
-
-
-	
-	
-
-	
-
-	
-	
-	
-	
-	
-	
-
-
-
-	
-	
-
-	
-
-	
-
-
-
-	
-	
-
-	
-
-	
-	
-	
-	
-	
-		
-</li>
-
-<h4>Share this:</h4>
-
-
-
-
-<!-- <div class="well">
-    <p class="post-meta">Get new posts by email!</p>
-		<p class="post-meta">Enter your email address to get an email whenever I write a new post.</p> 
-    <form id="newsLetter" style="margin: 30px; text-align: center;">
-        <input type="email" style="text-align: center; width: 100%; line-height: 1.5;" name="email" value=""
-            placeholder="Enter your email address" required>
-        <input class="btn" style="align-self: center" type="submit" value="Subscribe">
-    </form>
-    
-</div>
-
-<script>
-    window.addEventListener("load", function () {
-        var form = document.getElementById("newsLetter");
-        
-        function getFormData() {
-            const formData = new FormData(form);
-            const obj = {};
-            for (const pair of formData.entries()) {
-                obj[pair[0]] = pair[1];
-            }
-            return obj;
-        }
-
-        function handleSubmit(data) {
-            const url = "https://themythicalengineer.herokuapp.com/newsletter"
-            const xhr = new XMLHttpRequest();
-
-            xhr.addEventListener("readystatechange", function () {
-                if (this.readyState === 4) {
-                    console.log(this.responseText);
-                    const message = JSON.parse(this.responseText).result;
-                    alert(message);
-                    // window.location.reload();
-                }
-            });
-
-            xhr.open("POST", url);
-            xhr.setRequestHeader("Content-Type", "application/json");
-
-            xhr.send(JSON.stringify(data));
-            return false;
-        }
-
-        form.addEventListener("submit", function (event) {
-            event.preventDefault();
-            const data = getFormData();
-            handleSubmit(data)
-        });
-    });
-</script> -->
-
-      </div>
-    </div></div>]]>
-            </description>
-            <link>https://themythicalengineer.com/how-to-setup-self-hosted-wiki-for-your-startup.html</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42162751</guid>
-            <pubDate>Sun, 17 Nov 2024 08:14:07 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[All-in-one embedding model for interleaved text, images, and screenshots]]>
-            </title>
-            <description>
-<![CDATA[
-Score 261 | Comments 31 (<a href="https://news.ycombinator.com/item?id=42162622">thread link</a>) | @fzliu
-<br/>
-November 16, 2024 | https://blog.voyageai.com/2024/11/12/voyage-multimodal-3/ | <a href="https://web.archive.org/web/*/https://blog.voyageai.com/2024/11/12/voyage-multimodal-3/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
-<div>
-
-
-
-
-<div><div>
-
-
-
-
-<p>TL;DR — We are excited to announce <code>voyage-multimodal-3</code>, a new state-of-the-art for multimodal embeddings and a big step forward towards seamless RAG and semantic search for documents rich with both visuals and text. Unlike existing multimodal embedding models, <code>voyage-multimodal-3</code> is capable of vectorizing interleaved texts + images and capturing key visual features from screenshots of PDFs, slides, tables, figures, and more, thereby eliminating the need for complex document parsing. <code>voyage-multimodal-3</code> improves retrieval accuracy by an average of 19.63% over the next best-performing multimodal embedding model when evaluated across 3 multimodal retrieval tasks (20 total datasets).</p>
-
-
-
-<p>Two months ago, we released the <a href="https://blog.voyageai.com/2024/09/18/voyage-3/" rel="nofollow" target="_blank"><code>voyage-3</code> and <code>voyage-3-lite</code></a> series of multilingual text embedding models, providing best-in-class performance across a variety of datasets. Today, we’re excited to introduce <code>voyage-multimodal-3</code>, our first multimodal embedding model and a big step toward RAG and semantic search for knowledge bases rich with both visuals and text.</p>
-
-
-
-<p><code>voyage-multimodal-3</code> supports text and content-rich images such as screenshots of texts, figures, tables, PDFs, slide decks, and more. The resultant vectors capture critical textual and visual features such as font size, text location, whitespace, etc. This eliminates the need for heuristic-based document parsing, which often struggles with accuracy when layouts are complex or interspersed with figures and photos. Unlike existing multimodal embedding models that handle either a single text or image input, <code>voyage-multimodal-3</code> allows for interleaved texts and images for maximum flexibility. Our <a href="https://colab.research.google.com/drive/12aFvstG8YFAWXyw-Bx5IXtaOqOzliGt9" rel="nofollow" target="_blank">sample notebook</a> demonstrates all of these features.</p>
-
-
-
-<p><code>voyage-multimodal-3</code> has an architecture that is similar to that of modern vision-language transformers. This makes it a significant departure from existing multimodal embedding models, including, but not limited to, OpenAI CLIP large (<code>clip-vit-large-patch14-336</code>) and Cohere multimodal v3 (<code>embed-multimodal-v3.0</code>).</p>
-
-
-
-<figure><img data-recalc-dims="1" fetchpriority="high" decoding="async" width="1440" height="800" data-attachment-id="1166" data-permalink="https://blog.voyageai.com/2024/11/12/voyage-multimodal-3/slide-2/" data-orig-file="https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/Slide-2.png?fit=1440%2C800&amp;quality=80&amp;ssl=1" data-orig-size="1440,800" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="Slide 2" data-image-description="" data-image-caption="" data-medium-file="https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/Slide-2.png?fit=300%2C167&amp;quality=80&amp;ssl=1" data-large-file="https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/Slide-2.png?fit=1024%2C569&amp;quality=80&amp;ssl=1" src="https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/Slide-2.png?resize=1440%2C800&amp;quality=80&amp;ssl=1" alt="" srcset="https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/Slide-2.png?w=1440&amp;quality=80&amp;ssl=1 1440w, https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/Slide-2.png?resize=300%2C167&amp;quality=80&amp;ssl=1 300w, https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/Slide-2.png?resize=1024%2C569&amp;quality=80&amp;ssl=1 1024w, https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/Slide-2.png?resize=768%2C427&amp;quality=80&amp;ssl=1 768w, https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/Slide-2.png?resize=1200%2C667&amp;quality=80&amp;ssl=1 1200w" sizes="(max-width: 1000px) 100vw, 1000px"></figure>
-
-
-
-<p>In a set of evaluations across 20 multimodal retrieval datasets and 34 text retrieval datasets, we found that <code>voyage-multimodal-3</code>:</p>
-
-
-
-<ol>
-<li>Outperforms OpenAI CLIP large and Cohere multimodal v3 by an average of 41.44% (a 2.1x improvement) and 43.37% (a 2.2x improvement) on table/figure retrieval, 26.54% and 25.84% on document screenshot retrieval, and 6.55% and 5.86% on text-to-photo retrieval, respectively.</li>
-
-
-
-<li>Outperforms OpenAI v3 large and Cohere multimodal/English<sup>1</sup> v3 by 5.13% and 13.70% on text-only datasets, respectively.</li>
-</ol>
-
-
-
-<h3>Support for Interleaved Text &amp; Images</h3>
-
-
-
-<p>All existing commonly used multimodal embedding models (such as Amazon Titan Multimodal G1, Google Vertex AI multimodal, and Cohere multimodal v3) are based on OpenAI’s CLIP, which processes different modalities of data through independent networks. In other words, images <em>must</em> be vectorized through the vision tower, while text <em>must</em> be vectorized through the text tower, preventing these models from being able to processing interleaved data.</p>
-
-
-
-<figure><img data-recalc-dims="1" decoding="async" width="1440" height="800" data-attachment-id="1167" data-permalink="https://blog.voyageai.com/2024/11/12/voyage-multimodal-3/slide-1/" data-orig-file="https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/Slide-1.png?fit=1440%2C800&amp;quality=80&amp;ssl=1" data-orig-size="1440,800" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="Slide 1" data-image-description="" data-image-caption="" data-medium-file="https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/Slide-1.png?fit=300%2C167&amp;quality=80&amp;ssl=1" data-large-file="https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/Slide-1.png?fit=1024%2C569&amp;quality=80&amp;ssl=1" src="https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/Slide-1.png?resize=1440%2C800&amp;quality=80&amp;ssl=1" alt="" srcset="https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/Slide-1.png?w=1440&amp;quality=80&amp;ssl=1 1440w, https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/Slide-1.png?resize=300%2C167&amp;quality=80&amp;ssl=1 300w, https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/Slide-1.png?resize=1024%2C569&amp;quality=80&amp;ssl=1 1024w, https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/Slide-1.png?resize=768%2C427&amp;quality=80&amp;ssl=1 768w, https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/Slide-1.png?resize=1200%2C667&amp;quality=80&amp;ssl=1 1200w" sizes="(max-width: 1000px) 100vw, 1000px"></figure>
-
-
-
-<p>In contrast, <code>voyage-multimodal-3</code> vectorizes both modalities of data directly within the same transformer encoder, ensuring that both text and visual features are treated as part of a unified representation rather than distinct components. This mimics the model architecture of the latest vision-language models, only for vectorization rather than generation. As a result, interleaved texts and images, document screenshots, PDFs with complex layouts, annotated images, etc can be vectorized in a way that preserves the contextual relationship between visual and textual information.</p>
-
-
-
-<h3>Mixed Modality Search with Screenshots</h3>
-
-
-
-<p>All CLIP-like models perform poorly on mixed-modality search due to a phenomenon known as the <a href="https://arxiv.org/abs/2203.02053" rel="nofollow" target="_blank">modality gap</a>. As illustrated in the figure below, the closest vector to the snippet “I address you, members of the Seventy-Seventh Congress…” is not its screenshot, but other texts. This leads to search results that are skewed towards items of the same modality; in other words, text vectors will be closer to irrelevant texts than relevant images in the embedding space.</p>
-
-
-
-<figure><img data-recalc-dims="1" decoding="async" width="692" height="660" data-attachment-id="1171" data-permalink="https://blog.voyageai.com/2024/11/12/voyage-multimodal-3/slide-3-v3/" data-orig-file="https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/Slide-3-v3.png?fit=692%2C660&amp;quality=80&amp;ssl=1" data-orig-size="692,660" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="Slide 3 v3" data-image-description="" data-image-caption="" data-medium-file="https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/Slide-3-v3.png?fit=300%2C286&amp;quality=80&amp;ssl=1" data-large-file="https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/Slide-3-v3.png?fit=692%2C660&amp;quality=80&amp;ssl=1" src="https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/Slide-3-v3.png?resize=692%2C660&amp;quality=80&amp;ssl=1" alt="" srcset="https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/Slide-3-v3.png?w=692&amp;quality=80&amp;ssl=1 692w, https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/Slide-3-v3.png?resize=300%2C286&amp;quality=80&amp;ssl=1 300w" sizes="(max-width: 692px) 100vw, 692px"></figure>
-
-
-
-<p>To illustrate this issue quantitatively, we conducted an experiment involving mixed-modality data. We created two sets of PyTorch documentation with identical content: one set as plain text (strings) and and the other set as screenshots. By combining a subset of text-based documentation with screenshots of remaining subset, we created a series of mixed-modality datasets. Each dataset represented a different proportion of text and screenshots, ranging from 0% to 100% screenshots. We then evaluated the retrieval accuracy of various multimodal models on these datasets, reporting the <a href="http://www.evidentlyai.com/ranking-metrics/ndcg-metric#:~:text=Normalized%20Discounted%20Cumulative%20Gain%20(NDCG)%20is%20a%20ranking%20quality%20metric,DCG%20representing%20a%20perfect%20ranking." rel="nofollow" target="_blank">normalized discounted cumulative gain</a>&nbsp;(NDCG@10) for each model across different screenshot ratios.</p>
-
-
-
-<div><div id="envira-gallery-wrap-1254" itemscope="" itemtype="https://schema.org/ImageGallery"><div data-row-height="" data-gallery-theme="" id="envira-gallery-1254" data-envira-columns="1"><div id="envira-gallery-item-1172" itemscope="" itemtype="https://schema.org/ImageObject"><div><a href="https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/voyage-multimodal-3_results.001.png?quality=80&amp;ssl=1" rel="enviragallery1254 nofollow" title="voyage-multimodal-3_results.001" data-envira-caption="voyage-multimodal-3_results.001" data-envira-retina="" data-thumbnail="" itemprop="contentUrl" target="_blank"><p><img decoding="async" id="envira-gallery-image-1172" data-envira-index="1" src="https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/voyage-multimodal-3_results.001.png?fit=1024%2C576&amp;quality=80&amp;ssl=1" data-envira-src="https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/voyage-multimodal-3_results.001.png?fit=1024%2C576&amp;quality=80&amp;ssl=1" data-envira-gallery-id="1254" data-envira-item-id="1172" data-envira-caption="voyage-multimodal-3_results.001" alt="" title="voyage-multimodal-3_results.001" itemprop="thumbnailUrl" data-envira-srcset="https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/voyage-multimodal-3_results.001.png?fit=1024%2C576&amp;quality=80&amp;ssl=1 400w,https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/voyage-multimodal-3_results.001.png?fit=1024%2C576&amp;quality=80&amp;ssl=1 2x" srcset="data:image/gif;base64,R0lGODlhAQABAIAAAP///////yH5BAEKAAEALAAAAAABAAEAAAICTAEAOw=="></p></a></div></div></div></div></div>
-
-
-
-<p>As shown above, CLIP-based models experience a decline in retrieval quality as the proportion of screenshots increases up to 90%, highlighting a retrieval bias influenced by modality. Moreover, these models perform poorly when all text is converted to images.</p>
-
-
-
-<p>In contrast, <code>voyage-multimodal-3</code> is not only the most performant for all ratios, but also has little-to-no performance drop across the board, indicating that the vectors truly capture the semantic content contained in the screenshots. This robustness is due to the model’s unique approach of processing all input modalities through the same backbone.</p>
-
-
-
-<p>With <code>voyage-multimodal-3</code>, there is no longer a need for screen parsing models, layout analysis, or any other complex text extraction pipelines; you can easily vectorize a knowledge base containing both pure-text documents as well unstructured data (such as PDFs/slides/webpages/etc) — screenshots are all you need.</p>
-
-
-
-<h3>Evaluation Details</h3>
-
-
-
-<p><strong>Datasets.</strong> We evaluate <code>voyage-multimodal-3</code> across 20 multimodal datasets spanning three different tasks: table/figure retrieval, document screenshot retrieval (the <a href="https://github.com/illuin-tech/vidore-benchmark" data-type="link" data-id="https://github.com/illuin-tech/vidore-benchmark" rel="nofollow" target="_blank">ViDoRe benchmark</a>), and text-to-photo retrieval. We also evaluate <code>voyage-multimodal-3</code> on a standard text retrieval task spanning 34 datasets in 6 domains (law, finance, conversation, code, web, and tech).</p>
-
-
-
-<p>For all datasets, the query is text, while the document could be a figure, photo, text, document screenshot, or a combination of these. For each task, we use prior top-performing models as the baseline. Alongside task names, we provide each task’s corresponding description and datasets used in the table below:</p>
-
-
-
-<figure><table><thead><tr><th>Task</th><th>Description</th><th><strong>Datasets</strong></th></tr></thead><tbody><tr><td>Table/figure retrieval</td><td>Table/figure retrieval measures the strength of a model’s ability to match an image containing a table or figure (charts, graphs, etc) with descriptions, captions, or other textual queries which reference the figure.</td><td>charxiv, mmtab-test, ChartQA, Chartve, FintabnetQA, PlotQA,</td></tr><tr><td>Document screenshot retrieval</td><td>In this category, models are used to match queries with scans or screenshots of documents containing both text and charts. We use all datasets from the <a href="https://github.com/illuin-tech/vidore-benchmark" data-type="link" data-id="https://github.com/illuin-tech/vidore-benchmark" rel="nofollow" target="_blank">ViDoRe benchmark</a> for this task.</td><td>Energy, Healthcare Industry, Artificial Intelligence, Government Report, InfoVQA, DocVQA, ArxivQA, TabFQuad, TAT-DQA, Shift Project</td></tr><tr><td>Text-to-photo retrieval</td><td>This is the typical text-to-image matching used by CLIP and other CLIP-like models, where queries are associated with the most semantically relevant photos.</td><td>meme-cap, mm-imdb, winoground, docci</td></tr><tr><td>Standard text retrieval</td><td>Standard text retrieval retrieves relevant documents by matching query strings with document strings.</td><td>LeCaRDv2, LegalQuAD legal_summarization, AILA_casedocs, AILA_statutes, rag-benchmark-finance-apple-10K-2022, financebench, TAT-QA, finance-alpaca-csv fiqa-personal-finance-dataset, finance-financialmodelingprep-stock-news-sentiments-rss-feed, ConvFinQA, finqa, hc3_finance, dialogsum, QAConv, HQA-data, LeetCodeCpp-new, LeetCodeJava-new, LeetCodePython-new, humaneval, mbpp, ds1000-referenceonly, ds1000, apps_5doc, Huffpostsports, Huffpostscience, Doordash, Healthforcalifornia, Cohere, 5GEdge, OneSignal, Langchain, PyTorch1024</td></tr></tbody></table></figure>
-
-
-
-<p>Note that the standard text retrieval task encompasses all datasets used to evaluate <code>voyage-3</code> and <code>voyage-3-lite</code> except long context and multilingual datasets. See our <a href="https://blog.voyageai.com/2024/09/18/voyage-3/" rel="nofollow" target="_blank">previous blog post</a> for more information.</p>
-
-
-
-<p><strong>Models</strong>. For the three multimodal tasks, we evaluate&nbsp;<code>voyage-multimodal-3</code>&nbsp;alongside four alternative multimodal embedding models: <a href="https://huggingface.co/openai/clip-vit-large-patch14-336" rel="nofollow" target="_blank">OpenAI CLIP large</a> (<code>clip-vit-large-patch14-336</code>), <a href="https://docs.aws.amazon.com/bedrock/latest/userguide/titan-multiemb-models.html" rel="nofollow" target="_blank">Amazon Titan Multimodal Embeddings G1</a> (<code>amazon.titan-embed-image-v1</code>), <a href="https://docs.cohere.com/reference/embed" rel="nofollow" target="_blank">Cohere multimodal v3</a> (<code>embed-multimodal-v3.0</code>), and <a href="https://huggingface.co/google/siglip-so400m-patch14-384" rel="nofollow" target="_blank">SigLIP So400M</a> (<code>siglip-so400m-patch14-384</code>). We also evaluate <a href="https://huggingface.co/vidore/colqwen2-v0.1" rel="nofollow" target="_blank">ColQwen2 v0.1</a> (<code>colqwen-v0.1</code>), a late interaction model that outputs many embeddings per document.</p>
-
-
-
-<p>For the standard text retrieval task, we evaluate <code>voyage-multimodal-3</code> alongside <a href="https://platform.openai.com/docs/guides/embeddings" rel="nofollow" target="_blank">OpenAI v3 large</a> (<code>text-embeddings-3-large</code>), Cohere multimodal/English<sup>1</sup> v3, and <code>voyage-3</code>.</p>
-
-
-
-<p><strong>Metrics.</strong> Given a query, we retrieve the top 10 results by cosine similarity and report the&nbsp;NDCG@10.</p>
-
-
-
-<h3>Results</h3>
-
-
-
-<p><strong>Multimodal retrieval</strong>. As shown in the figure below, <code>voyage-multimodal-3</code> outperforms OpenAI CLIP large, Amazon Titan Multimodal G1, Cohere multimodal v3, SigLIP So400M, and ColQwen2 v0.1 by:</p>
-
-
-
-<ul>
-<li>41.44%, 45.00%, 43.37%, 20.66%, and 6.14% on table/figure retrieval, respectively</li>
-
-
-
-<li>26.54%, 37.68%, 25.84%, 35.62%, and 0.98% on document screenshot retrieval, respectively</li>
-
-
-
-<li>6.55%, 5.16%, 5.86%, 3.42%, and 10.34% on text-to-photo retrieval, respectively</li>
-</ul>
-
-
-
-<div><div id="envira-gallery-wrap-1257" itemscope="" itemtype="https://schema.org/ImageGallery"><div data-row-height="" data-gallery-theme="" id="envira-gallery-1257" data-envira-columns="1"><div id="envira-gallery-item-1226" itemscope="" itemtype="https://schema.org/ImageObject"><div><a href="https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/voyage-multimodal-3_results.002-3.png?quality=80&amp;ssl=1" rel="enviragallery1257 nofollow" title="voyage-multimodal-3_results.002" data-envira-caption="voyage-multimodal-3_results.002" data-envira-retina="" data-thumbnail="" itemprop="contentUrl" target="_blank"><p><img decoding="async" id="envira-gallery-image-1226" data-envira-index="1" src="https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/voyage-multimodal-3_results.002-3.png?fit=1024%2C576&amp;quality=80&amp;ssl=1" data-envira-src="https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/voyage-multimodal-3_results.002-3.png?fit=1024%2C576&amp;quality=80&amp;ssl=1" data-envira-gallery-id="1257" data-envira-item-id="1226" data-envira-caption="voyage-multimodal-3_results.002" alt="" title="voyage-multimodal-3_results.002" itemprop="thumbnailUrl" data-envira-srcset="https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/voyage-multimodal-3_results.002-3.png?fit=1024%2C576&amp;quality=80&amp;ssl=1 400w,https://i0.wp.com/blog.voyageai.com/wp-content/uploads/2024/11/voyage-multimodal-3_results.002-3.png?fit=1024%2C576&amp;quality=80&amp;ssl=1 2x" srcset="data:image/gif;base64,R0lGODlhAQABAIAAAP///////yH5BAEKAAEALAAAAAABAAEAAAICTAEAOw=="></p></a></div></div></div></div></div>
-
-
-
-<p><strong>Standard text retrieval</strong>. As shown in the figure below, <code>voyage-multimodal-3</code> outperforms OpenAI v3 large and Cohere multimodal/English<sup>1</sup> v3 by 5.13% and 13.70%, respectively. The performance of <code>voyage-multimodal-3</code> is 0.05% better than that of <code>voyage-3</code>, making the two comparable in terms of retrieval accuracy for pure text documents.</p>
-
-
-
-<p>All evaluation results are available in <a href="https://docs.google.com/spreadsheets/d/1LAbDBkzO--LGR9y4FWzqhFsImO6ic5NITxgPWGmMIP4/edit?gid=222347087#gid=222347087" rel="nofollow" target="_blank">this spreadsheet</a>.</p>
-
-
-
-<h3>Try voyage-multimodal-3 now!</h3>
-
-
-
-<p><code>voyage-multimodal-3</code> is available today! The first 200 million tokens are free. To get started, check out our <a href="https://colab.research.google.com/drive/12aFvstG8YFAWXyw-Bx5IXtaOqOzliGt9" rel="nofollow" target="_blank">sample notebook</a>, or head over to our&nbsp;<a href="https://docs.voyageai.com/docs/multimodal-embeddings" rel="nofollow" target="_blank">docs</a>&nbsp;to learn more.</p>
-
-
-
-<p>If you’re also interested in fine-tuned embedding models, we’d love to hear from you—please email us at&nbsp;<a href="mailto:contact@voyageai.com">contact@voyageai.com</a>. Follow us on&nbsp;<a href="https://x.com/VoyageAI" rel="nofollow" target="_blank">X (Twitter)</a>&nbsp;and&nbsp;<a href="https://www.linkedin.com/company/voyageai/" rel="nofollow" target="_blank">LinkedIn</a>,&nbsp;and join our&nbsp;<a href="https://discord.gg/zAU7GQEmvT" rel="nofollow" target="_blank">Discord</a>&nbsp;for more updates.</p>
-
-
-
-<hr>
-
-
-
-<p><sup>1 </sup>Cohere multimodal v3 uses Cohere English v3 (<code>embed-english-v3.0</code>) for the text tower, which makes the both models’ vectors identical on pure text. To minimize confusion, we use “Cohere multimodal v3” as the only label in the charts.</p>
-</div></div>
-
-
-
-
-</div>
-</div></div>]]>
-            </description>
-            <link>https://blog.voyageai.com/2024/11/12/voyage-multimodal-3/</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42162622</guid>
-            <pubDate>Sun, 17 Nov 2024 07:42:08 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[CSS gets a new logo and it uses the color `rebeccapurple`]]>
-            </title>
-            <description>
-<![CDATA[
-Score 875 | Comments 181 (<a href="https://news.ycombinator.com/item?id=42161919">thread link</a>) | @thunderbong
-<br/>
-November 16, 2024 | https://michaelcharl.es/aubrey/en/code/new-rebeccapurple-css-logo | <a href="https://web.archive.org/web/*/https://michaelcharl.es/aubrey/en/code/new-rebeccapurple-css-logo">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><p><a href="https://github.com/CSS-Next/css-next/issues/105">A community vote</a> in the CSS-Next repository on GitHub decided on a new official logo for CSS. The design follows the design language of the logos of other web technologies like JavaScript, TypeScript, and WebAssembly.</p>
-<figure><img src="https://files.michaelcharl.es/f8dd798e-7651-49a4-9071-c1621c639b3b.png" alt="A demonstration of the new rebeccapurple colored CSS logo alongside the logos from JavaScript, TypeScript, WebAssembly, and other web technologies"></figure>
-<p>But perhaps more importantly, the logo uses the color <code><span>rebeccapurple</span></code> (<code><span>#663399</span></code>), a color that was <a href="https://lists.w3.org/Archives/Public/www-style/2014Jun/0312.html">added to the CSS specification</a> in 2014 in honor of Eric Meyer's daughter, Rebecca, who passed away at the age of six on her birthday from brain cancer.</p>
-<p>Eric Meyer, author of several books on CSS, has been an important figure in the CSS community since the late 1990s.</p>
-<p>The color was originally going to be called <code><span>beccapurple</span></code>, but <a href="https://meyerweb.com/eric/thoughts/2014/06/19/rebeccapurple/">Meyer asked</a> that it instead be named <code><span>rebeccapurple</span></code>, as his daughter had wanted to be called Rebecca once she had turned six. She had said that Becca was a "baby name," and that once she had turned six, she wanted to be called Rebecca. As Eric Meyer put it, "She made it to six. For almost twelve hours, she was six. So Rebecca it is and must be."</p>
-</div></div></div>]]>
-            </description>
-            <link>https://michaelcharl.es/aubrey/en/code/new-rebeccapurple-css-logo</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42161919</guid>
-            <pubDate>Sun, 17 Nov 2024 04:18:12 GMT</pubDate>
         </item>
     </channel>
 </rss>
