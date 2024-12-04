@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Wed, 04 Dec 2024 08:23:47 GMT</lastBuildDate>
+        <lastBuildDate>Wed, 04 Dec 2024 12:25:00 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-10.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Wed, 04 Dec 2024 08:23:47 GMT</pubDate>
+        <pubDate>Wed, 04 Dec 2024 12:25:00 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,1350 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Linux TCP So_reuseport: Usage and Implementation]]>
+            </title>
+            <description>
+<![CDATA[
+Score 12 | Comments 4 (<a href="https://news.ycombinator.com/item?id=42316091">thread link</a>) | @todsacerdoti
+<br/>
+December 4, 2024 | https://linuxjournal.rubdos.be/ljarchive/LJ/298/12538.html | <a href="https://web.archive.org/web/*/https://linuxjournal.rubdos.be/ljarchive/LJ/298/12538.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
+  <div id="logo-wrapper">
+    <div id="logo">
+      <p><img src="https://linuxjournal.rubdos.be/ljarchive/images/lj-logo-white.png">
+      </p>
+      
+    </div>
+  </div>
+
+  
+
+  
+
+
+<h2>
+Improve your server performance using a relatively new feature of
+the Linux networking stack: the <code>SO_REUSEPORT</code> socket option. By Krishna
+Kumar</h2>
+<div>
+<p><img alt="Alt Tag Name" src="https://linuxjournal.rubdos.be/ljarchive/LJ/298/12538c.jpg"></p>
+</div>
+
+<p>
+HAProxy and NGINX are some of the few applications that use the TCP
+<code>SO_REUSEPORT</code> <a href="https://lwn.net/Articles/542629">socket
+option of the Linux networking stack</a>. This option,
+initially introduced in 4.4 BSD, is used to implement high-performance
+servers that help better utilize today's large multicore systems. The
+first few sections of this article explain some essential concepts of
+TCP/IP sockets, and the remaining sections use that knowledge to describe
+the rationale, usage and implementation of the <code>SO_REUSEPORT</code> socket option.
+</p>
+
+<h3>
+TCP Connection Basics</h3>
+
+<p>
+A TCP connection is defined by a <a href="https://en.wikipedia.org/wiki/Network_socket">unique 5-tuple</a>:
+</p>
+
+<blockquote>
+<p>
+<em>[ Protocol, Source IP Address, Source Port, Destination IP Address, Destination
+Port ]</em>
+</p>
+</blockquote>
+
+<p>
+Individual tuple elements are specified in different ways by clients
+and servers. Let's take a look at how each tuple element is initialized.
+</p>
+
+<h3>
+Client Application</h3>
+
+<p>
+<strong>Protocol:</strong> this field is initialized when the socket is created based on
+parameters provided by the application. The protocol is always TCP for the purposes
+of this article. For example:
+      
+</p>
+<pre><code>
+socket(AF_INET, SOCK_STREAM, 0);  /* create a TCP socket */
+</code>
+</pre>
+
+
+<p>
+<strong>Source IP address and port:</strong> these are usually set by the kernel when the
+application calls <code>connect()</code> without a prior invocation to
+<code>bind()</code>. The kernel
+picks a suitable IP address for communicating with the destination server
+and a source port from the ephemeral port range (<code>sysctl
+net.ipv4.ip_local_port_range</code>).
+</p>
+
+<p>
+<strong>Destination IP address and port:</strong> these are set by the application by invoking
+<code>connect()</code>. For example:
+
+</p>
+<pre><code>
+server.sin_family  = AF_INET;
+server.sin_port    = htons(SERVER_PORT);
+bcopy(server_ent-&gt;h_addr, &amp;server.sin_addr.s_addr,
+      server_ent-&gt;h_length);
+/* Connect to server, and set the socket's destination IP
+ * address and port# based on above parameters. Also, request
+ * the kernel to automatically set the Source IP and port# if
+ * the application did not call bind() prior to connect().
+ */
+connect(fd, (struct sockaddr *)&amp;server, sizeof server);
+</code>
+</pre>
+
+
+<h3>
+Server Application</h3>
+
+<p>
+<strong>Protocol:</strong> initialized in the same way as described for a client application.
+</p>
+
+<p>
+<strong>Source IP address and port:</strong> set by the application when it
+invokes <code>bind()</code>,
+for example:
+
+</p>
+<pre><code>
+srv_addr.sin_family        = AF_INET;
+srv_addr.sin_addr.s_addr   = INADDR_ANY;
+srv_addr.sin_port          = htons(SERVER_PORT);
+bind(fd, &amp;srv_addr, sizeof srv_addr);
+</code>
+</pre>
+
+
+<p>
+<strong>Destination IP address and port:</strong> a client connects to a server by completing
+the <a href="https://en.wikipedia.org/wiki/Transmission_Control_Protocol">TCP
+three-way handshake</a>. The server's TCP/IP stack creates a new socket
+to track the client connection and sets its Source IP:Port and Destination
+IP:Port from the incoming client connection parameters. The new socket is
+transitioned to the <code>ESTABLISHED</code> state, while the server's
+<code>LISTEN</code> socket is
+left unmodified. At this time, the server application's call to
+<code>accept()</code> on
+the <code>LISTEN</code> socket returns with a reference to the newly
+<code>ESTABLISHED</code> socket.
+See the listing at the end of this article for an example
+implementation of client and server applications.
+</p>
+
+<h3>
+TIME-WAIT Sockets</h3>
+
+<p>
+A <a href="https://en.wikipedia.org/wiki/File:Tcp_state_diagram.png">TIME-WAIT
+socket</a> is created when an application closes its end of a
+TCP connection first. This results in the initiation of a TCP four-way
+handshake, during which the socket state changes from <code>ESTABLISHED</code> to
+<code>FIN-WAIT1</code> to <code>FIN-WAIT2</code> to <code>TIME-WAIT</code>, before the socket is closed. The
+<code>TIME-WAIT</code> state is a lingering state for protocol reasons. An application can
+instruct the TCP/IP stack not to linger a connection by sending a TCP RST
+packet. In doing so, the connection is terminated instantly without going
+through the TCP four-way handshake. The following code fragment implements the
+reset of a connection by specifying a socket linger time of zero seconds:
+
+</p>
+<pre><code>
+const struct linger opt = { .l_onoff = 1, .l_linger = 0 };
+
+setsockopt(fd, SOL_SOCKET, SO_LINGER, &amp;opt, sizeof opt);
+close(fd);
+</code>
+</pre>
+
+
+<h3>
+Understanding the Different States of a Server Socket</h3>
+
+<p>
+A server typically executes the following system calls at start up:
+</p>
+
+<p>
+1) Create a socket:
+     
+</p>
+<pre><code>
+server_fd = socket(...);
+</code>
+</pre>
+
+
+<p>
+2) Bind to a well known IP address and port number:
+  
+</p>
+<pre><code>    
+ret = bind(server_fd, ...);
+</code>
+</pre>
+
+
+<p>
+3) Mark the socket as passive by changing its state to <code>LISTEN</code>:
+      
+</p>
+<pre><code>
+ret = listen(server_fd, ...);
+</code>
+</pre>
+
+
+<p>
+4) Wait for a client to connect and get a reference file descriptor:
+      
+</p>
+<pre><code>
+client_fd = accept(server_fd, ...);
+</code>
+</pre>
+
+
+<p>
+Any new socket, created via <code>socket()</code> or <code>accept()</code> system calls, is tracked in
+the kernel using a <a href="https://elixir.bootlin.com/linux/v4.17.13/source">"struct sock"
+structure</a>. In the code fragment above, a
+socket is created in step #1 and given a well known address in step #2. This
+socket is transitioned to the <code>LISTEN</code> state in step #3. Step #4 calls
+<code>accept()</code>, which blocks until a client connects to this IP:port. After the
+client completes the TCP three-way handshake, the kernel creates a second socket and
+returns a reference to this socket. The state of the new socket is set to
+<code>ESTABLISHED</code>, while the <code>server_fd</code> socket remains in a
+<code>LISTEN</code> state.
+</p>
+
+<h3>
+The SO_REUSEADDR Socket Option</h3>
+
+<p>
+Let's look at two use cases to better understand the <code>SO_REUSEADDR</code>
+option for TCP sockets.
+</p>
+
+<p>
+<strong>Use case #1:</strong> a server application restarts in two steps, an exit followed by
+a start up. During the exit, the server's <code>LISTEN</code> socket is closed immediately.
+Two situations can arise due to the presence of
+existing connections to the server:
+</p>
+
+<ol>
+<li>
+All established connections that were being handled by this dying server
+process are closed, and those sockets transition to the <code>TIME-WAIT</code> state.
+</li>
+
+<li>
+All established connections that were handed off to a child process
+continue to remain in the <code>ESTABLISHED</code> state.
+</li>
+</ol>
+
+<p>
+When the server is subsequently started up, its attempt to bind to its
+<code>LISTEN</code> port fails with <code>EADDRINUSE</code>, because some sockets on the system are
+already bound to this IP:port combination (for example, a socket in either
+the <code>TIME-WAIT</code> or <code>ESTABLISHED</code> state). Here's a
+demonstration of this problem:
+
+</p>
+<pre><code>
+# Server is listening on port #45000.
+$ ss -tan | grep :45000
+LISTEN   0     1      10.20.1.1:45000      *:*
+
+# A client connects to the server using its source
+# port 54762. A new socket is created and is seen 
+# in the ESTABLISHED state, along with the
+# earlier LISTEN socket.
+$ ss -tan | grep :45000
+LISTEN     0     1    10.20.1.1:45000      *:*
+ESTAB      0     0    10.20.1.1:45000      10.20.1.100:54762
+
+# Kill the server application.
+$ pkill -9 my_server
+
+# Restart the server application.
+$ ./my_server 45000
+bind: Address already in use
+
+# Find out why
+$ ss -tan | grep :45000
+TIME-WAIT  0     0    10.20.1.1:45000      10.20.1.100:54762
+</code>
+</pre>
+
+
+<p>
+This listing shows that the earlier <code>ESTABLISHED</code> socket is the same one that
+is now seen in the <code>TIME-WAIT</code> state. The presence of this socket bound to the
+local address—10.20.1.1:45000—prevented the server from being able to
+subsequently <code>bind()</code> to the same IP:port combination for its
+<code>LISTEN</code> socket.
+</p>
+
+<p>
+<strong>Use case #2:</strong> if two processes attempt to <code>bind()</code> to the same IP:port
+combination, the process that executes <code>bind()</code> first succeeds, while the latter
+fails with <code>EADDRINUSE</code>. Another instance of this use case involves an
+application binding to a specific IP:port (for example, 192.168.100.1:80),
+and another application attempting to bind to the wildcard IP address with
+the same port number (for example, 0.0.0.0:80) or vice versa. The latter
+<code>bind()</code> invocation fails, as it attempts to bind to all addresses with the same
+port number that was used by the first process. If both processes set the
+<code>SO_REUSEADDR</code> option on their sockets, both sockets can be bound successfully.
+However, note this caveat: if the first process calls <code>bind()</code> and
+<code>listen()</code>,
+the second process still would be unable to <code>bind()</code> successfully, since the
+first socket is in the <code>LISTEN</code> state. Hence, this use case is usually meant for
+clients that want to bind to a specific IP:port before connecting to
+different services.
+</p>
+
+<p>
+How does <code>SO_REUSEADDR</code> help solve this problem? When the server is restarted
+and invokes <code>bind()</code> on a socket with
+<code>SO_REUSEADDR</code> set, the kernel ignores all
+non-<code>LISTEN</code> sockets bound to the same IP:port combination. The 
+<em>UNIX Network Programming</em> book <a href="https://www.amazon.com/Unix-Network-Programming-Sockets-Networking/dp/0131411551">describes
+this feature as</a>:
+"<code>SO_REUSEADDR</code> allows a listening server to start and bind its well-known
+port, even if previously established connections exist that use this port as
+their local port".
+</p>
+
+<p>
+However, we need the <code>SO_REUSEPORT</code> option to allow two or more processes to
+invoke <code>listen()</code> on the same port successfully. I describe this option 
+in more detail in the remaining sections.
+</p>
+
+<h3>
+The SO_REUSEPORT Socket Option</h3>
+
+<p>
+While <code>SO_REUSEADDR</code> allows sockets to <code>bind()</code> to the same IP:port combination
+when existing <code>ESTABLISHED</code> or <code>TIME-WAIT</code> sockets may be
+present, <code>SO_REUSEPORT</code>
+allows binding to the same IP:port when existing <code>LISTEN</code> sockets
+also may be
+present. The kernel ignores all sockets, including sockets in the
+<code>LISTEN</code> state,
+when an application invokes <code>bind()</code> or <code>listen()</code> on a
+socket with <code>SO_REUSEPORT</code>
+enabled. This permits a server process to be invoked multiple times, allowing
+many processes to listen for connections. The next section examines the
+kernel implementation <code>SO_REUSEPORT</code>.
+</p>
+
+<h3>
+How Are Connections Distributed among Multiple Listeners?</h3>
+
+<p>
+When multiple sockets are in the <code>LISTEN</code> state, how does the kernel decide which
+socket—and, thus, which application process—receives an incoming
+connection? Is this determined using a round-robin, least-connection, random
+or some other method? Let's take a deeper look into the TCP/IP code to
+understand how socket selection is performed.
+</p>
+
+<p>
+Notes:
+</p>
+
+<ul>
+<li> 
+Data structures and code snippets in this section are heavily simplified
+for the sake of clarity—removing some structure elements, function
+arguments, variables and unnecessary code—but without losing correctness.
+Some parts of the listing are also in pseudo-code for better ease of
+understanding.
+</li>
+
+<li>   
+<code>sk</code> represents a kernel socket data structure of type "struct sock".
+</li>
+
+<li> 
+<code>skb</code>, or the socket buffer, represents a network packet of type "struct
+sk_buff".
+</li>
+
+<li> 
+<code>src_addr</code>, <code>src_port</code> and <code>dst_addr</code>,
+<code>dst_port</code> refers to source IP:port and
+destination IP:port, respectively.
+</li>
+
+<li>
+Readers can correlate the code snippets with the <a href="https://elixir.bootlin.com/linux/v4.17.13/source">actual source code</a>,
+if desired.
+</li>
+</ul>
+
+<p>
+As an incoming packet (<code>skb</code>) moves up the TCP/IP stack, the IP subsystem calls
+into the TCP packet receive handler, <code>tcp_v4_rcv()</code>, providing the
+<code>skb</code> as
+argument. <code>tcp_v4_rcv()</code> attempts to locate a socket associated with
+this <code>skb</code>:
+
+</p>
+<pre><code>
+sk = __inet_lookup_skb(&amp;tcp_hashinfo, skb, src_port, dst_port);
+</code>
+</pre>
+
+
+<p>
+<code>tcp_hashinfo</code> is a global variable of type <code>struct
+inet_hashinfo</code>, containing,
+among others, two hash tables of <code>ESTABLISHED</code> and
+<code>LISTEN</code> sockets, respectively.
+The <code>LISTEN</code> hash table is sized to 32 buckets, as shown below:
+
+</p>
+<pre><code>
+#define LHTABLE_SIZE 32 /* Yes, this really is all you need */
+struct inet_hashinfo {
+   /* Hash table for fully established sockets */
+   struct inet_ehash_bucket *ehash;
+   /* Hash table for LISTEN sockets */
+   struct inet_listen_hashbucket listening_hash[LHTABLE_SIZE];
+};
+
+struct inet_hashinfo tcp_hashinfo;
+</code>
+</pre>
+
+
+<p>
+<code>__inet_lookup_skb()</code> extracts the source and destination IP addresses from the
+incoming <code>skb</code> and passes these along with the source and destination ports to
+<code>__inet_lookup()</code> to find the associated <code>ESTABLISHED</code> or
+<code>LISTEN</code> socket, as shown
+here:
+
+</p>
+<pre><code>
+struct sock *__inet_lookup_skb(tcp_hashinfo, skb, 
+ ↪src_port, dst_port)
+{
+   /* Get the IPv4 header to know 
+    * the source and destination IPs */
+   const struct iphdr *iph = ip_hdr(skb);
+
+   /*
+    * Look up the incoming skb in tcp_hashinfo using the
+    * [ Source-IP:Port, Destination-IP:Port ] tuple.
+    */
+   return __inet_lookup(tcp_hashinfo, skb, iph-&gt;saddr, 
+            ↪src_port, iph-&gt;daddr, dst_port);
+}
+</code>
+</pre>
+
+
+<p>
+<code>__inet_lookup()</code> looks in <code>tcp_hashinfo-&gt;ehash</code> for an already established
+socket matching the client four-tuple parameters. In the absence of an
+established socket, it looks in <code>tcp_hashinfo-&gt;listening_hash</code> for a
+<code>LISTEN</code>
+socket:
+
+</p>
+<pre><code>
+struct sock *__inet_lookup(tcp_hashinfo, skb, src_addr, 
+                ↪src_port, dst_addr, dst_port)
+{
+   /* Convert dest_port# from network to host byte order */
+   u16 hnum = ntohs(dst_port);
+
+   /* First look for an established socket ... */
+   sk = __inet_lookup_established(tcp_hashinfo, src_addr, 
+            ↪src_port, dst_addr, hnum);
+   if (sk)
+      return sk;
+
+   /* failing which, look for a LISTEN socket */
+   return __inet_lookup_listener(tcp_hashinfo, skb, src_addr,
+                                 src_port, dst_addr, hnum);
+}
+</code>
+</pre>
+
+
+<p>
+The <code>__inet_lookup_listener()</code> function implements the selection of
+a <code>LISTEN</code>
+socket:
+
+</p>
+<pre><code>
+struct sock *__inet_lookup_listener(tcp_hashinfo, skb, 
+                  ↪src_addr, src_port, dst_addr, dst_port)
+{
+   /*
+    * Use the destination port# to calculate a hash table 
+    * slot# of the listen socket. inet_lhashfn() returns 
+    * a number between 0
+    * and LHTABLE_SIZE-1 (both inclusive).
+    */
+   unsigned int hash = inet_lhashfn(dst_port);
+
+   /* Use this slot# to index the global LISTEN hash table */
+   struct inet_listen_hashbucket *ilb =
+                       ↪tcp_hashinfo-&gt;listening_hash[hash];
+
+   /* Track best matching LISTEN socket 
+    * so far and its "score" */
+   struct sock *result = NULL, *sk;
+   int hi_score = 0;
+
+   for each socket, 'sk', in the selected hash bucket, 'ilb' {
+      /*
+       * Calculate the "score" of this LISTEN socket (sk) 
+       * against the incoming skb. Score is computed on 
+       * some parameters, such as exact destination port#, 
+       * destination IP address exact match (as against 
+       * matching INADDR_ANY, for example),
+       * with each criteria getting a different weight.
+       */
+      score = compute_score(sk, dst_port, dst_addr);
+      if (score &gt; hi_score) {
+         /* Highest score - best matched socket till now */
+         if (sk-&gt;sk_reuseport) {
+            /*
+             * sk has SO_REUSEPORT feature enabled. Call
+             * inet_ehashfn() with dest_addr, dest_port, 
+             * src_addr and src_port to compute a 
+             * 2nd hash, phash.
+             */
+            phash = inet_ehashfn(dst_addr, dst_port,
+                                 src_addr, src_port);
+
+            /* Select a socket from sk's SO_REUSEPORT group 
+             * using 'phash'.
+             */
+            result = reuseport_select_sock(sk, phash);
+            if (result)
+               return result;
+         }
+
+         /* Update new best socket and its score */
+         result = sk;
+         hi_score = score;
+      }
+   }
+
+   return result;
+}
+</code>
+</pre>
+
+
+<p>
+Selecting a socket from the <code>SO_REUSEPORT</code> group is done with
+<code>reuseport_select_sock()</code>:
+
+</p>
+<pre><code>
+struct sock *reuseport_select_sock(struct sock *sk,
+                                   unsigned int phash)
+{
+   /* Get control block of sockets 
+    * in this SO_REUSEPORT group */
+   struct sock_reuseport *reuse = sk-&gt;sk_reuseport_cb;
+
+   /* Get count of sockets in the group */
+   int num_socks = reuse-&gt;num_socks;
+
+   /* Calculate value between 0 and 'num_socks-1' 
+    * (both inclusive) */
+   unsigned int index = reciprocal_scale(phash, num_socks);
+
+   /* Index into the SO_REUSEPORT group using this index */
+   return reuse-&gt;socks[index];
+}
+</code>
+</pre>
+
+
+<p>
+Let's step back a little to understand how this works. When the first
+process invoked <code>listen()</code> on a socket with
+<code>SO_REUSEPORT</code> enabled, a pointer in
+its "struct sock" structure, <code>sk_reuseport_cb</code>, is allocated. This structure
+is defined as:
+
+</p>
+<pre><code>
+struct sock_reuseport {
+  u16      max_socks; /* Allocated size of socks[] array */
+  u16      num_socks; /* #Elements in socks[] */
+  struct sock *socks[0]; /* All sockets added to this group */
+};
+</code>
+</pre>
+
+
+<p>
+The last element of this structure is a <a href="https://gcc.gnu.org/onlinedocs/gcc/Zero-Length.html">"flexible array
+member"</a>. The
+entire structure is allocated such that the <code>socks[]</code> array has 128 elements of
+type <code>struct sock *</code>. Note that as the number of listeners increases beyond
+128, this structure is reallocated such that the <code>socks[]</code> array size is
+doubled.
+</p>
+
+<p>
+The first socket, <code>sk1</code>, that invoked <code>listen()</code>, is saved in the first slot of
+its own <code>socks[]</code> array, for example:
+
+</p>
+<pre><code>
+sk1-&gt;sk_reuseport_cb-&gt;socks[0] = sk1;
+</code>
+</pre>
+
+
+<p>
+When <code>listen()</code> is subsequently invoked on other sockets
+(<code>sk2</code>, ...) bound to
+the same IP:port, two operations are performed:
+</p>
+
+<ol>
+<li>
+The address of the new socket (<code>sk2</code>, ...) is appended to the
+<code>sk_reuseport_cb-&gt;socks[]</code> of the first socket (<code>sk1</code>).
+</li>
+
+<li>
+The new socket's <code>sk_reuseport_cb</code> pointer is made to point to the first
+socket's <code>sk_reuseport_cb</code> pointer. This ensures that all
+<code>LISTEN</code> sockets of the
+same group reference the same <code>sk_reuseport_cb</code> pointer.
+</li>
+</ol>
+
+<p>
+Figure 1 shows the 
+result of these two steps.
+</p>
+<div>
+<p><img alt="Alt Tag Name" src="https://linuxjournal.rubdos.be/ljarchive/LJ/298/12538f1.jpg"></p><p>Figure 1. Representation of the <code>SO_REUSEPORT</code> Group of
+<code>LISTEN</code> Sockets</p>
+</div>
+
+<p>
+In Figure 1, <code>sk1</code> is the first <code>LISTEN</code> socket, and
+<code>sk2</code> and <code>sk3</code> are sockets
+that invoked <code>listen()</code> subsequently. The two steps described above are
+performed in the following code snippet and executed via the
+<code>listen()</code> call
+chain:
+
+</p>
+<pre><code>
+static int inet_reuseport_add_sock(struct sock *new_sk)
+{
+   /*
+    * First check if another identical LISTEN socket, prev_sk,
+    * exists. ... Then do the following:
+    */
+   if (prev_sk) {
+      /*
+       * Not the first listener - do the following:
+       * - Grow prev_sk-&gt;sk_reuseport_cb structure if required.
+       * - Save new_sk socket pointer in prev_sk's socks[].
+       *   prev_sk-&gt;sk_reuseport_cb-&gt;socks[num_socks] = new_sk;
+       * - prev_sk-&gt;sk_reuseport_cb-&gt;num_socks++;
+       * - Pointer assignment of the control block:
+       *   new_sk-&gt;sk_reuseport_cb = prev_sk-&gt;sk_reuseport_cb;
+       */
+      return reuseport_add_sock(new_sk, prev_sk);
+   }
+
+   /*
+    * First listener - do the following:
+    * - allocate new_sk-&gt;sk_reuseport_cb to contain 128 socks[]
+    * - new_sk-&gt;sk_reuseport_cb-&gt;max_socks = 128;
+    * - new_sk-&gt;sk_reuseport_cb-&gt;socks[0] = new_sk;
+    * - new_sk-&gt;sk_reuseport_cb-&gt;numsocks = 1;
+    */
+   return reuseport_alloc(new_sk);
+}
+</code>
+</pre>
+
+
+<p>
+Now let's go back to <code>reuseport_select_sock()</code> to see how a
+<code>LISTEN</code> socket is
+selected. The <code>socks[]</code> array is indexed via a call to
+<code>reciprocal_scale()</code> as
+follows:
+
+</p>
+<pre><code>
+unsigned int index = reciprocal_scale(phash, num_socks);
+return reuse-&gt;socks[index];
+</code>
+</pre>
+
+
+<p>
+<a href="http://homepage.cs.uiowa.edu/~jones/bcd/divide.html">reciprocal_scale()</a> is an optimized function that implements a
+pseudo-modulo operation using multiply and shift operations.
+</p>
+
+<p>
+As shown earlier, <code>phash</code> was calculated in
+<code>__inet_lookup_listener()</code>:
+
+</p>
+<pre><code>
+phash = inet_ehashfn(dst_addr, dst_port, src_addr, src_port);
+</code>
+</pre>
+
+
+<p>
+And, <code>num_socks</code> is the number of sockets in the
+<code>socks[]</code> array. The function
+<code>reciprocal_scale(phash, num_socks)</code> calculates an index, <code>0 &lt;=
+index &lt;
+num_socks</code>. This index is used to retrieve a socket from the
+<code>SO_REUSEPORT</code>
+socket group.
+</p>
+
+<p>
+Hence, you can see that the kernel selects a socket by hashing the client IP:port
+and server IP:port values. This method provides a good distribution of
+connections among different <code>LISTEN</code> sockets.
+</p>
+
+<h3>
+SO_REUSEPORT in Action</h3>
+
+<p>
+Let's look at the effect of <code>SO_REUSEPORT</code> on the command line through two tests.
+</p>
+
+<p>
+1) An application opens a socket for listen and creates two processes.
+</p>
+
+<p>
+Application code path: <code>socket(); bind(); listen(); fork();</code>
+
+</p>
+<pre><code>
+$ ss -tlnpe | grep :45000
+LISTEN     0     128    *:45000      *:* users:(("my_server",
+↪pid=3020,fd=3),("my_server",pid=3019,fd=3)) 
+ ↪ino:3854904087 sk:37d5a0
+</code>
+</pre>
+
+
+<p>
+The string <code>ino:3854904087 sk:37d5a0</code> describes a single kernel socket.
+</p>
+
+<p>
+2) An application creates two processes, and each creates a <code>LISTEN</code>
+socket after setting <code>SO_REUSEPORT</code>.
+</p>
+
+<p>
+Application code path: <code>fork(); socket(); setsockopt(SO_REUSEPORT);
+bind(); listen();</code>
+
+</p>
+<pre><code>
+$ ss -tlnpe | grep :45000
+LISTEN     0     128    *:45000     *:*  users:(("my_server",
+↪pid=1975,fd=3)) ino:3854935788 sk:37d59c
+LISTEN     0     128    *:45000     *:*  users:(("my_server",
+↪pid=1974,fd=3)) ino:3854935786 sk:37d59d
+</code>
+</pre>
+
+
+<p>
+Now you see two different kernel sockets—notice the different inode numbers.
+</p>
+
+<p>
+Applications using multiple processes to accept connections on a single
+<code>LISTEN</code> socket may experience significant performance issues, since each
+process contends for the same socket lock in <code>accept()</code>, as shown in the
+following simplified pseudo-code:
+
+</p>
+<pre><code>
+struct sock *inet_csk_accept(struct sock *sk)
+{
+   struct sock *newsk = NULL;   /* client socket */
+
+   /* We need to make sure that this socket is listening, and 
+    * that it has something pending.
+    */
+   lock_sock(sk);
+   if (sk-&gt;sk_state == TCP_LISTEN)
+      if ("there are completed connections waiting 
+            ↪to be accepted")
+         newsk = get_first_connection(sk);
+   release_sock(sk);
+
+   return newsk;
+}
+</code>
+</pre>
+
+
+<p>
+Both <code>lock_sock()</code> and <code>release_sock()</code> internally acquires and releases a
+spinlock embedded in <code>sk</code>. (See Figure 3 later in this article to observe the
+overhead due to the spinlock contention.)
+</p>
+
+<h3>
+Benchmarking SO_REUSEPORT</h3>
+
+<p>
+The following setup is used to measure <code>SO_REUSEPORT</code> performance:
+</p>
+
+<ol>
+<li>
+Kernel version: 4.17.13.
+</li>
+
+<li> 
+Client and server systems both have 48 hyper-threaded cores and are
+connected to each other using a 40g NIC over a switch.
+</li>
+
+<li>
+Server is started in one of two ways:
+create a single <code>LISTEN</code> socket and fork 48 times, or
+fork 48 times, and each child process creates a <code>LISTEN</code> socket after
+enabling <code>SO_REUSEPORT</code>.
+</li>
+
+<li> 
+Client creates 48 processes. Each process connects and disconnects to the
+server a million times sequentially.
+</li>
+</ol>
+
+<p>
+With the fork of the <code>LISTEN</code> socket:
+
+</p>
+<pre><code>
+server-system-$  ./my_server 45000  48  0   (0 indicates fork)
+client-system-$  time ./my_client &lt;server-ip&gt; 45000 48 1000000
+real   4m45.471s
+</code>
+</pre>
+
+
+<p>
+With <code>SO_REUSEPORT</code>:
+
+</p>
+<pre><code>
+server-system-$ ./my_server 45000 48  1  (1 indicates 
+ ↪SO_REUSEPORT)
+client-system-$ time ./my_client &lt;server-ip&gt; 45000 48 1000000
+real   1m36.766s
+</code>
+</pre>
+
+
+<h3>
+Performance Analysis of SO_REUSEPORT</h3>
+
+<p>
+Figures 2–5 provide a look at the performance profile for the above two tests using
+the <code>perf</code> tool.
+</p>
+<div>
+<p><img alt="Performance Counter" src="https://linuxjournal.rubdos.be/ljarchive/LJ/298/12538f2.jpg"></p><p>Figure 2. Performance Counter Statistics without
+<code>SO_REUSEPORT</code></p>
+</div>
+
+<div>
+<p><img alt="Performance Profile" src="https://linuxjournal.rubdos.be/ljarchive/LJ/298/12538f3.jpg"></p><p>Figure 3. Performance Profile of the Top 25 Functions without
+<code>SO_REUSEPORT</code></p>
+</div>
+
+<div>
+<p><img alt="Counter Statistics" src="https://linuxjournal.rubdos.be/ljarchive/LJ/298/12538f4.jpg"></p><p>Figure 4. Performance Counter Statistics with <code>SO_REUSEPORT</code></p>
+</div>
+
+<div>
+<p><img alt="Top 25" src="https://linuxjournal.rubdos.be/ljarchive/LJ/298/12538f5.jpg"></p><p>Figure 5. Performance Profile of the Top 25 Functions with
+<code>SO_REUSEPORT</code></p>
+</div>
+
+<h3>
+Source Code for Client and Server Applications</h3>
+
+<p>
+The listing below implements a server and client application that were used
+for <code>SO_REUSEPORT</code> performance testing:
+
+</p>
+<pre><code>
+$ cat my_server.c
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;sys/wait.h&gt;
+#include &lt;netdb.h&gt;
+
+void create_children(int nprocs, int parent_pid)
+{
+   while (nprocs-- &gt; 0) {
+      if (getpid() == parent_pid &amp;&amp; fork() &lt; 0)
+         exit(1);
+   }
+}
+
+int main(int argc, char *argv[])
+{
+   int reuse_port, fd, cfd, nprocs, opt = 1, parent_pid = 
+    ↪getpid();
+   struct sockaddr_in server;
+
+   if (argc != 4) {
+      fprintf(stderr, "Port# #Procs {0-&gt;fork, or 
+       ↪1-&gt;SO_REUSEPORT}\n");
+      return 1;
+   }
+
+   nprocs = atoi(argv[2]);
+   reuse_port = atoi(argv[3]);
+   if (reuse_port)   /* proper SO_REUSEPORT */
+      create_children(nprocs, parent_pid);
+
+   if ((fd = socket(AF_INET, SOCK_STREAM, 0)) &lt; 0) {
+      perror("socket");
+      return 1;
+   }
+
+   if (reuse_port)
+      setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, (char *)&amp;opt,
+                 sizeof opt);
+
+   server.sin_family      = AF_INET;
+   server.sin_addr.s_addr = INADDR_ANY;
+   server.sin_port        = htons(atoi(argv[1]));
+
+   if (bind(fd, (struct sockaddr *)&amp;server, sizeof server) 
+    ↪&lt; 0) {
+      perror("bind");
+      return 1;
+   }
+
+   if (!reuse_port)   /* simple fork instead of SO_REUSEPORT */
+      create_children(nprocs, parent_pid);
+
+   if (parent_pid == getpid()) {
+      while (wait(NULL) != -1);   /* wait for all children */
+   } else {
+      listen(fd, SOMAXCONN);
+      while (1) {
+         if ((cfd = accept(fd, NULL, NULL)) &lt; 0) {
+            perror("accept");
+            return 1;
+         }
+         close(cfd);
+      }
+   }
+
+   return 0;
+}
+
+$ cat my_client.c
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;strings.h&gt;
+#include &lt;sys/wait.h&gt;
+#include &lt;netdb.h&gt;
+
+void create_children(int nprocs, int parent_pid)
+{
+void create_children(int nprocs, int parent_pid)
+{
+   while (nprocs-- &gt; 0) {
+      if (getpid() == parent_pid &amp;&amp; fork() &lt; 0)
+         exit(1);
+   }
+}
+
+int main(int argc, char *argv[])
+{
+   int fd, count, nprocs, parent_pid = getpid();
+   struct sockaddr_in server;
+   struct hostent *server_ent;
+   const struct linger nolinger = { .l_onoff = 1, 
+    ↪.l_linger = 0 };
+
+   if (argc != 5) {
+      fprintf(stderr, "Server-IP Port# #Processes 
+       ↪#Conns_per_Proc\n");
+      return 1;
+   }
+
+   nprocs = atoi(argv[3]);
+   count = atoi(argv[4]);
+
+   if ((server_ent = gethostbyname(argv[1])) == NULL) {
+      perror("gethostbyname");
+      return 1;
+   }
+
+   bzero((char *)&amp;server, sizeof server);
+   server.sin_family = AF_INET;
+   server.sin_port   = htons(atoi(argv[2]));
+   bcopy((char *)server_ent-&gt;h_addr, (char *)
+↪&amp;server.sin_addr.s_addr,
+         server_ent-&gt;h_length);
+
+   create_children(nprocs, parent_pid);
+
+   if (getpid() == parent_pid) {
+      while (wait(NULL) != -1);   /* wait for all children */
+   } else {
+      while (count-- &gt; 0) {
+         if ((fd = socket(AF_INET, SOCK_STREAM, 0)) &lt; 0) {
+            perror("socket");
+            return 1;
+         }
+
+         if (connect(fd, (struct sockaddr *)&amp;server,
+                     sizeof server) &lt; 0) {
+            perror("connect");
+            return 1;
+         }
+
+         /* Reset connection to avoid TIME-WAIT state */
+         setsockopt(fd, SOL_SOCKET, SO_LINGER, &amp;nolinger,
+                    sizeof nolinger);
+         close(fd);
+      }
+   }
+
+   return 0;
+}
+</code>
+</pre>
+
+
+<h3>
+Resources</h3>
+
+<ul>
+<li>
+<a href="https://lwn.net/Articles/542629">"The SO_REUSEPORT socket option" by
+Michael Kerrisk</a> on LWN.net
+</li>
+
+<li>
+<a href="https://en.wikipedia.org/wiki/Network_socket">Network Socket</a>
+(Wikipedia)</li>
+
+<li>
+<a href="https://en.wikipedia.org/wiki/Transmission_Control_Protocol">Transmission
+Control Protocol</a> (Wikipedia)
+</li>
+
+<li>
+<a href="https://en.wikipedia.org/wiki/File:Tcp_state_diagram.png">TCP State
+Transition Diagram</a></li>
+
+<li>
+<a href="https://elixir.bootlin.com/linux/v4.17.13/source">Kernel Source
+Code</a></li>
+
+<li><a href="https://www.amazon.com/Unix-Network-Programming-Sockets-Networking/dp/0131411551">UNIX
+Network Programming</a> by W. Richard Stevens, Bill Fenner and Andrew M.
+Rudoff</li>
+
+<li>
+<a href="https://gcc.gnu.org/onlinedocs/gcc/Zero-Length.html">Arrays of Length
+Zero</a></li>
+
+<li>
+<a href="http://homepage.cs.uiowa.edu/~jones/bcd/divide.html">Reciprocal
+Multiplication</a></li>
+</ul>
+
+<h3>About the Author</h3>
+
+<p>
+Krishna Kumar works at Flipkart Internet Pvt Ltd, India's largest e-commerce
+company. He is especially interested in today's topic, as Flipkart uses this
+technology to host millions of connections from visitors all over the world.
+His other interests are playing chess, struggling to learn to use apps, and
+occasionally bringing stray puppies home much to his wife's consternation.
+Please send your comments and feedback to krishna.ku@flipkart.com.
+</p>
+
+  
+  
+
+  
+
+  <p>
+    Copyright © 1994 - 2019 <cite>Linux Journal</cite>.  All rights reserved.
+  </p>
+
+</div>]]>
+            </description>
+            <link>https://linuxjournal.rubdos.be/ljarchive/LJ/298/12538.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42316091</guid>
+            <pubDate>Wed, 04 Dec 2024 10:13:40 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[How to Grow Professional Relationships]]>
+            </title>
+            <description>
+<![CDATA[
+Score 38 | Comments 2 (<a href="https://news.ycombinator.com/item?id=42315946">thread link</a>) | @Liriel
+<br/>
+December 4, 2024 | https://tej.as/blog/how-to-grow-professional-relationships-tjs-model | <a href="https://web.archive.org/web/*/https://tej.as/blog/how-to-grow-professional-relationships-tjs-model">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div> <p>Over my career, I’ve had the opportunity to get to know some of the world’s <a href="https://x.com/TejasKumar_/status/1862048032973324369">most</a> <a href="https://x.com/DavidKPiano">incredible</a> <a href="https://x.com/swyx">builders</a>. This same career has also seen quite a significant amount of gatekeeping: various <code>(m|b)</code>illionaire boys clubs and cliques have made it quite clear that they’d prefer to keep their world small and exclusive, and that there’s no room at their table. To each their own, but this dynamic has led to some thinking and reflection around the nature of professional relationships, friendships, and identity—ultimately resulting in what I’m calling <strong>TJS (The Journey to Synergy)</strong> Collaboration Model.</p>
+<p><img src="https://tej.as/_astro/tjs.Dlc-SqUb_z1FF9.svg" alt="The TJS Collaboration Model" width="1775" height="801" loading="lazy" decoding="async"></p>
+<p>This spectrum is how I measure professional relationships and where I stand in those relationships. It outlines seven states moving from a competitive, zero-sum mindset to one of shared identity (which is equally problematic).</p>
+<p>Let’s briefly understand each state. One way we can make this information really practical is to understand it in context. A great illustrative context for this is <a href="https://tej.as/podcast">my podcast</a>, because it requires regularly interacting with people that inevitably reveals where we land on this spectrum.</p>
+<h2 id="states-of-the-tjs-collaboration-model">States of the TJS Collaboration Model</h2>
+<p>The TJS collaboration model is made up of the following seven distinct states.</p>
+<ol>
+<li>
+<p><strong>Everything is a competition</strong>: in this initial state, interactions are characterized by <strong>gatekeeping and a zero-sum mentality</strong>: the idea that <em>for one party to eat, the other must starve</em>. People are not willing to share information, resources, or opportunities. There’s usually discrimination and exclusionary behavior here, either from racism, sexism, xenophobia, etc. I tend to not spend too much time with parties that hold this perspective.</p>
+<p>In the context of the podcast, this is usually characterized not by rejection but instead by outright refusal to participate in any interaction whatsoever: what some call <a href="https://en.wikipedia.org/wiki/Ghosting_(behavior)#:~:text=Ghosting%2C%20simmering%20and%20icing%20are,any%20subsequent%20attempts%20to%20communicate.">“ghosting”</a>. I’m not entirely sure if they leave read receipts on to make their point, but I’ve found this behavior to be a pretty good indicator of where we stand on this spectrum. Of course, there are those that simply don’t receive any notifications and have read receipts turned off: these folks are likely not in this state and are just as busy as the rest of us.</p>
+<p>Also in the context of the podcast, I’ve had guests accept an invitation and then later decline closer to the time of recording because they got invited to go on <a href="https://x.com/lexfridman">Lex Fridman</a> and mention “thanks for the invite, but now I don’t need this anymore”. There is no judgment at all here, but such behavior indicates where on this spectrum these relationships stand.</p>
+</li>
+<li>
+<p><strong>Coexist</strong>: parties acknowledge each other’s existence but maintain minimal interaction, summarized as “I know <em>of</em> them, but we don’t really talk”. This is usually characterized by mutual respect, but a general distancing for myriad reasons that might include:</p>
+<ul>
+<li>
+<p><strong>Personal differences</strong>: people might not get along personally, and while they may respect each other, they choose to maintain a distance. Ultimately, human beings are more or less big bundles of chemicals with legs. When chemicals interact, there’s usually a reaction: sometimes positive <code>(2H₂ + O₂ → 2H₂O)</code>, sometimes negative <code>(SO₃ + H₂O → H₂SO₄)</code>. This is usually natural and nothing personal.</p>
+</li>
+<li>
+<p><strong>Professional differences</strong>: people may have different professional goals or values, which can lead to a lack of shared interests or collaboration. Some might want to be influencers, some might want to be builders, some might want to be investors—they pick the right relationships to be in for them at the time.</p>
+</li>
+<li>
+<p><strong>Values differences</strong>: people may have different values that lead them to invest in different relationships. Some might value emotionality highly, leading them to be friends with other emotional people; others might value logic and reason, leading them to be friends with other logical people. Some might value money, leading them to be friends with other wealthy people, etc.</p>
+</li>
+</ul>
+<p>In the context of the podcast, I’ve experienced folks who are aware it exists and even talk about it, but have never expressed interest in being a guest on it. I too have not extended invites here because we’re both in the same state of the spectrum. There’s nothing wrong with this: instead it’s kind of beautiful that both parties clearly understand where the other one stands on this spectrum and can move without any drama. It also doesn’t exclude the relationship from ever progressing and is usually just a matter of time before it does.</p>
+</li>
+<li>
+<p><strong>Communicate</strong>: basic information exchange occurs, where either party would describe the other as “we spoke about something once” but the relationship doesn’t progress much further for similar reasons as above.</p>
+<p>In the context of the podcast, this is where a conversation eventually leads to <em>“yeah, let’s do it”</em>, and then nothing ever happens, or an event is scheduled but has not yet taken place. Communication has happened, positive communication even, but—specifically in the case of the podcast—we have not yet cooperated on anything.</p>
+<p>This is where the vast majority of western relationships live: a “comfortable distance” of sorts. We see traits of this outside a professional context as well, where shallow friends will talk and say <em>“let’s get coffee some time!”</em>, but then never actually follow up. Perhaps even worse, people in this state often make plans and then cancel at the last minute because it’s simply not convenient.</p>
+<p>It’s pretty remarkable that this state is quite prominent in western culture and less so in other parts of the world as eloquently highlighted by my former <a href="https://x.com/TejasKumar_/status/1384524632263471106">Spotify</a> colleague <a href="https://x.com/orkohunter">Himanshu</a> in his <a href="https://orkohunter.net/blog/why-dont-you-move-abroad/">blog post about moving back to India</a>.</p>
+</li>
+<li>
+<p><strong>Cooperate</strong>: parties participate in a neutral task together, where they’re both contributing to the same goal. The stakes are usually low, and the relationship is still mostly transactional.</p>
+<p>A great experiential example of this from my career is when I’ve spoken at conferences with some folks who I’ve heard of but haven’t really developed much rapport with. The relationship is cordial, but not much else. How this low-stakes cooperation goes strongly influences next states: from here, either party can choose to remain in earlier states, or progress to the next state, <strong>Coordinate</strong>, based on how well they were able to work together (as popular culture calls it, <em>“the vibezzz”</em>).</p>
+<p>In the context of the podcast, this is where we actually spend time in conversation together on an episode: both parties are contributing to the same goal, cooperating with each other to meet it. It’s slightly less convenient than the previous state, but given the quality of the cooperation, leads to far better outcomes.</p>
+</li>
+<li>
+<p><strong>Coordinate</strong>: at this stage, one or both parties take deliberate steps to coordinate their actions toward a goal that belongs to one of the parties. This goal is often “adopted” by the other, looking something like:</p>
+<ul>
+<li>
+<p><em>“we’re both going to be at this conference a day earlier, shall we go explore the city together?”</em> — one person’s goal of exploration is adopted by the other.</p>
+</li>
+<li>
+<p><em>”I see you’re <a href="https://x.com/kentcdodds/status/1861808243590549572">working on a new course</a>—shall I do a <a href="https://x.com/TejasKumar_/status/1845140333933322311">giveaway</a> on my podcast when you launch?”</em> — one person’s goal of promoting their course is adopted by the other.</p>
+</li>
+</ul>
+<p>Both of these cases are coordinated efforts. Though the latter is a more advanced state of coordination, the main gist here is that one or both parties take deliberate steps to coordinate their actions to achieve a newly shared goal: to support each other.</p>
+<p>Either party can make the first move, and this tends to be a pretty chaotic space because it calls into question a number of topics like motivation, trust, and alignment. The party that makes the first move risks the other one thinking they’re being too aggressive, pushy, or plain weird.</p>
+<p>They also risk the other party questioning their motivations:</p>
+<ul>
+<li>
+<p><em>“Why is this person offering to amplify my course launch?"</em></p>
+</li>
+<li>
+<p><em>"Why do they want to explore the city together?"</em></p>
+</li>
+<li>
+<p><em>"What’s the catch?"</em></p>
+</li>
+<li>
+<p><em>"Will I owe them a favor later?”</em></p>
+</li>
+</ul>
+<p>The coordination state is usually perceived as risky—though empirical evidence proves it is not because <strong>people are on average more good than evil</strong> according to research from the lab of <a href="https://psychology.stanford.edu/people/jamil-zaki">Dr. Jamil Zaki</a> at Stanford University’s Department of Psychology, where they have demonstrated that <a href="https://www.youtube.com/watch?v=M7aUF3hi_8Q">coordinated efforts can lead to increased trust, motivation, and even happiness</a>.</p>
+<p>Coordination is typically an inflection point in the relationship, as referenced in the diagram. If people have not spent enough time in previous states, this state usually will not work. If there were intense positive vibes in previous states, this will feel natural and seamless. Ultimately, both parties grow synergistically from coordinated efforts while working on entirely separate but complementary topics.</p>
+<p>Folks that I’ve coordinated well with include:</p>
+<ul>
+<li>
+<p><strong><a href="https://x.com/kentcdodds">Kent C. Dodds</a></strong> on deprecating his library <a href="https://github.com/paypal/glamorous">glamorous</a> in favor of <a href="https://github.com/emotion-js/emotion">emotion</a>: we built <em>separate things</em> that were complementary and coordinated on them together.</p>
+</li>
+<li>
+<p><strong><a href="https://x.com/Aymen_Ben_Amor">Aymen Ben Amor</a></strong>, <strong><a href="https://x.com/theclarksell">Clark Sell</a></strong>, and <strong><a href="https://x.com/joshuakgoldberg">Josh Goldberg</a></strong> on <a href="https://tej.as/podcast/tell-me-about-that-conference">supporting their conferences via the podcast</a>: they were building a conference, I was building a podcast, and we coordinated on promoting the conference together (I adopted their goal of promoting the conference).</p>
+</li>
+<li>
+<p><strong><a href="https://x.com/alexnmoldovan">Alex Moldovan</a></strong> who runs <a href="https://jsheroes.io/">JS Heroes</a> and has me as an ambassador: he creates the conference and coordinates with a set of ambassadors. We do not <em>create the conference</em> together. If we did, this would be the next step—<strong>Collaboration</strong>.</p>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Collaborate</strong>: something beautiful happens when two or more people repeatedly execute successful coordinated efforts: there is a common recognition of high-quality synergy; that together, they are greater than the sum of their parts and they can continually share joy in their work. Collaboration is not when people coordinate efforts on building separate things that are complementary, but instead when they <strong>build the same thing together</strong>.</p>
+<p>I’ve had the privilege of collaborating with a number of great folks over my career. If I was to start a company, go to war, or happen to be in a zombie apocalypse, I’d want these folks by my side. At this stage, all parties have established a high level of trust and understanding of each other. They understand boundaries and each other’s value systems extremely well. They are able to push boundaries and challenge ideas respectfully, with grace, without ego, at the right time and in the right circumstance.</p>
+<p>Folks that I’ve had and continue to have excellent collaboration with include:</p>
+<ul>
+<li>
+<p><strong><a href="https://x.com/fabien0102">Fabien Bernard</a></strong> and <strong><a href="https://x.com/mpotomin">Mikhail Potomin</a></strong>, where we built some software that was cool at the time but is now obsolete. Specifically,</p>
+<ul>
+<li>
+<p><strong><a href="https://github.com/contiamo/restful-react">Restful React</a></strong>: a RESTful data layer for React applications that had a fully type-safe interface for working with REST APIs predictably.</p>
+</li>
+<li>
+<p><strong><a href="https://github.com/contiamo/operational-ui">Operational UI</a></strong>: a React component library whose documentation had interactive <a href="https://microsoft.github.io/monaco-editor/">Monaco Editor</a> playgrounds with IntelliSense for TypeScript autocompletion <em>in the browser</em>. I did a talk about this at <a href="https://www.youtube.com/watch?v=ZsBW4S8hYMU">React Finland</a> in 2019 where I first met</p>
+</li>
+</ul>
+</li>
+<li>
+<p><strong><a href="https://x.com/davidkpiano">David Khourshid</a></strong> and <strong><a href="https://x.com/jen_ayy_">Jenny Truong</a></strong>, where we built their wedding ceremony together where I was the officiant. This is a collaboration and not a coordination because we built the same thing (a wedding ceremony) together, instead of coordinating on building separate things that are complementary.</p>
+</li>
+<li>
+<p><strong><a href="https://x.com/danieljcafonso">Daniel Afonso</a></strong>, <strong><a href="https://x.com/sergiikirianov">Sergii Kirianov</a></strong>, <strong><a href="https://x.com/ythecombinator">Matheus Albuquerque</a></strong>, <strong><a href="https://x.com/acemarke">Mark Erikson</a></strong>, <strong><a href="https://x.com/rickhanlonii">Rick Hanlon II</a></strong>, and more where we built my book <a href="https://www.amazon.com/Fluent-React-Performant-Intuitive-Applications/dp/1098138716/ref=sr_1_1?dib=eyJ2IjoiMSJ9.eigFqxPBQ8MG8Reub4v6d26VACrOAWNNB4flZUD6j_lArvmiIuT-RzRq5-7vyhvJd3ZruoaI9ZRp_I3r3-a5SNuGE_MAKaNluhRqBfjh6FQ.JAAVgZuJ8Rxht6r7T-dw4pSLd6FOIt8ckVtmo5QIHZ4&amp;dib_tag=se&amp;keywords=fluent+react&amp;qid=1732797223&amp;sr=8-1">Fluent React</a> together. I may have authored the book, but it was a strong collaborative effort where they reviewed it and continued to provide high-quality feedback until it was ready for publication. It was <em>one thing</em> that we all built together: a collaboration.</p>
+</li>
+</ul>
+<p>I don’t yet build the podcast with anyone, but I’m open to it.</p>
+</li>
+<li>
+<p><strong>We are the same</strong>: the final state represents a shared identity and enmeshment, which is <strong>not a positive state</strong>. Keeping with the old adage of “too much of a good thing is a bad thing”, this is a state where parties are co-dependent and enmeshed, where one or more members unhealthily depend on the other. There is a dissolution of individuality, a loss of identity and boundaries: this is a toxic state. <strong>In this state, we find and experience burnout.</strong></p>
+<p>It’s easy to exploit this state and take advantage of one or more members. Ownership over collaborative efforts is also disputed in this state, and it’s not uncommon to see folks take credit for things that they didn’t do, or to see people step down from collaborative efforts because they feel they’re not being valued.</p>
+<p>Attempts to reach ideal and healthy levels of collaboration often go wrong and end up here, usually by employers using toxic positivity and platitudes like <em>“we’re a startup family”</em>. You may recognize you’re in this state by several key warning signs:</p>
+<ul>
+<li>
+<p><strong>Loss of Personal Identity</strong>: inability to develop or maintain a strong sense of self, only being able to describe yourself in relation to others, being uncomfortable taking credit for your own good work, and difficulty knowing your own wants and needs.</p>
+</li>
+<li>
+<p><strong>Difficulty Making Independent Decisions</strong>: struggling to make choices without consulting others, feeling unable to function independently, anxious overthinking, and constantly seeking approval before taking action.</p>
+</li>
+<li>
+<p><strong>Lack of Boundaries</strong>: having trouble saying “no,” allowing others to invade your privacy, and being unable to separate your emotions from those of others.</p>
+</li>
+</ul>
+<p>I’ve fallen into this state a few times for very short periods and what has helped me get out of it is to redevelop <strong>my identity alone</strong> as a separate and beautiful thing from really any other party. That and separation from the problematic party. The combination of rediscovering self-identity, establishing healthy boundaries, separation, and working with a board-certified therapist is something that can be helpful for folks that find themselves in this state.</p>
+<p>Ideally, we learn to recognize quality collaboration as the peak of synergy and protect against this state. I am thankful to rarely if ever find myself here and take strong measures to avoid it. If you’re in this state, it is my hope that this diagram and post will help you understand where you are and how to move forward. Keep reading for some actionable steps you can take to move your relationships forward.</p>
+</li>
+</ol>
+<h2 id="making-it-practical">Making it Practical</h2>
+<p>Take a moment to think about where your relationships stand on this spectrum. It’s a great exercise to help you understand where you are and where you want to be. I’ve already mentioned a few of my own excellent collaborators and folks with whom I coordinate well—who are yours? Who can you credit? For real, scroll up, copy the image, place it beside you, and ponder it closely.</p>
+<p>Who are folks that you coexist with? Why? Who gatekeeps and excludes you? Who would you build a company with? I’d encourage carefully considering the answers to these questions and even copying the graph and placing avatars along its axis to help you visualize the status of your relationships. From there, you can start to take action to move relationships to where you want them to be, ultimately bringing your social setting into alignment with your goals and values.</p>
+<p>Should you decide you’d like to move some relationships forward, here are some actionable pathways you can take.</p>
+<h2 id="moving-relationships-forward">Moving Relationships Forward</h2>
+<p>There’s plenty of evidence that shows that we’re at our worst when we are exclusionary and <em>zero-sum</em>. The inverse is also true: we are at our best when we are collaborating well with others. For example, <a href="https://pmc.ncbi.nlm.nih.gov/articles/PMC4360764/">this paper</a> has two key ideas that I think are worth repeating here:</p>
+<p>Working in isolation creates significant limitations:</p>
+<ol>
+<li>It creates a <strong>false sense of security</strong> because ideas are not likely to be challenged.</li>
+<li>It results in work that <strong>will not reach as wide an audience</strong>.</li>
+<li>It <strong>wastes limited resources</strong> through duplicated efforts.</li>
+</ol>
+<p>The paper also states that:</p>
+<blockquote>
+<p>The benefits of collaboration allow participants to achieve together more than they can individually, serve larger groups of people, and grow on individual and organizational levels.</p>
+</blockquote>
+<p>With this, we can see that <strong>collaboration is not just a nice-to-have but a necessity</strong>. It’s not just about getting along with others, but about building greater things together. Should you decide to move some relationships forward, here’s what has worked well for me:</p>
+<ol>
+<li>
+<p><strong>Cultivate an abundance mindset</strong>: not virtue signaling, but I often <a href="https://x.com/Beccalytics/status/1858935386757886175">give away money</a> and time to folks. People question this from time to time and ultimately, the answer I end up giving is that <strong>there is so much to go around</strong>. The world is abundant and not zero-sum. I intentionally let people take advantage of me because I know I’ll recover whatever I need in another way. If you pour your entire bucket into others, it may become empty but it will never <em>stay empty</em>: it has rained on this planet since the beginning of time on rich and poor alike, and it will continue to rain. <strong>The rain will fill your bucket again.</strong></p>
+<p>To cultivate this mindset, these practical steps from <a href="https://pmc.ncbi.nlm.nih.gov/articles/PMC10039809/">these</a> <a href="https://pmc.ncbi.nlm.nih.gov/articles/PMC10794476/">scientific</a> <a href="https://www.researchgate.net/publication/236137739_Volunteering_Predicts_Health_Among_Those_Who_Value_Others_Two_National_Studies">papers</a> may help:</p>
+<ul>
+<li>
+<p><strong>Start Small</strong>: begin with micro-giving. Allocate a small percentage of your resources to deliberately give away. I do 10%, but you can start with 5% and see how it feels. Another useful habit is to practice random acts of kindness daily, whenever convient.</p>
+</li>
+<li>
+<p><strong>Build Social Connections</strong>: join giving circles, participate in community service, and create giving networks. This is a great way to meet like-minded people and cultivate relationships. It’s like <em>“scarcity mindsets anonymous”</em>: a rehab group for those that suffer with scarcity mindset. Cooperate and collaborate with each other to achieve goals that are greater than the sum of your parts.</p>
+</li>
+<li>
+<p><strong>Mindfulness Practice</strong>: daily gratitude journaling, abundance visualization, and regular meditation focusing on interconnectedness have all been scientifically proven (papers above) to help shift your mindset towards abundance.</p>
+</li>
+<li>
+<p><strong>Track Impact</strong>: keep a “giving diary” to document your positive outcomes and ripple effects. This can help you remember to do it again and track your personal growth.</p>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Abandon lost causes</strong>: people have literally blocked me on social media, ghosted me, or outright said “there’s no room for you at this table”. Anti-foreigner folks have physically attacked me and mentioned “go home” (to your country) in Germany, where I am a tax-paying permanent resident.</p>
+<p>A lesson I learned from reading <a href="https://www.amazon.com.mx/Models-Attract-Women-Through-Honesty/dp/1463750358">Mark Manson’s “Models”</a> as an awkward stupid teenager who wanted to get girls is that the world is an abundant one full of all kinds of people: some who shun us, others who love us. When someone reveals that there’s no room for a relationship, they do us a huge favor and free us up to go pursue others who are open to it. I’ve seen great success in quickly being thankful for the data and moving on.</p>
+</li>
+<li>
+<p><strong>Love your neighbor as yourself</strong>: I really love myself well. I feed myself good food, I give myself good exercise, I make money to invest in myself. I’ve seen enormous value and joy in extending the same love to others, beyond just one’s physical neighbor. It would be strange of me to expect something in return from myself as I take care of myself. When I treat people the way I want to be treated—and honor them appropriately, <strong>giving expecting nothing in return</strong>, there usually ends up being quite a wonderful return that leads to quality collaboration.</p>
+<p>Obviously this isn’t <em>every time</em>, but the few times it works is worth all the times it doesn’t. It does open you up to abuse and being taken advantage of, but the few times it has worked for me heavily outweighs the times it hasn’t. I’d recommend reading <a href="https://www.amazon.com/Hope-Cynics-Surprising-Science-Goodness/dp/B0D5SD8W2B/ref=sr_1_1?dib=eyJ2IjoiMSJ9.YGSiHm0vKfPnGGrkfEHzjo81gfFIgxL-9JYZ3wynncT9hkigUoOdVe5Xf7co4vmVoA67pcbuC0blFH61PwRXw-jsQYC2X4Tmt7MvGdhEs1ew59RSDe-NSq2RvklLU_ZKA0xljACwL2T2dUUYYhzVow.6TyURxQ4Lkcxjo6baEUiRI0cpgny4R5Bay4IUE9Hu0k&amp;dib_tag=se&amp;keywords=hope+for+cynics&amp;qid=1732808871&amp;sr=8-1">Hope for Cynics</a> by the aforementioned Dr. Jamil Zaki for more on this topic.</p>
+</li>
+<li>
+<p><strong>Sweat the details</strong>: we live in an age where we’re constantly bombarded by random nonsense vying for our attention. Conforming to the pattern of this world, it’s fairly common to respond to folks with low-effort communication.</p>
+<ul>
+<li><em>”sup"</em></li>
+<li><a href="https://x.com/TejasKumar_/status/1747176544433230198"><em>"lgtm"</em></a></li>
+<li><em>"sounds good”</em></li>
+</ul>
+<p>This is characteristic of the <strong>communicate</strong> state in our diagram.</p>
+<p>Every single time a relationship has moved forward for me has been when <strong>I cared. A lot.</strong> It has been when folks have mentioned something that’s stressing them out and I listened. It has been when I followed up with them about it weeks later. It has been when my people and I have <strong>shown up and done the work</strong> that puts them at ease or actively invests in their goals—when we don’t conform to the pattern of the world, but instead transform our behavior to align closer to our values.</p>
+<p>To circle back, <strong>coordination happens when one party adopts the goal of the other and takes initiative to support it</strong>. Sweating the details and doing the work, even at a cost to ourselves, is a great way to move from cooperation to coordination. When there are repeatedly successful coordinated efforts, the relationship will naturally progress to collaboration.</p>
+</li>
+</ol>
+<h2 id="conclusion">Conclusion</h2>
+<p>If you’ve made it this far, I hope you’ve found this useful. I also hope that you have actually <em>done the exercise</em> (and cooperated with me) to identify the current state of your relationships and feel empowered to move the ones that you’d like to forward.</p>
+<p>If you’d like to join a <strong>coordinated</strong> effort to bring this information to more people, you can do so in the following ways:</p>
+<ul>
+<li>Share this post on social media however/wherever you want.</li>
+<li>Share your version of the graph above with avatars superimposed on it with your collaborators and others.</li>
+<li>Share your thoughts about this text with me on <a href="https://x.com/tejaskumar_">𝕏</a> or other platforms.</li>
+</ul>
+<p>If you’d like to <strong>collaborate</strong> on this post or its ideas, some great ways to do so are:</p>
+<ul>
+<li>Translate it into other languages to make it more accessible to more people.</li>
+<li>Suggest typo fixes and studies to include.</li>
+<li>Fact check and suggest removal of any inaccuracies.</li>
+</ul>
+<p>Notice how for <strong>collaboration</strong>, we’re working on the same thing (this post) together, and for <strong>coordination</strong> you’re creating separate things that are complementary? Okay, I think I’ve made my point.</p>
+<p>Goodbye.</p> </div></div>]]>
+            </description>
+            <link>https://tej.as/blog/how-to-grow-professional-relationships-tjs-model</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42315946</guid>
+            <pubDate>Wed, 04 Dec 2024 09:42:02 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[No Nat November: My Month Without IPv4]]>
             </title>
             <description>
 <![CDATA[
-Score 82 | Comments 36 (<a href="https://news.ycombinator.com/item?id=42313507">thread link</a>) | @LinuxBender
+Score 156 | Comments 88 (<a href="https://news.ycombinator.com/item?id=42313507">thread link</a>) | @LinuxBender
 <br/>
 December 3, 2024 | https://blog.infected.systems/posts/2024-12-01-no-nat-november/ | <a href="https://web.archive.org/web/*/https://blog.infected.systems/posts/2024-12-01-no-nat-november/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
@@ -39,7 +1378,7 @@ December 3, 2024 | https://blog.infected.systems/posts/2024-12-01-no-nat-novembe
             </title>
             <description>
 <![CDATA[
-Score 21 | Comments 1 (<a href="https://news.ycombinator.com/item?id=42312203">thread link</a>) | @codezerox
+Score 26 | Comments 1 (<a href="https://news.ycombinator.com/item?id=42312203">thread link</a>) | @codezerox
 <br/>
 December 3, 2024 | https://www.kifinity.com/github/dataexpert-io/data-engineer-handbook | <a href="https://web.archive.org/web/*/https://www.kifinity.com/github/dataexpert-io/data-engineer-handbook">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -54,7 +1393,7 @@ December 3, 2024 | https://www.kifinity.com/github/dataexpert-io/data-engineer-h
             </title>
             <description>
 <![CDATA[
-Score 511 | Comments 253 (<a href="https://news.ycombinator.com/item?id=42312121">thread link</a>) | @veesahni
+Score 636 | Comments 293 (<a href="https://news.ycombinator.com/item?id=42312121">thread link</a>) | @veesahni
 <br/>
 December 3, 2024 | https://www.armaansahni.com/game/ | <a href="https://web.archive.org/web/*/https://www.armaansahni.com/game/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -86,7 +1425,7 @@ December 3, 2024 | https://www.armaansahni.com/game/ | <a href="https://web.arch
             </title>
             <description>
 <![CDATA[
-Score 15 | Comments 16 (<a href="https://news.ycombinator.com/item?id=42311933">thread link</a>) | @m463
+Score 17 | Comments 24 (<a href="https://news.ycombinator.com/item?id=42311933">thread link</a>) | @m463
 <br/>
 December 3, 2024 | https://www.abc.net.au/news/2024-11-17/solar-flooded-australia-told-its-okay-to-waste-some/104606640 | <a href="https://web.archive.org/web/*/https://www.abc.net.au/news/2024-11-17/solar-flooded-australia-told-its-okay-to-waste-some/104606640">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>Amid the growing warmth and increasingly volatile weather of an approaching summer, Australia passed a remarkable milestone this week.</p><p>The number of homes and businesses with a solar installation clicked past 4 million — barely 20 years since there was practically none anywhere in the country.</p><p>It is a love affair that shows few signs of stopping.</p><p>And it's a technology that is having ever greater effects, not just on the bills of its household users but on the very energy system itself.</p><p>At no time of the year is that effect more obvious than spring, when solar output soars as the days grow longer and sunnier but demand remains subdued as mild temperatures mean people leave their air conditioners switched off.</p><p>Such has been the extraordinary production of solar in Australia this spring, the entire state of South Australia has — at various times — met all of its electricity needs from the technology.</p><p>What South Australia could not use itself, it exported to other states.</p><p>And everywhere, it seems, demand for power from the grid — that is, demand for power not being met by rooftop solar — has fallen to record lows.</p><p>But all of this solar is prompting some hard questions, and gnashing of teeth, for one, simple reason — there is, at times, too much solar power in Australia's electricity systems to handle.</p><p>To deal with this abundance, experts say Australia needs to come to terms what appears a counter-intuitive argument.</p><p>It needs to accept that much of this solar will have to be wasted — or spilled — sometimes.</p><h2 data-component="Heading">When it rains, it pours</h2><p>Jess Hunt, an electricity market designer based in Adelaide, likens Australia's abundance of sun-powered electricity to another natural resource — water.</p><p>Ms Hunt says it is simply unviable and unnecessary to capture every drop of water that falls to the ground.</p><figure data-print="inline-media" data-component="Figure" id="104607926" data-uri="coremedia://imageproxy/104607926"><div><div><div><p><img alt="A person watches on as the Warragamba Dam spillway is seen outflowing in november 27 2021" sizes="100vw" src="https://live-production.wcms.abc-cdn.net.au/a616a52ac580488c4b5aa7b9c949581b?impolicy=wcms_crop_resize&amp;cropH=3333&amp;cropW=5000&amp;xPos=0&amp;yPos=0&amp;width=862&amp;height=575" loading="lazy" data-component="Image" data-lazy="true"></p></div></div></div><figcaption><p data-component="Typography">We don't try to catch every drop of rain that falls. There are calls to treat solar the same way.<!-- --> <cite>(<span>AAP: Dan Himbrechts</span>)</cite></p></figcaption></figure><p>Similarly, she says it makes no sense to store every ray of sunshine that hits a solar panel.</p><p>"Spilling solar shouldn't be seen as a cause for hand-wringing," Ms Hunt wrote on social media.</p><p>"We are heading for a world of plentiful, cheap energy where spilling solar will be analogous to rainfall that does not go into a reservoir."</p><p>At the heart of the concerns about Australia's occasional over-abundance of solar is a technical phenomenon known as minimum demand.</p><p>The term refers to the demand for power from the grid.</p><p>Necessarily, it excludes the demand that is met by rooftop solar panels — so-called behind-the-meter sources of supply that are provided by customers themselves.</p><p>When the amount of rooftop solar in Australia was immaterial, it wasn't a problem.</p><figure data-print="inline-media" data-component="Figure" id="104607910" data-uri="coremedia://imageproxy/104607910"><div><div><div><p><img alt="The smoke stacks of the Bayswater power station." sizes="100vw" src="https://live-production.wcms.abc-cdn.net.au/7e30fa4a8be2a6927ec0254340d0c298?impolicy=wcms_crop_resize&amp;cropH=554&amp;cropW=831&amp;xPos=169&amp;yPos=0&amp;width=862&amp;height=575" loading="lazy" data-component="Image" data-lazy="true"></p></div></div></div><figcaption><p data-component="Typography">Coal plants not only provide electricity — they also help keep the grid strong.<!-- --> <cite>(<span>Supplied: AGL</span>)</cite></p></figcaption></figure><p>The proportion of demand for power being met by solar was tiny, and conventional generators such as coal- and gas-fired power plants carried on almost totally unaffected.</p><p>But as the amount of small-scale solar has grown to truly monumental levels, the dent it has put in demand for power from the grid has become equally large.</p><p>Rooftop solar is now such a dominant force in the system, at times, it is pushing the minimum level of demand for power from the grid to critically low levels.</p><h2 data-component="Heading">The problem of physics</h2><p>Alex Wonhas, the chief executive of battery developer AMPYR and a former executive at the Australian Energy Market Operator, said the problem was a physical one.</p><p>Dr Wonhas said traditional sources of generation such as coal- and gas-fired plants, as well as electricity, provide the services that make the grid resilient and help it ride through shocks.</p><p>These include inertia, the physical property that makes balancing a moving bicycle easier than a stationary one, and "system strength", which helps maintain the heartbeat of the grid.</p><figure data-print="inline-media" data-component="Figure" id="104608160" data-uri="coremedia://imageproxy/104608160"><div><div><div><p><img alt="An old windmill stands in front of wind turbines in a paddock near the Hornsdale Power Reserve, South Australia" sizes="100vw" src="https://live-production.wcms.abc-cdn.net.au/3283b8fa8af3b4d82d0f0e029802661b?impolicy=wcms_crop_resize&amp;cropH=852&amp;cropW=1280&amp;xPos=0&amp;yPos=0&amp;width=862&amp;height=575" loading="lazy" data-component="Image" data-lazy="true"></p></div></div></div><figcaption><p data-component="Typography">Like solar panels, wind turbines typically don't provide so-called system strength services.<!-- --> <cite>(<span>Reuters: David Gray/File</span>)</cite></p></figcaption></figure><p>By contrast, Dr Wonhas said wind turbines, solar panels and batteries did not typically provide such services.</p><p>The result, he said, was a grid that could be left dangerously short of resilience when minimum demand fell too low.</p><p>In other words, when too many conventional generators were squeezed out of the system.</p><p>"The minimum demand problem typically happens in the middle of the day on weekend days when you have a lot of solar output but maybe not a lot of demand," Dr Wonhas said.</p><p>"At that time, the electricity grid effectively becomes a little bit unstable.</p><p>"It's a little like cycling on your bicycle when it's moving very slowly — the inertial forces of the bicycle become less and really very difficult to keep it straight.</p><p>"That's the same challenge of operating an energy system during those periods of time.</p><p>"You have to either increase the load (demand) during that time to make it more stable or you have to basically reduce the solar output or other output."</p><p>For all these challenges, Dr Wonhas noted times were changing.</p><h2 data-component="Heading">In batteries we trust?</h2><figure data-print="inline-media" data-component="Figure" id="104608122" data-uri="coremedia://imageproxy/104608122"><div><div><div><p><img alt="Drone photos of the Kwinana big battery Stage One" sizes="100vw" src="https://live-production.wcms.abc-cdn.net.au/b7352bbe0551d4bcc380a12087b4c37a?impolicy=wcms_crop_resize&amp;cropH=2250&amp;cropW=3375&amp;xPos=313&amp;yPos=0&amp;width=862&amp;height=575" loading="lazy" data-component="Image" data-lazy="true"></p></div></div></div><figcaption><p data-component="Typography">There are high hopes batteries can help Australia soak up much of its excess solar.<!-- --> <cite>(<span>ABC News: Glyn Jones</span>)</cite></p></figcaption></figure><p>Importantly, he said improved technology for inverters — which enable assets such as solar panels to connect to the grid — was allowing green energy to provide the system with strength and security services.</p><p>Equally, he said batteries would significantly help deal with the problem "in a number of different ways".</p><p>It was for this reason, he said, that investors were flooding into the space, stumping up billions of dollars to build batteries that would add dozens of gigawatts of storage to the system.</p><p>"To put it simply, batteries are the solution to the minimum demand challenge.</p><p>"Batteries can actually start to provide those services and can help to stabilise the grid.</p><p>"And we are seeing increasing applications of batteries to help to manage the minimum demand challenge.</p><p>"They can firstly absorb a lot of the energy in the middle of the day and then obviously release it at a later time.</p><p>"As a result of that happening, we see an absolute wave of battery projects now coming into the electricity market to fulfil that role.</p><p>"But batteries can also go even further — with the latest technology they can actually provide inertia so they can basically pretend to be a coal or a gas plant."</p><figure data-print="inline-media" data-component="Figure" id="104607962" data-uri="coremedia://imageproxy/104607962"><div><div><div><p><img alt="an aerial photo of some solar panels" sizes="100vw" src="https://live-production.wcms.abc-cdn.net.au/2befe3fe9d7089a69e27387dedc7b363?impolicy=wcms_crop_resize&amp;cropH=893&amp;cropW=1340&amp;xPos=1&amp;yPos=0&amp;width=862&amp;height=575" loading="lazy" data-component="Image" data-lazy="true"></p></div></div></div><figcaption><p data-component="Typography">Solar farms are among the hardest hit when rooftop systems squeeze other sources offline.<!-- --> <cite>(<span>ABC News: Michael Franchi</span>)</cite></p></figcaption></figure><p>Despite his bullishness of the potential for batteries, Dr Wonhas acknowledged that it would be impractical and too costly to store every unit of electricity generated by solar in Australia.</p><p>He said there would inevitably be a "trade-off" between cost and efficiency once enough storage was built to handle most of the excess solar.</p><p>"Buying batteries at the moment has become cheaper but it's still relatively expensive, say, compared with the cost of solar energy," he said.</p><p>"So, there's simply an economic trade-off decision whether you want to build a battery for every single kilowatt hour that comes out of a solar panel or maybe at some point say, 'We already have enough … but that's okay because it's still the lowest cost outcome for consumers.'"</p><h2 data-component="Heading">No stopping solar 'juggernaut'</h2><p>According to Ms Hunt, building more batteries to cope with the surge in solar was only part of the solution to the minimum demand problem.</p><p>She said another, arguably better option, was to increase demand for electricity during the middle of the day when solar output was highest.</p><p>This, Ms Hunt argued, was ultimately likely to be the cheapest and most efficient way of using Australia's solar riches.</p><p>And to that end, she said encouraging consumers from householders to industrial customers to shift their consumption as much as possible was the key.</p><figure data-print="inline-media" data-component="Figure" id="104607908" data-uri="coremedia://imageproxy/104607908"><div><div><div><p><img alt="Aerial shot of a group of houses, all of which have solar panels on their roof" sizes="100vw" src="https://live-production.wcms.abc-cdn.net.au/d4d4341f0a2c0d833acf62257ed6392c?impolicy=wcms_crop_resize&amp;cropH=1125&amp;cropW=1687&amp;xPos=157&amp;yPos=0&amp;width=862&amp;height=575" loading="lazy" data-component="Image" data-lazy="true"></p></div></div></div><figcaption><p data-component="Typography">About one in every three Australian homes now has a rooftop solar installation.<!-- --> <cite>(<span>ABC News: Glyn Jones</span>)</cite></p></figcaption></figure><p>"While I agree that we need to replace coal with flexible storage and gas, I don't see this as a solution for managing minimum demand," Ms Hunt wrote.</p><p>"It will only buy us a handful of years before the rooftop PV juggernaut rolls on and we have a grid stability problem again.</p><p>"We need to get better at demand flexibility so that we can use solar as productively as we can, and we to change our mindset."</p></div></div>]]>
@@ -101,7 +1440,7 @@ December 3, 2024 | https://www.abc.net.au/news/2024-11-17/solar-flooded-australi
             </title>
             <description>
 <![CDATA[
-Score 58 | Comments 16 (<a href="https://news.ycombinator.com/item?id=42311828">thread link</a>) | @goodburb
+Score 69 | Comments 17 (<a href="https://news.ycombinator.com/item?id=42311828">thread link</a>) | @goodburb
 <br/>
 December 3, 2024 | https://kevindavid.org/code/2024/03/20/chrome-os-flex-proxmox.html | <a href="https://web.archive.org/web/*/https://kevindavid.org/code/2024/03/20/chrome-os-flex-proxmox.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div aria-label="Content">
@@ -442,7 +1781,7 @@ December 3, 2024 | https://isonomiaquarterly.com/volume-2-issue-4/against-free-m
             </title>
             <description>
 <![CDATA[
-Score 14 | Comments 3 (<a href="https://news.ycombinator.com/item?id=42310969">thread link</a>) | @kaashmonee
+Score 17 | Comments 9 (<a href="https://news.ycombinator.com/item?id=42310969">thread link</a>) | @kaashmonee
 <br/>
 December 3, 2024 | https://docs.sqlc.dev/en/stable/tutorials/getting-started-postgresql.html | <a href="https://web.archive.org/web/*/https://docs.sqlc.dev/en/stable/tutorials/getting-started-postgresql.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div role="main" itemscope="itemscope" itemtype="http://schema.org/Article">
@@ -683,7 +2022,7 @@ updated database schema.</p>
             </title>
             <description>
 <![CDATA[
-Score 113 | Comments 49 (<a href="https://news.ycombinator.com/item?id=42310461">thread link</a>) | @airstrike
+Score 117 | Comments 53 (<a href="https://news.ycombinator.com/item?id=42310461">thread link</a>) | @airstrike
 <br/>
 December 3, 2024 | https://lord.io/text-editing-hates-you-too/ | <a href="https://web.archive.org/web/*/https://lord.io/text-editing-hates-you-too/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div class="page">
@@ -754,7 +2093,7 @@ December 3, 2024 | https://lord.io/text-editing-hates-you-too/ | <a href="https:
             </title>
             <description>
 <![CDATA[
-Score 92 | Comments 44 (<a href="https://news.ycombinator.com/item?id=42308234">thread link</a>) | @williamsmj
+Score 96 | Comments 47 (<a href="https://news.ycombinator.com/item?id=42308234">thread link</a>) | @williamsmj
 <br/>
 December 3, 2024 | https://blog.vladovince.com/my-brand-new-digitizing-workflow-using-a-25-year-old-film-scanner/ | <a href="https://web.archive.org/web/*/https://blog.vladovince.com/my-brand-new-digitizing-workflow-using-a-25-year-old-film-scanner/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -964,7 +2303,7 @@ December 3, 2024 | https://watilo.com/my-domain-registrar-dnsimple-tried-to-5x-t
             </title>
             <description>
 <![CDATA[
-Score 214 | Comments 201 (<a href="https://news.ycombinator.com/item?id=42305348">thread link</a>) | @todsacerdoti
+Score 244 | Comments 234 (<a href="https://news.ycombinator.com/item?id=42305348">thread link</a>) | @todsacerdoti
 <br/>
 December 3, 2024 | https://blog.erodriguez.de/dependency-management-fatigue-or-why-i-forever-ditched-react-for-go-htmx-templ/ | <a href="https://web.archive.org/web/*/https://blog.erodriguez.de/dependency-management-fatigue-or-why-i-forever-ditched-react-for-go-htmx-templ/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>After getting to work on some personal projects using Go+HTMX+Templ this year, I have decided to give up on using React on any personal projects.</p><p>You can actually find a lot of compelling arguments for ditching React in favor of HTMX in the essays found in the HTMX official website.
@@ -998,7 +2337,7 @@ The language itself has kept a remarkably stable stdlib and language specificati
             </title>
             <description>
 <![CDATA[
-Score 191 | Comments 59 (<a href="https://news.ycombinator.com/item?id=42302673">thread link</a>) | @todsacerdoti
+Score 194 | Comments 60 (<a href="https://news.ycombinator.com/item?id=42302673">thread link</a>) | @todsacerdoti
 <br/>
 December 2, 2024 | https://vereis.com/posts/disterl_inbox | <a href="https://web.archive.org/web/*/https://vereis.com/posts/disterl_inbox">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><p>
@@ -1639,7 +2978,7 @@ Definitely check it out!
             </title>
             <description>
 <![CDATA[
-Score 74 | Comments 38 (<a href="https://news.ycombinator.com/item?id=42302560">thread link</a>) | @themagyar
+Score 83 | Comments 43 (<a href="https://news.ycombinator.com/item?id=42302560">thread link</a>) | @themagyar
 <br/>
 December 2, 2024 | https://www.bonbook.co/showhn | <a href="https://web.archive.org/web/*/https://www.bonbook.co/showhn">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><div><div><p>Send the email below, OR write your own. Responses in 15 seconds.</p></div><div><div><p>Your Email Inbox</p></div><div><div><div><div><div></div></div><div><div><div><div><h3>New Message</h3></div><div><p><label for="email-to">To:</label></p><p><label for="email-subject">Subject:</label></p><p><label for="email-message">Message:</label></p></div></div></div></div><p><span>0<!-- --> messages</span></p></div></div></div></div><div data-orientation="vertical"><div data-state="closed" data-orientation="vertical"><h3 data-orientation="vertical" data-state="closed"></h3></div><div data-state="closed" data-orientation="vertical"><h3 data-orientation="vertical" data-state="closed"></h3></div><div data-state="closed" data-orientation="vertical"><h3 data-orientation="vertical" data-state="closed"></h3></div><div data-state="closed" data-orientation="vertical"><h3 data-orientation="vertical" data-state="closed"></h3></div><div data-state="closed" data-orientation="vertical"><h3 data-orientation="vertical" data-state="closed"></h3></div></div><div><p><a target="_blank" rel="noopener noreferrer" id="request-access" href="https://bonbook.co/access">Request Access</a></p></div></div></div></div></div>]]>
@@ -1654,7 +2993,7 @@ December 2, 2024 | https://www.bonbook.co/showhn | <a href="https://web.archive.
             </title>
             <description>
 <![CDATA[
-Score 255 | Comments 254 (<a href="https://news.ycombinator.com/item?id=42302426">thread link</a>) | @droideqa
+Score 255 | Comments 262 (<a href="https://news.ycombinator.com/item?id=42302426">thread link</a>) | @droideqa
 <br/>
 December 2, 2024 | https://chshersh.com/blog/2023-12-16-8-months-of-ocaml-after-8-years-of-haskell.html | <a href="https://web.archive.org/web/*/https://chshersh.com/blog/2023-12-16-8-months-of-ocaml-after-8-years-of-haskell.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2086,7 +3425,7 @@ December 2, 2024 | https://www.elodin.systems/post/a-better-approach-to-gravity-
             </title>
             <description>
 <![CDATA[
-Score 496 | Comments 262 (<a href="https://news.ycombinator.com/item?id=42299863">thread link</a>) | @heshiebee
+Score 503 | Comments 263 (<a href="https://news.ycombinator.com/item?id=42299863">thread link</a>) | @heshiebee
 <br/>
 December 2, 2024 | https://www.map.cv/blog/redbook | <a href="https://web.archive.org/web/*/https://www.map.cv/blog/redbook">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-framer-name="Content" data-framer-component-type="RichTextContainer"><p>In 2012, Facebook was facing a challenge as it hit a billion users: rapid scaling was outpacing their ability to maintain focus on the big picture. Narratives became fragmented, and with them, the essence of what tied the company to Zuckerberg's vision began to fade.</p><p>They made a bold move by codifying their story into a <em>Little Red Book</em>. Which they distributed internally.</p><p>Created by designer <!--$--><a href="https://benbarry.com/" target="_blank" rel="noopener">Ben Barry</a><!--/$-->, the book distilled Facebook’s ethos—breaking things, thinking big, and moving fast—into a manifesto. More than a handbook, it was a declaration of identity, solving the problem of scaling culture during explosive growth. It reminded employees: <em>This is who we are. This is why we exist.</em></p><p>Few copies remain today, and most of the digital versions floating around the internet are low resolution.</p><p>After years of sporadically checking eBay, I found a copy. It arrived at our office a few weeks ago.</p><p><img alt="" data-framer-asset="data:framer/asset-reference,Il710XsKIqtIBh4o3bxWhOTafsI.png" data-framer-height="723" data-framer-width="1410" height="361" src="https://framerusercontent.com/images/Il710XsKIqtIBh4o3bxWhOTafsI.png" srcset="https://framerusercontent.com/images/Il710XsKIqtIBh4o3bxWhOTafsI.png?scale-down-to=512 512w,https://framerusercontent.com/images/Il710XsKIqtIBh4o3bxWhOTafsI.png?scale-down-to=1024 1024w,https://framerusercontent.com/images/Il710XsKIqtIBh4o3bxWhOTafsI.png 1410w" width="705" data-framer-original-sizes="" sizes="(min-width: 1200px) 100vw, (min-width: 810px) and (max-width: 1199px) 100vw, (max-width: 809px) 100vw"></p><h6>Determined to create a <em>better</em> digital version, I reached out to a few public libraries and universities in NYC. One gave me access to their $150,000 DT-BC100 scanner.</h6><p>This isn’t just a scan of a book; it’s a testament to the power of storytelling.</p><p>Stories build belief. They turn strangers into teammates, teams into movements, and movements into businesses that can change the world.</p><p>So here it is, the highest quality publicly available version of the <em>Little Red Book</em>,<em> </em>preserved for anyone curious about how great companies scale culture and ideas.</p></div></div>]]>
@@ -2149,7 +3488,7 @@ December 2, 2024 | https://openbao.org/blog/release-v2-1-0/ | <a href="https://w
             </title>
             <description>
 <![CDATA[
-Score 462 | Comments 133 (<a href="https://news.ycombinator.com/item?id=42297644">thread link</a>) | @dmarcos
+Score 465 | Comments 133 (<a href="https://news.ycombinator.com/item?id=42297644">thread link</a>) | @dmarcos
 <br/>
 December 2, 2024 | https://www.worldlabs.ai/blog | <a href="https://web.archive.org/web/*/https://www.worldlabs.ai/blog">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -2568,7 +3907,7 @@ December 2, 2024 | https://christopherferan.com/2021/12/25/kenya-and-the-decline
             </title>
             <description>
 <![CDATA[
-Score 175 | Comments 220 (<a href="https://news.ycombinator.com/item?id=42294902">thread link</a>) | @chrisjj
+Score 175 | Comments 221 (<a href="https://news.ycombinator.com/item?id=42294902">thread link</a>) | @chrisjj
 <br/>
 December 2, 2024 | https://www.postofficescandal.uk/post/proposed-amendment-to-legal-assumption-about-the-reliability-of-computers/ | <a href="https://web.archive.org/web/*/https://www.postofficescandal.uk/post/proposed-amendment-to-legal-assumption-about-the-reliability-of-computers/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2997,7 +4336,7 @@ since multiple items can share the same bits. How can we represent deleted items
             </title>
             <description>
 <![CDATA[
-Score 118 | Comments 64 (<a href="https://news.ycombinator.com/item?id=42292805">thread link</a>) | @todsacerdoti
+Score 119 | Comments 64 (<a href="https://news.ycombinator.com/item?id=42292805">thread link</a>) | @todsacerdoti
 <br/>
 December 1, 2024 | https://parentheticallyspeaking.org/articles/bicameral-not-homoiconic/ | <a href="https://web.archive.org/web/*/https://parentheticallyspeaking.org/articles/bicameral-not-homoiconic/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><table><tbody><tr><td><p><span>&nbsp;&nbsp;&nbsp;&nbsp;</span><a href="#%28part.__.Weak__.Homoiconicity%29" data-pltdoc="x">1<span>&nbsp;</span>(Weak) Homoiconicity</a></p></td></tr><tr><td></td></tr><tr><td><p><span>&nbsp;&nbsp;&nbsp;&nbsp;</span><a href="#%28part.__.Strong__.Homoiconicity%29" data-pltdoc="x">2<span>&nbsp;</span>(Strong) Homoiconicity</a></p></td></tr><tr><td></td></tr><tr><td><p><span>&nbsp;&nbsp;&nbsp;&nbsp;</span><a href="#%28part._.The_.Parsing_.Pipeline%29" data-pltdoc="x">3<span>&nbsp;</span>The Parsing Pipeline</a></p></td></tr><tr><td></td></tr><tr><td><p><span>&nbsp;&nbsp;&nbsp;&nbsp;</span><a href="#%28part._.The_.Bicameral_.Analogy%29" data-pltdoc="x">4<span>&nbsp;</span>The Bicameral Analogy</a></p></td></tr><tr><td></td></tr><tr><td><p><span>&nbsp;&nbsp;&nbsp;&nbsp;</span><a href="#%28part._.Bicameral_.Syntax%29" data-pltdoc="x">5<span>&nbsp;</span>Bicameral Syntax</a></p></td></tr><tr><td></td></tr><tr><td><p><span>&nbsp;&nbsp;&nbsp;&nbsp;</span><a href="#%28part._.Back_to_.Lisps%29" data-pltdoc="x">6<span>&nbsp;</span>Back to Lisps</a></p></td></tr><tr><td></td></tr><tr><td><p><span>&nbsp;&nbsp;&nbsp;&nbsp;</span><a href="#%28part._.What_.About_.Other_.Languages_%29" data-pltdoc="x">7<span>&nbsp;</span>What About Other Languages?</a></p></td></tr></tbody></table><p>If you spend enough time reading internet discussions of programming
