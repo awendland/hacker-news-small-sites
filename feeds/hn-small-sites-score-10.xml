@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Mon, 09 Dec 2024 16:23:39 GMT</lastBuildDate>
+        <lastBuildDate>Mon, 09 Dec 2024 20:23:14 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-10.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Mon, 09 Dec 2024 16:23:39 GMT</pubDate>
+        <pubDate>Mon, 09 Dec 2024 20:23:14 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,405 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Show HN: Performing a zero downtime major version upgrade on RDS Aurora Postgres]]>
+            </title>
+            <description>
+<![CDATA[
+Score 11 | Comments 2 (<a href="https://news.ycombinator.com/item?id=42369426">thread link</a>) | @mattlong
+<br/>
+December 9, 2024 | https://www.medplum.com/blog/zero-downtime-postgres-major-version-upgrade | <a href="https://web.archive.org/web/*/https://www.medplum.com/blog/zero-downtime-postgres-major-version-upgrade">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="__blog-post-container"><p>Medplum is built on Postgres. Until recently, our hosted Medplum service was using an Amazon Web Services (AWS) RDS Aurora Postgres cluster running version 12.16. Since v12 is rather outdated and nearing the end of its standard support window on RDS, it was time to plan our upgrade to the newest version available on RDS, v16.4. Various methods to upgrade to a new major version on various places across the downtime vs level-of-effort continuum; we decided to upgrade our database with no downtime. This is how we did it.</p>
+<p>The upgrade methods we evaluated:</p>
+<ul>
+<li><strong>RDS in-place major version upgrade</strong> - Update the cluster’s version through the web console, AWS CLI, etc., choose “Apply immediately”, and wait for the cluster to undergo the Postgres major version upgrade process.</li>
+<li><strong>RDS Blue/Green Deployments</strong> - A managed workflow provided by RDS for testing database configuration changes before implementing them in production, such as upgrading the major database version.</li>
+<li><strong>Self-managed blue/green deployment</strong> - A workflow similar in spirit to the one provided by an RDS-managed Blue/Green deployment mentioned above, but one that is fully managed by us.</li>
+</ul>
+<h3 id="rds-in-place-major-version-upgrade">RDS in-place major version upgrade<a href="#rds-in-place-major-version-upgrade" aria-label="Direct link to RDS in-place major version upgrade" title="Direct link to RDS in-place major version upgrade">​</a></h3>
+<p>This is perhaps the lowest-effort way to upgrade to a new major version of Postgres if you can tolerate <strong>20-30+ minutes of downtime</strong>. With just a handful of mouse clicks in the AWS web console, you can sit back and wait for your database to update itself. We did not seriously consider this option since that much downtime was not acceptable.</p>
+<h3 id="rds-bluegreen-deployment">RDS Blue/Green Deployment<a href="#rds-bluegreen-deployment" aria-label="Direct link to RDS Blue/Green Deployment" title="Direct link to RDS Blue/Green Deployment">​</a></h3>
+<p>With just a little more effort than upgrading your cluster in place, using an RDS Blue/Green deployment will typically result in <strong>less than one minute of downtime</strong>, “but it can be longer depending on your workload”.</p>
+<p>Some background. A <a href="https://en.wikipedia.org/wiki/Blue%E2%80%93green_deployment" target="_blank" rel="noopener noreferrer">blue/green deployment</a> is a tried and true method for rolling out changes to a service. From the RDS docs:</p>
+<blockquote>
+<p>In a blue/green deployment, the&nbsp;<em>blue environment</em>&nbsp;is the current production environment. The&nbsp;<em>green environment</em>&nbsp;is the staging environment. The staging environment stays in sync with the current production environment using logical replication…</p>
+</blockquote>
+<p>…When ready, you can switch over the environments to transition the green environment to be the new production environment. The switchover typically takes under a minute with no data loss and no need for application changes.</p>
+<blockquote>
+</blockquote>
+<p>The RDS team provides ample documentation on their <a href="https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-overview.html" target="_blank" rel="noopener noreferrer">managed Blue/Green Deployments</a> and how they can be <a href="https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments.html" target="_blank" rel="noopener noreferrer">used for major version upgrades</a> in particular. There are a number of limitations and restrictions for Blue/Green Deployments; <a href="https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-considerations.html#blue-green-deployments-limitations-general" target="_blank" rel="noopener noreferrer">some specific to RDS</a> and <a href="https://www.postgresql.org/docs/current/logical-replication-restrictions.html" target="_blank" rel="noopener noreferrer">some applicable to any workflow that built around Postgres logical replication</a>.</p>
+<p>When testing an RDS Blue/Green Deployment on a staging environment, we consistently observed that the database cluster was disconnected and unavailable to our app servers for at least 30 seconds and sometimes longer during the switchover from blue to green.</p>
+<h3 id="self-managed-bluegreen-deployment">Self-managed Blue/Green deployment<a href="#self-managed-bluegreen-deployment" aria-label="Direct link to Self-managed Blue/Green deployment" title="Direct link to Self-managed Blue/Green deployment">​</a></h3>
+<p>While 30 seconds of downtime is clearly a huge improvement over the 20+ minutes from an in-place version upgrade, but we wanted to drop that number even lower even if it meant investing more time and effort. Why? In addition to making this particular database version upgrade as seamless and unnoticeable as possible for our customers, we always want to improve our familiarity with and ability to administer and manage Postgres since it is such an foundational part of the Medplum service.</p>
+<p>To achieve this, we went about designing a plan to manually manage a blue/green deployment and switchover to facilitate our major version upgrade that would both minimize database downtime and avoid database clients from disconnecting during the switchover; thus eliminating the need for our servers to be aware that the switchover was happening. Our plan was built around three major components:</p>
+<ol>
+<li>Using Postgres logical replication to create a green database cluster continuously kept in sync with the blue production database cluster.</li>
+<li>Using PgBouncer as a proxy/connection pooler to facilitate the switchover and avoid any dropped database client connections</li>
+<li>A switchover script to orchestrate the switchover as fast as possible</li>
+</ol>
+<p>To cut to the chase, <strong>here is the <a href="https://github.com/medplum/medplum-postgres-upgrade/blob/main/docs/runbook.md" target="_blank" rel="noopener noreferrer">step-by-step postgres upgrade runbook</a> we used to manage our database upgrade</strong> and its <a href="https://github.com/medplum/medplum-postgres-upgrade" target="_blank" rel="noopener noreferrer">supporting resources</a>. Let’s walk through some steps of the runbook to provide some more color.</p>
+<h3 id="enabling-logical-replication-in-rds-aurora-cluster-parameter-group">Enabling logical replication in RDS Aurora cluster parameter group<a href="#enabling-logical-replication-in-rds-aurora-cluster-parameter-group" aria-label="Direct link to Enabling logical replication in RDS Aurora cluster parameter group" title="Direct link to Enabling logical replication in RDS Aurora cluster parameter group">​</a></h3>
+<p>A prerequisite for using Postgres logical replication on an RDS cluster is setting <code>rds.logical_replication</code> to <code>1</code>. The values we used for the other <code>max_*</code> settings were pulled from other guides and write ups we studied. They may need adjusting based on the instance type or your cluster instances.</p>
+<p>Here are all the parameters we set/updated:</p>
+<div><div><pre tabindex="0"><code><span><span>{</span><span></span><br></span><span><span>  </span><span>"rds.logical_replication"</span><span>:</span><span> </span><span>"1"</span><span>,</span><span></span><br></span><span><span>  </span><span>"max_replication_slots"</span><span>:</span><span> </span><span>"25"</span><span>,</span><span></span><br></span><span><span>  </span><span>"max_wal_senders"</span><span>:</span><span> </span><span>"25"</span><span>,</span><span></span><br></span><span><span>  </span><span>"max_logical_replication_workers"</span><span>:</span><span> </span><span>"25"</span><span>,</span><span></span><br></span><span><span>  </span><span>"max_worker_processes"</span><span>:</span><span> </span><span>"50"</span><span></span><br></span><span><span></span><span>}</span><br></span></code></pre></div></div>
+<p>Note that <code>rds.logical_replication</code> is a <strong>static</strong> parameter meaning the database must be rebooted for the change to take effect. The reboot generally takes around <strong>5-10 seconds during which time your database will be unavailable and drop connections</strong>. As such, you should ideally schedule this reboot should during a maintenance window and/or when traffic to your database is at a minimum. An improvement for next time we go through this process could be to utilize PgBouncer as a proxy (discussed below) to <code>PAUSE</code> and <code>RESUME</code> the database around the reboot to substitute dropped connections for increased query time since client queries are held at the proxy until the database is resumed.</p>
+<h3 id="provisioning-a-pgbouncer-server">Provisioning a PgBouncer server<a href="#provisioning-a-pgbouncer-server" aria-label="Direct link to Provisioning a PgBouncer server" title="Direct link to Provisioning a PgBouncer server">​</a></h3>
+<p>PgBouncer is a powerful tool with a lot of use cases and tons of configuration settings. Since configuration is mostly file-based and is only going to be in our stack temporarily to facilitate the upgrade, we chose to set it up as a one-off EC2 server to simplify things. Since PgBouncer would only be getting used for around an hour, we decided introducing it as single-point-of-failure (SPOF) was acceptable.</p>
+<p>Why didn’t we keep PgBouncer in our stack permanently? We prefer to keep our stack as simple as possible to avoid the overhead of managing another service. Furthermore, making PgBouncer into a highly available (HA) service is non-trivial.</p>
+<p>A few things to call our from our <a href="https://github.com/medplum/medplum-postgres-upgrade/blob/main/docs/pgbouncer-setup.md" target="_blank" rel="noopener noreferrer">PgBouncer setup guide</a>:</p>
+<p>PgBouncer has pretty low CPU and memory requirements for the way we use it, but we wanted to get as much network bandwidth without totally breaking the bank to avoid introducing a network bandwidth bottleneck to/from our database. As such, we provisioned our PgBouncer instance on an <code>m5.2xlarge</code> instance which was likely overkill.</p>
+<p>Make sure to put the server in the same VPC as your RDS cluster and application servers. To minimize network lag, we put PgBouncer in the same availability zone (AZ) as our cluster’s writer instance.</p>
+<h3 id="provisioning-a-jumpbox">Provisioning a jumpbox<a href="#provisioning-a-jumpbox" aria-label="Direct link to Provisioning a jumpbox" title="Direct link to Provisioning a jumpbox">​</a></h3>
+<p>This is another EC2 server that you’ll SSH onto in order to perform various steps (most notably, execute the switchover script). It needs SSH access to your PgBouncer server as well as Postgres access (port 5432) to PgBouncer as well as your blue and green database clusters.</p>
+<p>There isn’t too much else to discuss from our <a href="https://github.com/medplum/medplum-postgres-upgrade/blob/main/docs/jumpbox-setup.md" target="_blank" rel="noopener noreferrer">jumpbox setup guide</a> besides commiserating that it can be a bit tedious to get all the security group rules setup correctly to allow SSH and Postgres access. The telltale that you haven’t configured your security groups quite right yet is an <code>ssh</code> or <code>psql</code> command hanging indefinitely.</p>
+<p>Throughout our runbook, unless otherwise noted, all SQL queries and other commands you run should be performed from the jumpbox. Why? The last thing you want is a network hiccup between your laptop/desktop and the AWS datacenter to halt the switchover script at just the wrong time. Along those lines, we highly recommend you use tmux, screen, or some other terminal multiplexer on your jumpbox to further avoid inflight scripts from being interrupted.</p>
+<h3 id="setting-up-logical-replication">Setting up logical replication<a href="#setting-up-logical-replication" aria-label="Direct link to Setting up logical replication" title="Direct link to Setting up logical replication">​</a></h3>
+<p><a href="https://www.postgresql.org/docs/current/logical-replication.html" target="_blank" rel="noopener noreferrer">Postgres logical replication</a> streams logical changes to a database from one Postgres server to others by utilizing the write-ahead log (WAL).</p>
+<p>There are several <a href="https://www.postgresql.org/docs/current/logical-replication-restrictions.html" target="_blank" rel="noopener noreferrer">limitations</a> to the types of changes that can be logically replicated. A few of these limitations are relevant to Medplum: database schema/DDL changes, Sequence data, and replica identities. Avoiding schema/DDL changes was just a people coordination problem; we barred anyone from deploying server changes that included database migrations during the time in which logical replication was in use; roughly 24 hours. For sequences, the next value of each sequence is synchronized as part of our switchover script as discussed below. Finally, each table to be logically replicated must have either a primary key or a <a href="https://www.postgresql.org/docs/current/sql-altertable.html#SQL-ALTERTABLE-REPLICA-IDENTITY" target="_blank" rel="noopener noreferrer">replica identity</a>. Medplum actually has a decent number of tables without primary keys; it was appropriate to use <code>REPLICA IDENTITY FULL</code> for them all. Of course that is not universally true; some tables may require other replica identity options.</p>
+<p>With <code>rds.logical_replication</code> enabled as discussed above, we begin to set up logical replication by creating a publication and replication slot on your live, production (i.e. blue) database. It is <strong>critical that the replication slot is created before cloning your database</strong>. Why? Logical replication can only march forward in time. More precisely, a replication slot references a log sequence number (LSN) in the WAL and can only advance forward to a more recent LSN; never backwards.</p>
+<p>Once the replication slot is created, it is best to perform the next few steps of creating your green database, upgrading it to your desired new Postgres major version, and finally enabling logical replication to it all happen in a timely manner. There is no need to rush through these steps by any means, just don’t let the replication slot linger unused for hours and certainly not days. Why? A Postgres server must retain as much of its WAL as is necessary to service its oldest replication slot and when the WAL grows too large, this can potentially lead to issues. On Aurora, there is an asterisk on that last sentence since Aurora stores the WAL differently than a traditional Postgres server but generally speaking, the point still stands.</p>
+<p><strong>Be sure to capture the initial LSN of the green database before upgrading it to the new Postgres version.</strong> Why? The LSNs on a server’s WAL get reset during the process of performing a major version upgrade. There is no good way to recover from this should you forget; you’ll need to throw away the green database clone and create a new one.</p>
+<p><strong>Under no circumstances should you skip running <code>ANALYZE VERBOSE</code> after upgrading your green database.</strong> Why? Table statistics are lost during the major version upgrade process. Without those statistics, indexes generally will not be used by the query planner resulting in most queries resorting to a sequential scan.</p>
+<h3 id="preparing-for-the-switchover">Preparing for the switchover<a href="#preparing-for-the-switchover" aria-label="Direct link to Preparing for the switchover" title="Direct link to Preparing for the switchover">​</a></h3>
+<p>We generally employ at least one reader instance in our Aurora cluster to shed some load from our writer. To simplify our upgrade story, we temporarily stopped employing readers starting about an hour before performing the switchover and added them back shortly after confirming the switchover was complete and verified. Since our writer can still handle <em>all</em> database traffic on its own even during the daily peak, taking them out of rotation during the low-traffic time we scheduled our switchover for wasn’t at all concerning for us. If reader availability is required throughout it, several parts of the upgrade process would have to be adjusted; including but not limited to using PgBouncer to also proxy reader traffic and adjusting the switchover script to pause and resume traffic to the reader endpoint in addition to the writer endpoint before and after the switch from blue to green.</p>
+<p>As discussed above, we only used PgBouncer temporarily to facilitate our database upgrade. We started using PgBouncer about an hour before the switchover and stopped using it shortly after the switchover was complete and verified.</p>
+<h3 id="executing-the-switchover">Executing the switchover<a href="#executing-the-switchover" aria-label="Direct link to Executing the switchover" title="Direct link to Executing the switchover">​</a></h3>
+<p>Spoiler alert: the actual switchover process was quick and anti-climatic just like we were planning for. Of course, making it quick and anti-climatic took quite a bit of preparation and iteration. We automated the switchover process by writing <a href="https://github.com/medplum/medplum-postgres-upgrade/blob/main/src/switchover.ts" target="_blank" rel="noopener noreferrer">a custom script</a>. We erred on the side of making the script too verbose rather than not enough. While the script was written with the particulars of Medplum in mind, it should be straightforward to adapt it to other environments.</p>
+<p>The first thing the switchover script does is run a number of precondition checks before it even considers executing the actual switchover. The checks include things like connectivity to the various databases, SSH access to the PgBouncer server, verifying PgBouncer configuration, verifying recent data is identical between the blue and green servers, logical replication lag is low enough, etc. The precondition check section is the time to be paranoid and verbose. Several of the checks included were added as a result of us forgetting to manually perform some earlier step or configuration change in one of our many test runs of the script.</p>
+<p>If all preconditions have passed, the script then waits for user confirmation to proceed with the actual switchover. Why? To allow us to ensure that we weren’t in the middle of handling a sudden spike in traffic and didn’t have any long-running queries. This was fairly easy to ascertain thanks to a custom realtime <a href="https://github.com/medplum/medplum-postgres-upgrade/blob/main/src/dashboard.ts" target="_blank" rel="noopener noreferrer">terminal-based dashboard</a> that displays active Postgres connections on the blue and green databases, PgBouncer configuration and traffic stats, and logical replication lag in near realtime.</p>
+<p>Once we proceeded, the switchover script did the following in about one second:</p>
+<ul>
+<li>Pauses the medplum database on PgBouncer, an operation that blocks until all in-flight queries (to the blue database) have finished</li>
+<li>Waits fro replication lag to drop to zero bytes</li>
+<li>Synchronizes auto-incrementing sequence last values from blue to green</li>
+<li>Updates PgBouncer to proxy connections to green instead of blue</li>
+<li>Resumes the medplum database on PgBouncer, forwarding client connections held during the paused period to the green database</li>
+</ul>
+<p>If something goes wrong during the switchover process, e.g. replication lag not dropping to zero in time, the script makes a best effort to revert back to the blue database.</p>
+<p>To get a feel for the customer experience during the switchover, we ran a k6 script starting a couple minutes before the switchover that tries to create a resource on Medplum every 0.5 seconds. In the steady state before and after the switchover, each request took about 35 milliseconds on average. During the switchover, all we noticed was one request taking just over a second (1082ms), a result we were very happy with:</p>
+<div><div><pre tabindex="0"><code><span><span>http_req_duration,1729645809,32.86</span><br></span><span><span>http_req_duration,1729645811,40.64</span><br></span><span><span>http_req_duration,1729645811,1082.12</span><br></span><span><span>http_req_duration,1729645811,35.78</span><br></span><span><span>http_req_duration,1729645812,33.79</span><br></span></code></pre></div></div>
+<h3 id="after-the-switch-over">After the switch over<a href="#after-the-switch-over" aria-label="Direct link to After the switch over" title="Direct link to After the switch over">​</a></h3>
+<p>After sanity checking that our systems were still working as expected, one last important step that should be performed promptly is to drop the logical replication subscription on the green database. While we were confident there would be no more traffic sent to the blue database, it is of course best to shut off the pipe to properly treat the green database and the new source of truth that it is.</p>
+<p>Next, we once altered all tables that we had previously altered to use <code>REPLICA IDENTITY FULL</code> back to <code>REPLICA IDENTITY DEFAULT</code> since we are longer be using logical replication. After that, there wasn’t anything else time-sensitive to do besides removing PgBouncer and starting to send traffic to readers once again in our new Aurora cluster. The next day we wrapped up the rest of the cleanup: deprovisioning the PgBouncer and jumpbox server, cleaning up security groups, etc.</p>
+<h3 id="wrapping-up">Wrapping up<a href="#wrapping-up" aria-label="Direct link to Wrapping up" title="Direct link to Wrapping up">​</a></h3>
+<p>We hope you find the guide useful! We wrote it not only to share with the community but to capture not only the “what” and “how” of a Postgres upgrade, but the “why” as well for the next time we find ourselves upgrading Postgres.</p>
+<p>We’d love to hear any comments or feedback if you’ve done something like this before.</p></div></div>]]>
+            </description>
+            <link>https://www.medplum.com/blog/zero-downtime-postgres-major-version-upgrade</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42369426</guid>
+            <pubDate>Mon, 09 Dec 2024 19:14:28 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Knight TV Resurrection (2018)]]>
+            </title>
+            <description>
+<![CDATA[
+Score 16 | Comments 3 (<a href="https://news.ycombinator.com/item?id=42367893">thread link</a>) | @rbanffy
+<br/>
+December 9, 2024 | http://pdp-6.net/knight-tv/knight-tv.html | <a href="https://web.archive.org/web/*/http://pdp-6.net/knight-tv/knight-tv.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
+    <a href="http://pdp-6.net/">Home</a>
+
+    
+    <p>The Knight TV system was a terminal system made by
+      <a href="https://people.csail.mit.edu/tk/">Tom Knight</a>
+      that was connected to the AI KA10.
+      It used a PDP-11/20 whose Unibus was directly connected
+      to the PDP-10 by the 10-11 interface that was
+      unique to AI. (At first we though it was an 11/10,
+      but that doesn't seem to have been the case)</p>
+    <p>The PDP-11 had 12kw of memory and a number of
+      16kw bitmap frame buffers that could be mapped
+      into the address space of the Unibus.
+      The frame buffers generated a video signal that 
+      was used as input for a video switch
+      configured by the PDP-11.
+      The output of that video switch was fed into
+      the TV sets which were used as terminals.
+      For input there was a keyboard multiplexer
+      to which the Knight keyboards were attached.</p>
+    <p>
+      The file <tt>.; TV BIN</tt> can be loaded into the 11
+      from the 10 with the <tt>STUFF</tt> program,
+      then the 10 and 11 communicate via shared memory.</p>
+    <p>The Knight TV system was the preferred way to talk to ITS
+      for a while so there was not question it had to be resurrected!</p>
+
+    <h2>Planning</h2>
+    <p><a href="http://lars.nocrew.org/">Lars</a> and I
+      talked about how this multi-level design should be implemented.
+      We had <a href="https://sky-visions.com/index.shtml">Rich's</a>
+      simh-based KA10 emulator to run ITS.
+      The first question was whether to use simh to emulate the PDP-11
+      or write a new emulator.
+      As I find simh code rather hard to read and because emulation is
+      fun we decided it would all be new code.
+      Also, since there is only one 11 but multiple displays/keyboards,
+      the 11 would best run as a server to which clients then connect.
+      This would also allow multiple people connected to the same
+      remote system to spy on each other's consoles,
+      an important feature.
+      </p>
+    <p>The idea was to have the 10 and 11 emulators run on the
+      same machine and have TV clients connect from remote.
+      Network connects are an easy way for processes to communicate
+      so we decided to use a simple protocol to implement
+      the 10-11 interface.
+      </p>
+      <img src="http://pdp-6.net/knight-tv/ktv_arch.png" width="720px">
+
+    <h2>PDP-11 emulation</h2>
+    <p>Writing emulators is fun and especially in the case of the PDP-11/10
+      it's easy enough to be done in a couple of days.
+      Since at first we thought it was a PDP-11/10 that was running the
+      TV system, that's what I wrote an emulator for.
+      It worked because the difference to an 11/20 isn't that great.
+      I later modified the emulator to behave more like an 11/20
+      but the following describes how I wrote the first version.</p>
+
+    <p>The PDP-11/10 is in fact the same model as the 11/05 and
+      all relevant documentation can be found on
+      <a href="http://bitsavers.trailing-edge.com/pdf/dec/pdp11/1105/">bitsavers</a>.
+      It is a low-end model very similar to the original PDP-11/20:
+      microcoded (unlike the 11/20),
+      16 bit address space,
+      no extended instructions (multiply, divide, &amp;c.).
+      A couple of peripherals are included in the 11/05 as part of the CPU:
+      a KW11 line clock look-alike, and a KL11-like TTY interface.
+      Since it has no extended instructions,
+      the MIT hackers equipped the TV 11 with the KE11 extended arithmetic module,
+      a device that sits in the Unibus IO page and is controlled
+      by writing values to a number of mapped registers.
+      </p>
+    <p>
+      I considered writing a rather low level emulator that
+      would actually execute the microcode but decided against it.
+      Instead I wrote some higher level code that was still
+      inspired by the schematics and microcode.
+      The emulator is written in C.
+      </p>
+    <p>In the PDP-11 all IO devices and memory are connected to the Unibus
+      (this is not the case in all models, but in our case it is).
+      The CPU is the bus master that arbitrates access to the bus.
+      When a device needs access to the bus it will request bus access
+      with one of 4 priorities (4-7).
+      To model this I made a struct for the CPU, the Bus and
+      devices connected to the bus:
+      </p>
+    <pre>
+// KD11-B is the 11/10 processor
+struct KD11B
+{
+        word r[16];   // register scratchpad
+        word ba;      // bus address
+        word ir;      // instruction register
+        Bus *bus;     // our lovely Unibus
+        byte psw;     // processor status word
+        int traps;    // flags to keep track of traps
+        int be;       // counter for bus errors, to catch double bus errors
+        int state;    // halted, running or waiting
+
+        // Keep track of bus requests for all channels
+        struct {
+                int (*bg)(void *dev);   // Bus grant callback
+                void *dev;              // device that requests bus access
+        } br[4];
+
+        word sw;      // console switch register
+
+        // omitted: internal devices
+        // line clock
+        // ...
+        // TTY input
+        // ...
+        // TTY output
+        // ...
+};
+
+// Unibus
+struct Bus
+{
+        Busdev *devs;   // linked list of devices on the bus
+        uint32 addr;    // addresses are 18 bit
+        word data;      // data is 16 bit
+};
+
+// A device on the bus
+struct Busdev
+{
+        Busdev *next;   // next in list
+        void *dev;      // pointer to individual device's struct
+        int (*dati)(Bus *bus, void *dev);   // read data from device
+        int (*dato)(Bus *bus, void *dev);   // write data (word) to device
+        int (*datob)(Bus *bus, void *dev);  // write data (byte) to device
+        int (*svc)(Bus *bus, void *dev);    // service callback,
+                                            // returns bus request priority if any
+        int (*bg)(void *dev);               // bus grant callback,
+                                            // returns interrupt vector
+        void (*reset)(void *dev);           // reset device
+};
+    </pre>
+    <p>The internal devices do not use the Bus, they're handled by CPU code.
+      For a given address a device which recognizes the address
+      will respond.
+      If no device responds, the access times out and the CPU
+      receives a bus error.
+      With bus grants, the electrically nearest device will receive
+      the grant and pass it on to the next device if it didn't request
+      bus access.
+      I modeled this mechanism with a linked list.
+      For all device specific behaviour there are virtual functions
+      that correspond to unibus transactions.
+      </p>
+    <p>While the CPU is running (i.e. not halted) it will execute
+      instructions.
+      If it is waiting it will not execute instructions until an interrupt
+      occurs (this is indicated by a bit in the traps variable).
+      The main loop does the expected, in pseudocode:
+      </p>
+    <pre>while state != halted
+    service-internal-devices()
+    service-bus-devices()
+    if(state == running || state == waiting &amp;&amp; traps)
+        state = running
+        execute-next-instruction()
+    </pre>
+
+    <p>Instruction execution is much like you would expect
+      from an emulator, if you're not familiar with the PDP-11
+      instruction set, a quick summary:</p>
+    <p>The PDP-11 has 8 general purpose registers
+      and 8 addressing modes,
+      that makes 6 bits to encode any register+mode combination.
+      Some instructions have two operands
+      (so 12 bits are needed to encode both),
+      some have only one operand (6 bits),
+      branch instructions have a signed 8 bit word offset,
+      the other instructions have no operands.
+      </p>
+    <p>All double operand instructions
+      first read the source operand and store it in temporary register R10,
+      read the destination operand and store it in R11,
+      execute the operation (they're all very simple ALU operations)
+      and store the result back at the destination address,
+      which was kept unchanged in the BA register.</p>
+    <p>Unary instructions work almost the same,
+      there just isn't a source operand.</p>
+    <p>Branch operations add the branch offset depending
+      on which status bits are set.</p>
+
+    <h3>K11-A - EAE</h3>
+    <p>The K11-A module is the extended arithmetic extension,
+      it implements multiplication, division, logical and arithmetic shifts
+      and normalization.
+      The <a href="http://bitsavers.trailing-edge.com/pdf/dec/pdp11/1120/KE11-A_ExtendedArithElem.pdf">manual</a>
+      is very well written and I recommend anyone interested in how
+      computers do math to read it.
+      The way it works is that you set its AC and MQ registers by writing
+      to their unibus addresses and then write a third value
+      to another address to kick of the calculation.
+      You then read back the result from AC and MQ from the same addresses.
+      Implementation was rather straight forward,
+      I simply transcribed the flow diagrams into C.
+      </p>
+
+    <h2>The TV hardware</h2>
+    <p>The TV hardware consists of essentially three parts:
+      the bitmapped frame buffers, the video switch and the keyboard multiplexer.
+      Luckily the TV code is very well commented so figuring out how they all work
+      was not too hard even if a bit confusing.
+      </p>
+    <h3>The console frame buffers</h3>
+    <p>The setup has a maximum of 16 frame buffers.
+      Each FB has a resolution of 576x454 pixels,
+      with 16 pixels per word that makes
+      037730 PDP-11 words, almost 16kw.</p>
+    <p>CREG (at 0164044) maps one of up to theoretically 256 FBs
+      to 060000 on the Unibus and sets the ALU operation that is
+      to be done on a write to the buffer memory.
+      For faster changes to the FB the hardware can perform 16
+      different ALU operations itself instead of having the PDP-11 do them.
+    </p><h3>The video switch</h3>
+    <p>Each of these 16 buffers are now fed into the inputs
+      of the video switch
+      that sends the video signal of every frame buffer to any
+      number of TVs.
+      The video switch is made up of two sections (S0 and S1 below),
+      each having 16 inputs and 32 outputs.
+      The corresponding outputs of both sections are mixed together
+      to form the final signal for the TV.
+      Since in the normal case you don't want to mix anything
+      with the consoles,
+      both sections have a null input on input 0,
+      which leaves 15 inputs per section for the consoles.
+      </p>
+    <p>This shows how the 16 console frame buffers
+      are fed into the video switch
+      and how the output is mixed.
+    </p>
+    <img src="http://pdp-6.net/knight-tv/ktv_vsw.png" width="720px">
+    <p>The VSW register (at 0764060) controls the switch.
+      For a section, input and output number
+      it sets the source of the ouput of that section
+      to the given input of the section.
+      Thus every console can be displayed on every TV
+      by setting the output of the section the buffer is connected
+      to to that buffer and the same output on the other
+      switch to 0.
+      </p>
+
+    <h3>The keyboard multiplexer</h3>
+    <p>Up to 64 keyboards can be connected to the keyboard mux.
+      It is controlled by the registers KMS (keyboard status, at 764050)
+      and KMA (keyboard address, at 764052).
+      When the multiplexer receives a key press from one of the keyboards,
+      it will DMA it together with the keyboard number into a buffer in memory,
+      the address of which is given by KMA.
+      It will also interrupt the CPU so that it may read the new key
+      and handle it.
+      </p>
+
+    <h3>Emulating all of this</h3>
+    <p>Implementing this in C is pretty straightforward.
+      It gets a bit complicated by the way how the video switch works.
+      Because every console buffer can be displayed
+      on every display and also be mixed with another signal,
+      it makes updating the TV client programs a bit more complex.
+      </p>
+
+    <h2>Source code</h2>
+      <p>Finally, here you can find source code:
+      <a href="https://github.com/aap/pdp11">https://github.com/aap/pdp11</a>
+      together some other PDP-11 emulation projects.
+      The <a href="https://github.com/pdp-10/its">ITS build script</a>
+      automatically builds and starts it when ran with <tt>./start tv11</tt>.
+      You can then connect to the 11 with <tt>tvcon</tt>.
+      The keyboard layout is modeled after the original layout,
+      but there are command line options to make it a bit more pleasant.
+      </p>
+
+    <h2>Screenshots</h2>
+      <a href="http://pdp-6.net/knight-tv/ktv1.png"><img src="http://pdp-6.net/knight-tv/ktv1.png" width="288"></a>
+      <a href="http://pdp-6.net/knight-tv/ktv4.png"><img src="http://pdp-6.net/knight-tv/ktv4.png" width="288"></a>
+      <a href="http://pdp-6.net/knight-tv/ktv2.png"><img src="http://pdp-6.net/knight-tv/ktv2.png" width="288"></a>
+      <a href="http://pdp-6.net/knight-tv/ktv3.png"><img src="http://pdp-6.net/knight-tv/ktv3.png" width="288"></a>
+      <a href="http://pdp-6.net/knight-tv/suds2.png"><img src="http://pdp-6.net/knight-tv/suds2.png" width="288"></a>
+
+  
+
+</div>]]>
+            </description>
+            <link>http://pdp-6.net/knight-tv/knight-tv.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42367893</guid>
+            <pubDate>Mon, 09 Dec 2024 16:55:46 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[The "Quiet Quitting" Myth Is Toxic for Tech]]>
             </title>
             <description>
 <![CDATA[
-Score 16 | Comments 18 (<a href="https://news.ycombinator.com/item?id=42366706">thread link</a>) | @devslovecoffee
+Score 18 | Comments 25 (<a href="https://news.ycombinator.com/item?id=42366706">thread link</a>) | @devslovecoffee
 <br/>
 December 9, 2024 | https://blackentropy.com/the-quiet-quitting-myth-is-toxic-for-tech/ | <a href="https://web.archive.org/web/*/https://blackentropy.com/the-quiet-quitting-myth-is-toxic-for-tech/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
@@ -98,11 +492,68 @@ Tech already faces public scrutiny over layoffs, automation, and pay disparities
         </item>
         <item>
             <title>
+<![CDATA[Show HN: Holos – Configure Kubernetes with CUE data structures instead of YAML]]>
+            </title>
+            <description>
+<![CDATA[
+Score 11 | Comments 2 (<a href="https://news.ycombinator.com/item?id=42366665">thread link</a>) | @JeffMcCune
+<br/>
+December 9, 2024 | https://holos.run/docs/v1alpha5/tutorial/overview/ | <a href="https://web.archive.org/web/*/https://holos.run/docs/v1alpha5/tutorial/overview/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><header></header>
+<h2 id="overview">Overview<a href="#overview" aria-label="Direct link to Overview" title="Direct link to Overview">​</a></h2>
+<p>Holos is a configuration management tool for Kubernetes implementing the
+<a href="https://akuity.io/blog/the-rendered-manifests-pattern" target="_blank" rel="noopener noreferrer">rendered manifests pattern</a>. It handles configurations ranging from single
+resources to multi-cluster platforms across regions.</p>
+<!-- -->
+<p>Key components:</p>
+<ul>
+<li>Platform schemas defining component integration</li>
+<li>Building blocks unifying Helm, Kustomize and Kubernetes configs with CUE</li>
+<li>BuildPlan pipeline for generating, transforming and validating manifests</li>
+</ul>
+<!-- -->
+<!-- -->
+<h2 id="video">Video<a href="#video" aria-label="Direct link to Video" title="Direct link to Video">​</a></h2>
+<p>The video below offers a basic overview of Holos by walking you through the
+tooling gap at the Kubernetes integration layer and demonstrating how to
+integrate multiple Helm charts using data from CUE.</p>
+<!-- -->
+<p><iframe src="https://www.youtube.com/embed/PSdceGlhHGo?rel=0" title="YouTube Video Player" allow="picture-in-picture; fullscreen; accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope;"></iframe></p>
+<h2 id="holos-role-in-your-organization">Holos' role in your organization<a href="#holos-role-in-your-organization" aria-label="Direct link to Holos' role in your organization" title="Direct link to Holos' role in your organization">​</a></h2>
+<p>Platform engineers use Holos to generate Kubernetes manifests, both locally and
+in CI pipelines. The manifests are committed to version control and deployed via
+GitOps tools like ArgoCD or Flux.</p>
+<p>Holos integrates seamlessly with existing Helm charts, Kustomize bases, and
+other version-controlled configurations.</p>
+<h2 id="advantages-of-holos">Advantages of Holos<a href="#advantages-of-holos" aria-label="Direct link to Advantages of Holos" title="Direct link to Advantages of Holos">​</a></h2>
+<h3 id="safe">Safe<a href="#safe" aria-label="Direct link to Safe" title="Direct link to Safe">​</a></h3>
+<p>Holos leverages <a href="https://cuelang.org/" target="_blank" rel="noopener noreferrer">CUE</a> for strong typing and validation of configuration data,
+ensuring consistent output from Helm and other tools.</p>
+<h3 id="consistent">Consistent<a href="#consistent" aria-label="Direct link to Consistent" title="Direct link to Consistent">​</a></h3>
+<p>A unified pipeline processes all configurations - whether from CUE, Helm, or
+Kustomize - through the same well-defined stages.</p>
+<h3 id="flexible">Flexible<a href="#flexible" aria-label="Direct link to Flexible" title="Direct link to Flexible">​</a></h3>
+<p>Composable building blocks for generation, transformation, validation and
+integration let teams assemble workflows that match their needs.</p>
+<p>The core is intentionally unopinionated about platform configuration patterns.
+Common needs like environments and clusters are provided as customizable
+<a href="https://holos.run/docs/v1alpha5/topics/">topics</a> recipes rather than enforced structures.</p>
+<h2 id="getting-help">Getting Help<a href="#getting-help" aria-label="Direct link to Getting Help" title="Direct link to Getting Help">​</a></h2>
+<p>Get support through our <a href="https://discord.gg/JgDVbNpye7" target="_blank" rel="noopener noreferrer">Discord</a> channel or <a href="https://github.com/holos-run/holos/discussions" target="_blank" rel="noopener noreferrer">GitHub discussions</a>. Configuration
+challenges arise at all experience levels - we welcome your questions and are
+here to help.</p></div></div>]]>
+            </description>
+            <link>https://holos.run/docs/v1alpha5/tutorial/overview/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42366665</guid>
+            <pubDate>Mon, 09 Dec 2024 14:48:04 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Research Note: Meta's Role in Romania's 2024 Presidential Election]]>
             </title>
             <description>
 <![CDATA[
-Score 27 | Comments 3 (<a href="https://news.ycombinator.com/item?id=42364790">thread link</a>) | @alexcos
+Score 28 | Comments 3 (<a href="https://news.ycombinator.com/item?id=42364790">thread link</a>) | @alexcos
 <br/>
 December 9, 2024 | https://checkfirst.network/research-note-metas-role-in-romanias-2024-presidential-election/ | <a href="https://web.archive.org/web/*/https://checkfirst.network/research-note-metas-role-in-romanias-2024-presidential-election/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="post">
@@ -181,11 +632,27 @@ December 9, 2024 | https://checkfirst.network/research-note-metas-role-in-romani
         </item>
         <item>
             <title>
+<![CDATA[Practical GrapheneOS for the Paranoid • Ventral Digital]]>
+            </title>
+            <description>
+<![CDATA[
+Score 11 | Comments 2 (<a href="https://news.ycombinator.com/item?id=42364630">thread link</a>) | @janandonly
+<br/>
+December 9, 2024 | https://ventral.digital/posts/2024/12/9/practical-grapheneos-for-the-paranoid/ | <a href="https://web.archive.org/web/*/https://ventral.digital/posts/2024/12/9/practical-grapheneos-for-the-paranoid/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><p><a href="https://grapheneos.org/" target="_blank" rel="noreferrer">GrapheneOS<span> (opens in a new tab)</span></a> is a FOSS (Free and Open Source Software) Operating System based on the <a href="https://www.android.com/" target="_blank" rel="noreferrer">Android Open Source Project (AOSP)<span> (opens in a new tab)</span></a>, specifically focusing on improving privacy and security. Although we'd all like to have the best security and best privacy possible, it's an unfortunate fact that such improvements rarely come without a cost to convenience and usability. Here, we will explore how to get the most out of Graphene's improvements, and the impact of these measures on the user experience with practical solutions.</p><p>Probably the most common question by those looking into the GrapheneOS project for the first time is: Why are only so few devices officially supported, and why the heck are all of them expensive Pixel phones made by evil Google?</p><p>According to GrapheneOS there currently simply isn't another reasonable choice.<sup>[<a href="#reference-183">183</a>]</sup> GrapheneOS does not have contractual exclusivity for Google's devices<sup>[<a href="#reference-186">186</a>]</sup>, and neither are Pixels incredibly secure, it's rather that all the alternatives are downright awful.<sup>[<a href="#reference-167">167</a>]</sup> The GrapheneOS project maintains a <a href="https://grapheneos.org/faq#future-devices" target="_blank" rel="noreferrer">list of detailed requirements<span> (opens in a new tab)</span></a> that they have for current and future officially supported devices<sup>[<a href="#reference-64">64</a>]</sup><sup>[<a href="#reference-65">65</a>]</sup> and, unfortunately, at this time only Pixels are able to meet them.</p><p>Pixel devices have first-class support for alternate operating systems<sup>[<a href="#reference-59">59</a>]</sup>, likely thanks to the fact that they serve as a reference for Android development.<sup>[<a href="#reference-134">134</a>]</sup> They receive proper regular updates of their firmware<sup>[<a href="#reference-64">64</a>]</sup>, and offer advanced hardware security features such as memory tagging<sup>[<a href="#reference-64">64</a>]</sup><sup>[<a href="#reference-167">167</a>]</sup> which remain available even when non-stock operating systems are installed on them.<sup>[<a href="#reference-181">181</a>]</sup></p><p>Most other OEMs on the other hand merely offer half-baked, partially working support for alternative operating systems, as they see it as a non-production hobbyist feature.<sup>[<a href="#reference-134">134</a>]</sup> Heck, most of them completely skip basic security features and don't bother providing proper updates.<sup>[<a href="#reference-64">64</a>]</sup> To make matters even worse, they often add lots of complexity and, with it, attack surface, with their overall changes to the system.<sup>[<a href="#reference-92">92</a>]</sup></p><p>In the past, GrapheneOS has attempted partnering with OEMs but it turns out to be incredibly hard to make a device with comparable security to a Pixel. These partnerships fell through, in the end it was simply easier for these OEMs to make money by producing questionable hardware wallets for cryptocurrencies.<sup>[<a href="#reference-141">141</a>]</sup></p><p>The only Android OEM even close to Pixel devices in terms of hardware security is Samsung.<sup>[<a href="#reference-92">92</a>]</sup> They have even partnered up with Google to improve device security, with some success<sup>[<a href="#reference-126">126</a>]</sup>, but in the end Samsung still tends to lag behind by 2-3 years in shipping the new security features introduced by Pixels.<sup>[<a href="#reference-180">180</a>]</sup> While Samsung is theoretically only missing a couple of the requirements, they still lack serious alternate OS support<sup>[<a href="#reference-59">59</a>]</sup><sup>[<a href="#reference-64">64</a>]</sup>, which prevents GrapheneOS from using even those features that it has.<sup>[<a href="#reference-65">65</a>]</sup></p><p>Broad device support would currently imply being available to very badly secured devices, unable to support many of Graphene's security features. It would also take away a substantial amount of resources from their work on privacy and security, due to a lot of it being rather hardware-specific.<sup>[<a href="#reference-123">123</a>]</sup><sup>[<a href="#reference-280">280</a>]</sup> However, if there were other devices complying with the requirements, the GrapheneOS project would certainly plan to support them.<sup>[<a href="#reference-155">155</a>]</sup></p><p>There are various alternate operating systems for Android devices with a focus on privacy and security, or at least a broader support of devices. Though, according to the GrapheneOS project, none of these can truly be considered viable alternatives.</p><p>The most basic critique the GrapheneOS team levies against pretty much all of them is the great delay and, in some cases, even complete omission of important security patches that users of the purely open source variant of Android (AOSP) would enjoy.<sup>[<a href="#reference-92">92</a>]</sup><sup>[<a href="#reference-172">172</a>]</sup></p><p><a href="https://lineageos.org/" target="_blank" rel="noreferrer">LineageOS<span> (opens in a new tab)</span></a> is one of these offenders, though granted, this project's focus is device longevity and broad compatibility rather than security<sup>[<a href="#reference-144">144</a>]</sup>. It's critically lacking verified boot, making it trivial to break into with physical access.<sup>[<a href="#reference-172">172</a>]</sup> The <a href="https://e.foundation/e-os/" target="_blank" rel="noreferrer">/e/OS<span> (opens in a new tab)</span></a> project markets itself as fully "deGoogled" mobile ecosystem focusing on privacy while building upon Lineage's shaky foundation<sup>[<a href="#reference-90">90</a>]</sup>. The e/OS comes bundled with applications and services that give users a questionable feeling of privacy while these services themselves are arguably invasive.<sup>[<a href="#reference-159">159</a>]</sup></p><p>Graphene's possibly greatest "competitor", <a href="https://calyxos.org/" target="_blank" rel="noreferrer">CalyxOS<span> (opens in a new tab)</span></a> is apparently not only regularly behind on patches but has also misled users about this with inaccurate Android security patch levels.<sup>[<a href="#reference-91">91</a>]</sup><sup>[<a href="#reference-92">92</a>]</sup> They furthermore implemented security features with serious flaws, such as the panic-wipe feature that didn't reliably delete incriminating data as intended.<sup>[<a href="#reference-122">122</a>]</sup><sup>[<a href="#reference-296">296</a>]</sup></p><p>Then there is <a href="https://copperhead.co/android/" target="_blank" rel="noreferrer">CopperheadOS<span> (opens in a new tab)</span></a>, the name under which GrapheneOS was formerly known. I will not go into detail on the drama behind the hostile takeover and eventual separation from the company that was intended to financially sponsor the project. It's noteworthy to mention though that this company now sells CopperheadOS as closed source fork.<sup>[<a href="#reference-184">184</a>]</sup></p><p>Finally <a href="https://puri.sm/" target="_blank" rel="noreferrer">Purism<span> (opens in a new tab)</span></a> with their custom, optionally Made-In-USA, hardware that promises control over your privacy with features such as (questionable?<sup>[<a href="#reference-161">161</a>]</sup>) hardware switches. The GrapheneOS team strongly disagrees with the choice of hardware security components made for their devices and also with the convoluted process required for firmware and microcode updates.<sup>[<a href="#reference-140">140</a>]</sup> Their Librem 5 device is nearly entirely closed source hardware and firmware<sup>[<a href="#reference-215">215</a>]</sup> though many people have been misled to believe the opposite to be true.<sup>[<a href="#reference-88">88</a>]</sup></p><p>GrapheneOS accuses these projects of empty marketing with buzzwords that mislead users into trusting both outdated and vulnerable soft- and hardware.<sup>[<a href="#reference-93">93</a>]</sup><sup>[<a href="#reference-121">121</a>]</sup><sup>[<a href="#reference-140">140</a>]</sup> They even go so far as to say that users would be better off using an iPhone (in Lockdown mode<sup>[<a href="#reference-194">194</a>]</sup>) instead of any of the mentioned projects as the next best option for privacy and security after GrapheneOS.<sup>[<a href="#reference-89">89</a>]</sup><sup>[<a href="#reference-92">92</a>]</sup><sup>[<a href="#reference-125">125</a>]</sup><sup>[<a href="#reference-126">126</a>]</sup><sup>[<a href="#reference-191">191</a>]</sup></p><p>Don't misunderstand, the GrapheneOS project does by no means claim that its operating system is impenetrable<sup>[<a href="#reference-168">168</a>]</sup><sup>[<a href="#reference-199">199</a>]</sup>, but it does focus on substance rather than branding and marketing. This becomes quite clear when comparing Graphene's <a href="https://grapheneos.org/" target="_blank" rel="noreferrer">website<span> (opens in a new tab)</span></a> to those of other projects: GrapheneOS is an unapologetically technical project which I personally greatly appreciate as it saves me from having to dig through marketing to find the technical facts.<sup>[<a href="#reference-245">245</a>]</sup> On the other hand, I can certainly see how this is rather intimidating to the average user.</p><p>We've covered that GrapheneOS currently only supports Pixel devices due to those being the only ones having sufficient hardware security measures in place. All well and good, but wouldn't that be pointless if those devices are backdoored?</p><p>As mentioned, Google's Pixels serve as reference devices for Android development, causing many experts to work with them.<sup>[<a href="#reference-134">134</a>]</sup> Furthermore, Google has been very open to external security research, thanks to which Pixels have received great security research attention.<sup>[<a href="#reference-212">212</a>]</sup> It would be arguably difficult to hide backdoors within the devices under these circumstances.</p><p>Another argument is that it would be far easier to attack the supply chains of tiny companies that outsource their manufacturing rather than compromise the global production of iPhone or Pixel devices without discovery. Users of such mainstream devices benefit from a lot of scrutiny that these devices receive.<sup>[<a href="#reference-179">179</a>]</sup> It's also worth noting that leaks from forensic firms, that specialize in breaking into smartphones and are often hired by governments, do not offer any evidence for the existence of purposefully placed backdoors either.<sup>[<a href="#reference-198">198</a>]</sup><sup>[<a href="#reference-199">199</a>]</sup></p><p>Still, some argue against using anything made by Google out of principle. For the best chances to achieve this, they'd have to make use of Apple's products though, due to Google playing a huge part in the development of many open-source projects, including the Linux kernel itself.<sup>[<a href="#reference-182">182</a>]</sup> The mission of GrapheneOS is not entirely centered around the idea of avoiding one particular company by any means necessary, rather it's to obtain the best possible privacy with the best possible tools available.<sup>[<a href="#reference-159">159</a>]</sup></p><p>For the best security, using a Pixel of the 8th or 9th generation is strongly recommended.<sup>[<a href="#reference-191">191</a>]</sup><sup>[<a href="#reference-280">280</a>]</sup>  They are considered significantly more secure thanks to the hardware features that GrapheneOS can make use of, such as memory tagging.<sup>[<a href="#reference-169">169</a>]</sup> The 9th generation comes with an additionally hardened<sup>[<a href="#reference-56">56</a>]</sup> and more efficient cellular radio, so if you are planning to use it with a SIM card you can expect improved security and battery life.<sup>[<a href="#reference-66">66</a>]</sup> The Pixel 9 Pros come with 16GB of RAM which will be especially useful if you're planning to use GrapheneOS with multiple user profiles (benefits of which will be explained later).<sup>[<a href="#reference-124">124</a>]</sup></p><p>The 9th generation is currently also ahead in terms of the hardened Linux kernel used, but the 8th generation is likely to be upgraded soon making both generations very similar in terms of security.<sup>[<a href="#reference-170">170</a>]</sup> With that in mind, a Pixel 8a phone will be the ideal budget device with some trade-offs in performance. Either way, both generations are receiving 7 years of full support.<sup>[<a href="#reference-62">62</a>]</sup></p><p>Pixel devices of the 6th and 7th generation still have a few years of support left, making them a decent choice if you already own one and want to keep using it for a while longer. This is not a recommendation for buying a new one of these generations though.<sup>[<a href="#reference-169">169</a>]</sup> Also, keep in mind that there are various security features that GrapheneOS can only make use of with the hardware of newer generations.<sup>[<a href="#reference-57">57</a>]</sup></p><p>Anything older than that is considered End-Of-Life and the GrapheneOS project strongly recommends against continuing to use them<sup>[<a href="#reference-173">173</a>]</sup>, regardless of which operating system is used.<sup>[<a href="#reference-62">62</a>]</sup> This is true even though GrapheneOS still provides extended support for some of them, which is merely intended for harm reduction to buy users some time to migrate to a fully supported device.<sup>[<a href="#reference-280">280</a>]</sup> For example, there no longer are firmware patches and driver support for the Pixel 5a<sup>[<a href="#reference-100">100</a>]</sup>, and there's even a known, unpatched remote code execution vulnerability that could be exploited to take control of the device.<sup>[<a href="#reference-83">83</a>]</sup></p><p>There are companies selling Pixel devices with GrapheneOS preinstalled, but there are also some that claim or wrongly suggest that the operating system installed is GrapheneOS or using parts of it.<sup>[<a href="#reference-87">87</a>]</sup> Additionally, there's a chance that such preinstall- or used devices have been tampered with.<sup>[<a href="#reference-86">86</a>]</sup></p><p>GrapheneOS is not affiliated and does not endorse any of these companies and instead recommends buying a supported device and going through the installation process yourself.<sup>[<a href="#reference-291">291</a>]</sup> Buying one at a local electronics store with cash will even allow you to do so anonymously.<sup>[<a href="#reference-125">125</a>]</sup> Just make sure to avoid devices that are locked to a specific carrier.<sup>[<a href="#reference-213">213</a>]</sup></p><p>The easiest method to install GrapheneOS is using a compatible web browser on a compatible second device - that can be a chromium browser on a laptop or even on a second Android phone!<sup>[<a href="#reference-267">267</a>]</sup> You just need a cable to connect both devices. On the secondary device, you simply have to open the <a href="https://grapheneos.org/install/web" target="_blank" rel="noreferrer">web installer<span> (opens in a new tab)</span></a> page and follow the instructions. Don't worry: Your device will not lose its warranty<sup>[<a href="#reference-132">132</a>]</sup>, it'll not get bricked<sup>[<a href="#reference-297">297</a>]</sup>, and if you don't like GrapheneOS you can always go back to stock Android.<sup>[<a href="#reference-298">298</a>]</sup></p><p>Assuming you are now a proud owner of a Pixel device with a fresh GrapheneOS installation, you might be surprised by the warning greeting you when the device is started. It'll disappear and continue booting GrapheneOS after a few seconds unless you press the power button to pause the screen. The string of characters shown following "ID:" is called the <em>verified boot key fingerprint</em> which is a cryptographic hash value that allows you to verify that the GrapheneOS version installed is authentic - and it should never change!<sup>[<a href="#reference-235">235</a>]</sup></p><p>The fingerprints differ depending on the device model and the above list of them was copied from the <a href="https://grapheneos.org/install/web#verified-boot-key-hash" target="_blank" rel="noreferrer">web installer page<span> (opens in a new tab)</span></a>.<sup>[<a href="#reference-222">222</a>]</sup> Although unlikely, it's possible that the server infrastructure of the GrapheneOS project was compromised and that attackers have replaced both the operating system files used during installation and the list of key hashes. You can compare the fingerprint displayed on your device with the table above to ensure that you've installed a legitimate version of GrapheneOS.<sup>[<a href="#reference-267">267</a>]</sup><sup>[<a href="#reference-235">235</a>]</sup></p><p>GrapheneOS comes bundled with the Auditor App. It's another way to validate the authenticity and integrity of the operating system to ensure that no tampering has occurred. You can execute a check manually with a second device that has the Auditor App installed. This does not need to be another GrapheneOS installation as you can <a href="https://play.google.com/store/apps/details?id=app.attestation.auditor.play&amp;hl=en" target="_blank" rel="noreferrer">find the app on Google's Play Store<span> (opens in a new tab)</span></a>.<sup>[<a href="#reference-292">292</a>]</sup></p><p>This verification can be automated using the <a href="https://attestation.app/" target="_blank" rel="noreferrer">attestation.app<span> (opens in a new tab)</span></a> website which is part of the GrapheneOS project. After registering on the website and pairing your device you'll receive an email alert if the device fails to provide valid attestations in time.<sup>[<a href="#reference-292">292</a>]</sup></p><p>Sadly it's currently not possible to host your own remote attestation server as using it would require changes to the Auditor App.<sup>[<a href="#reference-299">299</a>]</sup></p><p>There are three fundamental aspects on how GrapheneOS defends itself against security vulnerabilities: It reduces the amount of "surface" (ie. active functionality/code) that is exposed to potential attackers, makes the exploitation of vulnerabilities as difficult as possible, and sandboxes (ie. isolates) components from each other to decrease the impact of a vulnerability being exploited. As such measures impact usability and device performance, GrapheneOS allows users to choose their own preferences via various toggles in the settings.<sup>[<a href="#reference-244">244</a>]</sup><sup>[<a href="#reference-248">248</a>]</sup></p><p>User data is stored in an encrypted manner with a key that is derived from, among other things, your chosen screen lock-method. That these can't simply be bypassed using brute force is ensured by delays enforced by "secure element" hardware.<sup>[<a href="#reference-281">281</a>]</sup> Thanks to this measure, even a random 6 digit PIN provides a high level of security. If you don't want to depend on the security of the secure element, you can make use of long passwords with up to 128 characters.<sup>[<a href="#reference-258">258</a>]</sup></p><p>Unlocking using a pattern was removed from GrapheneOS as it is essentially a much worse version of a PIN and encourages unsafe pattern choices.<sup>[<a href="#reference-177">177</a>]</sup> Instead, you should use at least a 6 digit PIN and consider turning on the PIN scrambling feature which raises the difficulty of figuring out the combination by an observer, fingerprint marks or side channels.<sup>[<a href="#reference-257">257</a>]</sup></p><p>Fingerprint Unlock can be configured, though for best security you should consider restricting it to authentication within apps (ie. disabling <em>'Use for screen unlocking'</em>). The GrapheneOS team has announced that 2-factor fingerprint unlocking will be launching soon where unlocking the device will require both a fingerprint scan and the PIN/password.<sup>[<a href="#reference-45">45</a>]</sup></p><p>If you have an eSIM or especially a physical SIM, it makes sense to configure a SIM PIN - though it should preferably be a different one than the one used for unlocking.<sup>[<a href="#reference-177">177</a>]</sup></p><p>Lastly, GrapheneOS offers setting a duress password/PIN. Once set, using it anywhere where a unlocking password or PIN can be entered, even in secondary user profiles<sup>[<a href="#reference-24">24</a>]</sup>, will irreversibly wipe the device (and installed eSIMs).<sup>[<a href="#reference-260">260</a>]</sup> When triggered, information required for decryption is deleted and the device will shut down. On the next boot an invalid filesystem is detected and the device can be set up again as if it had been factory reset.<sup>[<a href="#reference-23">23</a>]</sup> Note that this does not wipe the encrypted data itself as that would take a long time and gives attackers an opportunity to interrupt the process.<sup>[<a href="#reference-24">24</a>]</sup></p><p>A freshly booted device that hasn't been unlocked yet has its user data still fully encrypted, or "at rest". Continued use after the first unlock often leads to unencrypted data accumulating in the device's ephemeral memory, which is something that forensic companies exploit. The Auto-Reboot feature was introduced as a protection against the extraction of unencrypted data.<sup>[<a href="#reference-48">48</a>]</sup></p><p>Although it's possible for applications to put sensitive data back to rest when the device locks, it's upon the developers to actually implement them that way - which rarely happens. Even the developers of the privacy-focused Signal messenger have shown little interest in implementing it, instead leaving it to forks like Molly to handle this in a better way. By automatically rebooting the device after some time, it is put back into a state of "before first unlock" (BFU).<sup>[<a href="#reference-49">49</a>]</sup></p><p>The reboot timer starts every time the device is locked and successfully unlocking it resets the timer. By default, the timer is set to 18 hours with the lowest, and most secure, option available at 10 minutes.<sup>[<a href="#reference-55">55</a>]</sup> Note that the timer will only start if the device has been unlocked at least once since the last reboot.<sup>[<a href="#reference-259">259</a>]</sup></p><p>With the default value of 18 hours, the timer will be cancelled during consistent use to avoid impacting user experience. Due to GrapheneOS's very frequent updates requiring regular reboots in any case, this feature serves a secondary useful purpose.<sup>[<a href="#reference-73">73</a>]</sup> If that still causes the device to reboot too often, the timer can be increased up to 78 hours or even completely disabled - though GrapheneOS strongly recommends against this.<sup>[<a href="#reference-44">44</a>]</sup></p><p>Note that if you're planning to use secondary user profiles, this feature may be particularly annoying as all user sessions will be ended and the device resets back to the default Owner user.<sup>[<a href="#reference-224">224</a>]</sup></p><p>When forensic companies attempt breaking into smartphones they typically prefer to do so via the USB interface which has a massive attack surface due to the many functions it offers.<sup>[<a href="#reference-54">54</a>]</sup><sup>[<a href="#reference-128">128</a>]</sup><sup>[<a href="#reference-176">176</a>]</sup> Pixel devices offer hardware-level control over the USB-C port, a feature that isn't currently even used by the stock version of Android but a very important aspect to the GrapheneOS project.<sup>[<a href="#reference-181">181</a>]</sup></p><p>By default, GrapheneOS disables new USB-C connections as soon as the device is locked. In other words, you can plug in and use USB-C data while the device is unlocked, but once it's locked and you've pulled the plug it will reject new connections.<sup>[<a href="#reference-54">54</a>]</sup><sup>[<a href="#reference-78">78</a>]</sup> This measure includes disabling USB-C alternate modes such as DisplayPort.<sup>[<a href="#reference-249">249</a>]</sup></p><p>The most secure, though arguably also the most inconvenient, option available is to fully disable the USB-C port while the operating system is running. This will even prevent any vulnerabilities present in the power delivery logic of the device, but will also require it to be turned off in order to be charged.<sup>[<a href="#reference-55">55</a>]</sup></p><p>With USB out of the picture that leaves wireless attack vectors such as Wi-Fi, Bluetooth, and cellular. However, getting into a device from any of these will be much harder and more complex.<sup>[<a href="#reference-54">54</a>]</sup> Isolation of hardware components has become the de-facto norm for mobile devices.<sup>[<a href="#reference-135">135</a>]</sup> Pixels even have separate chips for each of these radios, and if you wanted you could remove the chips individually and the device would be able to continue to function.<sup>[<a href="#reference-178">178</a>]</sup></p><p>Although not yet enabled by default<sup>[<a href="#reference-69">69</a>]</sup>, you can set a timer to automatically turn off Wi-Fi and Bluetooth. The timer will begin once there's no longer an active connection. The GrapheneOS project is planning to extend this to NFC in the future as well.<sup>[<a href="#reference-55">55</a>]</sup></p><p>The issue of cellular connectivity is a lot more complex. First off, 5G, SMS, MMS, and Calls generally work as fine on GrapheneOS as they would with stock Android.<sup>[<a href="#reference-279">279</a>]</sup> GrapheneOS adds various toggles that once again attempt to reduce the attack surface<sup>[<a href="#reference-195">195</a>]</sup>, though depending on your carrier, and the country you're in, you may have to play around with them to see what works.<sup>[<a href="#reference-40">40</a>]</sup><sup>[<a href="#reference-116">116</a>]</sup><sup>[<a href="#reference-117">117</a>]</sup><sup>[<a href="#reference-223">223</a>]</sup></p><p>The GrapheneOS project recommends using the LTE-only toggle when possible.<sup>[<a href="#reference-275">275</a>]</sup> LTE, which is sometimes referred to as 4G or 5Ge<sup>[<a href="#reference-279">279</a>]</sup>, is much more modern than the legacy 2G and 3G protocols, but also a lot less complex and more stable than the new 5G protocol.<sup>[<a href="#reference-209">209</a>]</sup><sup>[<a href="#reference-129">129</a>]</sup>. Note that, although it may make some forms of interception more difficult, the only intention of the LTE-only mode is disabling an enormous amount of code related to both these legacy and bleeding edge protocols.<sup>[<a href="#reference-275">275</a>]</sup></p><p>LTE and 5G do come with a form of encryption, but this is mostly intended for the protection of the network itself and not for the protection of your privacy.<sup>[<a href="#reference-275">275</a>]</sup> No matter which mode you're using, you should avoid traditional phone calls and text using the cellular network, and instead use end-to-end encrypted messengers such as Signal and SimpleX. In fact, if you can, always prefer using Wi-Fi over cellular.<sup>[<a href="#reference-101">101</a>]</sup><sup>[<a href="#reference-106">106</a>]</sup><sup>[<a href="#reference-160">160</a>]</sup></p><p>The traditional telephone system is historically insecure and not designed with the goal of protecting user's privacy. You can imagine it like a walled garden where, once you've become a trusted party with access into it, you gain a significant amount of information and control over the network. This access can be bought for a few thousand USD per month and allows intercepting phone calls, SMS messages, and in some cases even roughly tracking someone's location. To do that an attacker needs your SIM card's unique IMSI identifier, but often it can be looked up simply by knowing your phone number. Using this the attacker would be able to intercept a 2-factor-authentication SMS while ensuring that your phone would not give any indication that such an SMS was ever sent to your number at all.<sup>[<a href="#reference-129">129</a>]</sup><sup>[<a href="#reference-283">283</a>]</sup><sup>[<a href="#reference-300">300</a>]</sup></p><p>When your phone authenticates with the cellular network it does so while providing information on both your SIM card and the device's cellular radio hardware. If you've bought both the phone and SIM anonymously, you're essentially using a persistent pseudonym. Since hardware information is being shared, replacing the SIM alone is not sufficient for a fresh identity.<sup>[<a href="#reference-96">96</a>]</sup><sup>[<a href="#reference-125">125</a>]</sup><sup>[<a href="#reference-127">127</a>]</sup></p><p>At this point, you might be considering using an external device, like a dedicated mobile hotspot, which would be much cheaper to regularly swap out together with a new SIM card. While this will increase your privacy, it will hurt your security as these devices typically have much worse hardware isolation and are way behind on security updates.<sup>[<a href="#reference-127">127</a>]</sup> Compared to using the isolated internal radio of your Pixel, this will make it much easier for an attacker to gain control over the dedicated device, and if it is connected to your Pixel via USB this opens up a massive surface for attacking your phone.<sup>[<a href="#reference-99">99</a>]</sup><sup>[<a href="#reference-128">128</a>]</sup><sup>[<a href="#reference-135">135</a>]</sup><sup>[<a href="#reference-176">176</a>]</sup></p><p>Some of these dedicated cellular devices allow spoofing the IMEI, ie. changing the hardware identifier to an arbitrary value. This would allow you to reuse the same dedicated device and simply change the IMEI value together with a new SIM card for obtaining a new identity on the network. You should know however that the IMEI is not the only hardware-specific identifier that cellular radios leak and, furthermore, there are ways to create "fingerprints" of these devices that could allow re-identifying them even with identifiers changed. In the worst case, you could even draw a lot of attention to yourself when the spoofing is too obvious.<sup>[<a href="#reference-96">96</a>]</sup><sup>[<a href="#reference-97">97</a>]</sup><sup>[<a href="#reference-98">98</a>]</sup><sup>[<a href="#reference-128">128</a>]</sup></p><p>The GrapheneOS project does not recommend using a secondary device for cellular communication, but if you really want to do it then it would be better to use another Pixel device with GrapheneOS installed for it.<sup>[<a href="#reference-97">97</a>]</sup> Note that if you're sharing cellular Internet via Wi-Fi, it's possible that someone nearby tracks your movements by tracking the signals of your Wi-Fi access point.<sup>[<a href="#reference-128">128</a>]</sup></p><p>Airplane mode is the only way to fully disable the cellular radio transmit, receive, and tracking capabilities of your device, and works appropriately on all Pixels. Once in airplane mode, Wi-Fi can be re-enabled and used without activating the cellular radio again.<sup>[<a href="#reference-106">106</a>]</sup><sup>[<a href="#reference-283">283</a>]</sup> If you intend to use your Pixel as a Wi-Fi-only device, you should consider removing the quick tile (the airplane-mode toggle visible when swiping down the status top-bar) so that you won't re-enable it by accident.<sup>[<a href="#reference-197">197</a>]</sup></p><p>You should be aware that cellular is not the only way carrier services can be used. Remember that there's Wi-Fi calling and texting. To prevent the SIM from authenticating with the carrier and using their network services via other Internet connections, you need to disable the SIM itself.<sup>[<a href="#reference-96">96</a>]</sup><sup>[<a href="#reference-101">101</a>]</sup><sup>[<a href="#reference-197">197</a>]</sup></p><p>Newer devices have special offline tracking systems intended to locate lost devices. GrapheneOS does not support and will not support these systems. If you want to be absolutely certain, you may consider keeping it within a faraday bag while you're not using it.<sup>[<a href="#reference-97">97</a>]</sup><sup>[<a href="#reference-228">228</a>]</sup></p><p>It doesn't particularly matter whether you're using a data-only SIM card in terms of privacy, you're still authenticated to the cellular network. Not having texts and calls however does reduce attack surface for exploits. GrapheneOS may in the future add toggles to disable these capabilities to practically turn normal SIM cards into data-only equivalents.<sup>[<a href="#reference-171">171</a>]</sup></p><p>Using a VPN has no influence on carrier-based calls or texts. These functions will not go through the VPN even if you are using a Wi-Fi connection instead of cellular.<sup>[<a href="#reference-234">234</a>]</sup></p><p>Enabling the data-saver toggle will globally (ie. in all user profiles) stop apps from using cellular data in the background. Apps that use foreground services, meaning those apps that keep themselves running in the foreground via a permanent notification, are excluded from this restriction. Mobile data use can also be restricted per app.<sup>[<a href="#reference-196">196</a>]</sup></p><p>If you have no SIM card, and you are not in airplane mode, your device will still connect to the cellular network but it will not authenticate and should also not share any hardware identifiers. You will still be able to make emergency calls and receive emergency alerts. Note that making an emergency call will share radio identifiers of your device.<sup>[<a href="#reference-197">197</a>]</sup></p><p>Emergency alerts are sent out through the cellular network to all connected phones, even if it has no SIM. Normally, only airplane mode prevents receiving them.<sup>[<a href="#reference-95">95</a>]</sup> Because GrapheneOS is not subject to typical regulations it provides toggles for turning off even alerts of "presidential" priority.<sup>[<a href="#reference-189">189</a>]</sup></p><p>So far we've discussed how to protect our device from outside threats, but it's just as important to ensure that none of the installed applications can take over from the inside. Apps on Android always run isolated within their own sandbox<sup>[<a href="#reference-233">233</a>]</sup>, limiting the resources they can access to those that they have been given permission for.<sup>[<a href="#reference-301">301</a>]</sup> Malicious apps may request and use permissions for purposes unrelated to the app's core functionality, others may even attempt breaking out of their sandbox. Often the application itself is not even intentionally malicious at all but has a vulnerability or its supply chain is being attacked.<sup>[<a href="#reference-248">248</a>]</sup></p><p>Under <em>App Exploit Protection</em> you can find various measures that will increase the difficulty of an application breaking out of its sandbox. Many of them are not enabled for user-installed apps by default because they may cause those apps to crash or not work properly. But it's better to turn them on by default globally and then turn them off selectively for those apps that have trouble.<sup>[<a href="#reference-32">32</a>]</sup><sup>[<a href="#reference-56">56</a>]</sup></p><p>There are other measures that are implicitly always turned on.<sup>[<a href="#reference-256">256</a>]</sup> One of them is the use of ahead-of-time compilation instead of just-in-time compilation. This saves battery life, improves the performance of many apps and, generally, is another important security feature. It has a drawback though: App installations and updates will take a lot longer than on stock Android.<sup>[<a href="#reference-220">220</a>]</sup><sup>[<a href="#reference-221">221</a>]</sup></p><p>In stock Android, permissions only exist for accessing the Camera, Microphone, Body Sensors, and Activity Recognition. Access to accelerometer, gyroscope, compass, barometer, thermometer, and any other sensors are simply given to apps by default without requiring any explicit consent. GrapheneOS adds a toggle to prevent access to these sensors being given by default. Since this too can cause crashes in applications that expect to receive valid data from these sensors, this measure is not active in a fresh GrapheneOS installation. Turning it on will notify you when apps attempted accessing such a sensor and you'll be able to selectively grant this permission according to your own judgment.<sup>[<a href="#reference-252">252</a>]</sup></p><p>Another permission that stock Android implicitly grants to all applications is access to networking functions. This includes device-local networking (localhost) which is currently a known way to bypass user profile isolation and allows apps of different profiles to communicate with each other. In GrapheneOS you'll be asked whether you want to grant this permission during the installation of an app. When the Network permission is not granted to an app, GrapheneOS pretends the network is down, which is usually handled by apps in a graceful manner.<sup>[<a href="#reference-252">252</a>]</sup></p><p>Just like you can disable app exploit protections on a per-app basis, you can take away permissions from apps according to your own judgment. Be careful to not remove any permissions from system apps that are installed by default though, as this can cause unforeseen issues.<sup>[<a href="#reference-230">230</a>]</sup></p><p>There are popular apps that demand rather invasive permissions such as access to all contacts or all files on the device. Graphene's scope functionality allows selecting a subset of contacts or files to which access is granted while the app in question will believe to have been given access to everything.<sup>[<a href="#reference-269">269</a>]</sup></p><p>By default, contact scopes act as if the contacts list is empty and users can then grant different kinds of access to specific contacts or groups of contacts.<sup>[<a href="#reference-255">255</a>]</sup> Access to contacts is quite granular, allowing you to only share specific data with the app instead of the full contact info.<sup>[<a href="#reference-75">75</a>]</sup></p><p>Users can enable storage scopes instead of granting the storage permission to apps.<sup>[<a href="#reference-254">254</a>]</sup> This will have the effect that the app can't see any of the files that were created by other apps, unless the user explicitly specifies files or directories that it should be allowed full access to.<sup>[<a href="#reference-268">268</a>]</sup></p><p>The GrapheneOS project is planning to add similar access scopes for other things such as Location, Camera, and Microphone.<sup>[<a href="#reference-76">76</a>]</sup></p><p>Although these are available in stock Android too, it might be noteworthy that there are toggles for disabling access to the microphone and camera. They are also available as quick tiles when swiping down the status top-bar.</p><p>While it might be tempting to disable access to these globally and only turn them on when needed, this might end up being very inconvenient when you quickly intend to snap a photo (eg. via the power button double-press shortcut) or when you want to accept a call while the phone is still locked. In these cases, you'd first have to unlock the phone and enable the appropriate access, which could take so long that the person calling decides to hang up. Instead, you could leave the system-wide access to microphone and camera enabled and deny these permissions at a per-app level: Leaving them enabled for the phone and camera app while setting all others to 'Ask every time'.<sup>[<a href="#reference-219">219</a>]</sup></p><p>If you're certain that you'll never need any of these sensors anyway, you could even buy one of <a href="https://shop.nitrokey.com/shop/nitrophone-5-pro-712?search=nitrophone#attr=1497,1502,1501" target="_blank" rel="noreferrer">Nitrokey<span> (opens in a new tab)</span></a>'s modified Pixel phones where the hardware components have been physically removed.<sup>[<a href="#reference-161">161</a>]</sup></p><p>GrapheneOS system-update download and installation is automatic and happens seamlessly in the background.<sup>[<a href="#reference-265">265</a>]</sup> A reboot is still needed for them to take effect<sup>[<a href="#reference-73">73</a>]</sup>, but this process comes without risk thanks to the automatic rollback if the first boot of the updated operating system fails.<sup>[<a href="#reference-265">265</a>]</sup></p><p>Automatic reboots after an update are possible but disabled by default as these could happen in the middle of a phone call.<sup>[<a href="#reference-239">239</a>]</sup> If you want to avoid updates being downloaded using cellular data, you should change the <em>'Permitted networks'</em> setting to <em>'Unmetered'</em> only.<sup>[<a href="#reference-231">231</a>]</sup> Some users have reported that updates heavily drain the battery and cause the device to heat up, which can especially get in the way while you're not home. You can turn on the <em>'Require device to be charging'</em> toggle to avoid such cases.<sup>[<a href="#reference-227">227</a>]</sup></p><p>It's possible to completely disable automatic updates by disabling the <em>'System Updater'</em> app.<sup>[<a href="#reference-271">271</a>]</sup> The GrapheneOS project strongly recommends against this, as you won't be getting privacy and security patches fixing vulnerabilities or adding improvements.<sup>[<a href="#reference-203">203</a>]</sup></p><p>Some may be concerned whether a future update could introduce a backdoor. There are several measures in place to prevent malicious updates: They must have a valid cryptographic signature, which is enforced by both the update client as well as the verified boot mechanism. Things like downgrade attacks are also prevented locally.<sup>[<a href="#reference-16">16</a>]</sup></p><p>The GrapheneOS project further argues that existing legislation can only target individual users, and cannot coerce malicious updates to be deployed to all GrapheneOS devices.<sup>[<a href="#reference-9">9</a>]</sup> Because the updater doesn't provide any uniquely identifiable device information while requesting system updates, GrapheneOS won't be able to comply with a government's demand to send a backdoored update to a specific user. The update server will however be able to see the requester's IP address, which can be obfuscated by using a VPN or Tor.<sup>[<a href="#reference-270">270</a>]</sup></p><p>GrapheneOS comes with <a href="https://github.com/seedvault-app/seedvault" target="_blank" rel="noreferrer">Seedvault<span> (opens in a new tab)</span></a> integrated at <em>Settings » System » Backup</em> as a solution for creating backups or moving from one device to another. Bear in mind that if you're using secondary user profiles, you'll need to set it up in each profile separately.<sup>[<a href="#reference-240">240</a>]</sup> Some apps like Signal or Molly use a type of encryption of their application's database that can only be backed up and restored through these apps themselves.<sup>[<a href="#reference-46">46</a>]</sup> If you're planning to use a USB drive to store your backups, a common best practice is initially creating the backup in the device's internal storage, and only moving it over to the drive once it has finished.<sup>[<a href="#reference-240">240</a>]</sup></p><p>There's also a known issue where backing up user files from storage might not include all of your files, therefore you shouldn't rely on Seedvault to include all of your important files yet. You may want to backup your important files separately, eg. to your laptop using a USB connection (<em>Use USB for 'File Transfer'</em>). But here too you'll have to establish the connection for each profile separately. GrapheneOS is hoping to replace Seedvault with a better and more reliable solution in the future, although there are currently tasks that have higher priority.<sup>[<a href="#reference-205">205</a>]</sup></p><p>User profiles mimic having separate phones to allow multiple users to share the same device.<sup>[<a href="#reference-192">192</a>]</sup> In the following, we'll be exploring how this can be used to isolate apps from each other and compartmentalize the user's data. Though before that, I'd like to point out that the isolation that the app sandbox provides and the compartmentalization offered by access scopes will already be sufficient for many users.</p><p>On a freshly installed GrapheneOS, multiple users are disabled by default. Even so, when you unlock your phone after booting, you'll log into the "Owner" user, as in "The user who is the owner of the device". The Owner user shouldn't be mistaken for something like a privileged "root" user from Linux. Although the Owner has more administrative control over the device than other users, regular apps have the same access when running in Owner as they would in any other user profile.<sup>[<a href="#reference-192">192</a>]</sup></p><p>Each user is encrypted with their own keys protected by their respective lock method.<sup>[<a href="#reference-261">261</a>]</sup> The Owner user is special in the sense that it does not only store the Owner's data, but also sensitive system-wide operating system data. Because of this, you always need to unlock the Owner profile first before any other user profile can be used. The Owner profile, and the apps running within it, will always be running in the background while you're using another profile. Nonetheless, the Owner profile does not have any access to the data stored in other profiles.<sup>[<a href="#reference-281">281</a>]</sup></p><p>As visible in the screenshot above, it's noteworthy that you can actually receive notifications from another profile that is running in the background. Although the notification will only tell you in what profile it happened and by what app it was triggered, this is still an addition by GrapheneOS that significantly improves the user experience with secondary user profiles.<sup>[<a href="#reference-7">7</a>]</sup><sup>[<a href="#reference-25">25</a>]</sup></p><p>Before continuing on the different types of user profiles available, we should first discuss what even the advantages of using multiple profiles, compared to only using the Owner profile, are.</p><p>First of all, after setting up a new user you'll be greeted by a phone that appears to be in the state of being started for the first time. None of the user-apps you've already installed are there, everything is empty.<sup>[<a href="#reference-261">261</a>]</sup> This can be very useful if you want to log into different users of the same application, eg. if you want to use a messenger with multiple accounts, but the app does not support that, you can simply install it twice in different profiles.<sup>[<a href="#reference-233">233</a>]</sup></p><p>Separating apps between different profiles will also prevent them from easily being able to communicate with each other. For example, there's the normal Facebook platform app but also the separate Facebook Messenger app. If both apps agree to it, they can use something akin to inter-process communication to exchange information between each other - but only if both of them are running within the same user profile.<sup>[<a href="#reference-25">25</a>]</sup><sup>[<a href="#reference-261">261</a>]</sup></p><p>As mentioned, if you have apps that run in the background of your Owner profile, they will always be running unless you manually stop them from doing so. If you have applications that you rarely make use of, it makes sense to install them in a secondary user profile. Once you're done with them you can hold the device's power button and you'll be offered to end that user's session. This will make sure that all apps of that profile are stopped and their data is put to rest and fully encrypted.<sup>[<a href="#reference-281">281</a>]</sup></p><p>You can also create and use user profiles only temporarily and immediately delete them afterward. As apps installed within one user are not aware of the other users, you can use profiles like a browser's incognito mode. A profile's filesystem is completely isolated from other profiles, and although you could set up a storage scope to achieve the same, there'll be no need to do that since your temporary profile will be empty.<sup>[<a href="#reference-282">282</a>]</sup></p><p>Further above, we've talked about how the Auto-Reboot feature was added to ensure that data is eventually put to rest and no unencrypted data will be available for forensic companies to extract. If you employ a secondary user profile instead of the Owner for your regular usage, this will be much less of a problem: While putting the Owner's data at rest requires a reboot, putting a secondary user's data at rest simply requires ending their session.<sup>[<a href="#reference-281">281</a>]</sup></p><p>GrapheneOS raises the limit on the number of secondary user profiles from the standard 4 to 32, where one of them is always reserved for the guest user.<sup>[<a href="#reference-114">114</a>]</sup><sup>[<a href="#reference-261">261</a>]</sup> However, being able to create so many user profiles does not mean that all of them can run concurrently as that would impact the device's performance rather negatively. GrapheneOS scales the number of maximum concurrent users based on the amount of RAM built into the device.</p><p>If you have user profiles for use cases where it's never necessary for that user to keep running in the background, you can un-toggle <em>'Allow running in background'</em> when editing that user via the Owner profile. That way you don't have to explicitly end the user's session, because simply switching away from that user will put the profile to rest.</p><p>You might be surprised to find out that it's possible for user profiles to update each other's apps, and also for the Owner user to be able to install his app into another profile. Didn't we say that the file systems of each profile are completely isolated? Well, yes - but it's not like each profile is running on a completely independent operating system, and it turns out that the code of applications isn't actually stored within each user but in the underlying system that is shared between all of them.<sup>[<a href="#reference-113">113</a>]</sup></p><p>The fact that the Owner is able to install apps in other profiles as long as they're already installed on the Owner means that we don't actually need to install app stores in every profile to get the apps we need. Instead, we could use the Owner profile as an "App Command Center"<sup>[<a href="#reference-232">232</a>]</sup>: We install app stores solely in the Owner user. When we install new apps we uncheck giving them the Network permission and immediately mark them as disabled.<sup>[<a href="#reference-263">263</a>]</sup> Then we open the user management and install the newly installed apps into the profile where we'll actually use them.</p><p>There are some inconveniences that come from making active use of secondary user profiles. For example, the Auto-Reboot feature will cause all user sessions to end and throws you back to unlocking the Owner profile first. That also means that all apps in those profiles will be forced to stop running and you'll miss out on receiving notifications from them until you log back into that user. Assuming you didn't set a very short time for Auto-Reboots, this shouldn't happen too often though.<sup>[<a href="#reference-224">224</a>]</sup></p><p>As mentioned, the file systems of profiles are completely isolated, which means there's no native way to eg. share a meme that you saw on social media in one profile via a messenger that is running in another profile. Typical workarounds include having <a href="https://cryptomator.org/" target="_blank" rel="noreferrer">cloud-based file synchronization<span> (opens in a new tab)</span></a> or a messenger installed within both profiles - but that will require an Internet connection and potentially wastes your mobile data. You could set up local file synchronization using apps like <a href="https://github.com/syncthing/syncthing-android" target="_blank" rel="noreferrer">Syncthing<span> (opens in a new tab)</span></a> or an FTP server+client app - but these are usually annoying to set up. If you're already on Linux with a KDE desktop you might as well use <a href="https://f-droid.org/en/packages/org.kde.kdeconnect_tp/" target="_blank" rel="noreferrer">KDE Connect<span> (opens in a new tab)</span></a> to exchange files between all of your devices and profiles. If not, the <a href="https://github.com/VentralDigital/InterProfileSharing" target="_blank" rel="noreferrer">Inter Profile Sharing<span> (opens in a new tab)</span></a> app I've built out of frustration on this issue will hopefully be your best friend. If you really want to avoid installing any apps for this, your best option is getting a USB Stick with a USB-to-USB-C adapter.<sup>[<a href="#reference-302">302</a>]</sup></p><p>If you're installing apps in secondary profiles that require SMS verification, you might need to temporarily enable <em>'Turn on phone calls &amp; SMS'</em> for that user.<sup>[<a href="#reference-225">225</a>]</sup></p><p>The private space feature is a recent addition to Android.<sup>[<a href="#reference-67">67</a>]</sup> Technically this is simply a secondary user profile that is nested within the Owner profile: When the space is locked, the private profile user is stopped, and when the space is unlocked, the user profile is started. Except for the shared clipboard with Owner, it's separated the same way as a secondary user profile.<sup>[<a href="#reference-109">109</a>]</sup><sup>[<a href="#reference-293">293</a>]</sup></p><p>The advantage of using a private space over a secondary user profile is that the UI, in places such as notifications and settings, will be "merged" while the space is unlocked. That means if there's a notification from within the private space, it will be fully displayed in the Owner profile (compared to normal secondary users where this will only show the user and app name). While this makes it slightly less isolated than a dedicated user, private spaces can be a lot more convenient.<sup>[<a href="#reference-7">7</a>]</sup><sup>[<a href="#reference-111">111</a>]</sup><sup>[<a href="#reference-112">112</a>]</sup></p><p>Compared to having up to 31 secondary user profiles, a device can only have a single private space and it must always be part of the Owner.<sup>[<a href="#reference-114">114</a>]</sup><sup>[<a href="#reference-124">124</a>]</sup><sup>[<a href="#reference-293">293</a>]</sup> The GrapheneOS project is considering changing this though, among other improvements for private spaces.<sup>[<a href="#reference-67">67</a>]</sup><sup>[<a href="#reference-120">120</a>]</sup> It's also noteworthy that the private space user is not listed within the user management interface, meaning features such as installing Owner apps into the private space are not available. Furthermore, locking the private space does not purge the encryption keys as well as ending a secondary user's session would.<sup>[<a href="#reference-6">6</a>]</sup></p><p>A drawback of private spaces, compared to full secondary user profiles, is that it's not possible to grant it access to <em>'phone calls &amp; SMS'</em>. This prevents verification via SMS from working and prohibits using some apps within private spaces.<sup>[<a href="#reference-13">13</a>]</sup><sup>[<a href="#reference-110">110</a>]</sup></p><p>Work profiles are similar to private spaces in terms of user experience. They were originally designed for BYOD (Bring Your Own Device) deployments for corporations, which is why you need a separate "device manager app" to create them.<sup>[<a href="#reference-233">233</a>]</sup> This app, and through it the corporation it belongs to, has control and ownership over the data within the work profile. However there are local management apps, such as <a href="https://f-droid.org/en/packages/net.typeblog.shelter/" target="_blank" rel="noreferrer">Shelter<span> (opens in a new tab)</span></a><sup>[<a href="#reference-124">124</a>]</sup>, that allow the creation and management of a work profile without an external owner.<sup>[<a href="#reference-120">120</a>]</sup> Either way, you'll always have to place trust in a third-party app to use work profiles, unless you program your own.<sup>[<a href="#reference-233">233</a>]</sup></p><p>GrapheneOS calls work profiles created by apps like Shelter a "poor man's private space"<sup>[<a href="#reference-120">120</a>]</sup>, and strongly recommends using real private spaces instead.<sup>[<a href="#reference-109">109</a>]</sup> Like private spaces, you can only have one and it must be located in the Owner profile. It's absolutely possible to use both a work profile and a private space alongside each other though.<sup>[<a href="#reference-102">102</a>]</sup><sup>[<a href="#reference-114">114</a>]</sup></p><p>Private spaces have better isolation, proper encryption, and better user interface integration with the Owner profile.<sup>[<a href="#reference-109">109</a>]</sup><sup>[<a href="#reference-120">120</a>]</sup> Work profile management apps can enable a lot of communication between the Owner user and the nested work profile.<sup>[<a href="#reference-113">113</a>]</sup> For example, work profiles do not block the communication of applications between profiles, which may increase convenience but negatively impacts privacy and security.<sup>[<a href="#reference-233">233</a>]</sup></p><p>For using VPNs the general best practice is that each of your devices should have a separate VPN connection that will obtain a separate exit IP address. <sup>[<a href="#reference-247">247</a>]</sup> Because of this, all profiles (including work profiles and private spaces) have their own VPN configuration by design. This prevents an external party from tying them together based on the same exit IP address.<sup>[<a href="#reference-237">237</a>]</sup></p><p>You can prevent a profile from ever directly accessing an Internet connection by enabling the <em>'Always-on VPN'</em> and <em>'Block connections without VPN'</em> toggles by default.<sup>[<a href="#reference-266">266</a>]</sup> GrapheneOS has made many improvements to Android to prevent connections from leaking, ie. bypassing a VPN connection. Although there are still some known cases of VPN leaks, fixing these is one of the top priorities of the GrapheneOS project.<sup>[<a href="#reference-264">264</a>]</sup> These toggles can even be exploited to create a secondary user profile that has no Internet access at all, if you have a use case for that.<sup>[<a href="#reference-242">242</a>]</sup></p><p>At the moment, the GrapheneOS project only recommends using the official WireGuard app and the official Mullvad app. Mullvad is generally preferable though, as it works well with Graphene's exploit protection features turned on.<sup>[<a href="#reference-246">246</a>]</sup><sup>[<a href="#reference-286">286</a>]</sup> To avoid fingerprinting and tracking, GrapheneOS recommends using the default, network-provided DNS servers to blend in with other users.<sup>[<a href="#reference-285">285</a>]</sup></p><p>Remember that while each profile has its own VPN configuration, the underlying networking is shared. Because of that, it's currently possible for apps with the Network permission to communicate across profiles via localhost, which is what I'm using for the Inter Profile Sharing app to function. But this will likely change in the future as the GrapheneOS project is planning to introduce separate network namespaces for each profile.<sup>[<a href="#reference-193">193</a>]</sup></p><p>A fresh install of GrapheneOS comes with a very minimal amount of apps, and there are several reasons for that: Bundling additional apps with the operating system will increase the attack surface right from the beginning, GrapheneOS prefers users to be able to choose which apps they want to install based on their own judgment. GrapheneOS is focused on meaningful improvements to privacy and security, bundling more apps into the operating system would likely not only be outside that focus but even counter to it. GrapheneOS also wants to avoid bundling apps and services of third parties as few of those would actually be aligned with its goals and values.<sup>[<a href="#reference-157">157</a>]</sup><sup>[<a href="#reference-174">174</a>]</sup><sup>[<a href="#reference-290">290</a>]</sup></p><p>You may notice that among these few apps, GrapheneOS actually comes with its own 'App Store'. Note that this app repository is mostly intended for the distribution of Graphene's own first-party applications, and hardened versions of externally developed open-source apps. The list of available applications will be purposefully kept minimal, while third-party apps should seek to be included in Accrescent - the officially endorsed app store of GrapheneOS, which can be installed via Graphene's minimal store.<sup>[<a href="#reference-84">84</a>]</sup><sup>[<a href="#reference-143">143</a>]</sup><sup>[<a href="#reference-262">262</a>]</sup></p><p>Of the few apps that GrapheneOS comes with, about half of them are inherited from the Android Open Source Project with minor changes and are very primitive in terms of functionality and user experience. Many of the AOSP apps were great choices 10+ years ago when Android's UI was more primitive and expectations were far lower. Over time Google replaced them with more modern versions for their stock OS but abandoned the open-source versions.<sup>[<a href="#reference-185">185</a>]</sup> GrapheneOS is planning to overhaul or replace them as well, though there are often licensing issues with possible alternatives.<sup>[<a href="#reference-174">174</a>]</sup></p><p>If you prefer Google's versions of apps such as the Camera, Gallery, and Keyboard, you can absolutely switch back to them without opting into their invasive usage statistic reporting and without uploading your photos to their service.<sup>[<a href="#reference-94">94</a>]</sup> Some of Google's stock Android apps, such as the screenshot editor (Markup) and the Thermometer (for Pixels with the appropriate sensor), are mirrored in Graphene's App Store as they're not available in the Play Store.<sup>[<a href="#reference-85">85</a>]</sup></p><p>The Camera app that GrapheneOS comes with has already been modernized<sup>[<a href="#reference-174">174</a>]</sup>, it's focused on privacy and security and is arguably better than any of the open-source alternatives and even most paid apps. It includes modes for capturing images, videos, and QR/barcode scanning.<sup>[<a href="#reference-273">273</a>]</sup> It has basic HDR+, Night mode, multi-camera zoom, EIS, etc. There's no loss in terms of photo quality of the camera by running GrapheneOS …</p></div>
+<br/><p><em>Article truncated for RSS feed. Read the full article at <a href="https://ventral.digital/posts/2024/12/9/practical-grapheneos-for-the-paranoid/">https://ventral.digital/posts/2024/12/9/practical-grapheneos-for-the-paranoid/</a></em></p>]]>
+            </description>
+            <link>https://ventral.digital/posts/2024/12/9/practical-grapheneos-for-the-paranoid/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42364630</guid>
+            <pubDate>Mon, 09 Dec 2024 10:04:34 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Noise Filtering Using €1 Filter (2020)]]>
             </title>
             <description>
 <![CDATA[
-Score 43 | Comments 16 (<a href="https://news.ycombinator.com/item?id=42363782">thread link</a>) | @dsego
+Score 69 | Comments 29 (<a href="https://news.ycombinator.com/item?id=42363782">thread link</a>) | @dsego
 <br/>
 December 8, 2024 | https://jaantollander.com/post/noise-filtering-using-one-euro-filter/ | <a href="https://web.archive.org/web/*/https://jaantollander.com/post/noise-filtering-using-one-euro-filter/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><details open=""><summary>Table of Contents</summary><nav id="TableOfContents"><ul><li><a href="#introduction">Introduction</a></li><li><a href="#1-filter">1€ Filter</a></li><li><a href="#algorithm">Algorithm</a></li><li><a href="#tuning-the-filter">Tuning the Filter</a></li><li><a href="#python-implementation">Python Implementation</a></li><li><a href="#conclusions">Conclusions</a></li><li><a href="#contribute">Contribute</a></li><li><a href="#references">References</a></li></ul></nav></details><h2 id="introduction">Introduction</h2><p>This article explores the <a href="http://cristal.univ-lille.fr/~casiez/1euro/" target="_blank" rel="noopener">1€ Filter</a>, a simple, but powerful algorithm for filtering noisy real-time signals. The article focuses on the practical implementation of the algorithm, and it covers the mathematical basis, a pseudocode implementation, and simple, pure Python implementation of the algorithm. To understand why and how the filter works, we recommend reading the original article <sup id="fnref:1"><a href="#fn:1" role="doc-noteref">1</a></sup>.</p><h2 id="1-filter">1€ Filter</h2><p>The 1€ Filter is a low pass filter for filtering noisy signals in real-time. It is also a simple filter with only two configurable parameters. The signal at time $T_i$ is denoted as value $X_i$ and the filtered signal as value $\hat{X}_i$. The filter uses <strong>exponential smoothing</strong></p><p>$$\hat{X}_1 = X_1$$
@@ -319,7 +786,7 @@ Creating content takes time and effort, so consider supporting me with <a href="
             </title>
             <description>
 <![CDATA[
-Score 54 | Comments 16 (<a href="https://news.ycombinator.com/item?id=42363374">thread link</a>) | @zdw
+Score 72 | Comments 26 (<a href="https://news.ycombinator.com/item?id=42363374">thread link</a>) | @zdw
 <br/>
 December 8, 2024 | https://www.circuitvalley.com/2024/12/how-to-reverse-engineering-12-eur-intel-fpga-board.html | <a href="https://web.archive.org/web/*/https://www.circuitvalley.com/2024/12/how-to-reverse-engineering-12-eur-intel-fpga-board.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="post-body-5073521517868804734">
@@ -340,7 +807,7 @@ December 8, 2024 | https://www.circuitvalley.com/2024/12/how-to-reverse-engineer
             </title>
             <description>
 <![CDATA[
-Score 53 | Comments 53 (<a href="https://news.ycombinator.com/item?id=42360898">thread link</a>) | @philip-b
+Score 55 | Comments 54 (<a href="https://news.ycombinator.com/item?id=42360898">thread link</a>) | @philip-b
 <br/>
 December 8, 2024 | https://crabman.me/does-soundcore-motion-sound-different-via-aux-in-and-bluetooth-and-how-to-measure-frequency-response-at-home/ | <a href="https://web.archive.org/web/*/https://crabman.me/does-soundcore-motion-sound-different-via-aux-in-and-bluetooth-and-how-to-measure-frequency-response-at-home/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -390,7 +857,7 @@ And this is what I got when playing from my phone via bluetooth:<br>
             </title>
             <description>
 <![CDATA[
-Score 119 | Comments 51 (<a href="https://news.ycombinator.com/item?id=42360685">thread link</a>) | @millimacro
+Score 134 | Comments 59 (<a href="https://news.ycombinator.com/item?id=42360685">thread link</a>) | @millimacro
 <br/>
 December 8, 2024 | https://lellep.xyz/blog/failed-data-science-project.html | <a href="https://web.archive.org/web/*/https://lellep.xyz/blog/failed-data-science-project.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -533,7 +1000,7 @@ drop me a message - I am happy to share the whole project with no strings attach
             </title>
             <description>
 <![CDATA[
-Score 49 | Comments 7 (<a href="https://news.ycombinator.com/item?id=42359905">thread link</a>) | @todsacerdoti
+Score 49 | Comments 9 (<a href="https://news.ycombinator.com/item?id=42359905">thread link</a>) | @todsacerdoti
 <br/>
 December 8, 2024 | https://rtfm.co.ua/en/victorialogs-a-grafana-dashboard-for-aws-vpc-flow-logs-migrating-from-grafana-loki/ | <a href="https://web.archive.org/web/*/https://rtfm.co.ua/en/victorialogs-a-grafana-dashboard-for-aws-vpc-flow-logs-migrating-from-grafana-loki/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
@@ -548,7 +1015,7 @@ December 8, 2024 | https://rtfm.co.ua/en/victorialogs-a-grafana-dashboard-for-aw
             </title>
             <description>
 <![CDATA[
-Score 11 | Comments 0 (<a href="https://news.ycombinator.com/item?id=42358435">thread link</a>) | @hackandthink
+Score 12 | Comments 0 (<a href="https://news.ycombinator.com/item?id=42358435">thread link</a>) | @hackandthink
 <br/>
 December 8, 2024 | https://www.businesstimes.com.sg/startups-tech/startups/defence-startups-palantir-anduril-save-data-battlefield-train-ai-models | <a href="https://web.archive.org/web/*/https://www.businesstimes.com.sg/startups-tech/startups/defence-startups-palantir-anduril-save-data-battlefield-train-ai-models">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p data-story-element="paragraph" data-testid="paragraph-component">SOFTWARE company Palantir Technologies and weapons maker Anduril Industries plan to accelerate the use of artificial intelligence (AI) in the US military and are inviting other companies to join the effort.</p><p data-story-element="paragraph" data-testid="paragraph-component">Under an agreement announced on Friday (Dec 6), battlefield information created by sensors, vehicles, robots and weapons will be collected by Anduril’s Lattice software and then pulled into a secure Palantir platform that will prepare the data for use in AI training and development. The data gathered would include information classified at the highest levels of secrecy.
@@ -571,7 +1038,7 @@ December 8, 2024 | https://www.businesstimes.com.sg/startups-tech/startups/defen
             </title>
             <description>
 <![CDATA[
-Score 172 | Comments 66 (<a href="https://news.ycombinator.com/item?id=42357669">thread link</a>) | @JustinSkycak
+Score 179 | Comments 67 (<a href="https://news.ycombinator.com/item?id=42357669">thread link</a>) | @JustinSkycak
 <br/>
 December 8, 2024 | https://www.justinmath.com/the-necessity-of-grinding-through-concrete-examples-before-jumping-up-a-level-of-abstraction/ | <a href="https://web.archive.org/web/*/https://www.justinmath.com/the-necessity-of-grinding-through-concrete-examples-before-jumping-up-a-level-of-abstraction/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><header><!----><p>by <a target="_blank" href="https://x.com/justinskycak">Justin Skycak (@justinskycak)</a> on <time datetime="2024-10-29T00:00:00-07:00">October 29, 2024</time></p><!--<p class="page__date"><strong><i class="fa fa-fw fa-calendar" aria-hidden="true"></i> Published:</strong> <time datetime="2024-10-29T00:00:00-07:00">October 29, 2024</time></p>--></header><section itemprop="text"><p><span size="3em"> <i>If you go directly to the most abstract ideas then you're basically like a kid who reads a book of famous quotes about life and thinks they understand everything about life by way of those quotes.</i> </span></p><p><span size="2em"> <i>Want to get notified about new posts? Join the <a target="_blank" href="https://justinmath.com/mailing-list">mailing list</a> and follow on <a target="_blank" href="https://x.com/justinskycak">X/Twitter</a>.</i> </span></p><p>What a lot of math learners fail to understand is that grinding through concrete examples imbues you with intuition that you will not get if you jump directly to studying the most abstract ideas.</p><p>If you go directly to the most abstract ideas then you’re basically like a kid who reads a book of famous quotes about life and thinks they understand everything about life by way of those quotes.</p><p>The way you come to understand life is not by just reading quotes. You have to actually accumulate lots of life experiences.</p><p>And you might think you understand the quotes when you’re young, but after you accumulate more life experience, you realize that you really had only the most naive, surface-level understanding of the quotes back then, and you really had no idea what the hell you were talking about.</p><p>It’s the same way in math. In general, the purpose and power of an abstract idea is that it compresses a zoo of concrete examples. But if you haven’t built up that zoo of concrete examples then you miss out on that power.</p><p>If you shy away from grinding some messy math then you will never truly know what the hell you’re talking about.</p><p><span size="3em"></span> <br><i>Want to get notified about new posts? Join the <a target="_blank" href="https://justinmath.com/mailing-list">mailing list</a> and follow on <a target="_blank" href="https://x.com/justinskycak">X/Twitter</a>.</i> </p><center></center> <!-- keep original code below (not sure if it is used) --></section></div></div>]]>
@@ -586,7 +1053,7 @@ December 8, 2024 | https://www.justinmath.com/the-necessity-of-grinding-through-
             </title>
             <description>
 <![CDATA[
-Score 159 | Comments 201 (<a href="https://news.ycombinator.com/item?id=42357041">thread link</a>) | @shreyans
+Score 167 | Comments 207 (<a href="https://news.ycombinator.com/item?id=42357041">thread link</a>) | @shreyans
 <br/>
 December 8, 2024 | https://shreyans.org/fatherhood | <a href="https://web.archive.org/web/*/https://shreyans.org/fatherhood">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p><img src="https://photostatic.shreyans.org/diary/20240925-smoosh-v2.jpg">
@@ -696,10 +1163,180 @@ It has a very cool "stand" which props up the unit at the back but also helps mo
             </title>
             <description>
 <![CDATA[
-Score 232 | Comments 42 (<a href="https://news.ycombinator.com/item?id=42353907">thread link</a>) | @ndiddy
+Score 232 | Comments 43 (<a href="https://news.ycombinator.com/item?id=42353907">thread link</a>) | @ndiddy
 <br/>
 December 7, 2024 | https://www.infochunk.com/schannel/index.html | <a href="https://web.archive.org/web/*/https://www.infochunk.com/schannel/index.html">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
+
+<hr>
+<h3>Introduction</h3>
+<p>Sega Channel was a games-on-demand service that gave cable subscribers access to a library of around 50 Sega Genesis games per month in exchange for a monthly fee (typically $10-$15/month depending on the cable provider). It operated between June 1994 (with a nationwide rollout in December 1994) and June 1998. Cable subscribers would be given an adapter cartridge that would connect their Genesis to a cable TV line. On boot, the cartridge would search for the Sega Channel signal, then download the game menu. This process typically took around 20 seconds. The user would then pick a game and wait about a minute for it to be downloaded to the adapter's RAM. At this point, the game would function exactly the same as a retail cartridge. Turning the system off or pressing the menu button on the adapter would erase the downloaded game, but game save data was retained unless the user downloaded a different game. Besides retail games, Sega Channel offered a "Test Drives" section where users could play time or content restricted versions of games before they got a retail release. There were also a number of games that were only available via Sega Channel, although it seems that most of them were titles where either Sega or the publisher weren't confident enough in their quality to give them a physical cartridge release. Sega Channel was a modest success, peaking at around 250,000 subscribers.</p>
+<img src="https://www.infochunk.com/schannel/adapter.jpg" alt="photograph of a Sega Channel adapter">
+
+<p>Sega Channel data was delivered to cable customers through a somewhat long-winded process. First, Sega Channel employees would select the game line-up and other content (game hints, manuals, news, digitized fan-art, etc.) for a given month. They would then send everything to a company called Foley Hi-Tech, who would create the game menu graphics/animations and insert all the monthly content. They ended up with a ~60MB file called a "game image", which was burnt to a CD and sent to a satellite uplink facility in Denver, Colorado. The CD would then be installed in the uplink game server computer, which would continuously transmit the game data in a loop over satellite. Cable headends all over the US would receive the satellite transmission and send it to cable subscribers. The data being sent in a continuous loop is how the service's "interactivity" was achieved at a time when cable TV providers could only transmit data to all subscribers and couldn't receive data (i.e. what game a given subscriber wants to download). When a user chose a game from the menu, their adapter was instructed to look through the Sega Channel data stream and pick out the data for the game they selected. The ~60MB game image file was transmitted at a rate of about 12Mbps using two 6Mbps carriers. Assuming that there were no signal problems, the user always got to play whatever game they picked in less than a minute (one loop of the data). The menu downloaded faster than this because additional redundant copies of it were added to the data stream to speed up downloads.</p>
+<img src="https://www.infochunk.com/schannel/servicediagram.jpg" alt="Diagram showing how Sega Channel service worked">
+
+<h3>Game Image</h3>
+<p>In November 2024, the user RisingFromRuins on the Sonic Retro forum <a href="https://forums.sonicretro.org/index.php?posts/1084673/">announced</a> that he had found a Sega Channel game image CD for September 1996 while he was going through a lot of PC equipment he had bought years earlier. He posted pictures of the CD and <a href="https://retrocdn.net/File:DOM0816_zipped_image_file.zip">uploaded a copy</a> of the game image file on the disc. I thought it would be a fun project to see if I could extract the data from the game image file to see if there were any exclusive or prototype games on there. It's always neat to see games that nobody's been able to play for over 25 years.</p>
+<p><img src="https://www.infochunk.com/schannel/gameimagecase.jpg" width="400" alt="photograph of a Sega Channel game image CD case">
+<img src="https://www.infochunk.com/schannel/gameimagedisc.jpg" width="400" alt="photograph of a Sega Channel game image CD">
+</p>
+
+<h3>Process</h3>
+<p>My first idea was to check out the image file's contents in a hex editor. Genesis games all have a standardized ASCII header, and I figured the game hints/downloadable manuals would be readable as well. Unfortunately, when I scrolled through the image file, there wasn't anything readable. My best guess was that the image file was either scrambled or encrypted.</p>
+<img src="https://www.infochunk.com/schannel/hxd.png" width="500" alt="screenshot of a portion of the image file being displayed in a hex editor">
+
+<p>At this point, I hit a lucky break. In 2017, someone with the username tdijital had <a href="https://hiddenpalace.org/Sega_Channel_(January_1996_dev_disc)">uploaded</a> a backup CD from Foley Hi-Tech (company I mentioned earlier that made the Sega Channel menus) containing Sega Channel development materials. People had <a href="https://forums.sonicretro.org/index.php?posts/897224/">previously gone over</a> some of the CD's contents and found some interesting stuff, including contest versions of Primal Rage, a couple quiz games from the Japanese version of Sega Channel, and standalone menu demo ROMs for December 1994 - January 1996 that could be run in an emulator and acted as time capsules for what was on the service that month. However, as far as I was aware, nobody had looked at any of the development tooling on the disc. My point of view was that if I wanted to extract the data from the game image file, it would be easier to reverse engineer the tooling that created the game image than to reverse engineer the Genesis-side downloading code and hope that the image file remained mostly intact during the data transmission process.</p>
+
+<p>After a bit of trial and error, I figured out how the image files were created. First, developers would add all the games, descriptions, news text, art, music, etc. using a program called MENUMAKR. They'd end up with a menu binary file and a script file (misleadingly named MENUSPIN.BAT despite not being a batch file) containing the ROM file paths, data offsets, how many copies of the ROM to include, and other metadata for each game.</p>
+<img src="https://www.infochunk.com/schannel/menumakr.png" alt="screenshot of MENUMAKR program">
+
+<p>Next, they'd run a program written by Scientific Atlanta (a cable equipment company that Sega partnered with to create the Sega Channel broadcast equipment and cartridge adapter) called PKSPREAD. This would validate the contents of the MENUSPIN.BAT file and output a binary file called PMAP.DAT, which contained instructions on how to split up and process the menu and game data for transmission.</p>
+<img src="https://www.infochunk.com/schannel/pkspread.png" alt="screenshot of PKSPREAD program">
+
+<p>Finally, they'd run another program written by Scientific Atlanta called NSF, which would use the PMAP.DAT file to encode all the input files and create the game image file. I decided that if I wanted to decode the image file, this was the program I should focus on.</p>
+<img src="https://www.infochunk.com/schannel/nsf.png" alt="screenshot of NSF program">
+
+<p>At this point, I hit another lucky break. I found that NSF.EXE had been compiled in debug mode, with optimizations turned off and with symbols embedded into the EXE. This meant that it would be easy to reverse engineer. Unfortunately, IDA Pro didn't automatically pick up the debug symbols from the executable, so I had to open NSF in Turbo Debugger (it was compiled with Borland C++ 4.1) and manually copy them over. Fortunately, the program was pretty small so this didn't take too long.</p>
+<p><img src="https://www.infochunk.com/schannel/td.png" width="500" alt="screenshot of portion of NSF code in Turbo Debugger">
+<img src="https://www.infochunk.com/schannel/ida.png" width="500" alt="screenshot of portion of NSF code in IDA">
+</p>
+
+<p>I could have gone straight to writing a decoder program here, but I thought it would be a better idea to first write an equivalent program to NSF.EXE. That way, if I was able to make a byte-for-byte identical image file to one created by the DOS NSF.EXE utility, I knew I had the algorithm figured out correctly. I created a test game image file (what the above screenshots of PKSPREAD and NSF show) and set about trying to match it. It took me a day of work and another couple evenings of debugging, but I wrote an <a href="https://github.com/nfroggy/sctools/blob/master/nsf.c">equivalent C program</a> to NSF.EXE and got the output to match. My basic process was I had IDA open on one monitor and Visual Studio open on the other, and I tried to match the assembly as closely as possible. This led to a couple interesting insights. Whoever wrote NSF was likely a novice C programmer. They also spent considerable effort on making everything 1-indexed rather than 0-indexed (maybe they were a Pascal fan?). Note that I made no effort to try to get the compiled binary to match the original. In fact, it likely won't even compile as a C file under Borland C++ 4, as I used C99 declarations and stdint.h types everywhere.</p>
+
+<details><summary><b>Simplified overview of what NSF does (click to expand)</b></summary>
+<ol>
+<li>The GetData function pulls information such as what file to open for a given packet, where to seek into the file for the packet, and Sega Channel specific metadata (file ID, how long the game should be playable for if it's a time-limited demo, etc.) from the PMAP.DAT file. It then loads a 246-byte chunk of data from the data file.</li>
+<li>The LoadFrame function adds a header to the start of the data packet and reverses all the data bytes (not sure if this is some data transmission thing, or if it was just to obfuscate the packet contents). It also intersperses <a href="https://en.wikipedia.org/wiki/BCH_code">BCH error-correcting codes</a> and parity bits throughout the game data. After this, 288 bytes are now used to hold the 246 bytes of data. Here's what the header structure looks like: (all multi-bit fields are in reverse bit order):
+<table>
+<thead><tr><th>Bit # (0-indexed)</th> <th>Bit Length</th> <th>Item</th> <th>Description</th></tr></thead>
+<tbody>
+<tr><td>0</td> <td>27</td> <td>Unknown</td> <td>Not added by NSF, maybe added at transmission by the server?</td></tr>
+<tr><td>27</td> <td>2</td> <td>Padding</td> <td>Always 0.</td></tr>
+<tr><td>29</td> <td>1</td> <td>GameTimeSync</td> <td>1 when the GameTimeBit field contains bit 15 of the game time-out value.</td></tr>
+<tr><td>30</td> <td>1</td> <td>GameTimeBit</td> <td>Contains one bit of the game time-out value (how long to allow the game to be played in 10-second intervals), clocked out for a given file in reverse bit order (highest bit first).</td></tr>
+<tr><td>31</td> <td>7</td> <td>ServiceID</td> <td>This is usually 1. May have something to do with Express Games (new titles that had to be individually ordered from a cable operator for an additional fee).</td></tr>
+<tr><td>38</td> <td>14</td> <td>FileID</td> <td>Uniquely identifies each file in the game image. The menu is always file 0.</td></tr>
+<tr><td>52</td> <td>15</td> <td>Address</td> <td>Where in RAM the adapter should download the file to.</td></tr>
+<tr><td>67</td> <td>16</td> <td>HeaderCRC</td> <td>16-bit CRC of bits 27-66 of the header.</td>
+</tr><tr><td>83</td> <td>56</td> <td>Header Copy</td> <td>Copy of bits 27-82 of the header.</td></tr>
+</tbody>
+</table>
+</li>
+<li>The InterLeave function splits the packet into 450-bit chunks and scrambles the bits around for each chunk. I think this has to have been done to obfuscate the data stream, as I can't think of a practical reason for this.</li>
+<li>The above steps are repeated for another 9 packets.</li>
+<li>All 10 packets are bundled up into a 2880 byte frame, and the data is woven together such that the first two bytes are from packet 0, the next two are from packet 1, and so on. The frame is then written to disk.</li>
+<li>This process repeats until the entire image file has been created.</li>
+</ol>
+</details>
+
+<p>Once I figured out how NSF works, it was fairly easy to write <a href="https://github.com/nfroggy/sctools/blob/master/densf.cpp">a decoder program</a> that would undo all these steps in reverse and spit out a bunch of individual data files. However, the data my decoder program output still wasn't valid Genesis ROM data:</p>
+<img src="https://www.infochunk.com/schannel/hexcompare.png" width="800" alt="screenshot of a game from an image file compared to a regular ROM">
+
+<p>Thankfully, this was just because the game data was compressed before transmission. The tool used to compress ROMS was in the Foley Hi-Tech CD (GAMEEDIT.EXE) but I didn't have to reverse engineer it because a GitHub user named Octocontrabass had <a href="https://github.com/Octocontrabass/channelzss">already done so</a>. I used his/her "unsa" tool to decompress all the .SA files into standard ROM files.</p>
+
+<h3>Findings</h3>
+<p>The most notable games from the image file are the two exclusive games that were broadcast in September 1996, Chessmaster and Klondike. Chessmaster is a chess game that was available on many platforms in the 90s (but not Genesis) and Klondike is a solitaire game commissioned by Sega for Sega Channel and programmed by David Crane of Pitfall fame.</p>
+<p><img src="https://www.infochunk.com/schannel/chessmaster.png" width="320" alt="Chessmaster title screen">
+<img src="https://www.infochunk.com/schannel/klondike.png" width="320" alt="Klondike title screen">
+</p>
+
+<p>Here's a categorized full list of all the games from the image file (list by <a href="http://www.retrolel.com/en/">ICEknight</a>):</p>
+<details><summary><b>Sega Channel September 1996 game list (click to expand)</b></summary>
+<h4>Exclusives</h4>
+<ul>
+<li>Chessmaster, The</li>
+<li>Klondike</li>
+<li>Olympic Summer Games - Test Drive</li>
+<li>Sega Channel Game Guide</li>
+</ul>
+
+<h4>New Builds</h4>
+<ul>
+<li>Bugs Bunny in Double Trouble</li>
+<li>OutRunners</li>
+<li>Super Volleyball</li>
+<li>World Series Baseball '96</li>
+</ul>
+
+<h4>Known Dumps with Different Padding</h4>
+<ul>
+<li>Flashback - The Quest for Identity (USA) (En,Fr)</li>
+<li>Phantasy Star II (USA, Europe) (Rev A)</li>
+<li>Punisher, The (USA)</li>
+</ul>
+
+<h4>Known Dumps with Watermarks Added</h4>
+<ul>
+<li>Alex Kidd in the Enchanted Castle (USA)</li>
+<li>Berenstain Bears' Camping Adventure, The (USA)</li>
+<li>Ecco - The Tides of Time (USA)</li>
+<li>Richard Scarry's Busytown (USA)</li>
+<li>Sonic &amp; Knuckles (World)</li>
+<li>Strider (USA, Europe)</li>
+<li>World Series Baseball (USA)</li>
+</ul>
+
+<h4>Match Known Dumps</h4>
+<ul>
+<li>Aaahh!!! Real Monsters (USA)</li>
+<li>Arcus Odyssey (USA)</li>
+<li>B.O.B. (USA, Europe)</li>
+<li>Ballz 3D - The Battle of the Ballz (USA, Europe)</li>
+<li>Castlevania - Bloodlines (USA)</li>
+<li>College Football's National Championship II (USA)</li>
+<li>Dr. Robotnik's Mean Bean Machine (USA)</li>
+<li>Fatal Labyrinth (USA, Europe) (En,Ja)</li>
+<li>G-LOC - Air Battle (World)</li>
+<li>Generations Lost (USA, Europe)</li>
+<li>Granada (Japan, USA) (En) (Rev A)</li>
+<li>Hard Drivin' (World)</li>
+<li>Junction (Japan, USA) (En)</li>
+<li>Jungle Strike (USA, Europe)</li>
+<li>M-1 Abrams Battle Tank (USA, Europe)</li>
+<li>Marsupilami (USA) (En,Fr,De,Es,It)</li>
+<li>Mega Bomberman (USA)</li>
+<li>NCAA Football (USA)</li>
+<li>Pele! (USA, Europe)</li>
+<li>PGA Tour Golf III (USA, Europe)</li>
+<li>Rugby World Cup 95 (USA, Europe) (En,Fr,It)</li>
+<li>Saint Sword (USA)</li>
+<li>Shinobi III - Return of the Ninja Master (USA)</li>
+<li>Space Harrier II (World)</li>
+<li>Streets of Rage 2 (USA)</li>
+<li>Taz-Mania (World)</li>
+<li>ToeJam &amp; Earl (USA, Europe, Korea) (En)</li>
+<li>Ultimate QIX (USA)</li>
+<li>Valis (USA)</li>
+<li>Vectorman (USA) (Sega Smash Pack)</li>
+<li>X-Men (USA)</li>
+<li>Ys III (USA)</li>
+<li>Zoop (USA)</li>
+</ul>
+</details>
+
+<p>After I posted my findings, Black Squirrel on Sonic Retro <a href="https://forums.sonicretro.org/index.php?posts/1085118/">found</a> that it was possible to get the September 1996 menu running in an emulator by copying bytes 0-0x1003FF from one of the Sega Channel demo cartridge ROMs and appending the menu data from the game image to the end. Obviously the download functionality doesn't work, but it's still fun to look around in the menu.</p>
+<img src="https://www.infochunk.com/schannel/sep96menu.png" width="320" alt="Sega Channel September 1996 menu screenshot">
+
+<p>The final bit of content from the image file was the game instructions ROM. It looked like a normal Genesis ROM file, but when I tried to run it in an emulator I just got a black screen. The problem here turned out to be that the ROM was linked with a base address of 0x100000 rather than 0 like a normal cartridge. It seems like it was meant to be run directly out of the Sega Channel adapter's memory without it getting mapped to the normal cartridge address space. My best guess is this had something to do with the functionality for jumping into the manual for a specific game from the game menu. I got it working in an emulator by adding zeroes after the header until the code lined up correctly with the vectors in the header. When it's started like this, at boot you see a menu intended for developers with all the internal names for each game. At this point, all of the content from the game image file was now able to be run in an emulator.</p>
+<p><img src="https://www.infochunk.com/schannel/sep96helpindex.png" width="320" alt="Sega Channel September 1996 manual index screenshot">
+<img src="https://www.infochunk.com/schannel/sep96help.png" width="320" alt="Sega Channel September 1996 manual screenshot">
+</p>
+
+<h3>Conclusion</h3>
+<p>I have to thank Tdijital for releasing the Sega Channel development backup CD, Octocontrabass for reverse engineeering the .SA compression format, and whoever at Scientific Atlanta compiled NSF.EXE in debug mode. This project would have been much harder without all of their assistance. Most of all, I have to thank RisingFromRuins for releasing the game image file. I hope if anyone else has a Sega Channel game image disc, they follow his example.</p>
+
+<h3>Downloads</h3>
+<ul>
+<li><a href="https://www.infochunk.com/schannel/sep96_unique_roms.zip">Unique ROMs from the game image file</a></li>
+<li><a href="https://www.infochunk.com/schannel/sep96menu.bin">Sega Channel September 1996 menu demo ROM</a></li>
+<li><a href="https://www.infochunk.com/schannel/sep96help.bin">Sega Channel September 1996 game instructions ROM</a></li>
+</ul>
+
+<br>
+<a href="https://www.infochunk.com/index.html">Back</a>
+
+</div>]]>
             </description>
             <link>https://www.infochunk.com/schannel/index.html</link>
             <guid isPermaLink="false">hacker-news-small-sites-42353907</guid>
@@ -711,7 +1348,7 @@ December 7, 2024 | https://www.infochunk.com/schannel/index.html | <a href="http
             </title>
             <description>
 <![CDATA[
-Score 235 | Comments 66 (<a href="https://news.ycombinator.com/item?id=42353778">thread link</a>) | @tripdout
+Score 237 | Comments 66 (<a href="https://news.ycombinator.com/item?id=42353778">thread link</a>) | @tripdout
 <br/>
 December 7, 2024 | https://aaka.sh/posts/20230129-bgp-at-home.html | <a href="https://web.archive.org/web/*/https://aaka.sh/posts/20230129-bgp-at-home.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
@@ -1177,7 +1814,7 @@ in the the <a href="http://mynor.org/my4th_downloads.htm#light">download area</a
             </title>
             <description>
 <![CDATA[
-Score 33 | Comments 7 (<a href="https://news.ycombinator.com/item?id=42351490">thread link</a>) | @aviat
+Score 33 | Comments 8 (<a href="https://news.ycombinator.com/item?id=42351490">thread link</a>) | @aviat
 <br/>
 December 7, 2024 | https://windowsonarm.org/blog/66031766-b200-4b5f-a707-28a2a7888da9 | <a href="https://web.archive.org/web/*/https://windowsonarm.org/blog/66031766-b200-4b5f-a707-28a2a7888da9">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -1192,7 +1829,7 @@ December 7, 2024 | https://windowsonarm.org/blog/66031766-b200-4b5f-a707-28a2a78
             </title>
             <description>
 <![CDATA[
-Score 82 | Comments 73 (<a href="https://news.ycombinator.com/item?id=42348664">thread link</a>) | @max_
+Score 84 | Comments 73 (<a href="https://news.ycombinator.com/item?id=42348664">thread link</a>) | @max_
 <br/>
 December 7, 2024 | https://asindu.xyz/posts/switching-to-firefox/ | <a href="https://web.archive.org/web/*/https://asindu.xyz/posts/switching-to-firefox/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div itemprop="articleBody"><p>When ever you hear people trying to convince other people to switch to Firefox the reason is usually moral or ideological. <sup id="fnref:1"><a href="#fn:1" role="doc-noteref">1</a></sup></p><p>A usually toted reason, is that capitalist browsers like Chrome, Safari &amp; Edge have too much market share. So we need to switch to the less pathologically operated Firefox — this post is not about that.</p><p>I recently switched to Firefox from Chrome. I felt like I was missing out on so much.</p><p>Chrome is simply <em>no longer better</em> than Firefox, features wise. <em>Firefox is now the superior browser!</em></p><hr><p>I recently felt like I should just “try out” Firefox.</p><p>So I installed it on my phone, this post is about features on Firefox Mobile that I suspect will never exist in chrome.</p><h2 id="firefox-extensions">Firefox Extensions <a href="#firefox-extensions">#</a></h2><p>Chrome extensions are only limited to the desktop version.</p><p>Not with Firefox Mobile, with Firefox mobile you can install extensions on the mobile browser. So you can actually block all ads on all websites using uBlock Origin’s Firefox Extension.</p><p>You can also install many other browser extensions. As I have below. This will probably never exist in chrome on mobile.</p><p><img src="https://asindu.xyz/files/10-switching-to-firefox/extensions_list.jpg" alt="List of My installed  Extensions" loading="lazy"></p><h2 id="view-pdfs-in-browser">View PDFs in browser <a href="#view-pdfs-in-browser">#</a></h2><p>I usually find my self following links that are not to web pages but PDF files.</p><p>Chrome on mobile has requires you to download the PDF file and is still not even capable of viewing them.</p><p>You will have to use a clunky third party app like Google Drive to view the contents of the PDF.</p><p>I expected this behavior on Firefox mobile. But everything just loaded nicely. I’m browser, without the need to download it or use third party clunky PDF reader apps.</p><p>PDFs on Firefox mobile were simply loaded fast, with panning, zooming capability and a download button incase you want it stored locally.</p><p>Everything with web hosted PDFs has become much more convenient with Firefox mobile.</p><p><img src="https://asindu.xyz/files/10-switching-to-firefox/pdf.jpg" alt="Reading the Bitcoin Whitepaper PDF without having to download it" loading="lazy"></p><h2 id="automatic-history-deletion">Automatic History Deletion <a href="#automatic-history-deletion">#</a></h2><p>On chrome, there is “incognito” that doesn’t Keep any browsing history after exiting. A similar product on Firefox is “private tabs”.</p><p>However, Firefox has something more bespoke for “power users”.</p><p>Suppose you only want your browsing history wiped out, but don’t want to log in again after opening the browser?</p><p>For this, Firefox has “delete browsing data on quit”. You won’t need need to use “private tabs” for this (Chrome’s incognito equivalent) it just works in the default Firefox tabs.</p><p>Every time you hit the “quite” button, Firefox will automatically wipe out the browsing history according to your exact specifications.</p><p><img src="https://asindu.xyz/files/10-switching-to-firefox/delete_browsing_data_on_quit.jpg" alt="Delete browsing data on quit" loading="lazy"></p><h2 id="a-word-to-the-mozilla-team">A word to the Mozilla team <a href="#a-word-to-the-mozilla-team">#</a></h2><p>Okay so given all this, Firefox still isn’t perfect.</p><p>Only one thing would make it perfect and better than Chrome in every possible way, feature wise.</p><p>The feature is <code>about:config</code>. In chrome the equivalent feature is called <code>chrome://flags</code>.</p><p>What funny is that it actually existed before and was simply turned off for about 4 years at the time of this writing.</p><p>It even still exists in Firefox Mobile Nightly (a buggy version of Firefox for testers).</p><p>The reasons for Firefox turning this off are very unsatisfactory. And many Firefox power users are begging for it to be returned <sup id="fnref:2"><a href="#fn:2" role="doc-noteref">2</a></sup></p><p>If anyone on the Firefox team can make that happen, please do 🙏🏿</p></div></div>]]>
@@ -1230,7 +1867,7 @@ December 6, 2024 | https://www.birmingham.ac.uk/news/2024/the-birmingham-blade-t
             </title>
             <description>
 <![CDATA[
-Score 648 | Comments 904 (<a href="https://news.ycombinator.com/item?id=42344002">thread link</a>) | @true_pk
+Score 653 | Comments 904 (<a href="https://news.ycombinator.com/item?id=42344002">thread link</a>) | @true_pk
 <br/>
 December 6, 2024 | https://shilin.ca/my-second-year-without-job/ | <a href="https://web.archive.org/web/*/https://shilin.ca/my-second-year-without-job/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1311,7 +1948,7 @@ December 6, 2024 | https://shilin.ca/my-second-year-without-job/ | <a href="http
             </title>
             <description>
 <![CDATA[
-Score 342 | Comments 116 (<a href="https://news.ycombinator.com/item?id=42343953">thread link</a>) | @antics
+Score 345 | Comments 117 (<a href="https://news.ycombinator.com/item?id=42343953">thread link</a>) | @antics
 <br/>
 December 6, 2024 | https://www.moment.dev/blog/lies-i-was-told-pt-1 | <a href="https://web.archive.org/web/*/https://www.moment.dev/blog/lies-i-was-told-pt-1">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>In early 2024, I began investigating collaborative editing systems for use in Moment’s core text editor.</p><p>In some ways, we are in a golden era for the problem. Several algorithms now claim to solve not only the online case (where many people simultaneously edit a document), but also the offline case (where people edit offline for an unbounded amount of time, come online, and “magically” their changes are merged together). I had read the papers and listened to the talks, and like others, I was initially optimistic the community had settled on the “right answer” to the whole problem space.</p><p>One of the earliest surprises in the evaluation process was that this is not true——that despite the marketing copy, blog posts, and technical papers stating otherwise, these collaborative editing algorithms provide a systematically poor offline editing experience. Specifically:</p><p>The two most popular families of collab editing algorithms (CRDTs and OT) resolve direct editing conflicts unintuitively enough that users generally interpreted their results as data corruption.</p><p>Offline editing dramatically increases the likelihood of direct conflicts, which means these algorithms are not, on their own, appropriate for offline editing.</p><p>In many ways, this is bad news. And we will spend much of this post discussing why we think these things are true—example anomalies, failure modes, what the practical limitations are, and so on.</p><p>But, the news is not all bad. We are heartened to see some recent research (e.g.) reversing the trend of treating collab editing as a pure algorithms problem, and instead treating it as a UI/UX problem in which algorithms assist. One of the goals of this post is to help motivate this line of reasoning, and we will make time at the end to encourage that, too.</p><p>Example: a seemingly trivial editing conflict</p><p>Let’s start with a game. I provide a trivial editing conflict and you try to guess what happens. Ready? Here’s the scenario: Alice and Bob are both offline. They are editing a document containing the following text:</p><p>return render(() =&gt; (
@@ -1454,9 +2091,9 @@ return render(({ useSetter }) =&gt; (
 		&lt;/&gt;
 	)
 });
-</p><p>✋ 🛑 Did you guess correctly? Seriously—you really should try this before continuing on.</p><p>These anomalies are common on direct conflicts.</p><p>The example above is interesting because it is a trivial, direct editing conflict which these (popular) collaborative editing algorithms do seem to claim to support, but which empirically produces a document that no human would ever write on their own. This is also a case where users interpreted the result as the Moment product corrupting their data.</p><p>So how common is this problem? Every use case is different, but, anecdotally we found that roughly 20-30% of direct conflicts we tried produced results that were similarly—in our opinion—unacceptable, for our use case of offline editing. [nb., I’m not sure if it’s helpful to list some of the anomalies we encountered here, if it is, let me know at <a href="https://www.moment.dev/cdn-cgi/l/email-protection" data-cfemail="57363b322f173a383a32392379333221">[email&nbsp;protected]</a> or the Moment Discord server and I’ll follow up with a more thorough review.]</p><p>Ultimately, though, because of the negativity of the feedback and the frequency of its occurrence, we felt we could not defend this result to our users.</p><p>These algorithms do seem to claim to support offline editing.</p><p>Initially, when we encountered this result, we thought that we must have misunderstood the semantics offered by these tools. Even now, though, when I read the technical copy for these projects, I can’t help but think this scenario really is in scope.</p><p>The Yjs readme explicitly states that it “supports […] offline editing.”</p><p>The ShareJS landing page claims to allow collaboration “with any amount of lag (from zero to an extended holiday).”</p><p>The Peritext authors describe it as “allow[ing] users to edit independent copies of a document” which can be “automatically merg[ed] […] back together in a way that preserves the users’ intent as much as possible.”</p><p>I admit to still not being quite sure what to make of this. We are in the market for a solution to this problem! I want to believe! I just don’t see how to reconcile these claims with the frequency and kinds of errors we’re seeing in practice.</p><p>Coordination-free algorithms will always have anomalies on direct conflicts.</p><p>At some point in the evaluation process we resigned ourself to the fact that the algorithms did not do what we wanted. But a lingering question remained: is this a fundamental problem for the algorithms, or with some careful contributions, could we contribute back and fix it?</p><p>Unfortunately, we think it’s a fundamental problem for the algorithms, for a few reasons.</p><p>The algorithms only have enough information to guess what the result should be. The algorithms can’t email Alice and Bob to see what they wanted or review it in the GitHub Pull Request UI. It receives Alice’s proposal to delete all the text and Bob’s proposal to change the spelling without knowing what their intent was, and it must use a heuristic to decide what to do with them.</p><p>The algorithms operate on characters and have very, very poor guarantees about their output. This is why in the example above, Alice and Bob end up with a document simply containing the letter u. Not a valid sentence, and not even a valid word!</p><p>Alice and Bob might make different decisions if they knew what the other was doing. Alice and Bob both made decisions based on the document containing the text, The Color of Pomegranates. If Alice knew Bob changed the spelling, or Bob knew Alice deleted the paragraph, they might change their decision to edit at all.</p><p>I think this is probably worth a post all on its own, particularly with more treatment given to the fact that these algorithms don’t—and cannot—obey a causal ordering (cf., Jamie Brandon’s post). But for now, I think we can settle for the intuitive version of this argument.</p><p>Offline editing is a UI/UX problem, not an algorithms problem; and other conclusions.</p><p>So far the news has been bad. We entered the evaluation hopeful that we’d be able to support true offline editing “incidentally” for having implemented a tricky algorithm. And it is true that we left the evaluation left process, well, bereft of hope—forced to conclude that users were right to think of these algorithms were corrupting their data, that the anomalies were fundamental to the algorithms themselves, and that they would be frequent enough to be a real issue. YMMV, but that is where we ended up.</p><p>As I said, though, the news is not all bad. Another way to view this result is as a strong argument for putting significant resources into collaborative editing as a UI/UX problem. The algorithms cannot completely solve the problem, but they can play a role in the solution.</p><p>There are a few reasons to be optimistic about this. One is that we already have one widely-adopted UI for merging documents: git! So in some sense, the research question is how much better it can be—more approachable, more accessible, more automatic, etc.</p><p>I think this resemblance is not superficial. In 2009, a surprising amount of the discourse was focused on the algorithms git used to automatically merge changes together. git adapted the Myers O(ND) diff algorithm, then used mostly by biologists to do BLAST-like sequence analysis. Bram Cohen thought the diff results were unintuitive, and invented the patience diff algorithm, which was then adopted by bzr, a now-defunct git competitor. The list goes on. I think the primary change is that these debates were focused on producing diffs that humans read; now the debate is whether the algorithms can accomplish this result with no human involvement at all.</p><p>Another reason to be optimistic is that some researchers do seem to be concentrating on this problem as a UI/UX problem. I am thinking particularly of Ink &amp; Switch, e.g., the work on collaborative history. I understand Ink &amp; Switch to be operating purposefully a few years ahead of production, but I am excited to see where this lands when it settles down.</p><p>Acknowledgements</p><p>Heartfelt thanks to Kyle Kingsbury, Sean Gillespie, Ian Livingstone, David Adrian, Ben Linsay, Alex Rasmussen, Lita Cho, Lenny Pruss, Michael Yamnitsky, Camille Fournier, James Turnbull, and Ryan Cox for their comments and feedback.</p><p>return render(() =&gt; (
+</p><p>✋ 🛑 Did you guess correctly? Seriously—you really should try this before continuing on.</p><p>These anomalies are common on direct conflicts.</p><p>The example above is interesting because it is a trivial, direct editing conflict which these (popular) collaborative editing algorithms do seem to claim to support, but which empirically produces a document that no human would ever write on their own. This is also a case where users interpreted the result as the Moment product corrupting their data.</p><p>So how common is this problem? Every use case is different, but, anecdotally we found that roughly 20-30% of direct conflicts we tried produced results that were similarly—in our opinion—unacceptable, for our use case of offline editing. [nb., I’m not sure if it’s helpful to list some of the anomalies we encountered here, if it is, let me know at <a href="https://www.moment.dev/cdn-cgi/l/email-protection" data-cfemail="2f4e434a576f4240424a415b014b4a59">[email&nbsp;protected]</a> or the Moment Discord server and I’ll follow up with a more thorough review.]</p><p>Ultimately, though, because of the negativity of the feedback and the frequency of its occurrence, we felt we could not defend this result to our users.</p><p>These algorithms do seem to claim to support offline editing.</p><p>Initially, when we encountered this result, we thought that we must have misunderstood the semantics offered by these tools. Even now, though, when I read the technical copy for these projects, I can’t help but think this scenario really is in scope.</p><p>The Yjs readme explicitly states that it “supports […] offline editing.”</p><p>The ShareJS landing page claims to allow collaboration “with any amount of lag (from zero to an extended holiday).”</p><p>The Peritext authors describe it as “allow[ing] users to edit independent copies of a document” which can be “automatically merg[ed] […] back together in a way that preserves the users’ intent as much as possible.”</p><p>I admit to still not being quite sure what to make of this. We are in the market for a solution to this problem! I want to believe! I just don’t see how to reconcile these claims with the frequency and kinds of errors we’re seeing in practice.</p><p>Coordination-free algorithms will always have anomalies on direct conflicts.</p><p>At some point in the evaluation process we resigned ourself to the fact that the algorithms did not do what we wanted. But a lingering question remained: is this a fundamental problem for the algorithms, or with some careful contributions, could we contribute back and fix it?</p><p>Unfortunately, we think it’s a fundamental problem for the algorithms, for a few reasons.</p><p>The algorithms only have enough information to guess what the result should be. The algorithms can’t email Alice and Bob to see what they wanted or review it in the GitHub Pull Request UI. It receives Alice’s proposal to delete all the text and Bob’s proposal to change the spelling without knowing what their intent was, and it must use a heuristic to decide what to do with them.</p><p>The algorithms operate on characters and have very, very poor guarantees about their output. This is why in the example above, Alice and Bob end up with a document simply containing the letter u. Not a valid sentence, and not even a valid word!</p><p>Alice and Bob might make different decisions if they knew what the other was doing. Alice and Bob both made decisions based on the document containing the text, The Color of Pomegranates. If Alice knew Bob changed the spelling, or Bob knew Alice deleted the paragraph, they might change their decision to edit at all.</p><p>I think this is probably worth a post all on its own, particularly with more treatment given to the fact that these algorithms don’t—and cannot—obey a causal ordering (cf., Jamie Brandon’s post). But for now, I think we can settle for the intuitive version of this argument.</p><p>Offline editing is a UI/UX problem, not an algorithms problem; and other conclusions.</p><p>So far the news has been bad. We entered the evaluation hopeful that we’d be able to support true offline editing “incidentally” for having implemented a tricky algorithm. And it is true that we left the evaluation left process, well, bereft of hope—forced to conclude that users were right to think of these algorithms were corrupting their data, that the anomalies were fundamental to the algorithms themselves, and that they would be frequent enough to be a real issue. YMMV, but that is where we ended up.</p><p>As I said, though, the news is not all bad. Another way to view this result is as a strong argument for putting significant resources into collaborative editing as a UI/UX problem. The algorithms cannot completely solve the problem, but they can play a role in the solution.</p><p>There are a few reasons to be optimistic about this. One is that we already have one widely-adopted UI for merging documents: git! So in some sense, the research question is how much better it can be—more approachable, more accessible, more automatic, etc.</p><p>I think this resemblance is not superficial. In 2009, a surprising amount of the discourse was focused on the algorithms git used to automatically merge changes together. git adapted the Myers O(ND) diff algorithm, then used mostly by biologists to do BLAST-like sequence analysis. Bram Cohen thought the diff results were unintuitive, and invented the patience diff algorithm, which was then adopted by bzr, a now-defunct git competitor. The list goes on. I think the primary change is that these debates were focused on producing diffs that humans read; now the debate is whether the algorithms can accomplish this result with no human involvement at all.</p><p>Another reason to be optimistic is that some researchers do seem to be concentrating on this problem as a UI/UX problem. I am thinking particularly of Ink &amp; Switch, e.g., the work on collaborative history. I understand Ink &amp; Switch to be operating purposefully a few years ahead of production, but I am excited to see where this lands when it settles down.</p><p>Acknowledgements</p><p>Heartfelt thanks to Kyle Kingsbury, Sean Gillespie, Ian Livingstone, David Adrian, Ben Linsay, Alex Rasmussen, Lita Cho, Lenny Pruss, Michael Yamnitsky, Camille Fournier, James Turnbull, and Ryan Cox for their comments and feedback.</p><p>return render(() =&gt; (
 	&lt;div class="bg-brand-translucent p-8 rounded"&gt;
-		👋 If you enjoyed this, you may enjoy other entries in &lt;a href="https://www.moment.dev/blog"&gt;the Moment devlog&lt;/a&gt;. We're also hiring! &lt;a href="mailto:<a href="https://www.moment.dev/cdn-cgi/l/email-protection" data-cfemail="274d484554674a484a42495309434251">[email&nbsp;protected]</a>"&gt;<a href="https://www.moment.dev/cdn-cgi/l/email-protection" data-cfemail="046e6b667744696b69616a702a606172">[email&nbsp;protected]</a>&lt;/a&gt;
+		👋 If you enjoyed this, you may enjoy other entries in &lt;a href="https://www.moment.dev/blog"&gt;the Moment devlog&lt;/a&gt;. We're also hiring! &lt;a href="mailto:<a href="https://www.moment.dev/cdn-cgi/l/email-protection" data-cfemail="eb81848998ab8684868e859fc58f8e9d">[email&nbsp;protected]</a>"&gt;<a href="https://www.moment.dev/cdn-cgi/l/email-protection" data-cfemail="305a5f5243705d5f5d555e441e545546">[email&nbsp;protected]</a>&lt;/a&gt;
 	&lt;/div&gt;
 ));
 </p></div></div>]]>
@@ -1586,7 +2223,7 @@ December 6, 2024 | https://lighthouseapp.io/blog/deep-dive-finding-rss-feeds | <
 Score 71 | Comments 32 (<a href="https://news.ycombinator.com/item?id=42343052">thread link</a>) | @loncat4215
 <br/>
 December 6, 2024 | https://lcat.dev/post.php?id=3cf8e1b9-e5e3-4a6d-af27-12720c5b2d54 | <a href="https://web.archive.org/web/*/https://lcat.dev/post.php?id=3cf8e1b9-e5e3-4a6d-af27-12720c5b2d54">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+<br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
             </description>
             <link>https://lcat.dev/post.php?id=3cf8e1b9-e5e3-4a6d-af27-12720c5b2d54</link>
             <guid isPermaLink="false">hacker-news-small-sites-42343052</guid>
@@ -1598,7 +2235,7 @@ December 6, 2024 | https://lcat.dev/post.php?id=3cf8e1b9-e5e3-4a6d-af27-12720c5b
             </title>
             <description>
 <![CDATA[
-Score 329 | Comments 143 (<a href="https://news.ycombinator.com/item?id=42341506">thread link</a>) | @Sharpie4679
+Score 332 | Comments 143 (<a href="https://news.ycombinator.com/item?id=42341506">thread link</a>) | @Sharpie4679
 <br/>
 December 6, 2024 | https://terriblesoftware.org/2024/12/04/the-6-mistakes-youre-going-to-make-as-a-new-manager/ | <a href="https://web.archive.org/web/*/https://terriblesoftware.org/2024/12/04/the-6-mistakes-youre-going-to-make-as-a-new-manager/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2738,7 +3375,7 @@ December 6, 2024 | https://jigsawstack.com/blog/jigsawstack-mixture-of-agents-mo
             </title>
             <description>
 <![CDATA[
-Score 211 | Comments 65 (<a href="https://news.ycombinator.com/item?id=42338738">thread link</a>) | @thunderbong
+Score 213 | Comments 65 (<a href="https://news.ycombinator.com/item?id=42338738">thread link</a>) | @thunderbong
 <br/>
 December 6, 2024 | https://briandouglas.ie/sqlite-defaults/ | <a href="https://web.archive.org/web/*/https://briandouglas.ie/sqlite-defaults/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>SQLite is cool now. DHH uses it, Laravel defaults to it. Here is a list of
