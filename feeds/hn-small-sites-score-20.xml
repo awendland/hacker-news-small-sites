@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Thu, 19 Dec 2024 00:35:58 GMT</lastBuildDate>
+        <lastBuildDate>Thu, 19 Dec 2024 04:23:53 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-20.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Thu, 19 Dec 2024 00:35:58 GMT</pubDate>
+        <pubDate>Thu, 19 Dec 2024 04:23:53 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,442 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Error Stacking in Rust]]>
+            </title>
+            <description>
+<![CDATA[
+Score 26 | Comments 7 (<a href="https://news.ycombinator.com/item?id=42457515">thread link</a>) | @samanthasu
+<br/>
+December 18, 2024 | https://greptime.com/blogs/2024-05-07-error-rust | <a href="https://web.archive.org/web/*/https://greptime.com/blogs/2024-05-07-error-rust">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-v-0de291f9=""><div data-v-0de291f9=""><div><div><p>TL;DR:</p><p>In this article, we discuss the practice of Rust error handling topic in <a href="https://github.com/GreptimeTeam/greptimedb" target="_blank" rel="noreferrer">GreptimeDB</a> and shares possibly future work in the end.</p><p>Topics including: (1) How to build a cheaper yet more accurate error stack to replace system backtrace; (2) How to organize errors in large projects; (3) How to print errors in different schemes to log and end users.</p><p>An error in GreptimeDB might look like this:</p><div><pre><code><span><span>0: Foo error, at src/common/catalog/src/error.rs:80:10</span></span>
+<span><span>1: Bar error, at src/common/function/src/error.rs:90:10</span></span>
+<span><span>2: Root cause, invalid table name, at src/common/catalog/src/error.rs:100:10</span></span></code></pre></div></div><h2 id="introduce" tabindex="-1">Introduce <a href="#introduce" aria-label="Permalink to &quot;Introduce&quot;">​</a></h2><h3 id="understanding-error-in-rust" tabindex="-1">Understanding <code>Error</code> in Rust <a href="#understanding-error-in-rust" aria-label="Permalink to &quot;Understanding `Error` in Rust&quot;">​</a></h3><p>Rust's error handling is centered around the <a href="https://doc.rust-lang.org/std/result/enum.Result.html#variant.Err" target="_blank" rel="noreferrer"><code>Result&lt;T, E&gt;</code></a> enum, where <code>E</code> typically (but unnecessarily) extends <a href="https://doc.rust-lang.org/std/error/trait.Error.html" target="_blank" rel="noreferrer"><code>std::error::Error</code></a>.</p><div><p><span>rust</span></p><pre><code><span><span>pub</span><span> </span><span>enum</span><span> </span><span>Result</span><span>&lt;</span><span>T</span><span>,</span><span> </span><span>E</span><span>&gt;</span><span> </span><span>{</span></span>
+<span><span>    /// Contains the success value</span></span>
+<span><span>    </span><span>Ok</span><span>(</span><span>T</span><span>),</span></span>
+<span><span>    /// Contains the error value</span></span>
+<span><span>    </span><span>Err</span><span>(</span><span>E</span><span>),</span></span>
+<span><span>}</span></span></code></pre></div><p>This blog shares our experience organizing variant types of <code>Error</code> in a complex system like GreptimeDB, from how an error is defined to how to log the error or present it to end-users. Such a system is composed of multiple components with their own <code>Error</code> definitions.</p><h3 id="status-quo-of-rust-s-error-handling" tabindex="-1">Status Quo of Rust's Error Handling <a href="#status-quo-of-rust-s-error-handling" aria-label="Permalink to &quot;Status Quo of Rust's Error Handling&quot;">​</a></h3><p>A few standard libraries in Rust provide <code>Error</code> structs that implement <code>std::error::Error</code>, like <code>std::io::Error</code> or <code>std::fmt::Error</code>. But developers would usually define custom errors for their project, as either they want to express the application specific error info, or there is a necessity to group multiple errors in an enum.</p><p>Since the <code>std::error::Error</code> trait is not quite complicated, it's easy to implement manually for one custom error type. However, you usually won't want to do so. Because as error variants grow, it would be very hard to work with the flooding template code.</p><p>Nowadays, there are some widely used utility crates to help work with customized error types. For example, <a href="https://docs.rs/thiserror/latest/thiserror/" target="_blank" rel="noreferrer"><code>thiserror</code></a> and <a href="https://docs.rs/anyhow/latest/anyhow/" target="_blank" rel="noreferrer"><code>anyhow</code></a> are developed by the famous Rust wizard @dtolnay, with the distinction that <code>thiserror</code> is mainly for libraries and <code>anyhow</code> is for binaries. This rule suits most of the cases.</p><p>But for projects like GreptimeDB, where we divide the entire workspace into several individual sub-crates, we need to define one error type for each crate while keeping a streamlined combination. Neither <code>thiserror</code> nor <code>anyhow</code> can achieve this easily.</p><p>Hence, we chose another crate, <a href="https://docs.rs/snafu/latest/snafu/" target="_blank" rel="noreferrer"><code>snafu</code></a>, to instrument our error system. It's like a combination of <code>thiserror</code> and <code>anyhow</code>. <code>thiserror</code> provides a convenient macro to define custom error types, with display, source, and some context fields. And <code>anyhow</code> gives a <code>Context</code> trait that can easily transform from one underlying error into another with a new context.</p><p><code>thiserror</code> mainly implements the <a href="https://doc.rust-lang.org/std/convert/trait.From.html" target="_blank" rel="noreferrer"><code>std::convert::From</code></a> trait for your error types, so that you can simply use <code>?</code> to propagate the error you receive. Consequently, this also means you cannot define two error variants from the same source type. Considering you are performing some I/O operations, you won't know whether an error is generated in the write path or the read path. This is also an important reason we don't use <code>thiserror</code>: the context is blurred in type.</p><h2 id="stacking-the-error" tabindex="-1">Stacking the Error <a href="#stacking-the-error" aria-label="Permalink to &quot;Stacking the Error&quot;">​</a></h2><h3 id="design-goals" tabindex="-1">Design Goals <a href="#design-goals" aria-label="Permalink to &quot;Design Goals&quot;">​</a></h3><p>In the real world, knowing barely the root cause of error is inadequate. Suppose we are building a protocol component in GreptimeDB. It reads messages from the network, decodes them, performs some operations, and then sends them. We may encounter errors from several aspects:</p><div><p><span>rust</span></p><pre><code><span><span>enum</span><span> </span><span>Error</span><span>{</span></span>
+<span><span>    </span><span>ReadSocket</span><span>(</span><span>hyper</span><span>::</span><span>Error</span><span>),</span></span>
+<span><span>    </span><span>DecodeMessage</span><span>(</span><span>serde_json</span><span>::</span><span>Error</span><span>),</span></span>
+<span><span>    </span><span>Operation</span><span>(</span><span>GreptimeError</span><span>),</span></span>
+<span><span>    </span><span>EncodeMessage</span><span>(</span><span>serde_json</span><span>::</span><span>Error</span><span>),</span></span>
+<span><span>    </span><span>WriteSocket</span><span>(</span><span>hyper</span><span>::</span><span>Error</span><span>),</span></span>
+<span><span>}</span></span></code></pre></div><p>One possible error message we can get is: <code>DecodeMessage(serde_json: invalid character at 1)</code>. However, in a specific code snippet, there can be more than 10 places where decoding the message (and thus throw this error)! How can we figure out in which step we see the invalid character?</p><p>So, despite the error itself telling what has happened, if we want to have a clue on where this error occurs and if we should pay attention to it, we need the error to carry more information. For comparison, here is an example of an error log you might see from GreptimeDB.</p><div><p><span>plain</span></p><pre><code><span><span>Failed to handle protocol</span></span>
+<span><span>0: Failed to handle incoming content, query: blabla, at src/protocol/handler.rs:89:22</span></span>
+<span><span>1: Failed to reading next message at queue 5 of 10, at src/protocol/loop.rs:254:14</span></span>
+<span><span>2: Failed to decode `01010001001010001` to ProtocolHeader, at src/protocol/codec.rs:90:14</span></span>
+<span><span>3: serde_json(invalid character at position 1)</span></span></code></pre></div><p><strong>A good error report is not only about how it gets constructed, but what is more important, to tell what human can understand from its cause and trace. We call it Stacked Error.</strong> It should be intuitive and you must have seen a similar format elsewhere like backtrace.</p><p>From this log, it's easy to know the entire thing with full context, from the user-facing behavior to the root cause. Plus the exact line and column number of where each error is propagated. You will know that this error is <em>"from the query "blabla", the fifth package's header is corrupted"</em>. It's likely to be invalid user input and we may not need to handle it from the server side.</p><p>This example shows the critical information that an error should contain:</p><ul><li><strong>The root cause</strong> that tells what is happening.</li><li><strong>The full context stack</strong> that can be used in debugging or figuring out where the error occurs.</li><li><strong>What happens from the user's perspective.</strong> Decide whether we need to expose the error to users.</li></ul><p>The first root cause is often clear in many cases, like the DecodeMessage example above, as long as the library or function we used implements their error type correctly. But only having the root cause can be not enough.</p><p>Here is another <a href="https://github.com/delta-incubator/delta-kernel-rs/pull/151" target="_blank" rel="noreferrer">evidence</a> from Delta Lake developed by Databricks:</p><p><img src="https://greptime.com/blogs/2024-05-07-error-rust/rust1.png" alt="Databricks's example"></p><p>In the following sections, we will focus on the context stack and the way to present errors. And shows the way we implement it. So hopefully you can reproduce the same practices as in GreptimeDB.</p><h3 id="system-backtrace" tabindex="-1">System Backtrace <a href="#system-backtrace" aria-label="Permalink to &quot;System Backtrace&quot;">​</a></h3><p>So, now you have the root cause (<code>DecodeMessage(serde_json: invalid character at 1)</code>). But it's not clear at which step this error occurs: when decoding the header, or the body?</p><p>A intuitive thought is to capture the backtrace. <code>.unwrap()</code> is the first choice, where the backtrace will show up when error occurs (of course this is a bad practice). It will give you a complete call stack along with the line number.</p><p>Such a call stack contains the full trace, including lots of unrelated system stacks, runtime stacks and std stacks. If you'd like to find the call in application code, you have to inspect the source code stack by stack, and skip all the unrelated ones.</p><p>Nowadays, many libraries also provide the ability to capture backtrace on an <code>Error</code> is constructed. Regardless of whether the system backtrace can provide what we truly want, it's very costly on either CPU (<a href="https://github.com/GreptimeTeam/greptimedb/pull/1261" target="_blank" rel="noreferrer">#1261</a>) and memory (<a href="https://github.com/GreptimeTeam/greptimedb/pull/1273" target="_blank" rel="noreferrer">#1273</a>).</p><p>Capturing a backtrace will significantly slow down your program, as it needs to walk through the call stack and translate the pointer. Then, to be able to translate the stack pointer we will need to include a large <code>debuginfo</code> in our binary. In GreptimeDB, this means increasing the binary size by &gt;700MB (4x compared to 170MB without debuginfo). And there will be many noises in the captured system backtrace because the system can't distinguish whether the code comes from the standard library, a third-party async runtime or the application code.</p><p>There is another difference between the system backtrace and the proposed Stacked Error. System backtrace tells us how to get to the position where the error occurs and you cannot control it, while the Stacked Error shows how the error is propagated.</p><p>Take the following code snippet as an example to examine the difference between system backtrace and virtual stack:</p><div><p><span>rust</span></p><pre><code><span><span>async</span><span> </span><span>fn</span><span> </span><span>handle_request</span><span>(</span><span>req</span><span>:</span><span> </span><span>Request</span><span>)</span><span> </span><span>-&gt;</span><span> </span><span>Result</span><span>&lt;</span><span>Output</span><span>&gt;</span><span> </span><span>{</span></span>
+<span><span>    </span><span>let</span><span> msg </span><span>=</span><span> </span><span>decode_msg</span><span>(&amp;</span><span>req</span><span>.</span><span>msg</span><span>).</span><span>context</span><span>(</span><span>DecodeMessage</span><span>)?;</span><span> // propagate error with new stack and context</span></span>
+<span><span>    </span><span>verify_msg</span><span>(&amp;</span><span>msg</span><span>)?;</span><span> // pass error to the caller directly</span></span>
+<span><span>    </span><span>process_msg</span><span>(</span><span>msg</span><span>).</span><span>await</span><span>?</span><span> // pass error to the caller directly</span></span>
+<span><span>}</span></span>
+<span></span>
+<span><span>async</span><span> </span><span>fn</span><span> </span><span>decode_msg</span><span>(</span><span>msg</span><span>:</span><span> </span><span>&amp;</span><span>RawMessage</span><span>)</span><span> </span><span>-&gt;</span><span> </span><span>Result</span><span>&lt;</span><span>Message</span><span>&gt;</span><span> </span><span>{</span></span>
+<span><span>    </span><span>serde_json</span><span>::</span><span>from_slice</span><span>(&amp;</span><span>msg</span><span>).</span><span>context</span><span>(</span><span>SerdeJson</span><span>)</span><span> // propagate error with new stack and context</span></span>
+<span><span>}</span></span></code></pre></div><p>System backtace will print the whole call stack, like:</p><div><pre><code><span><span>1: &lt;alloc::boxed::Box&lt;F,A&gt; as core::ops::function::Fn&lt;Args&gt;&gt;::call</span></span>
+<span><span>            at /rustc/3f28fe133475ec5faf3413b556bf3cfb0d51336c/library/alloc/src/boxed.rs:2029:9</span></span>
+<span><span>    std::panicking::rust_panic_with_hook</span></span>
+<span><span>            at /rustc/3f28fe133475ec5faf3413b556bf3cfb0d51336c/library/std/src/panicking.rs:783:13</span></span>
+<span><span>... many lines for std's internal traces</span></span>
+<span><span></span></span>
+<span><span>22: tokio::runtime::task::raw::RawTask::poll</span></span>
+<span><span>            at /home/wayne/.cargo/registry/src/index.crates.io-6f17d22bba15001f/tokio-1.35.1/src/runtime/task/raw.rs:201:18</span></span>
+<span><span>... many lines for tokio's internal traces</span></span>
+<span><span></span></span>
+<span><span>32: std::thread::Builder::spawn_unchecked_::{{closure}}::{{closure}}</span></span>
+<span><span>            at /rustc/3f28fe133475ec5faf3413b556bf3cfb0d51336c/library/std/src/thread/mod.rs:529:17</span></span>
+<span><span>... many lines for std's internal traces</span></span></code></pre></div><p>As you can see, it includes a lot of internal stacks that you are uninterested in.</p><p>For other complex logic like batch processing, where errors may not be propagate immediately but be holded for a while, virtual stack can also help making it easy to understand. System backtrace is captured in place when the leaf error is generated, like in the middle step of a map-reduce logic. But with virtual stack, you can postpone the timing to or after reduce step, where you have more information about the overall task.</p><h3 id="virtual-user-stack" tabindex="-1">Virtual User Stack <a href="#virtual-user-stack" aria-label="Permalink to &quot;Virtual User Stack&quot;">​</a></h3><p>Now let's introduce the virtual user stack. The word "virtual" means the contrast of the system stack. Means it's defined and constructed fully on user code. Look closer into the previous example:</p><div><pre><code><span><span>0: Failed to handle incoming content, query: blabla, at src/protocol/handler.rs:89:22</span></span>
+<span><span>1: Failed to reading next message at queue 5 of 10, at src/protocol/loop.rs:254:14</span></span>
+<span><span>2: Failed to decode `01010001001010001` to ProtocolHeader, at src/protocol/codec.rs:90:14</span></span>
+<span><span>3: serde_json(invalid character at position 1)</span></span></code></pre></div><p>A stack layer is composed of 3 parts: <code>[STACK_NUM]: [MSG], at [FILE_LOCATION]</code></p><ul><li><strong>Stack num</strong> is the number of this stack. Smaller number means outer error layer. And starts from 0 of course.</li><li><strong>Message</strong> is the message related to one layer. This is scraped from the <a href="https://doc.rust-lang.org/std/fmt/trait.Display.html" target="_blank" rel="noreferrer"><code>std::fmt::Display</code></a> implementation of that error. Developers can attach useful context here, like the query string or loop counter.</li><li><strong>File location</strong> is the location where one error is generated (and propagated, for intermediate error layer). Rust provides <a href="https://doc.rust-lang.org/std/macro.file.html" target="_blank" rel="noreferrer"><code>file!</code></a>, <a href="https://doc.rust-lang.org/std/macro.line.html" target="_blank" rel="noreferrer"><code>line!</code></a> and <a href="https://doc.rust-lang.org/std/macro.column.html" target="_blank" rel="noreferrer"><code>column!</code></a> macros to help get that information. And the way we display it is also considered, most editors can jump to that location directly.</li></ul><p>In practice, we utilize <a href="https://docs.rs/snafu/0.8.2/snafu/struct.Location.html" target="_blank" rel="noreferrer"><code>snafu::Location</code></a> to gather the code location. So each location points to where the error is constructed. Through this chain we know how this error is generated and propagated to the uppermost.</p><p>Here is what it looks like all together from the code side:</p><div><p><span>rust</span></p><pre><code><span><span>#[</span><span>derive</span><span>(</span><span>Snafu</span><span>)]</span></span>
+<span><span>pub</span><span> </span><span>enum</span><span> </span><span>Error</span><span> </span><span>{</span></span>
+<span><span>    </span><span>#[</span><span>snafu</span><span>(</span><span>display</span><span>(</span><span>"</span><span>General catalog error: </span><span>"</span><span>))]</span><span> // &lt;-- the `Display` impl derive</span></span>
+<span><span>    </span><span>Catalog</span><span> </span><span>{</span></span>
+<span><span>        location</span><span>:</span><span> </span><span>Location</span><span>,</span><span> // &lt;-- the `location`</span></span>
+<span><span>        source</span><span>:</span><span> </span><span>catalog</span><span>::</span><span>error</span><span>::</span><span>Error</span><span>,</span><span> // &lt;-- inner cause</span></span>
+<span><span>    </span><span>}</span></span>
+<span><span>}</span></span></code></pre></div><p>Besides, we implemented a proc-macro <a href="https://greptimedb.rs/common_macro/attr.stack_trace_debug.html" target="_blank" rel="noreferrer"><code>stack_trace_debug</code></a> to scrape necessary information from the Error's definition and generate the implementation of the related trait <a href="https://greptimedb.rs/common_error/ext/trait.StackError.html" target="_blank" rel="noreferrer"><code>StackError</code></a>, which provides useful methods to access and print the error:</p><div><p><span>rust</span></p><pre><code><span><span>pub</span><span> </span><span>trait</span><span> </span><span>StackError</span><span>:</span><span> </span><span>std</span><span>::</span><span>error</span><span>::</span><span>Error</span><span> </span><span>{</span></span>
+<span><span>    </span><span>fn</span><span> </span><span>debug_fmt</span><span>(&amp;</span><span>self</span><span>,</span><span> layer</span><span>:</span><span> </span><span>usize</span><span>,</span><span> buf</span><span>:</span><span> </span><span>&amp;</span><span>mut</span><span> </span><span>Vec</span><span>&lt;</span><span>String</span><span>&gt;);</span></span>
+<span><span>    </span><span>fn</span><span> </span><span>next</span><span>(&amp;</span><span>self</span><span>)</span><span> </span><span>-&gt;</span><span> </span><span>Option</span><span>&lt;&amp;</span><span>dyn</span><span> </span><span>StackError</span><span>&gt;;</span></span>
+<span><span>    </span><span>fn</span><span> </span><span>last</span><span>(&amp;</span><span>self</span><span>)</span><span> </span><span>-&gt;</span><span> </span><span>&amp;</span><span>dyn</span><span> </span><span>StackError</span><span> </span><span>where</span><span> Self</span><span>:</span><span> </span><span>Sized</span><span> </span><span>{</span><span> </span><span>...</span><span> </span><span>}</span></span>
+<span><span>}</span></span></code></pre></div><p>This proc-macro mainly does two things:</p><ul><li>Implement <a href="https://greptimedb.rs/common_error/ext/trait.StackError.html" target="_blank" rel="noreferrer"><code>StackError</code></a> as the scaffold</li><li>Implement <a href="https://doc.rust-lang.org/std/fmt/trait.Debug.html" target="_blank" rel="noreferrer"><code>std::fmt::Debug</code></a> based on <code>debug_fmt()</code></li></ul><p>By the way, we have added <code>Location</code> and <code>display</code> to all errors in GreptimeDB. This is the hard work behind the methodology.</p><h3 id="macro-details" tabindex="-1">Macro Details <a href="#macro-details" aria-label="Permalink to &quot;Macro Details&quot;">​</a></h3><p>Error is a singly linked list, like an onion from outer to inner. So we can capture an error at the outermost and walk through it.</p><p>One tricky thing we did here is about how to distinguish internal and external errors. Internal errors all implement the same trait <a href="https://greptimedb.rs/common_error/ext/trait.ErrorExt.html" target="_blank" rel="noreferrer"><code>ErrorExt</code></a> which can be used as a marker. But depending on this requires a <code>downcast</code> every time. We avoid this extra <code>downcast</code> call by simply giving a different name to them and detect in our macro.</p><p>As shown below, we name all external errors <code>error</code> and all internal errors <code>source</code>. Then return <code>None</code> on implementing <a href="https://greptimedb.rs/common_error/ext/trait.StackError.html#tymethod.next" target="_blank" rel="noreferrer"><code>StackError::next</code></a> method if we find an error, or <code>Some(source)</code> if we read source.</p><div><p><span>rust</span></p><pre><code><span><span>#[</span><span>derive</span><span>(</span><span>Snafu</span><span>)]</span></span>
+<span><span>#[</span><span>stack_trace_debug</span><span>]</span></span>
+<span><span>pub</span><span> </span><span>enum</span><span> </span><span>Error</span><span> </span><span>{</span></span>
+<span><span>    </span><span>#[</span><span>snafu</span><span>(</span><span>display</span><span>(</span><span>"</span><span>Failed to deserialize value</span><span>"</span><span>))]</span></span>
+<span><span>    </span><span>ValueDeserialize</span><span> </span><span>{</span></span>
+<span><span>        </span><span>#[</span><span>snafu</span><span>(</span><span>source</span><span>)]</span></span>
+<span><span>        error</span><span>:</span><span> </span><span>serde_json</span><span>::</span><span>error</span><span>::</span><span>Error</span><span>,</span><span> // &lt;-- external source</span></span>
+<span><span>        location</span><span>:</span><span> </span><span>Location</span><span>,</span></span>
+<span><span>    </span><span>},</span></span>
+<span></span>
+<span><span>    </span><span>#[</span><span>snafu</span><span>(</span><span>display</span><span>(</span><span>"</span><span>Table engine not found: </span><span>{}"</span><span>,</span><span> engine_name</span><span>))]</span></span>
+<span><span>    </span><span>TableEngineNotFound</span><span> </span><span>{</span></span>
+<span><span>        engine_name</span><span>:</span><span> </span><span>String</span><span>,</span></span>
+<span><span>        location</span><span>:</span><span> </span><span>Location</span><span>,</span></span>
+<span><span>        source</span><span>:</span><span> </span><span>table</span><span>::</span><span>error</span><span>::</span><span>Error</span><span>,</span><span>    // &lt;-- internal source</span></span>
+<span><span>    </span><span>}</span></span>
+<span><span>}</span></span></code></pre></div><p>The method <a href="https://greptimedb.rs/common_error/ext/trait.StackError.html#tymethod.debug_fmt" target="_blank" rel="noreferrer"><code>StackError::debug_fmt</code></a> is used to render the error stack. It would be called recursively in the generated code. Each layer of error will write its own debug message to the mutable <code>buf</code>. The content will contain error description captured from <code>#[snafu(display)]</code> attribute, the variant arm type like <code>TableEngineNotFound</code> and the location from the enumeration.</p><p>Given we already defined our error types in that way, adopting stack error doesn't require too much work, only adding the attribute macro <code>#[stack_trace_debug]</code> to every error type would be enough.</p><h3 id="present-error-to-end-users" tabindex="-1">Present Error to End Users <a href="#present-error-to-end-users" aria-label="Permalink to &quot;Present Error to End Users&quot;">​</a></h3><p>So far, we've covered most aspects. Now, let's delve into the final piece which is how to present errors to your users.</p><p>Unlike system developers, users may not care about the line number and even the stack. What information, then, is truly beneficial to end users?</p><p>This topic is very subjective. Still taking the above error as an example, let's consider which parts would or should users care about:</p><div><p><span>plain</span></p><pre><code><span><span>Failed to handle protocol</span></span>
+<span><span>0: Failed to handle incoming content, query: blabla, at src/protocol/handler.rs:89:22</span></span>
+<span><span>1: Failed to reading next message at queue 5 of 10, at src/protocol/loop.rs:254:14</span></span>
+<span><span>2: Failed to decode `01010001001010001` to ProtocolHeader, at src/protocol/codec.rs:90:14</span></span>
+<span><span>3: serde_json(invalid character at position 1)</span></span></code></pre></div><p>The first line gives a brief description of this error, i.e., what users actually saw from the top layer. We should keep it as well. Line 2 and line 3 are about internal details, which are too verbose to include. Line 4 is the leaf internal error, or the boundary from internal code to external dependency. It might sometimes contain useful information, so we count it in. However, we only include the error description since the stack number and code location are useless to users. Then the last line is external error, which is usually the root cause and we'd also include it.</p><p>Let's assemble the pieces we just picked. The final error message presents to users is as follow:</p><div><p><span>plain</span></p><pre><code><span><span>Failed to handle protocol - Failed to decode `01010001001010001` to ProtocolHeader (serde_json(invalid character at position 1))</span></span></code></pre></div><p>This can be achieved easily with previous <code>StackError::next</code> and <a href="https://greptimedb.rs/common_error/ext/trait.StackError.html#method.last" target="_blank" rel="noreferrer"><code>StackError::last</code></a>. Or you can customize the format you want with those methods.</p><p>Our experience is that the leaf (or the innermost) error's message might be useful as it is closer to what really goes wrong. The message can be further divided into two parts: internal and external, where the internal error is those defined in our codebase and the external is from dependencies, like <code>serde_json</code> from the previous example. The root (or the outermost) error's category is more accurate as it comes from where the error is thrown to the user.</p><p>In short, the error message scheme we proposed is:</p><div><p><span>plain</span></p><pre><code><span><span>KIND - REASON ([EXTERNAL CAUSE])</span></span></code></pre></div><h2 id="cost" tabindex="-1">Cost? <a href="#cost" aria-label="Permalink to &quot;Cost?&quot;">​</a></h2><p>The virtual stack is sweet so far, and it proves to be both more cost-effective and accurate compared to the system backtrace. So what is the cost?</p><p>As for runtime overhead, it only requires some string format for the per-level reason and location.</p><p>It's even better in binary size. In GreptimeDB's binary, the debug symbols occupied ~700MB. As a comparison, the <code>strip</code>-ed binary size is around 170MB, with <code>.rodata</code> section size <code>016a2225</code> (~22.6M), and the <code>.text</code> section occupies <code>06ad7511</code> (~ 106.8M).</p><p>Removing all <code>Location</code> reduces the <code>.rodata</code> size to <code>0169b225</code> (still ~22.6M, changes are very small) and the overall binary size to 170MB, while removing all <code>#[snafu(display)]</code> reduces the <code>.rodata</code> size to <code>01690225</code> (~22.5M) and the overall binary size to 170MB.</p><p>Hence, the Stacked Error mechanism's overhead to binary size is very low (~100K).</p><h2 id="conclusion-and-future-works" tabindex="-1">Conclusion and Future Works <a href="#conclusion-and-future-works" aria-label="Permalink to &quot;Conclusion and Future Works&quot;">​</a></h2><p>In this post, we present how to implement a proc-macro <a href="https://greptimedb.rs/common_macro/attr.stack_trace_debug.html" target="_blank" rel="noreferrer"><code>stack_trace_debug</code></a> and use it to assemble a low-overhead but still powerful stacked error message. It also provides a convenient way to walk through the error chain, to help render the error in different schema for different purposes.</p><p>This macro is only adopted in GreptimeDB now, we are attempting to make it more generic for different projects. A wide adoption of this pattern can also make it even more powerful by bridging third-party stacks and detailed reasons.</p><p>Besides, <code>std::error::Error</code> now provides an unstable API <a href="https://doc.rust-lang.org/std/error/trait.Error.html#method.provide" target="_blank" rel="noreferrer"><code>provide</code></a>, that allows getting a field in a struct. We can consider using it in refactoring our stack-trace utils.</p><hr><h4 id="about-greptime" tabindex="-1">About Greptime <a href="#about-greptime" aria-label="Permalink to &quot;About Greptime&quot;">​</a></h4><p>We help industries that generate large amounts of time-series data, such as Connected Vehicles (CV), IoT, and Observability, to efficiently uncover the hidden value of data in real-time.</p><p>Visit the <a href="https://www.greptime.com/resources" target="_blank" rel="noreferrer">latest version</a> from any device to get started and get the most out of your data.</p><ul><li><a href="https://github.com/GreptimeTeam/greptimedb" target="_blank" rel="noreferrer">GreptimeDB</a>, written in Rust, is a distributed, open-source, time-series database designed for scalability, efficiency, and powerful analytics.</li><li><a href="https://www.greptime.com/product/cloud" target="_blank" rel="noreferrer">GreptimeCloud</a> is a fully-managed cloud database-as-a-service (DBaaS) solution built on GreptimeDB. It efficiently supports applications in fields such as observability, IoT, and finance. The built-in observability solution, <a href="https://www.greptime.com/product/ai" target="_blank" rel="noreferrer">GreptimeAI</a>, helps users comprehensively monitor the cost, performance, traffic, and security of LLM applications.</li><li><strong>Vehicle-Cloud Integrated TSDB</strong> solution is tailored for business scenarios of automotive enterprises. It addresses the practical business pain points that arise when enterprise vehicle data grows exponentially.</li></ul><p>If anything above draws your attention, don't hesitate to star us on <a href="https://github.com/GreptimeTeam/greptimedb" target="_blank" rel="noreferrer">GitHub</a> or join GreptimeDB Community on <a href="https://www.greptime.com/slack" target="_blank" rel="noreferrer">Slack</a>. Also, you can go to our <a href="https://github.com/GreptimeTeam/greptimedb/contribute" target="_blank" rel="noreferrer">contribution page</a> to find some interesting issues to start with.</p></div></div></div><div data-v-0de291f9="" data-v-f7b8a506=""><h2 data-v-f7b8a506="">Join our community</h2><p>Get the latest updates and discuss with other users.</p></div></div>]]>
+            </description>
+            <link>https://greptime.com/blogs/2024-05-07-error-rust</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42457515</guid>
+            <pubDate>Thu, 19 Dec 2024 01:47:05 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[There's No Such Thing as Software Productivity (2012)]]>
+            </title>
+            <description>
+<![CDATA[
+Score 65 | Comments 53 (<a href="https://news.ycombinator.com/item?id=42457436">thread link</a>) | @pbrowne011
+<br/>
+December 18, 2024 | https://www.benrady.com/2012/11/theres-no-such-thing-as-software-productivity.html | <a href="https://web.archive.org/web/*/https://www.benrady.com/2012/11/theres-no-such-thing-as-software-productivity.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
+            </description>
+            <link>https://www.benrady.com/2012/11/theres-no-such-thing-as-software-productivity.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42457436</guid>
+            <pubDate>Thu, 19 Dec 2024 01:34:31 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Embedding Lua in Sqleibniz with Rust]]>
+            </title>
+            <description>
+<![CDATA[
+Score 38 | Comments 1 (<a href="https://news.ycombinator.com/item?id=42456707">thread link</a>) | @xnacly
+<br/>
+December 18, 2024 | https://xnacly.me/posts/2024/embed-lua-in-rust/ | <a href="https://web.archive.org/web/*/https://xnacly.me/posts/2024/embed-lua-in-rust/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><blockquote><p>I am currently writing a analysis tool for Sql:
+<a href="https://github.com/xnacly/sqleibniz"><code>sqleibniz</code></a>, specifically for the
+sqlite dialect.</p><p>The goal is to perform static analysis for sql input, including: syntax
+checks, checks if tables, columns and functions exist. Combining this with an
+embedded sqlite runtime and the ability to assert conditions in this runtime,
+creates a really great dev experience for sql.</p><p>Furthermore, I want to be able to show the user high quality error messages
+with context, explainations and the ability to mute certain diagnostics.</p><p>After completing the static analysis part of the project, I plan on writing a
+lsp server for sql, so stay tuned for that.</p></blockquote><h2 id="lua-as-scriptable-configuration--extending-sqleibniz-with-hooks">Lua as scriptable configuration &amp; extending sqleibniz with hooks</h2><p>I want to get the most out of sqleibniz, for me this includes the ability for
+configuration while providing sensible defaults.</p><p>Before the changes layed out in this post, sqleibniz was configured via a
+<code>leibniz.toml</code> file:</p><div><pre tabindex="0"><code data-lang="toml"><span><span> 1</span><span><span># this is an example file, consult: https://toml.io/en/ for syntax help and</span>
+</span></span><span><span> 2</span><span><span># src/rules.rs::Config for all available options</span>
+</span></span><span><span> 3</span><span>[disabled]
+</span></span><span><span> 4</span><span>    <span># see sqleibniz --help for all available rules</span>
+</span></span><span><span> 5</span><span>    rules = [
+</span></span><span><span> 6</span><span>        <span># by default, sqleibniz specific errors are disabled:</span>
+</span></span><span><span> 7</span><span>        <span>"NoContent"</span>, <span># source file is empty</span>
+</span></span><span><span> 8</span><span>        <span>"NoStatements"</span>, <span># source file contains no statements</span>
+</span></span><span><span> 9</span><span>        <span>"Unimplemented"</span>, <span># construct is not implemented yet</span>
+</span></span><span><span>10</span><span>        <span>"BadSqleibnizInstruction"</span>, <span># source file contains a bad sqleibniz instruction</span>
+</span></span><span><span>11</span><span>
+</span></span><span><span>12</span><span>        <span># ignoring sqlite specific diagnostics:</span>
+</span></span><span><span>13</span><span>        <span># "UnknownKeyword", # an unknown keyword was encountered</span>
+</span></span><span><span>14</span><span>        <span># "UnterminatedString", # a not closed string was found</span>
+</span></span><span><span>15</span><span>        <span># "UnknownCharacter", # an unknown character was found</span>
+</span></span><span><span>16</span><span>        <span># "InvalidNumericLiteral", # an invalid numeric literal was found</span>
+</span></span><span><span>17</span><span>        <span># "InvalidBlob", # an invalid blob literal was found (either bad hex data or incorrect syntax)</span>
+</span></span><span><span>18</span><span>        <span># "Syntax", # a structure with incorrect syntax was found</span>
+</span></span><span><span>19</span><span>        <span># "Semicolon", # a semicolon is missing</span>
+</span></span><span><span>20</span><span>    ]
+</span></span></code></pre></div><div id="callout"><h3>Tip</h3><p>A <code>rule</code> refers to a group of diagnostics, as their comments document.
+Sqleibniz groups diagnostics according to these rules. This enables omitting a
+singular or multiple diagnostics, alternatively to the configuration file,
+sqleibniz accepts the <code>-D</code> (short for disable) cli flag, followed the be rule
+to disable (the list of available rules can be found with <code>sqleibniz --help</code>).
+For instance, disabling all non sqlite diagnostics:</p><div><pre tabindex="0"><code data-lang="text"><span><span>1</span><span>$ sqleibniz \
+</span></span><span><span>2</span><span>    -Dno-statements \
+</span></span><span><span>3</span><span>    -Dno-content \
+</span></span><span><span>4</span><span>    -Dunimplemented \
+</span></span><span><span>5</span><span>    -Dbad-sqleibniz-instruction
+</span></span></code></pre></div><p>Sqleibniz prints the rules it currently ignores:</p><div><pre tabindex="0"><code data-lang="text"><span><span> 1</span><span>$ sqleibniz \
+</span></span><span><span> 2</span><span>    -Dno-statements \
+</span></span><span><span> 3</span><span>    -Dno-content \
+</span></span><span><span> 4</span><span>    -Dunimplemented \
+</span></span><span><span> 5</span><span>    -Dbad-sqleibniz-instruction
+</span></span><span><span> 6</span><span>warn: Ignoring the following diagnostics, as specified:
+</span></span><span><span> 7</span><span> -&gt; NoStatements
+</span></span><span><span> 8</span><span> -&gt; NoContent
+</span></span><span><span> 9</span><span> -&gt; Unimplemented
+</span></span><span><span>10</span><span> -&gt; BadSqleibnizInstruction
+</span></span></code></pre></div></div><p>Why switch from toml to lua when cleary toml already allows us to have all the
+configuration we need? The answer is scripting. I want to enable users to write
+their own plugins/addons/hooks for whatever usecase anyone could have.</p><p>My idea is to provide an array of hooks in lua, each one with a name, a node
+type to run the callback for and a callback that, once run, gets the context of
+the node. Node refers to an element in the abstract syntax tree generated by
+sqleibniz. <code>leibniz.lua</code> already contains the configuration from before,
+extended with two examplary hooks:</p><div><pre tabindex="0"><code data-lang="lua"><span><span> 1</span><span><span>-- this is an example configuration, consult: https://www.lua.org/manual/5.4/</span>
+</span></span><span><span> 2</span><span><span>-- or https://learnxinyminutes.com/docs/lua/ for syntax help and</span>
+</span></span><span><span> 3</span><span><span>-- src/rules.rs::Config for all available options</span>
+</span></span><span><span> 4</span><span>leibniz <span>=</span> {
+</span></span><span><span> 5</span><span>    disabled_rules <span>=</span> {
+</span></span><span><span> 6</span><span>        <span>-- ignore sqleibniz specific diagnostics:</span>
+</span></span><span><span> 7</span><span>        <span>"NoContent"</span>,               <span>-- source file is empty</span>
+</span></span><span><span> 8</span><span>        <span>"NoStatements"</span>,            <span>-- source file contains no statements</span>
+</span></span><span><span> 9</span><span>        <span>"Unimplemented"</span>,           <span>-- construct is not implemented yet</span>
+</span></span><span><span>10</span><span>        <span>"BadSqleibnizInstruction"</span>, <span>-- source file contains a bad sqleibniz instruction</span>
+</span></span><span><span>11</span><span>
+</span></span><span><span>12</span><span>        <span>-- ignore sqlite specific diagnostics:</span>
+</span></span><span><span>13</span><span>
+</span></span><span><span>14</span><span>        <span>-- "UnknownKeyword", -- an unknown keyword was encountered</span>
+</span></span><span><span>15</span><span>        <span>-- "UnterminatedString", -- a not closed string was found</span>
+</span></span><span><span>16</span><span>        <span>-- "UnknownCharacter", -- an unknown character was found</span>
+</span></span><span><span>17</span><span>        <span>-- "InvalidNumericLiteral", -- an invalid numeric literal was found</span>
+</span></span><span><span>18</span><span>        <span>-- "InvalidBlob", -- an invalid blob literal was found (either bad hex data or incorrect syntax)</span>
+</span></span><span><span>19</span><span>        <span>-- "Syntax", -- a structure with incorrect syntax was found</span>
+</span></span><span><span>20</span><span>        <span>-- "Semicolon", -- a semicolon is missing</span>
+</span></span><span><span>21</span><span>    },
+</span></span><span><span>22</span><span>    <span>-- sqleibniz allows for writing custom rules with lua</span>
+</span></span><span><span>23</span><span>    hooks <span>=</span> {
+</span></span><span><span>24</span><span>        {
+</span></span><span><span>25</span><span>            <span>-- summarises the hooks content</span>
+</span></span><span><span>26</span><span>            name <span>=</span> <span>"idents should be lowercase"</span>,
+</span></span><span><span>27</span><span>            <span>-- instructs sqleibniz which node to execute the `hook` for</span>
+</span></span><span><span>28</span><span>            node <span>=</span> <span>"literal"</span>,
+</span></span><span><span>29</span><span>            <span>-- sqleibniz calls the hook function once it encounters a node name</span>
+</span></span><span><span>30</span><span>            <span>-- matching the hook.node content</span>
+</span></span><span><span>31</span><span>            <span>--</span>
+</span></span><span><span>32</span><span>            <span>-- The `node` argument holds the following fields:</span>
+</span></span><span><span>33</span><span>            <span>--</span>
+</span></span><span><span>34</span><span>            <span>--```</span>
+</span></span><span><span>35</span><span>            <span>--    node: {</span>
+</span></span><span><span>36</span><span>            <span>--     kind: string,</span>
+</span></span><span><span>37</span><span>            <span>--     content: string,</span>
+</span></span><span><span>38</span><span>            <span>--     children: node[],</span>
+</span></span><span><span>39</span><span>            <span>--    }</span>
+</span></span><span><span>40</span><span>            <span>--```</span>
+</span></span><span><span>41</span><span>            <span>--</span>
+</span></span><span><span>42</span><span>            hook <span>=</span> <span>function</span>(node)
+</span></span><span><span>43</span><span>                <span>if</span> node.kind <span>==</span> <span>"ident"</span> <span>then</span>
+</span></span><span><span>44</span><span>                    <span>if</span> string.match(node.content, <span>"%u"</span>) <span>then</span>
+</span></span><span><span>45</span><span>                        <span>-- returing an error passes the diagnostic to sqleibniz,</span>
+</span></span><span><span>46</span><span>                        <span>-- thus a pretty message with the name of the hook, the</span>
+</span></span><span><span>47</span><span>                        <span>-- node it occurs and the message passed to error() is</span>
+</span></span><span><span>48</span><span>                        <span>-- generated</span>
+</span></span><span><span>49</span><span>                        error(<span>"All idents should be lowercase"</span>)
+</span></span><span><span>50</span><span>                    <span>end</span>
+</span></span><span><span>51</span><span>                <span>end</span>
+</span></span><span><span>52</span><span>            <span>end</span>
+</span></span><span><span>53</span><span>        },
+</span></span><span><span>54</span><span>        {
+</span></span><span><span>55</span><span>            name <span>=</span> <span>"idents shouldn't be longer than 12 characters"</span>,
+</span></span><span><span>56</span><span>            node <span>=</span> <span>"literal"</span>,
+</span></span><span><span>57</span><span>            hook <span>=</span> <span>function</span>(node)
+</span></span><span><span>58</span><span>                <span>local</span> max_size <span>=</span> <span>12</span>
+</span></span><span><span>59</span><span>                <span>if</span> node.kind <span>==</span> <span>"ident"</span> <span>then</span>
+</span></span><span><span>60</span><span>                    <span>if</span> string.len(node.content) <span>&gt;=</span> max_size <span>then</span>
+</span></span><span><span>61</span><span>                        error(<span>"idents shouldn't be longer than "</span> <span>..</span> max_size <span>..</span> <span>" characters"</span>)
+</span></span><span><span>62</span><span>                    <span>end</span>
+</span></span><span><span>63</span><span>                <span>end</span>
+</span></span><span><span>64</span><span>            <span>end</span>
+</span></span><span><span>65</span><span>        }
+</span></span><span><span>66</span><span>    }
+</span></span><span><span>67</span><span>}
+</span></span></code></pre></div><p>Since no one uses sqleibniz yet and I have no semantic versioning in place, I
+do not care about breaking backwards compatibility and just made the change,
+small projects ROCK!</p><h2 id="rust-to-lua-lua-to-rust">Rust to Lua, Lua to Rust</h2><p>Since the lua configuration is only useful when accessed inside the rust
+application, I created an equivalent data structure, containg both the disabled
+rules and the hooks.</p><div><pre tabindex="0"><code data-lang="rust"><span><span>1</span><span><span>pub</span> <span>struct</span> <span>Config</span> {
+</span></span><span><span>2</span><span>    <span>pub</span> disabled_rules: <span>Vec</span><span>&lt;</span>Rule<span>&gt;</span>,
+</span></span><span><span>3</span><span>    <span>pub</span> hooks: <span>Option</span><span>&lt;</span><span>Vec</span><span>&lt;</span>Hook<span>&gt;&gt;</span>,
+</span></span><span><span>4</span><span>}
+</span></span></code></pre></div><blockquote><p>I use the <a href="https://crates.io/crates/mlua"><code>mlua</code></a> package, because it has
+serde support and a lot of examples, even though I no longer use this
+feature.</p><div><pre tabindex="0"><code data-lang="toml"><span><span>1</span><span>mlua = { version = <span>"0.10.2"</span>, features = [<span>"lua54"</span>, <span>"vendored"</span>] }
+</span></span></code></pre></div><p>The <code>vendored</code>-feature allows me to not care about dependency managment regarding lua:</p><blockquote><p><code>vendored</code>: build static Lua(JIT) library from sources during mlua compilation using lua-src or luajit-src crates</p></blockquote></blockquote><p>mlua uses the <code>FromLua</code> and <code>IntoLua</code> traits for converting rust types to lua
+types and vice versa.</p><div><pre tabindex="0"><code data-lang="rust"><span><span>1</span><span><span>// from mlua/src/traits.rs
+</span></span></span><span><span>2</span><span><span></span>
+</span></span><span><span>3</span><span><span>/// Trait for types convertible from [`Value`].
+</span></span></span><span><span>4</span><span><span></span><span>pub</span> <span>trait</span> FromLua: <span>Sized</span> {
+</span></span><span><span>5</span><span>    <span>/// Performs the conversion.
+</span></span></span><span><span>6</span><span><span></span>    <span>fn</span> <span>from_lua</span>(value: <span>Value</span>, lua: <span>&amp;</span><span>Lua</span>) -&gt; <span>Result</span><span>&lt;</span>Self<span>&gt;</span>;
+</span></span><span><span>7</span><span>}
+</span></span></code></pre></div><p>mlua implements these traits for all primitive types and some ADT, while the
+<code>serde</code>-feature enables the serialization and deserialization of structures
+annotated with <code>serde::Deserialize</code> and <code>serde::Serialize</code>. The only issue I
+found with the above, is the ability to deserialize lua functions
+(<code>mlua::Function</code>). Serde does not support these, thus I implemented <code>FromLua</code>
+and <code>IntoLua</code> for my types on my own, taking serde out of the equation:</p><div><pre tabindex="0"><code data-lang="rust"><span><span> 1</span><span><span>impl</span> FromLua <span>for</span> Config {
+</span></span><span><span> 2</span><span>    <span>fn</span> <span>from_lua</span>(value: <span>mlua</span>::Value, lua: <span>&amp;</span><span>mlua</span>::Lua) -&gt; <span>mlua</span>::<span>Result</span><span>&lt;</span>Self<span>&gt;</span> {
+</span></span><span><span> 3</span><span>        <span>let</span> table: <span>Table</span> <span>=</span> lua.unpack(value)<span>?</span>;
+</span></span><span><span> 4</span><span>        <span>let</span> disabled_rules: <span>Vec</span><span>&lt;</span>Rule<span>&gt;</span> <span>=</span> table.get(<span>"disabled_rules"</span>).unwrap_or_else(<span>|</span>_<span>|</span> vec![]);
+</span></span><span><span> 5</span><span>        <span>let</span> hooks: <span>Option</span><span>&lt;</span><span>Vec</span><span>&lt;</span>Hook<span>&gt;&gt;</span> <span>=</span> table.get(<span>"hooks"</span>).ok();
+</span></span><span><span> 6</span><span>        <span>Ok</span>(Self {
+</span></span><span><span> 7</span><span>            disabled_rules,
+</span></span><span><span> 8</span><span>            hooks,
+</span></span><span><span> 9</span><span>        })
+</span></span><span><span>10</span><span>    }
+</span></span><span><span>11</span><span>}
+</span></span></code></pre></div><blockquote><p>Since the context (<code>lua</code>) is passed into the conversion, we can unpack the
+value to convert, because we want to work directly on the <code>mlua::Value</code> type.</p></blockquote><p>Implementing <code>FromLua</code> for <code>Config</code> requires <code>sqleibniz::types::config::Rule</code>
+and <code>sqleibniz::types::config::Hook</code> to implement <code>FromLua</code> too:</p><div><pre tabindex="0"><code data-lang="rust"><span><span> 1</span><span><span>pub</span> <span>enum</span> <span>Rule</span> {
+</span></span><span><span> 2</span><span>    NoContent,
+</span></span><span><span> 3</span><span>    NoStatements,
+</span></span><span><span> 4</span><span>    Unimplemented,
+</span></span><span><span> 5</span><span>    UnknownKeyword,
+</span></span><span><span> 6</span><span>    BadSqleibnizInstruction,
+</span></span><span><span> 7</span><span>    UnterminatedString,
+</span></span><span><span> 8</span><span>    UnknownCharacter,
+</span></span><span><span> 9</span><span>    InvalidNumericLiteral,
+</span></span><span><span>10</span><span>    InvalidBlob,
+</span></span><span><span>11</span><span>    Syntax,
+</span></span><span><span>12</span><span>    Semicolon,
+</span></span><span><span>13</span><span>}
+</span></span><span><span>14</span><span>
+</span></span><span><span>15</span><span><span>impl</span> mlua::FromLua <span>for</span> Rule {
+</span></span><span><span>16</span><span>    <span>fn</span> <span>from_lua</span>(value: <span>mlua</span>::Value, lua: <span>&amp;</span><span>mlua</span>::Lua) -&gt; <span>mlua</span>::<span>Result</span><span>&lt;</span>Self<span>&gt;</span> {
+</span></span><span><span>17</span><span>        <span>let</span> value: <span>String</span> <span>=</span> lua.unpack(value)<span>?</span>;
+</span></span><span><span>18</span><span>        <span>Ok</span>(<span>match</span> value.as_str() {
+</span></span><span><span>19</span><span>            <span>"NoContent"</span> <span>=&gt;</span> Self::NoContent,
+</span></span><span><span>20</span><span>            <span>"NoStatements"</span> <span>=&gt;</span> Self::NoStatements,
+</span></span><span><span>21</span><span>            <span>"Unimplemented"</span> <span>=&gt;</span> Self::Unimplemented,
+</span></span><span><span>22</span><span>            <span>"UnterminatedString"</span> <span>=&gt;</span> Self::UnterminatedString,
+</span></span><span><span>23</span><span>            <span>"UnknownCharacter"</span> <span>=&gt;</span> Self::UnknownCharacter,
+</span></span><span><span>24</span><span>            <span>"InvalidNumericLiteral"</span> <span>=&gt;</span> Self::InvalidNumericLiteral,
+</span></span><span><span>25</span><span>            <span>"InvalidBlob"</span> <span>=&gt;</span> Self::InvalidBlob,
+</span></span><span><span>26</span><span>            <span>"Syntax"</span> <span>=&gt;</span> Self::Syntax,
+</span></span><span><span>27</span><span>            <span>"Semicolon"</span> <span>=&gt;</span> Self::Semicolon,
+</span></span><span><span>28</span><span>            <span>"BadSqleibnizInstruction"</span> <span>=&gt;</span> Self::BadSqleibnizInstruction,
+</span></span><span><span>29</span><span>            <span>"UnknownKeyword"</span> <span>=&gt;</span> Self::UnknownKeyword,
+</span></span><span><span>30</span><span>            _ <span>=&gt;</span> {
+</span></span><span><span>31</span><span>                <span>return</span> <span>Err</span>(mlua::Error::FromLuaConversionError {
+</span></span><span><span>32</span><span>                    from: <span>"string"</span>,
+</span></span><span><span>33</span><span>                    to: <span>"sqleibniz::rules::Rule"</span>.into(),
+</span></span><span><span>34</span><span>                    message: <span>Some</span>(<span>"Unknown rule name"</span>.into()),
+</span></span><span><span>35</span><span>                })
+</span></span><span><span>36</span><span>            }
+</span></span><span><span>37</span><span>        })
+</span></span><span><span>38</span><span>    }
+</span></span><span><span>39</span><span>}
+</span></span></code></pre></div><p>The same for <code>HookContext</code>, but a lot shorter:</p><div><pre tabindex="0"><code data-lang="rust"><span><span> 1</span><span><span>pub</span> <span>struct</span> <span>Hook</span> {
+</span></span><span><span> 2</span><span>    <span>pub</span> name: <span>String</span>,
+</span></span><span><span> 3</span><span>    <span>/// node is optional, because omitting it executes the hook for every encountered node
+</span></span></span><span><span> 4</span><span><span></span>    <span>pub</span> node: <span>Option</span><span>&lt;</span><span>String</span><span>&gt;</span>,
+</span></span><span><span> 5</span><span>    <span>pub</span> hook: <span>Option</span><span>&lt;</span>Function<span>&gt;</span>,
+</span></span><span><span> 6</span><span>}
+</span></span><span><span> 7</span><span>
+</span></span><span><span> 8</span><span><span>impl</span> mlua::FromLua <span>for</span> Hook {
+</span></span><span><span> 9</span><span>    <span>fn</span> <span>from_lua</span>(value: <span>mlua</span>::Value, lua: <span>&amp;</span><span>mlua</span>::Lua) -&gt; <span>mlua</span>::<span>Result</span><span>&lt;</span>Self<span>&gt;</span> {
+</span></span><span><span>10</span><span>        <span>let</span> table: <span>Table</span> <span>=</span> lua.unpack(value)<span>?</span>;
+</span></span><span><span>11</span><span>        <span>let</span> name <span>=</span> table.get(<span>"name"</span>)<span>?</span>;
+</span></span><span><span>12</span><span>        <span>let</span> node <span>=</span> table.get(<span>"node"</span>).ok();
+</span></span><span><span>13</span><span>        <span>let</span> hook: <span>Option</span><span>&lt;</span>Function<span>&gt;</span> <span>=</span> table.get(<span>"hook"</span>).ok();
+</span></span><span><span>14</span><span>        <span>Ok</span>(Self { name, node, hook })
+</span></span><span><span>15</span><span>    }
+</span></span><span><span>16</span><span>}
+</span></span></code></pre></div><h2 id="calling-lua-functions-from-rust">Calling Lua functions from Rust</h2><p>Since we now have the ability to convert a lua value to a <code>mlua::Function</code>, we
+can call said function and provide the context it needs as its argument(s):</p><div><pre tabindex="0"><code data-lang="rust"><span><span>1</span><span><span>impl</span> Hook {
+</span></span><span><span>2</span><span>    <span>pub</span> <span>fn</span> <span>exec</span>(<span>&amp;</span>self, arg: <span>HookContext</span>) -&gt; <span>mlua</span>::<span>Result</span><span>&lt;</span>()<span>&gt;</span> {
+</span></span><span><span>3</span><span>        <span>if</span> <span>let</span> <span>Some</span>(hook) <span>=</span> <span>&amp;</span>self.hook {
+</span></span><span><span>4</span><span>            hook.call(arg)<span>?</span>
+</span></span><span><span>5</span><span>        }
+</span></span><span><span>6</span><span>        <span>Ok</span>(())
+</span></span><span><span>7</span><span>    }
+</span></span><span><span>8</span><span>}
+</span></span></code></pre></div><p>The <code>sqleibniz::types::ctx::HookContext</code> represents the context I want every hook to have, specifically:</p><div><pre tabindex="0"><code data-lang="rust"><span><span> 1</span><span><span>pub</span> <span>struct</span> <span>HookContext</span> {
+</span></span><span><span> 2</span><span>    <span>/// [Self::kind] will be the name of the node for most nodes, except nodes
+</span></span></span><span><span> 3</span><span><span></span>    <span>/// that hold different kinds, such as Literal, which can be an Ident, a
+</span></span></span><span><span> 4</span><span><span></span>    <span>/// String, a Number, etc.
+</span></span></span><span><span> 5</span><span><span></span>    <span>pub</span> kind: <span>String</span>,
+</span></span><span><span> 6</span><span>    <span>/// [Self::content] holds the textual representation of a nodes contents if
+</span></span></span><span><span> 7</span><span><span></span>    <span>/// it is [crates::parser::nodes::Literal].
+</span></span></span><span><span> 8</span><span><span></span>    <span>pub</span> content: <span>Option</span><span>&lt;</span><span>String</span><span>&gt;</span>,
+</span></span><span><span> 9</span><span>    <span>pub</span> children: <span>Vec</span><span>&lt;</span>HookContext<span>&gt;</span>,
+</span></span><span><span>10</span><span>}
+</span></span></code></pre></div><p>Due to us passing this structure to <code>Hook::exec</code> and therefore to
+<code>mlua::Function::call</code> it has to implement the <code>IntoLua</code> trait:</p><div><pre tabindex="0"><code data-lang="rust"><span><span>1</span><span><span>impl</span> IntoLua <span>for</span> HookContext {
+</span></span><span><span>2</span><span>    <span>fn</span> <span>into_lua</span>(self, lua: <span>&amp;</span><span>mlua</span>::Lua) -&gt; <span>mlua</span>::<span>Result</span><span>&lt;</span>mlua::Value<span>&gt;</span> {
+</span></span><span><span>3</span><span>        <span>let</span> table <span>=</span> lua.create_table()<span>?</span>;
+</span></span><span><span>4</span><span>        table.set(<span>"kind"</span>, self.kind)<span>?</span>;
+</span></span><span><span>5</span><span>        table.set(<span>"text"</span>, self.content.unwrap_or_else(<span>||</span> <span>String</span>::new()))<span>?</span>;
+</span></span><span><span>6</span><span>        table.set(<span>"children"</span>, self.children)<span>?</span>;
+</span></span><span><span>7</span><span>        lua.pack(table)
+</span></span><span><span>8</span><span>    }
+</span></span><span><span>9</span><span>}
+</span></span></code></pre></div><h2 id="putting-it-all-together">Putting it all together</h2><p>Inside of the lua scripting context, we now are able to access all of these fields:</p><div><pre tabindex="0"><code data-lang="lua"><span><span> 1</span><span>leibniz <span>=</span> {
+</span></span><span><span> 2</span><span>    hooks <span>=</span> {
+</span></span><span><span> 3</span><span>        {
+</span></span><span><span> 4</span><span>            name <span>=</span> <span>"hook test"</span>,
+</span></span><span><span> 5</span><span>            hook <span>=</span> <span>function</span>(node)
+</span></span><span><span> 6</span><span>                print(node.kind <span>..</span> <span>" "</span> <span>..</span> node.text <span>..</span> <span>" "</span> <span>..</span> <span>#</span>node.children)
+</span></span><span><span> 7</span><span>            <span>end</span>
+</span></span><span><span> 8</span><span>        }
+</span></span><span><span> 9</span><span>    }
+</span></span><span><span>10</span><span>}
+</span></span></code></pre></div><p>Executing this hook with the <code>HookContext</code> ends in the
+expected result: <code>literal this_is_an_ident 0</code>.</p><p>The following shows the full example I use for sqleibniz:</p><div><pre tabindex="0"><code data-lang="rust"><span><span> 1</span><span><span>fn</span> <span>configuration</span>(lua: <span>&amp;</span><span>mlua</span>::Lua, file_name: <span>&amp;</span><span>str</span>) -&gt; <span>Result</span><span>&lt;</span>Config, <span>String</span><span>&gt;</span> {
+</span></span><span><span> 2</span><span>    <span>let</span> conf_str <span>=</span> fs::read_to_string(file_name)
+</span></span><span><span> 3</span><span>        .map_err(<span>|</span>err<span>|</span> format!(<span>"Failed to read configuration file '</span><span>{}</span><span>': </span><span>{}</span><span>"</span>, file_name, err))<span>?</span>;
+</span></span><span><span> 4</span><span>
+</span></span><span><span> 5</span><span>    <span>// load the lua configuration string, execute it
+</span></span></span><span><span> 6</span><span><span></span>    lua.load(conf_str)
+</span></span><span><span> 7</span><span>        .set_name(file_name)
+</span></span><span><span> 8</span><span>        .exec()
+</span></span><span><span> 9</span><span>        .map_err(<span>|</span>err<span>|</span> format!(<span>"</span><span>{}</span><span>: </span><span>{}</span><span>"</span>, file_name, err))<span>?</span>;
+</span></span><span><span>10</span><span>    <span>let</span> globals <span>=</span> lua.globals();
+</span></span><span><span>11</span><span>
+</span></span><span><span>12</span><span>    <span>let</span> raw_conf <span>=</span> globals
+</span></span><span><span>13</span><span>        .get::<span>&lt;</span>mlua::Value<span>&gt;</span>(<span>"leibniz"</span>)
+</span></span><span><span>14</span><span>        .map_err(<span>|</span>err<span>|</span> format!(<span>"</span><span>{}</span><span>: </span><span>{}</span><span>"</span>, file_name, err))<span>?</span>;
+</span></span><span><span>15</span><span>    <span>// if the leibniz table does not exist, mlua does not return an Err, we
+</span></span></span><span><span>16</span><span><span></span>    <span>// have to check for this case
+</span></span></span><span><span>17</span><span><span></span>    <span>if</span> raw_conf.is_nil() {
+</span></span><span><span>18</span><span>        <span>return</span> <span>Err</span>(format!(
+</span></span><span><span>19</span><span>            <span>"</span><span>{}</span><span>: leibniz table is missing from configuration"</span>,
+</span></span><span><span>20</span><span>            file_name
+</span></span><span><span>21</span><span>        ));
+</span></span><span><span>22</span><span>    }
+</span></span><span><span>23</span><span>
+</span></span><span><span>24</span><span>    <span>let</span> conf: <span>Config</span> <span>=</span> lua
+</span></span><span><span>25</span><span>         <span>// calls mlua::FromLua(conf)
+</span></span></span><span><span>26</span><span><span></span>        .unpack(raw_conf)
+</span></span><span><span>27</span><span>        .map_err(<span>|</span>err<span>|</span> format!(<span>"</span><span>{}</span><span>: </span><span>{}</span><span>"</span>, file_name, err))<span>?</span>;
+</span></span><span><span>28</span><span>    <span>Ok</span>(conf)
+</span></span><span><span>29</span><span>}
+</span></span><span><span>30</span><span>
+</span></span><span><span>31</span><span><span>fn</span> <span>main</span>() {
+</span></span><span><span>32</span><span>    <span>let</span> <span>mut</span> config <span>=</span> Config {
+</span></span><span><span>33</span><span>        disabled_rules: <span>vec</span><span>!</span>[],
+</span></span><span><span>34</span><span>        hooks: <span>None</span>,
+</span></span><span><span>35</span><span>    };
+</span></span><span><span>36</span><span>
+</span></span><span><span>37</span><span>    <span>// lua defined here because it would be dropped at the end of configuration(), in the
+</span></span></span><span><span>38</span><span><span></span>    <span>// future this will probably need to be moved one scope up to life long enough for analysis
+</span></span></span><span><span>39</span><span><span></span>    <span>let</span> lua <span>=</span> mlua::Lua::new();
+</span></span><span><span>40</span><span>    <span>match</span> configuration(<span>&amp;</span>lua, <span>&amp;</span>args.config) {
+</span></span><span><span>41</span><span>        <span>Ok</span>(conf) <span>=&gt;</span> config <span>=</span> conf,
+</span></span><span><span>42</span><span>        <span>Err</span>(err) <span>=&gt;</span> {
+</span></span><span><span>43</span><span>            error::warn(<span>&amp;</span>err.to_string());
+</span></span><span><span>44</span><span>        }
+</span></span><span><span>45</span><span>    }
+</span></span><span><span>46</span><span>
+</span></span><span><span>47</span><span>    <span>if</span> <span>let</span> <span>Some</span>(hooks) <span>=</span> <span>&amp;</span>config.hooks {
+</span></span><span><span>48</span><span>        <span>let</span> ctx <span>=</span> types::ctx::HookContext {
+</span></span><span><span>49</span><span>            kind: <span>"literal"</span>.into(),
+</span></span><span><span>50</span><span>            content: <span>Some</span>(<span>"this_is_an_ident"</span>.into()),
+</span></span><span><span>51</span><span>            children: <span>vec</span><span>!</span>[],
+</span></span><span><span>52</span><span>        };
+</span></span><span><span>53</span><span>
+</span></span><span><span>54</span><span>        <span>for</span> hook <span>in</span> hooks {
+</span></span><span><span>55</span><span>            <span>let</span> _ <span>=</span> hook.exec(ctx.clone());
+</span></span><span><span>56</span><span>        }
+</span></span><span><span>57</span><span>    }
+</span></span><span><span>58</span><span>}
+</span></span></code></pre></div><p>If the configuration has invalid syntax or the <code>leibniz</code> table is missing, a
+warning is omitted and sqleibniz falls back to the default empty configuration:</p><div><pre tabindex="0"><code data-lang="text"><span><span>1</span><span>warn: leibniz.lua: syntax error: [string "leibniz.lua"]:6: '}' expected (to close '{' at line 4) near 'bled_rules'
+</span></span><span><span>2</span><span>warn: leibniz.lua: leibniz table is missing from configuration
+</span></span></code></pre></div></div></div>]]>
+            </description>
+            <link>https://xnacly.me/posts/2024/embed-lua-in-rust/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42456707</guid>
+            <pubDate>Wed, 18 Dec 2024 23:33:14 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Show HN: K8s Cleaner – Roomba for Kubernetes]]>
             </title>
             <description>
 <![CDATA[
-Score 44 | Comments 26 (<a href="https://news.ycombinator.com/item?id=42454723">thread link</a>) | @pescerosso
+Score 58 | Comments 41 (<a href="https://news.ycombinator.com/item?id=42454723">thread link</a>) | @pescerosso
 <br/>
 December 18, 2024 | https://sveltos.projectsveltos.io/k8sCleaner.html | <a href="https://web.archive.org/web/*/https://sveltos.projectsveltos.io/k8sCleaner.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
@@ -352,7 +783,7 @@ December 18, 2024 | https://sveltos.projectsveltos.io/k8sCleaner.html | <a href=
             </title>
             <description>
 <![CDATA[
-Score 21 | Comments 18 (<a href="https://news.ycombinator.com/item?id=42454139">thread link</a>) | @kfrzcode
+Score 33 | Comments 27 (<a href="https://news.ycombinator.com/item?id=42454139">thread link</a>) | @kfrzcode
 <br/>
 December 18, 2024 | https://www.eqtylab.io/blog/verifiable-compute-press-release | <a href="https://web.archive.org/web/*/https://www.eqtylab.io/blog/verifiable-compute-press-release">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><section><h2>Updates</h2><ul><li>Wed 18 Dec 2024</li></ul></section><section><ul><li><p><i><span>Breakthrough provides the first-ever certificates of authenticity and compliance for independent verification of AI training, inference, and benchmarks at runtime.</span></i></p></li></ul><ul><li><p><i><span>The solution delivers on-silicon, real-time governance — an industry-first created from two years of intensive research joined by advisors at Stanford and MIT.</span></i></p></li></ul><ul><li><p><i><span>Delivered this month to first clients with transformative applications across the life sciences, public sector, finance, and media to certify smarter, safer AI systems and agents.</span></i></p></li></ul><p><b><span>Los Angeles, CA – December 18, 2024</span></b><span> – </span><a href="https://www.eqtylab.io/"><span><u>EQTY Lab</u></span></a><span>, in collaboration with </span><a href="https://www.intel.com/content/www/us/en/homepage.html"><span><u>Intel</u></span></a><span> (NASDAQ: INTC) and </span><a href="https://www.nvidia.com/en-us/"><span><u>NVIDIA</u></span></a><span> (NASDAQ: NVDA), announced today the release of the Verifiable Compute AI framework, the first hardware-based solution to govern and audit AI workflows. Verifiable Compute represents a significant leap forward in ensuring that AI is explainable, accountable, and secure at runtime. It gives consumers and businesses new confidence to accelerate AI adoption and development.</span></p><blockquote><span>“<span>As a new era of autonomous AI agents emerges, we must evolve our trust in AI systems. Verifiable Compute protects and controls AI data, models, and agents with the industry’s most advanced cryptography. <p>It transforms how organizations enforce AI governance, automate auditing, and collaborate to build safer and more valuable AI.</p></span>”</span><cite>Jonathan Dotan, Founder of EQTY Lab</cite></blockquote><p><span>Verifiable Compute introduces a patent-pending hardware-based cryptographic AI notary and certificate system to isolate sensitive AI operations and notarize them with a tamperproof record of every data object and code computed in AI training and inference. It also provides real-time compliance checks and enforcement of AI business policies and new sovereign AI regulations such as the EU AI Act. Verifiable Compute’s new layer of trust is rooted right in the silicon of next-generation hardware from NVIDIA and Intel, setting the pace for a new standard for AI safety</span><span> </span><span>and innovation. A copy of the Verifiable Compute white paper is available for download at </span><a href="https://vcomp.eqtylab.io/"><span><u>vcomp.eqtylab.io</u></span></a><span>.</span></p><blockquote><span>“<span>Intel is pushing the boundaries on delivering Confidential AI from edge to cloud, and EQTY Lab provides another level of trust to the confidential computing ecosystem. Adding Verifiable Compute to Confidential AI deployments helps companies enhance the security, privacy, and accountability of their AI solutions.</span>”</span><cite>Anand Pashupathy, VP &amp; General Manager, Security Software &amp; Services Division, Intel Corporation</cite></blockquote><blockquote><span>“<span>The true potential of AI won’t be fully realized until we can provide confidential computing to verify every component in the stack. Securing the trust boundary in the processor sets a standard for next-generation AI workloads to be cryptographically secure and verifiable.</span>”</span><cite>Michael O'Connor, NVIDIA Chief Architect for Confidential Computing, NVIDIA</cite></blockquote><p><span>The Verifiable Compute framework and notary system unlocks a powerful new capability in Trusted Execution Environments (TEEs) available on the 5th Gen Intel® Xeon® Processors with Intel® Trust Domain Extensions (Intel® TDX), extending the trust zone through confidential VMs to the NVIDIA H100/H200 GPUs and NVIDIA’s forthcoming Blackwell GPU architecture. The demand for confidential computing has surged this year owing to requirements for compliance with data sovereignty laws and new AI regulations. The market is projected to reach global sales of </span><a href="https://www.einpresswire.com/article/766030625/confidential-computing-market-size-to-exceed-usd-184-5-billion-by-2032-cagr-of-46-8"><span><u>$184.5 billion by 2032</u></span></a><span>.</span></p><p><span>Verifiable Compute addresses the unique and escalating risks to AI supply chains, from AI poisoning and information extraction to privacy backdoors and denial-of-service attacks. According to recent studies, </span><a href="https://www.securitymagazine.com/articles/100402-91-of-organizations-faced-a-software-supply-chain-attack-last-year"><span><u>91% of organizations have experienced supply chain attacks</u></span></a><span> on traditional software systems — an issue that becomes even more pronounced in the context of AI agents that automate tasks with less supervision.</span></p><p><span>By providing a cryptographically secure record of every stage of the AI lifecycle, Verifiable Compute demonstrates how innovation can thwart attacks with provable authentication, security, and assurance rooted in silicon. Verifiable Compute also allows for provable records of conformity with regulatory frameworks that can preserve AI artifacts years after a model has delivered results. If mandatory controls are not satisfied, a verifiable governance gate halts an AI system and can notify or integrate into an enterprise’s remediation tooling, with native connectors to ServiceNow, Databricks, and Palantir. If the system is compliant, it can issue an AI audit and lineage certificate that is verified instantly in a browser or can be independently audited at any point in the future. Together, these advanced capabilities eliminate a major trust gap for enterprises, allowing them to innovate responsibly with AI and prepare to meet the new promise of autonomous AI agent systems.</span></p><p><b><span>About EQTY Lab</span></b></p><p><span>EQTY Lab pioneers solutions to accelerate innovation and trust in AI. Their flagship product, the AI Integrity Suite, applies cryptographic technology to ensure that the governance of AI data, models, and agents is accountable to all stakeholders. With applications spanning the public sector, life sciences, and media, EQTY Lab is at the forefront of enabling trusted and responsible AI. To learn more about Verifiable Compute, go to </span><a href="https://vcomp.eqtylab.io/"><span><u>vcomp.eqtylab.io</u></span></a><span> and </span><a href="http://eqtylab.io/"><span><u>eqtylab.io</u></span></a><span>.&nbsp;</span></p><p><b><span>Press Contacts</span></b></p><p><span>EQTY Lab — Zenobia Godschalk</span></p><p><a href="mailto:zenobia@zagcommunications.com"><span><u>zenobia@zagcommunications.com</u></span></a></p><p><span>Intel — Jennifer Foss</span></p><p><a href="mailto:jennifer.foss@intel.com"><span><u>jennifer.foss@intel.com</u></span></a></p><p><span>NVIDIA — Laura Martinez</span></p><p><a href="mailto:lauram@nvidia.com"><span><u>lauram@nvidia.com</u></span></a></p></section></div></div>]]>
@@ -367,7 +798,7 @@ December 18, 2024 | https://www.eqtylab.io/blog/verifiable-compute-press-release
             </title>
             <description>
 <![CDATA[
-Score 77 | Comments 12 (<a href="https://news.ycombinator.com/item?id=42453431">thread link</a>) | @aboodman
+Score 80 | Comments 13 (<a href="https://news.ycombinator.com/item?id=42453431">thread link</a>) | @aboodman
 <br/>
 December 18, 2024 | https://bugs.rocicorp.dev/issue/0 | <a href="https://web.archive.org/web/*/https://bugs.rocicorp.dev/issue/0">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -382,7 +813,7 @@ December 18, 2024 | https://bugs.rocicorp.dev/issue/0 | <a href="https://web.arc
             </title>
             <description>
 <![CDATA[
-Score 46 | Comments 16 (<a href="https://news.ycombinator.com/item?id=42451886">thread link</a>) | @PaulHoule
+Score 47 | Comments 16 (<a href="https://news.ycombinator.com/item?id=42451886">thread link</a>) | @PaulHoule
 <br/>
 December 18, 2024 | https://matt.blwt.io/post/leadership-power-tools-sql-and-statistics/ | <a href="https://web.archive.org/web/*/https://matt.blwt.io/post/leadership-power-tools-sql-and-statistics/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>A common pattern I’ve seen over the years have been folks in engineering leadership positions that are not super comfortable with extracting and interpreting data from stores, be it databases, CSV files in an object store, or even just a spreadsheet. We’re going to cover SQL &amp; DuckDB, then some useful statistical tools: summary stats, distributions, confidence intervals and Bayesian reasoning.</p><p>All too often a request is put into an BI team or data analyst to “run a report” or something similar. Instead, pick up some power tools and <a href="https://www.youtube.com/watch?v=vOBr0jcqnZo">do it yourself</a>!</p><figure><img src="https://matt.blwt.io/leadership-power-tools-sql-and-statistics/header.webp" alt="A line drawing of a power drill and table saw, continuing the power tools metaphor."></figure><h2 id="table-of-contents">Table of Contents</h2><ul><li><a href="#sql-and-duckdb">SQL and DuckDB</a></li><li><a href="#statistics">Statistics</a><ul><li><a href="#applying-summary-statistics">Applying Summary Statistics</a></li><li><a href="#confidence-intervals">Confidence Intervals</a></li><li><a href="#bayesian-reasoning">Bayesian Reasoning</a></li></ul></li><li><a href="#wrap-up">Wrap Up</a></li></ul><h2 id="sql-and-duckdb">SQL and DuckDB</h2><p><a href="https://duckdb.org/">DuckDB</a> is probably going to be your best entry point into the world of SQL. It’s a lightweight, in-process SQL database that you can use to run queries against CSV files, Parquet files, and more. It’s a great way to get started with SQL without having to worry about setting up a database server or anything like that. It can also connect to remote databases, <a href="https://duckdb.org/docs/guides/database_integration/postgres">like Postgres</a> or <a href="https://duckdb.org/docs/guides/database_integration/mysql">MySQL</a>.</p><p>If you aren’t familiar with SQL, I’d recommend going through a brief tutorial - <a href="https://www.sqltutorial.org/">SQLTutorial</a> is a pretty good place to start - look at using <a href="https://www.sqlite.org/index.html">SQLite</a> as a database to practice with. Once you’re comfortable with the basics, you can start using DuckDB to run queries against your data.</p><p>SQL is our <em>lingua franca</em> for data querying. Knowing how to write SQL queries is a powerful tool to have in your toolbox, and <em>will</em> make you more effective. It’s not just for data analysts or BI folks - it’s for anyone who needs to make decisions based on data. I’d recommend getting familiar with <code>JOIN</code>s, <code>GROUP BY</code>, and <code>HAVING</code> clauses, as well as window functions. If you want to push the envelope, look into CTEs (Common Table Expressions) and recursive queries.</p><p>Lets say you have an extract of data from your production database, and you want to find out how many users signed up per day over the last month. Given a CSV file <code>users.csv</code> with the following columns:</p><pre tabindex="0"><code data-lang="csv">user_id,created_at
@@ -772,7 +1203,7 @@ December 18, 2024 | https://efoodalert.com/2024/12/17/usda-locks-barn-door-after
             </title>
             <description>
 <![CDATA[
-Score 39 | Comments 37 (<a href="https://news.ycombinator.com/item?id=42451449">thread link</a>) | @erikgahner
+Score 40 | Comments 37 (<a href="https://news.ycombinator.com/item?id=42451449">thread link</a>) | @erikgahner
 <br/>
 December 18, 2024 | https://erikgahner.dk/2024/ai-will-be-dead-in-five-years/ | <a href="https://web.archive.org/web/*/https://erikgahner.dk/2024/ai-will-be-dead-in-five-years/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="page">
@@ -812,7 +1243,7 @@ December 18, 2024 | https://erikgahner.dk/2024/ai-will-be-dead-in-five-years/ | 
             </title>
             <description>
 <![CDATA[
-Score 153 | Comments 201 (<a href="https://news.ycombinator.com/item?id=42447762">thread link</a>) | @thunderbong
+Score 157 | Comments 211 (<a href="https://news.ycombinator.com/item?id=42447762">thread link</a>) | @thunderbong
 <br/>
 December 17, 2024 | https://olivernguyen.io/w/namespace.error/ | <a href="https://web.archive.org/web/*/https://olivernguyen.io/w/namespace.error/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div itemprop="articleBody"><p><em>Handling errors in Go is simple and flexible – yet no structure!</em></p><p><em>It’s supposed to be simple, right? Just return an <code>error</code> , wrapped with a message, and move on. Well, that simplicity quickly turns into chaotic as our codebase grows with more packages, more developers, and more “quick fixes” that stay there forever. Over time, the logs are full of “failed to do this” and “unexpected that”, and nobody knows if it’s the user’s fault, the server’s fault, buggy code, or it’s just a misalignment of the stars!</em></p><p><em>Errors are created with inconsistent messages. Each package has it own set of styles, constants, or custom error types. Error codes are added arbitrarily. No easy way to tell which errors may be returned from which function without digging into its implementation!</em></p><p><em>So, I took the challenge of creating a new error framework. We decided to go with a structured, centralized system using namespace codes to make errors meaningful, traceable, and – most importantly – give us peace of mind!</em></p><p><em>This is the story of how we started with a simple error handling approach, got thoroughly frustrated as the problems grew, and eventually built our own error framework. The design decisions, how it’s implemented, the lessons learned, and why it transformed our approach to managing errors. I hope that it will bring some ideas for you too!</em></p><hr><h2 id="go-errors-are-just-values">Go errors are just values</h2><p>Go has a straightforward way to handle errors: errors are just values. An error is just a value that implements the <code>error</code> interface with a single method <code>Error() string</code>. Instead of throwing an exception and disrupting the current execution flow, Go functions return an <code>error</code> value alongside other results. The caller can then decide how to handle it: check its value to make decision, wrap with new messages and context, or simply return the error, leaving the handling logic for parent callers.</p><p>We can make any type an <code>error</code> by adding the <code>Error() string</code> method on it. This flexibility allows each package to define its own error-handling strategy, and choose whatever works best for them. This also integrates well with Go’s philosophy of composability, making it easy to wrap, extend, or customize errors as required.</p><h2 id="every-package-needs-to-deal-with-errors">Every package needs to deal with errors</h2><p>The common practice is to return an error value that implements the <code>error</code> interface and lets the caller decide what to do next. Here’s a typical example:</p><div><pre tabindex="0"><code data-lang="go"><span>func</span> <span>loadCredentials</span><span>()</span> <span>(</span><span>Credentials</span><span>,</span> <span>error</span><span>)</span> <span>{</span>
@@ -1431,7 +1862,7 @@ December 17, 2024 | https://olivernguyen.io/w/namespace.error/ | <a href="https:
             </title>
             <description>
 <![CDATA[
-Score 79 | Comments 128 (<a href="https://news.ycombinator.com/item?id=42446995">thread link</a>) | @semking
+Score 80 | Comments 128 (<a href="https://news.ycombinator.com/item?id=42446995">thread link</a>) | @semking
 <br/>
 December 17, 2024 | https://semking.com/google-search-real-user-feedback/ | <a href="https://web.archive.org/web/*/https://semking.com/google-search-real-user-feedback/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1967,7 +2398,7 @@ December 17, 2024 | https://blackentropy.com/why-companies-overspend-on-recruiti
             </title>
             <description>
 <![CDATA[
-Score 111 | Comments 37 (<a href="https://news.ycombinator.com/item?id=42443022">thread link</a>) | @bambax
+Score 111 | Comments 40 (<a href="https://news.ycombinator.com/item?id=42443022">thread link</a>) | @bambax
 <br/>
 December 17, 2024 | https://blog.medusis.com/38_Adventures+in+OCR.html | <a href="https://web.archive.org/web/*/https://blog.medusis.com/38_Adventures+in+OCR.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2174,7 +2605,7 @@ response = client.annotate_image(request=request)</code></pre>
             </title>
             <description>
 <![CDATA[
-Score 172 | Comments 29 (<a href="https://news.ycombinator.com/item?id=42442354">thread link</a>) | @ekmartin
+Score 222 | Comments 34 (<a href="https://news.ycombinator.com/item?id=42442354">thread link</a>) | @ekmartin
 <br/>
 December 17, 2024 | https://increase.com/articles/iso-8583-the-language-of-credit-cards | <a href="https://web.archive.org/web/*/https://increase.com/articles/iso-8583-the-language-of-credit-cards">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -2189,7 +2620,7 @@ December 17, 2024 | https://increase.com/articles/iso-8583-the-language-of-credi
             </title>
             <description>
 <![CDATA[
-Score 690 | Comments 251 (<a href="https://news.ycombinator.com/item?id=42441333">thread link</a>) | @vinnyglennon
+Score 692 | Comments 251 (<a href="https://news.ycombinator.com/item?id=42441333">thread link</a>) | @vinnyglennon
 <br/>
 December 17, 2024 | https://brightonruby.com/2024/getting-to-2-million-users-as-a-one-woman-dev-team/ | <a href="https://web.archive.org/web/*/https://brightonruby.com/2024/getting-to-2-million-users-as-a-one-woman-dev-team/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2216,7 +2647,7 @@ December 17, 2024 | https://brightonruby.com/2024/getting-to-2-million-users-as-
             </title>
             <description>
 <![CDATA[
-Score 503 | Comments 250 (<a href="https://news.ycombinator.com/item?id=42440886">thread link</a>) | @gniting
+Score 505 | Comments 253 (<a href="https://news.ycombinator.com/item?id=42440886">thread link</a>) | @gniting
 <br/>
 December 17, 2024 | https://dylanhuang.com/blog/closing-my-startup/ | <a href="https://web.archive.org/web/*/https://dylanhuang.com/blog/closing-my-startup/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><p>by<!-- --> <a href="https://dylanhuang.com/">Dylan Huang</a> <!-- -->on <!-- -->November 25, 2024</p><p>And by "all," I mean everything: core product, failed pivots, miscellaneous
@@ -4521,7 +4952,7 @@ December 16, 2024 | https://decodeinvesting.com/chat?agents=lima | <a href="http
             </title>
             <description>
 <![CDATA[
-Score 179 | Comments 243 (<a href="https://news.ycombinator.com/item?id=42433205">thread link</a>) | @hosolmaz
+Score 180 | Comments 243 (<a href="https://news.ycombinator.com/item?id=42433205">thread link</a>) | @hosolmaz
 <br/>
 December 16, 2024 | https://solmaz.io/our-muscles-will-atrophy | <a href="https://web.archive.org/web/*/https://solmaz.io/our-muscles-will-atrophy">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div aria-label="Content">
@@ -4696,7 +5127,7 @@ December 16, 2024 | https://solmaz.io/our-muscles-will-atrophy | <a href="https:
             </title>
             <description>
 <![CDATA[
-Score 93 | Comments 41 (<a href="https://news.ycombinator.com/item?id=42432374">thread link</a>) | @Abishek_Muthian
+Score 131 | Comments 73 (<a href="https://news.ycombinator.com/item?id=42432374">thread link</a>) | @Abishek_Muthian
 <br/>
 December 16, 2024 | https://abishekmuthian.com/apple-watch-with-android/ | <a href="https://web.archive.org/web/*/https://abishekmuthian.com/apple-watch-with-android/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>A friend passed away recently during sleep due to unknown natural causes when they were all alone in a hotel in a foreign country. I couldn't dismiss the thought that may be if they had worn a smart watch they could have had better chances of reaching out for help and perhaps even got alerted of some discrepancies in their vitals.</p><p>There's no dearth of smart watches in the market offering health monitoring solutions but Apple Watch has been leading the pack in terms of accuracy of heart-rate, sleep and exercise tracking for years; In fact a 4 year old Apple Watch is more accurate than most recent commercial competitors.<sup><a href="#sources">1</a></sup></p><p>Only issue is that I decided not to give any more money to Apple years ago after being fed up with their walled-garden,<sup><a href="#sources">2</a></sup>abuse of their monopoly powers<sup><a href="#sources">3</a>,<a href="#sources">3.1</a></sup>, blatant aspiration porn<sup><a href="#sources">4</a></sup> marketing, anti-repair agenda<sup><a href="#sources">4.1</a></sup> etc.</p><p>Instead, I've been happily using a refurbished BLE smart watch and refurbished smart phones with great open-source community support for several years.</p><p>Gadgetbridge,<sup><a href="#sources">5</a></sup> enables me to have total control of the data from my smart watch by getting rid of the proprietary app of the manufacturer. Lineage OS<sup><a href="#sources">6</a></sup> along with microG<sup><a href="#sources">7</a></sup> and F-Droid<sup><a href="#sources">7</a></sup> enables me to have a private and secure smartphone and protect my data from Google and its data-hoarding pals; thanks to the vibrant and steadfast open-source community.</p><p>Occasionally I even dabble with mainline Linux smartphones with postmarketOS<sup><a href="#sources">8</a></sup> and smart watch powered by Asteroid OS<sup><a href="#sources">8.1</a></sup> to recover from the fatigue induced by the duopolies of the smartphone ecosystem.</p><p>There's no fall-detection or SOS functionality in my Gadgetbridge compatible watch. The accuracy of the health trackers in these watches are by no means comparable to that from an Apple Watch and due to the tight coupling of Apple Watch with iOS, it's not worth the effort of making it work with Gadgetbridge.</p><p>Health tracking has become important to me but not at the expense of the freedom &amp; security I enjoy with my computing devices powered by open-source ecosystems.</p><p>So I decided to make Apple Watch work with my Android phone using <strong>open-source applications, interoperable protocols and 3rd party services</strong>. If you just want to use my code and techniques and not read my commentary on it then feel free to checkout my GitHub for sources<sup><a href="#sources">9</a></sup>.</p><h2 id="impossible-without-an-iphone-but-need-not-carry-one">Impossible without an iPhone, but need not carry one</h2><p>I bought a refurbished cellular Apple Watch which supports all the health functions<sup><a href="#sources">10</a></sup> I need and latest Apple Watch OS.</p><p>My initial plan was to use the Apple Watch for Kids<sup><a href="#sources">11</a></sup> paired with my partner's iPhone but I was defeated quickly as the Apple Watch for kids doesn't enable crucial health features like ECG; even though my profile clearly states me as an adult.</p><p>Besides, only one of the oligopoly telecom networks in my country supports an Apple Watch eSIM under "Apple Watch for Kids" program, which, when I tried promptly deactivated my network services. Fortunately this was my secondary SIM and so I moved on.</p><p>This made it clear that I cannot continue without an iPhone and so I got a refurbished iPhone which still has some years of OS updates left.</p><p>I've compromised on my initial goal of not having to buy an iPhone to use an Apple Watch with Android. But I managed to achieve the new goal of not having to carry an iPhone with me but still getting all the functions I need from an Apple Watch synced with an Android phone.</p><h3 id="cellular">Cellular</h3><p>I got the cellular working in the Apple Watch by using the same SIM from my Android phone in the iPhone, pairing with the Apple Watch and setting up the mobile data.</p><p>Receiving and making calls via Apple Watch (when Wifi/BT is disabled) works well, but since the SIM is in the Android phone, the SMS functionality doesn't work; with it SOS messages to emergency contacts(even if they're on iMessage ʅ₍ッ₎ʃ ); but SOS calls work.</p><figure><img alt="Apple Watch showing a call from mummy" src="https://abishekmuthian.com/images/apple-watch-call-screen.png" width="25%" height="auto" layout="responsive"><figcaption>Calls received on Apple Watch and on my Android phone simultaneously</figcaption></figure><figure><img alt="Android showing a call from mummy" src="https://abishekmuthian.com/images/android-call-screen.png" width="25%" height="auto" layout="responsive"><figcaption>Calls received on Android and on my Apple Watch simultaneously</figcaption></figure><h3 id="notifications">Notifications</h3><p>Implementing notifications on Apple Watch from Android required the most effort. But it was worth it as notifications are crucial for productivity and for saving power on the smartphone.</p><p>I wrote a python script to read the notifications in Android using the invaluable terminal emulator - Termux<sup><a href="#sources">12</a></sup> (one of the main reasons why I can't leave the Android ecosystem) and sent it over to Apple Watch using Pushover<sup><a href="#sources">13</a></sup> - a push notification service.</p><figure><img alt="Apple Watch on hand showing a message reading hello from shilpi" src="https://abishekmuthian.com/images/apple-watch-notification-screen-on-hand.jpg" width="50%" height="auto" layout="responsive"><figcaption>Notifications on Apple Watch sent from an Android Phone</figcaption></figure><h3 id="calendar">Calendar</h3><p>Calendar syncing from Android to Apple Watch was made possible using CalDAV,<sup><a href="#sources">14</a></sup> an interoperable protocol for calendar data from my self-hosted Nextcloud server<sup><a href="#sources">14.1</a></sup> and with apps like Fossify Calendar<sup><a href="#sources">15</a></sup> &amp; DavX<sup><a href="#sources">16</a></sup>.</p><figure><img alt="Android screenshot showing the calendar app with an event" src="https://abishekmuthian.com/images/calendar-app-android.png" width="50%" height="auto" layout="responsive"><figcaption>Events created on the Android calendar app are now synced with the Apple Watch</figcaption></figure><figure><img alt="Apple Watch screenshot showing the synced event from the Android calendar" src="https://abishekmuthian.com/images/calendar-events-apple-watch.png" width="25%" height="auto" layout="responsive"><figcaption>Apple Watch showing the synced event from the Android calendar</figcaption></figure><h3 id="contacts">Contacts</h3><p>It would have been weird if the calls on Apple Watch showed just the phone numbers, so I synced the contacts from my Android phone to Apple Watch using CardDAV<sup><a href="#sources">17</a></sup>, an interoperable protocol for contact data from my self-hosted Nextcloud server and with apps like Fossify Contacts &amp; DavX.</p><figure><img alt="Apple Watch screenshot of the contact screen" src="https://abishekmuthian.com/images/contacts-apple-watch.png" width="25%" height="auto" layout="responsive"><figcaption>Contacts from Android synced to Apple Watch</figcaption></figure><h3 id="tasks">Tasks</h3><p>One added advantage of using DAVx is that it allows to sync tasks from tasks app like jtxBoard<sup><a href="#sources">18</a></sup> using aforementioned interoperable protocols.</p><p>Tasks from Android get synced to Apple Watch Calendar and the Reminders apps.</p><figure><img alt="Android screenshot showing the tasks from the jtxBoard app" src="https://abishekmuthian.com/images/jtx-tasks-android.png" width="50%" height="auto" layout="responsive"><figcaption>Tasks in the jtxBoard app</figcaption></figure><figure><img alt="Apple Watch screenshot showing the synced task in the Calendar app" src="https://abishekmuthian.com/images/tasks-apple-watch.png" width="25%" height="auto" layout="responsive"><figcaption>Apple Watch Calendar app with the synced task from Android</figcaption></figure><figure><img alt="Apple Watch screenshot showing the synced task in the Reminders app" src="https://abishekmuthian.com/images/reminders-app-watch.png" width="25%" height="auto" layout="responsive"><figcaption>Apple Watch Reminders app with the synced sub-tasks from Android</figcaption></figure><h3 id="conclusion">Conclusion</h3><p>I now have a functional Apple Watch working with my Android phone. I keep my iPhone at home, powered and connected to the Internet but don't use it as a daily driver.</p><p>There could be room for improvement in various aspects of this project. If you feel would like to help then start a discussion in the GitHub project repository.</p><p>Finally, none of this would have been possible without the open-source community, interoperable protocols and community focussed small applications; all of which are under tremendous threat from vested interests.</p><h3 id="discussions">Discussions</h3><p>If you would like to discuss with me about Apple Watch with Android, hop on to any of these social platforms - <a href="https://news.ycombinator.com/item?id=42432374" target="_blank">Hacker News</a>, <a href="https://fosstodon.org/@abishek_muthian/113663385882365752" target="_blank">Mastodon</a>, <a href="https://bsky.app/profile/abishek-muthian.fosstodon.org.ap.brid.gy/post/3ldgpvthqyt22" target="_blank">Bluesky</a>, <a href="https://x.com/Abishek_Muthian/status/1868696009028915645" target="_blank">Twitter</a> and <a href="https://www.linkedin.com/feed/update/urn:li:share:7274625303237292032/" target="_blank">LinkedIn</a>.</p><hr><h4 id="sources">Sources</h4><p>1: Quantified Scientist's review of Apple Watch 6's HR tracker - <a href="https://www.youtube.com/watch?v=5cUXNlxcKUE" target="_blank">https://www.youtube.com/watch?v=5cUXNlxcKUE</a></p><p>2: Closed Platform - <a href="https://en.wikipedia.org/wiki/Closed_platform" target="_blank">https://en.wikipedia.org/wiki/Closed_platform</a></p><p>3: Green bubbles, Apple Pay and other reasons why America says Apple is breaking the law - <a href="https://edition.cnn.com/2024/03/21/tech/america-apple-monopoly/index.html" target="_blank">https://edition.cnn.com/2024/03/21/tech/america-apple-monopoly/index.html</a></p><p>3.1: Abrupt transfer of 'Arcade' category of games to 'X' category because Apple's game subscription platform was named 'Apple Arcade' - <a href="https://news.ycombinator.com/item?id=28327374" target="_blank">https://news.ycombinator.com/item?id=28327374</a></p><p>4: iPhone price drop making to headlines is aspiration porn - <a href="https://abishekmuthian.com/iphone-price-drop-making-to-headlines-is-aspiration-porn/" target="_blank">https://abishekmuthian.com/iphone-price-drop-making-to-headlines-is-aspiration-porn/</a></p><p>4.1: Uncovering Every Lie in MKBHD's Softball Interview; a scathing critique of 'brand safe' influencers - <a href="https://www.youtube.com/watch?v=Z0DF-MOkotA" target="_blank">https://www.youtube.com/watch?v=Z0DF-MOkotA</a></p><p>5: Gadgetbridge - <a href="https://gadgetbridge.org/" target="_blank">https://gadgetbridge.org/</a></p><p>6: LineageOS - <a href="https://lineageos.org/" target="_blank">https://lineageos.org/</a></p><p>7: microG - <a href="https://microg.org/" target="_blank">https://microg.org/</a></p><p>8: postmarketOS - <a href="https://postmarketos.org/" target="_blank">https://postmarketos.org/</a></p><p>8.1: Smart Watch to Smart Clock - <a href="https://abishekmuthian.com/smart-watch-to-smart-clock/" target="_blank">https://abishekmuthian.com/smart-watch-to-smart-clock/</a></p><p>9: Apple Watch with Android - <a href="https://github.com/abishekmuthian/apple-watch-with-android" target="_blank">https://github.com/abishekmuthian/apple-watch-with-android</a></p><p>10: Apple Watch Health features - <a href="https://www.apple.com/in/healthcare/apple-watch/" target="_blank">https://www.apple.com/in/healthcare/apple-watch/</a></p><p>11: Apple Watch for Kids - <a href="https://www.apple.com/in/apple-watch-for-your-kids/" target="_blank">https://www.apple.com/in/apple-watch-for-your-kids/</a></p><p>12: Termux - <a href="https://termux.dev/en/" target="_blank">https://termux.dev/en/</a></p><p>13: Pushover - <a href="https://pushover.net/" target="_blank">https://pushover.net/</a></p><p>14: CalDAV on Wikipedia - <a href="https://en.wikipedia.org/wiki/CalDAV" target="_blank">https://en.wikipedia.org/wiki/CalDAV</a></p><p>14.1: Nextcloud - <a href="https://nextcloud.com/" target="_blank">https://nextcloud.com/</a></p><p>15: Fossify - <a href="https://www.fossify.org/apps/" target="_blank">https://www.fossify.org/apps/</a></p><p>16: DAVx - <a href="https://www.davx5.com/" target="_blank">https://www.davx5.com/</a></p><p>17: CardDAV - <a href="https://en.wikipedia.org/wiki/CardDAV" target="_blank">https://en.wikipedia.org/wiki/CardDAV</a></p><p>18: jtxBoard - <a href="https://jtx.techbee.at/" target="_blank">https://jtx.techbee.at/</a></p></div><p>I strive to write low frequency, High quality content on Health, Product Development, Programming, Software Engineering, DIY, Security, Philosophy and other interests.
@@ -4746,7 +5177,7 @@ to use open source models in production environments!</p>
             </title>
             <description>
 <![CDATA[
-Score 77 | Comments 35 (<a href="https://news.ycombinator.com/item?id=42430080">thread link</a>) | @freetonik
+Score 78 | Comments 37 (<a href="https://news.ycombinator.com/item?id=42430080">thread link</a>) | @freetonik
 <br/>
 December 16, 2024 | https://rakhim.exotext.com/jupyter-notebooks-as-e2e-tests | <a href="https://web.archive.org/web/*/https://rakhim.exotext.com/jupyter-notebooks-as-e2e-tests">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
