@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Sat, 21 Dec 2024 16:23:19 GMT</lastBuildDate>
+        <lastBuildDate>Sat, 21 Dec 2024 20:22:13 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-10.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Sat, 21 Dec 2024 16:23:19 GMT</pubDate>
+        <pubDate>Sat, 21 Dec 2024 20:22:13 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,1320 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Dividing unsigned 8-bit numbers]]>
+            </title>
+            <description>
+<![CDATA[
+Score 26 | Comments 12 (<a href="https://news.ycombinator.com/item?id=42481612">thread link</a>) | @mfiguiere
+<br/>
+December 21, 2024 | http://0x80.pl/notesen/2024-12-21-uint8-division.html | <a href="https://web.archive.org/web/*/http://0x80.pl/notesen/2024-12-21-uint8-division.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="dividing-unsigned-8-bit-numbers">
+
+<table>
+<colgroup><col>
+<col>
+</colgroup><tbody>
+<tr><th>Author:</th>
+<td>Wojciech Muła</td></tr>
+<tr><th>Added on:</th><td>2024-12-21</td>
+</tr>
+</tbody>
+</table>
+
+<div id="introduction">
+
+<p>Division is quite an expansive operation. For instance, latency of the 32-bit
+division varies between 10 and 15 cycles on the Cannon Lake CPU, and for Zen4
+this range is from 9 to 14 cycles. The latency of 32-bit multiplication is
+3 or 4 cycles on both CPU models.</p>
+<p>SIMD ISAs usually do not provide the integer division; the only known exception
+is <a href="http://0x80.pl/notesen/2024-11-09-riscv-vector-extension.html">RISC-V Vector Extension</a>. However, SIMD ISAs have floating point division.</p>
+<p>In this text we present two approaches to achieve a SIMD-ized division of 8-bit
+unsigned numbers:</p>
+<ol>
+<li>using floating point division,</li>
+<li>using the long division algorithm.</li>
+</ol>
+<p>We try to vectorize the following C++ procedure:</p>
+<pre><span>void</span><span> </span><span>scalar_div_u8</span><span>(</span><span>const</span><span> </span><span>uint8_t</span><span>*</span><span> </span><span>a</span><span>,</span><span> </span><span>const</span><span> </span><span>uint8_t</span><span>*</span><span> </span><span>b</span><span>,</span><span> </span><span>uint8_t</span><span>*</span><span> </span><span>out</span><span>,</span><span> </span><span>size_t</span><span> </span><span>n</span><span>)</span><span> </span><span>{</span><span>
+    </span><span>for</span><span> </span><span>(</span><span>size_t</span><span> </span><span>i</span><span>=</span><span>0</span><span>;</span><span> </span><span>i</span><span> </span><span>&lt;</span><span> </span><span>n</span><span>;</span><span> </span><span>i</span><span>++</span><span>)</span><span> </span><span>{</span><span>
+        </span><span>out</span><span>[</span><span>i</span><span>]</span><span> </span><span>=</span><span> </span><span>a</span><span>[</span><span>i</span><span>]</span><span> </span><span>/</span><span> </span><span>b</span><span>[</span><span>i</span><span>];</span><span>
+    </span><span>}</span><span>
+</span><span>}</span>
+</pre>
+<p>Compilers cannot vectorize it. For example GCC 14.1.0 produces the following assembly
+(stripped from code alignment junk):</p>
+<pre>2b40:       48 85 c9                test   %rcx,%rcx
+2b43:       74 30                   je     2b75 &lt;_Z13scalar_div_u8PKhS0_Phm+0x35&gt;
+2b45:       45 31 c0                xor    %r8d,%r8d
+2b60:       42 0f b6 04 07          movzbl (%rdi,%r8,1),%eax
+2b65:       42 f6 34 06             divb   (%rsi,%r8,1)
+2b69:       42 88 04 02             mov    %al,(%rdx,%r8,1)
+2b6d:       49 ff c0                inc    %r8
+2b70:       4c 39 c1                cmp    %r8,%rcx
+2b73:       75 eb                   jne    2b60 &lt;_Z13scalar_div_u8PKhS0_Phm+0x20&gt;
+2b75:       c3                      ret
+</pre>
+</div>
+<div id="floating-point-point-operations">
+
+<p>An 8-bit number can be converted into single precision floating point number
+without any precision loss.</p>
+<p>The generic outline of division consist the following steps:</p>
+<ol>
+<li>cast 8-bit dividend and divisor into 32-bit integers,</li>
+<li>convert unsigned integers into floating-point numbers,</li>
+<li>perform floating-point division,</li>
+<li>convert floating-point result into 32-bit integers,</li>
+<li>cast back 32-bit integer into 8-bit final result.</li>
+</ol>
+<div id="division-with-rounding">
+<h2>Division with rounding</h2>
+<p>Here is the actual implementation of SSE procedure. Note that we need to explicitly
+truncate the floating point number before converting back into integer. By default
+that conversion rounds the argument, so we would get wrong results (off by 1).</p>
+<ol>
+<li><p>Load four 8-bit dividends.</p>
+<pre><span>uint32_t</span><span> </span><span>buf_a</span><span>;</span><span>
+</span><span>memcpy</span><span>(</span><span>&amp;</span><span>buf_a</span><span>,</span><span> </span><span>&amp;</span><span>a</span><span>[</span><span>i</span><span>],</span><span> </span><span>4</span><span>);</span>
+</pre>
+</li>
+<li><p>And four 8-bit divisors.</p>
+<pre><span>uint32_t</span><span> </span><span>buf_b</span><span>;</span><span>
+</span><span>memcpy</span><span>(</span><span>&amp;</span><span>buf_b</span><span>,</span><span> </span><span>&amp;</span><span>b</span><span>[</span><span>i</span><span>],</span><span> </span><span>4</span><span>);</span>
+</pre>
+</li>
+<li><p>Transfer them to SSE register and cast to 32-bit numbers.</p>
+<pre><span>const</span><span> </span><span>__m128i</span><span> </span><span>a_u8</span><span>  </span><span>=</span><span> </span><span>_mm_cvtsi32_si128</span><span>(</span><span>buf_a</span><span>);</span><span>
+</span><span>const</span><span> </span><span>__m128i</span><span> </span><span>a_u32</span><span> </span><span>=</span><span> </span><span>_mm_cvtepu8_epi32</span><span>(</span><span>a_u8</span><span>);</span><span>
+
+</span><span>const</span><span> </span><span>__m128i</span><span> </span><span>b_u8</span><span>  </span><span>=</span><span> </span><span>_mm_cvtsi32_si128</span><span>(</span><span>buf_b</span><span>);</span><span>
+</span><span>const</span><span> </span><span>__m128i</span><span> </span><span>b_u32</span><span> </span><span>=</span><span> </span><span>_mm_cvtepu8_epi32</span><span>(</span><span>b_u8</span><span>);</span>
+</pre>
+</li>
+<li><p>Cast 32-bit integers into floats.</p>
+<pre><span>const</span><span> </span><span>__m128</span><span>  </span><span>a_f32</span><span> </span><span>=</span><span> </span><span>_mm_cvtepi32_ps</span><span>(</span><span>a_u32</span><span>);</span><span>
+</span><span>const</span><span> </span><span>__m128</span><span>  </span><span>b_f32</span><span> </span><span>=</span><span> </span><span>_mm_cvtepi32_ps</span><span>(</span><span>b_u32</span><span>);</span>
+</pre>
+</li>
+<li><p>Perform division and then truncation.</p>
+<pre><span>const</span><span> </span><span>__m128</span><span>  </span><span>c_f32</span><span>   </span><span>=</span><span> </span><span>_mm_div_ps</span><span>(</span><span>a_f32</span><span>,</span><span> </span><span>b_f32</span><span>);</span><span>
+</span><span>const</span><span> </span><span>__m128</span><span>  </span><span>c_f32_2</span><span> </span><span>=</span><span> </span><span>_mm_round_ps</span><span>(</span><span>c_f32</span><span>,</span><span> </span><span>_MM_FROUND_TO_ZERO</span><span> </span><span>|</span><span> </span><span>_MM_FROUND_NO_EXC</span><span>);</span>
+</pre>
+</li>
+<li><p>Convert floats back into integers.</p>
+<pre><span>const</span><span> </span><span>__m128i</span><span> </span><span>c_i32</span><span> </span><span>=</span><span> </span><span>_mm_cvtps_epi32</span><span>(</span><span>c_f32_2</span><span>);</span>
+</pre>
+</li>
+<li><p>Cast 32-bit into 8-bit numbers: gather lowest 8-bit numbers into single
+32-bit word and save this word to the output array.</p>
+<pre><span>const</span><span> </span><span>__m128i</span><span> </span><span>c_u8</span><span>  </span><span>=</span><span> </span><span>_mm_shuffle_epi8</span><span>(</span><span>c_i32</span><span>,</span><span> </span><span>_mm_setr_epi8</span><span>(</span><span>
+    </span><span>0</span><span>,</span><span> </span><span>4</span><span>,</span><span> </span><span>8</span><span>,</span><span> </span><span>12</span><span>,</span><span>
+    </span><span>-1</span><span>,</span><span> </span><span>-1</span><span>,</span><span> </span><span>-1</span><span>,</span><span> </span><span>-1</span><span>,</span><span>
+    </span><span>-1</span><span>,</span><span> </span><span>-1</span><span>,</span><span> </span><span>-1</span><span>,</span><span> </span><span>-1</span><span>,</span><span>
+    </span><span>-1</span><span>,</span><span> </span><span>-1</span><span>,</span><span> </span><span>-1</span><span>,</span><span> </span><span>-1</span><span>
+</span><span>));</span><span>
+
+</span><span>const</span><span> </span><span>uint32_t</span><span> </span><span>buf</span><span> </span><span>=</span><span> </span><span>_mm_cvtsi128_si32</span><span>(</span><span>c_u8</span><span>);</span><span>
+</span><span>memcpy</span><span>(</span><span>&amp;</span><span>out</span><span>[</span><span>i</span><span>],</span><span> </span><span>&amp;</span><span>buf</span><span>,</span><span> </span><span>4</span><span>);</span>
+</pre>
+</li>
+</ol>
+</div>
+<div id="division-without-rounding">
+<h2>Division without rounding</h2>
+<p>Rounding instruction ROUNDPS has quite big latency, at least on Intel CPUs. On IceLake it is 8 cycles,
+while Zen4 has only 3 cycles.</p>
+<p>We can avoid floating point rounding by multiplying the dividend 256 (shift left by 8 bits) and
+shifting right by 8 the final result. The shift right can be done at no cost, because we anyway
+use shuffling to gather individual bytes, so it's only matter of a constant. Shifting left by 8 is
+suitable only for SSE code — we can use byte shuffle to shift-and-extend integers. In the case
+of AVX2 code, byte shuffling is done on 128-bit lanes, thus we would need more work to prepare
+input for that operation.</p>
+<p>The SSE procedure is almost the same as in the previous section:</p>
+<ol>
+<li><p>Load four dividends.</p>
+<pre><span>uint32_t</span><span> </span><span>buf_a</span><span>;</span><span>
+</span><span>memcpy</span><span>(</span><span>&amp;</span><span>buf_a</span><span>,</span><span> </span><span>&amp;</span><span>a</span><span>[</span><span>i</span><span>],</span><span> </span><span>4</span><span>);</span><span>
+</span><span>const</span><span> </span><span>__m128i</span><span> </span><span>a_u8</span><span>  </span><span>=</span><span> </span><span>_mm_cvtsi32_si128</span><span>(</span><span>buf_a</span><span>);</span>
+</pre>
+</li>
+<li><p>Convert <tt>dividend &lt;&lt; 8</tt> into 32-bit numbers.</p>
+<pre><span>const</span><span> </span><span>__m128i</span><span> </span><span>a_u32</span><span> </span><span>=</span><span> </span><span>_mm_shuffle_epi8</span><span>(</span><span>a_u8</span><span>,</span><span> </span><span>_mm_setr_epi8</span><span>(</span><span>
+    </span><span>-1</span><span>,</span><span> </span><span>0</span><span>,</span><span> </span><span>-1</span><span>,</span><span> </span><span>-1</span><span>,</span><span>
+    </span><span>-1</span><span>,</span><span> </span><span>1</span><span>,</span><span> </span><span>-1</span><span>,</span><span> </span><span>-1</span><span>,</span><span>
+    </span><span>-1</span><span>,</span><span> </span><span>2</span><span>,</span><span> </span><span>-1</span><span>,</span><span> </span><span>-1</span><span>,</span><span>
+    </span><span>-1</span><span>,</span><span> </span><span>3</span><span>,</span><span> </span><span>-1</span><span>,</span><span> </span><span>-1</span><span>
+</span><span>));</span>
+</pre>
+</li>
+<li><p>Load four divisors and convert them to 32-bit numbers.</p>
+<pre><span>uint32_t</span><span> </span><span>buf_b</span><span>;</span><span>
+</span><span>memcpy</span><span>(</span><span>&amp;</span><span>buf_b</span><span>,</span><span> </span><span>&amp;</span><span>b</span><span>[</span><span>i</span><span>],</span><span> </span><span>4</span><span>);</span><span>
+</span><span>const</span><span> </span><span>__m128i</span><span> </span><span>b_u8</span><span>  </span><span>=</span><span> </span><span>_mm_cvtsi32_si128</span><span>(</span><span>buf_b</span><span>);</span><span>
+</span><span>const</span><span> </span><span>__m128i</span><span> </span><span>b_u32</span><span> </span><span>=</span><span> </span><span>_mm_cvtepu8_epi32</span><span>(</span><span>b_u8</span><span>);</span>
+</pre>
+</li>
+<li><p>Cast all 32-bit integers into floats.</p>
+<pre><span>const</span><span> </span><span>__m128</span><span>  </span><span>a_f32</span><span> </span><span>=</span><span> </span><span>_mm_cvtepi32_ps</span><span>(</span><span>a_u32</span><span>);</span><span>
+</span><span>const</span><span> </span><span>__m128</span><span>  </span><span>b_f32</span><span> </span><span>=</span><span> </span><span>_mm_cvtepi32_ps</span><span>(</span><span>b_u32</span><span>);</span>
+</pre>
+</li>
+<li><p>Perform division.</p>
+<pre><span>const</span><span> </span><span>__m128</span><span>  </span><span>c_f32</span><span>   </span><span>=</span><span> </span><span>_mm_div_ps</span><span>(</span><span>a_f32</span><span>,</span><span> </span><span>b_f32</span><span>);</span>
+</pre>
+</li>
+<li><p>Convert quotient into 32-bit integers.</p>
+<pre><span>const</span><span> </span><span>__m128i</span><span> </span><span>c_i32</span><span> </span><span>=</span><span> </span><span>_mm_cvtps_epi32</span><span>(</span><span>c_f32</span><span>);</span>
+</pre>
+</li>
+<li><p>Cast <tt>quotient &gt;&gt; 8</tt> into 8-bit numbers: gather bit #1 of each 32-bit word.</p>
+<pre><span>const</span><span> </span><span>__m128i</span><span> </span><span>c_u8</span><span>  </span><span>=</span><span> </span><span>_mm_shuffle_epi8</span><span>(</span><span>c_i32</span><span>,</span><span> </span><span>_mm_setr_epi8</span><span>(</span><span>
+    </span><span>0</span><span> </span><span>+</span><span> </span><span>1</span><span>,</span><span> </span><span>4</span><span> </span><span>+</span><span> </span><span>1</span><span>,</span><span> </span><span>8</span><span> </span><span>+</span><span> </span><span>1</span><span>,</span><span> </span><span>12</span><span> </span><span>+</span><span> </span><span>1</span><span>,</span><span>
+    </span><span>-1</span><span>,</span><span> </span><span>-1</span><span>,</span><span> </span><span>-1</span><span>,</span><span> </span><span>-1</span><span>,</span><span>
+    </span><span>-1</span><span>,</span><span> </span><span>-1</span><span>,</span><span> </span><span>-1</span><span>,</span><span> </span><span>-1</span><span>,</span><span>
+    </span><span>-1</span><span>,</span><span> </span><span>-1</span><span>,</span><span> </span><span>-1</span><span>,</span><span> </span><span>-1</span><span>
+</span><span>));</span><span>
+
+</span><span>const</span><span> </span><span>uint32_t</span><span> </span><span>buf</span><span> </span><span>=</span><span> </span><span>_mm_cvtsi128_si32</span><span>(</span><span>c_u8</span><span>);</span><span>
+</span><span>memcpy</span><span>(</span><span>&amp;</span><span>out</span><span>[</span><span>i</span><span>],</span><span> </span><span>&amp;</span><span>buf</span><span>,</span><span> </span><span>4</span><span>);</span>
+</pre>
+</li>
+</ol>
+</div>
+<div id="using-approximate-reciprocal">
+<h2>Using approximate reciprocal</h2>
+<p>SSE comes with instruction RCPPS that calculates the approximate inversion of its argument:
+<span>1/<i>x</i></span>. This would allow us to use expression <span><i>dividend</i> ⋅ <i>approx</i>(1/<i>divisor</i>)</span>.</p>
+<p>The specification says <strong>relative</strong> error does not exceed <span>1.5 ⋅ 2<sup> − 12</sup></span>.
+But for our needs, the absolute error is too big to use the instruction result
+directly.  The following table shows the results for initial x values, for
+which the error is significant.</p>
+<p>However, by trial-and-error search, we found that after multiplying
+the dividend by value <tt>1.00025</tt>, the result of RCPPS can be used.
+To be precise, any multiplier between 1.00024 and 1.00199 works.</p>
+<p><img alt="2024-12-21-uint8-division/rcp_diff.png" src="http://0x80.pl/notesen/2024-12-21-uint8-division/rcp_diff.png"></p><table>
+<colgroup>
+<col width="8%">
+<col width="16%">
+<col width="22%">
+<col width="16%">
+<col width="22%">
+<col width="17%">
+</colgroup>
+<thead>
+<tr><th rowspan="2">x</th>
+<th colspan="2">1 / x</th>
+<th colspan="2">approx 1 / x</th>
+<th rowspan="2">error</th>
+</tr>
+<tr><th>float</th>
+<th>hex</th>
+<th>float</th>
+<th>hex</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>1</td>
+<td>1.000000</td>
+<td><tt>3f800000</tt></td>
+<td>0.999756</td>
+<td><tt>3f7ff000</tt></td>
+<td>0.000244</td>
+</tr>
+<tr><td>2</td>
+<td>0.500000</td>
+<td><tt>3f000000</tt></td>
+<td>0.499878</td>
+<td><tt>3efff000</tt></td>
+<td>0.000122</td>
+</tr>
+<tr><td>3</td>
+<td>0.333333</td>
+<td><tt>3eaaaaab</tt></td>
+<td>0.333313</td>
+<td><tt>3eaaa800</tt></td>
+<td>0.000020</td>
+</tr>
+<tr><td>4</td>
+<td>0.250000</td>
+<td><tt>3e800000</tt></td>
+<td>0.249939</td>
+<td><tt>3e7ff000</tt></td>
+<td>0.000061</td>
+</tr>
+<tr><td>5</td>
+<td>0.200000</td>
+<td><tt>3e4ccccd</tt></td>
+<td>0.199951</td>
+<td><tt>3e4cc000</tt></td>
+<td>0.000049</td>
+</tr>
+<tr><td>6</td>
+<td>0.166667</td>
+<td><tt>3e2aaaab</tt></td>
+<td>0.166656</td>
+<td><tt>3e2aa800</tt></td>
+<td>0.000010</td>
+</tr>
+<tr><td>7</td>
+<td>0.142857</td>
+<td><tt>3e124925</tt></td>
+<td>0.142822</td>
+<td><tt>3e124000</tt></td>
+<td>0.000035</td>
+</tr>
+<tr><td>8</td>
+<td>0.125000</td>
+<td><tt>3e000000</tt></td>
+<td>0.124969</td>
+<td><tt>3dfff000</tt></td>
+<td>0.000031</td>
+</tr>
+<tr><td>9</td>
+<td>0.111111</td>
+<td><tt>3de38e39</tt></td>
+<td>0.111084</td>
+<td><tt>3de38000</tt></td>
+<td>0.000027</td>
+</tr>
+<tr><td>10</td>
+<td>0.100000</td>
+<td><tt>3dcccccd</tt></td>
+<td>0.099976</td>
+<td><tt>3dccc000</tt></td>
+<td>0.000024</td>
+</tr>
+<tr><td>11</td>
+<td>0.090909</td>
+<td><tt>3dba2e8c</tt></td>
+<td>0.090897</td>
+<td><tt>3dba2800</tt></td>
+<td>0.000012</td>
+</tr>
+<tr><td>12</td>
+<td>0.083333</td>
+<td><tt>3daaaaab</tt></td>
+<td>0.083328</td>
+<td><tt>3daaa800</tt></td>
+<td>0.000005</td>
+</tr>
+<tr><td>13</td>
+<td>0.076923</td>
+<td><tt>3d9d89d9</tt></td>
+<td>0.076920</td>
+<td><tt>3d9d8800</tt></td>
+<td>0.000004</td>
+</tr>
+<tr><td>14</td>
+<td>0.071429</td>
+<td><tt>3d924925</tt></td>
+<td>0.071411</td>
+<td><tt>3d924000</tt></td>
+<td>0.000017</td>
+</tr>
+<tr><td>15</td>
+<td>0.066667</td>
+<td><tt>3d888889</tt></td>
+<td>0.066650</td>
+<td><tt>3d888000</tt></td>
+<td>0.000016</td>
+</tr>
+<tr><td>16</td>
+<td>0.062500</td>
+<td><tt>3d800000</tt></td>
+<td>0.062485</td>
+<td><tt>3d7ff000</tt></td>
+<td>0.000015</td>
+</tr>
+<tr><td>17</td>
+<td>0.058824</td>
+<td><tt>3d70f0f1</tt></td>
+<td>0.058807</td>
+<td><tt>3d70e000</tt></td>
+<td>0.000016</td>
+</tr>
+<tr><td>18</td>
+<td>0.055556</td>
+<td><tt>3d638e39</tt></td>
+<td>0.055542</td>
+<td><tt>3d638000</tt></td>
+<td>0.000014</td>
+</tr>
+<tr><td>19</td>
+<td>0.052632</td>
+<td><tt>3d579436</tt></td>
+<td>0.052620</td>
+<td><tt>3d578800</tt></td>
+<td>0.000012</td>
+</tr>
+<tr><td>20</td>
+<td>0.050000</td>
+<td><tt>3d4ccccd</tt></td>
+<td>0.049988</td>
+<td><tt>3d4cc000</tt></td>
+<td>0.000012</td>
+</tr>
+<tr><td colspan="6">...</td>
+</tr>
+<tr><td>255</td>
+<td>0.003922</td>
+<td><tt>3b808081</tt></td>
+<td>0.003922</td>
+<td><tt>3b808000</tt></td>
+<td>0.000000</td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+<div id="long-division">
+
+<p><a href="http://en.wikipedia.org/wiki/Long_division">The long division algorithm</a> is the one we know from school.</p>
+<ol>
+<li>We start with the <strong>reminder</strong> and <strong>quotient</strong> equals zero.</li>
+<li>Then, in each step, we extend the reminder with the next digit of the dividend,
+starting from most significant digits.</li>
+<li>If the remainder becomes bigger than the divisor, we calculate <span><i>q</i> := <i>reminder</i>/<i>divisor</i></span>.
+This number, <strong>a digit</strong>, is in range [0, 9] for decimal division, or is either 0 or 1
+for binary division.</li>
+<li>We decrement reminder by <span><i>q</i> ⋅ <i>divisor</i></span>.</li>
+<li>We <strong>prepend</strong> the digit <span><i>q</i></span> to the quotient.</li>
+<li>If there are still digits in dividend, go to point #2.</li>
+</ol>
+<p>A nice property of the algorithm is calculating both the quotient and reminder.
+The cons of algorithm are:</p>
+<ul>
+<li>Each step depends on the predecessor, it makes hard to utilize out-of-order CPUs.</li>
+<li>The number of iterations equal the number of significant digits in dividend
+minus # of digits in divisor plus 1. In the worst case, it equals # of digits
+in dividend.</li>
+</ul>
+<p>Since we're going to divide 8-bit numbers, it means that the basic step of algorithm
+has to be repeated eight times. Below is a reference implementation.</p>
+<pre><span>uint8_t</span><span> </span><span>long_div_u8</span><span>(</span><span>uint8_t</span><span> </span><span>dividend</span><span>,</span><span> </span><span>uint8_t</span><span> </span><span>divisor</span><span>)</span><span> </span><span>{</span><span>
+    </span><span>uint8_t</span><span> </span><span>reminder</span><span> </span><span>=</span><span> </span><span>0</span><span>;</span><span>
+    </span><span>uint8_t</span><span> </span><span>quotient</span><span> </span><span>=</span><span> </span><span>0</span><span>;</span><span>
+
+    </span><span>for</span><span> </span><span>(</span><span>int</span><span> </span><span>i</span><span>=</span><span>7</span><span>;</span><span> </span><span>i</span><span> </span><span>&gt;=</span><span> </span><span>0</span><span>;</span><span> </span><span>i</span><span>--</span><span>)</span><span> </span><span>{</span><span>
+        </span><span>// make room for i-th bit of dividend at 0-th position
+</span><span>        </span><span>reminder</span><span> </span><span>&lt;&lt;=</span><span> </span><span>1</span><span>;</span><span>
+
+        </span><span>// inject that bit
+</span><span>        </span><span>reminder</span><span> </span><span>|=</span><span> </span><span>(</span><span>dividend</span><span> </span><span>&gt;&gt;</span><span> </span><span>i</span><span>)</span><span> </span><span>&amp;</span><span> </span><span>1</span><span>;</span><span>
+
+        </span><span>if</span><span> </span><span>(</span><span>reminder</span><span> </span><span>&gt;=</span><span> </span><span>divisor</span><span>)</span><span> </span><span>{</span><span>
+            </span><span>// set i-th bit in quotient
+</span><span>            </span><span>quotient</span><span> </span><span>|=</span><span> </span><span>1</span><span> </span><span>&lt;&lt;</span><span> </span><span>i</span><span>;</span><span>
+
+            </span><span>// adjust reminder
+</span><span>            </span><span>reminder</span><span> </span><span>-=</span><span> </span><span>divisor</span><span>;</span><span>
+        </span><span>}</span><span>
+    </span><span>}</span><span>
+
+    </span><span>return</span><span> </span><span>quotient</span><span>;</span><span>
+</span><span>}</span>
+</pre>
+<div>
+    
+
+    <table padding="0" id="bits">
+        <tbody><tr>
+            <td>dividend</td>
+            <td id="dividend_7"></td>
+            <td id="dividend_6"></td>
+            <td id="dividend_5"></td>
+            <td id="dividend_4"></td>
+            <td id="dividend_3"></td>
+            <td id="dividend_2"></td>
+            <td id="dividend_1"></td>
+            <td id="dividend_0"></td>
+            <td id="dividend"></td>
+        </tr>
+        <tr>
+            <td>divisor</td>
+            <td id="divisor_7"></td>
+            <td id="divisor_6"></td>
+            <td id="divisor_5"></td>
+            <td id="divisor_4"></td>
+            <td id="divisor_3"></td>
+            <td id="divisor_2"></td>
+            <td id="divisor_1"></td>
+            <td id="divisor_0"></td>
+            <td id="divisor"></td>
+        </tr>
+        <tr>
+            <td>reminder</td>
+            <td id="reminder_7"></td>
+            <td id="reminder_6"></td>
+            <td id="reminder_5"></td>
+            <td id="reminder_4"></td>
+            <td id="reminder_3"></td>
+            <td id="reminder_2"></td>
+            <td id="reminder_1"></td>
+            <td id="reminder_0"></td>
+            <td id="reminder"></td>
+        </tr>
+        <tr>
+            <td>quotient</td>
+            <td id="quotient_7"></td>
+            <td id="quotient_6"></td>
+            <td id="quotient_5"></td>
+            <td id="quotient_4"></td>
+            <td id="quotient_3"></td>
+            <td id="quotient_2"></td>
+            <td id="quotient_1"></td>
+            <td id="quotient_0"></td>
+            <td id="quotient"></td>
+        </tr>
+        <tr>
+            <td>&nbsp;</td>
+            <td colspan="16"><span id="relation"></span></td>
+        </tr>
+    </tbody></table>
+</div>
+<p>The long division can be also applied to signed integers. We need to calculate
+the absolute values of dividend &amp; divisor and perform the algorithm. Then
+quotient has to be negated if the operands have different signs.</p>
+<p>Since 8-bit signed integers have range <span> − 128…127</span>, the range
+of their absolute values is <span>0…128</span>. It means the long division
+operands still have eight bits.</p>
+</div>
+<div id="vectorization">
+
+<p>The algorithm consist the following operations:</p>
+<ol>
+<li><p>extract i-th bit from the divisor and shift it into the reminder:</p>
+<pre><span>reminder</span><span> </span><span>=</span><span> </span><span>(</span><span>reminder</span><span> </span><span>&lt;&lt;</span><span> </span><span>1</span><span>)</span><span> </span><span>|</span><span> </span><span>((</span><span>dividend</span><span> </span><span>&gt;&gt;</span><span> </span><span>i</span><span>)</span><span> </span><span>&amp;</span><span> </span><span>1</span><span>);</span>
+</pre>
+</li>
+<li><p>compare the reminder and divisor;</p>
+</li>
+<li><p>conditionally set i-th bit in the quotient and adjust the reminder:</p>
+<pre><span>quotient</span><span> </span><span>|=</span><span> </span><span>1</span><span> </span><span>&lt;&lt;</span><span> </span><span>i</span><span>;</span><span>
+</span><span>reminder</span><span> </span><span>-=</span><span> </span><span>divisor</span><span>;</span>
+</pre>
+</li>
+</ol>
+<div id="sse-avx2">
+<h2>SSE &amp; AVX2</h2>
+<div id="step-1-updating-reminder">
+<h3>Step 1: Updating reminder</h3>
+<p>In SSE &amp; AVX2 it's easy to copy the most significant bit to the least
+significant bit #0. We compare the number interpreted as <strong>a signed one</strong>
+with zero. It yields either 0x00 or 0xff (<span> − 1</span>).</p>
+<p>We can rewrite the main loop to shift the dividend left by 1, thus
+we'll be able to copy all its bits using that technique.</p>
+<p>Shifting left by 1 is simple addition, which is a really fast operation.</p>
+</div>
+<div id="step-2-comparison">
+<h3>Step 2: Comparison</h3>
+<p>There's no unsigned comparison in SSE nor AVX2, only signed one. It is possible
+to compare two unsigned numbers with a signed comparison: we need to negate
+their most significant bits. This is done by XOR-ing with 0x80.</p>
+<p>Note that we need to perform xor once for the divisor, and eight times for
+the reminder.</p>
+</div>
+<div id="step-3-conditional-operations">
+<h3>Step 3: Conditional operations</h3>
+<p>Once we get a mask from the comparison, we can easily compute masked operations.</p>
+<p>In fact we need <strong>unconditionally</strong> shift the quotient by 1 and then <strong>conditionally</strong>
+set the i-th bit.</p>
+</div>
+<div id="implementation-sse">
+<h3>Implementation (SSE)</h3>
+<p>The following C code shows all the implementation details.</p>
+<pre><span>uint8_t</span><span> </span><span>long_div_u8</span><span>(</span><span>uint8_t</span><span> </span><span>dividend</span><span>,</span><span> </span><span>uint8_t</span><span> </span><span>divisor</span><span>)</span><span> </span><span>{</span><span>
+    </span><span>uint8_t</span><span> </span><span>reminder</span><span> </span><span>=</span><span> </span><span>0</span><span>;</span><span>
+    </span><span>uint8_t</span><span> </span><span>quotient</span><span> </span><span>=</span><span> </span><span>0</span><span>;</span><span>
+    </span><span>uint8_t</span><span> </span><span>bit</span><span> </span><span>=</span><span> </span><span>0x80</span><span>;</span><span>
+
+    </span><span>uint8_t</span><span> </span><span>divisor_xored</span><span> </span><span>=</span><span> </span><span>divisor</span><span> </span><span>^</span><span> </span><span>0x80</span><span>;</span><span>
+
+    </span><span>for</span><span> </span><span>(</span><span>int</span><span> </span><span>i</span><span>=</span><span>7</span><span>;</span><span> </span><span>i</span><span> </span><span>&gt;=</span><span> </span><span>0</span><span>;</span><span> </span><span>i</span><span>--</span><span>)</span><span> </span><span>{</span><span>
+
+        </span><span>// msb =&gt; 0 or -1
+</span><span>        </span><span>const</span><span> </span><span>uint8_t</span><span> </span><span>msb</span><span> </span><span>=</span><span> </span><span>(</span><span>int8_t</span><span>)</span><span>dividend</span><span> </span><span>&lt;</span><span> </span><span>0</span><span> </span><span>?</span><span> </span><span>0xff</span><span> </span><span>:</span><span> </span><span>0x00</span><span>;</span><span>
+
+        </span><span>// inject bit
+</span><span>        </span><span>reminder</span><span> </span><span>-=</span><span> </span><span>msb</span><span>;</span><span>
+
+        </span><span>if</span><span> </span><span>((</span><span>int8_t</span><span>)(</span><span>reminder</span><span> </span><span>^</span><span> </span><span>0x80</span><span>)</span><span> </span><span>&gt;=</span><span> </span><span>(</span><span>int8_t</span><span>)(</span><span>divisor_xored</span><span>)</span><span> </span><span>{</span><span>
+            </span><span>// set i-th bit in quotient
+</span><span>            </span><span>quotient</span><span> </span><span>|=</span><span> </span><span>bit</span><span>;</span><span>
+
+            </span><span>// adjust reminder
+</span><span>            </span><span>reminder</span><span> </span><span>-=</span><span> </span><span>divisor</span><span>;</span><span>
+        </span><span>}</span><span>
+
+        </span><span>bit</span><span> </span><span>&gt;&gt;=</span><span> </span><span>1</span><span>;</span><span>
+        </span><span>dividend</span><span> </span><span>&lt;&lt;=</span><span> </span><span>1</span><span>;</span><span>
+        </span><span>// make room for i-th bit of dividend at 0-th position
+</span><span>        </span><span>reminder</span><span> </span><span>&lt;&lt;=</span><span> </span><span>1</span><span>;</span><span>
+    </span><span>}</span><span>
+
+    </span><span>return</span><span> </span><span>quotient</span><span>;</span><span>
+</span><span>}</span>
+</pre>
+<p>The actual SSE implementation.</p>
+<pre><span>void</span><span> </span><span>sse_long_div_u8</span><span>(</span><span>const</span><span> </span><span>uint8_t</span><span>*</span><span> </span><span>A</span><span>,</span><span> </span><span>const</span><span> </span><span>uint8_t</span><span>*</span><span> </span><span>B</span><span>,</span><span> </span><span>uint8_t</span><span>*</span><span> </span><span>C</span><span>,</span><span> </span><span>size_t</span><span> </span><span>n</span><span>)</span><span> </span><span>{</span><span>
+    </span><span>const</span><span> </span><span>__m128i</span><span> </span><span>msb</span><span>  </span><span>=</span><span> </span><span>_mm_set1_epi8</span><span>(</span><span>int8_t</span><span>(</span><span>0x80</span><span>));</span><span>
+    </span><span>const</span><span> </span><span>__m128i</span><span> </span><span>zero</span><span> </span><span>=</span><span> </span><span>_mm_set1_epi8</span><span>(</span><span>0x00</span><span>);</span><span>
+
+    </span><span>for</span><span> </span><span>(</span><span>size_t</span><span> </span><span>i</span><span>=</span><span>0</span><span>;</span><span> </span><span>i</span><span> </span><span>&lt;</span><span> </span><span>n</span><span>;</span><span> </span><span>i</span><span> </span><span>+=</span><span> </span><span>16</span><span>)</span><span> </span><span>{</span><span>
+        </span><span>__m128i</span><span> </span><span>dividend</span><span> </span><span>=</span><span> </span><span>_mm_loadu_si128</span><span>((</span><span>__m128i</span><span>*</span><span>)(</span><span>&amp;</span><span>A</span><span>[</span><span>i</span><span>]));</span><span>
+
+        </span><span>const</span><span> </span><span>__m128i</span><span> </span><span>divisor</span><span> </span><span>=</span><span> </span><span>_mm_loadu_si128</span><span>((</span><span>__m128i</span><span>*</span><span>)(</span><span>&amp;</span><span>B</span><span>[</span><span>i</span><span>]));</span><span>
+        </span><span>__m128i</span><span> </span><span>divisor_xored</span><span> </span><span>=</span><span> </span><span>_mm_xor_si128</span><span>(</span><span>divisor</span><span>,</span><span> </span><span>msb</span><span>);</span><span>
+
+        </span><span>__m128i</span><span> </span><span>bit</span><span>      </span><span>=</span><span> </span><span>msb</span><span>;</span><span>
+        </span><span>__m128i</span><span> </span><span>reminder</span><span> </span><span>=</span><span> </span><span>_mm_set1_epi16</span><span>(</span><span>0</span><span>);</span><span>
+        </span><span>__m128i</span><span> </span><span>quotient</span><span> </span><span>=</span><span> </span><span>_mm_set1_epi16</span><span>(</span><span>0</span><span>);</span><span>
+        </span><span>for</span><span> </span><span>(</span><span>int</span><span> </span><span>j</span><span>=</span><span>0</span><span>;</span><span> </span><span>j</span><span> </span><span>&lt;</span><span> </span><span>8</span><span>;</span><span> </span><span>j</span><span>++</span><span>)</span><span> </span><span>{</span><span>
+            </span><span>// copy msb of dividend into reminder
+</span><span>            </span><span>const</span><span> </span><span>__m128i</span><span> </span><span>t0</span><span> </span><span>=</span><span> </span><span>_mm_cmplt_epi8</span><span>(</span><span>dividend</span><span>,</span><span> </span><span>zero</span><span>);</span><span>
+            </span><span>reminder</span><span> </span><span>=</span><span> </span><span>_mm_sub_epi8</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>t0</span><span>);</span><span>
+
+            </span><span>// unsigned comparison of divisor and reminder
+</span><span>            </span><span>const</span><span> </span><span>__m128i</span><span> </span><span>reminder_xored</span><span> </span><span>=</span><span> </span><span>_mm_xor_si128</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>msb</span><span>);</span><span>
+            </span><span>const</span><span> </span><span>__m128i</span><span> </span><span>gt</span><span> </span><span>=</span><span> </span><span>_mm_cmpgt_epi8</span><span>(</span><span>divisor_xored</span><span>,</span><span> </span><span>reminder_xored</span><span>);</span><span>
+
+            </span><span>// derive condition subtract and quotient bit
+</span><span>            </span><span>const</span><span> </span><span>__m128i</span><span> </span><span>cond_divisor</span><span>      </span><span>=</span><span> </span><span>_mm_andnot_si128</span><span>(</span><span>gt</span><span>,</span><span> </span><span>divisor</span><span>);</span><span>
+            </span><span>const</span><span> </span><span>__m128i</span><span> </span><span>cond_quotient_bit</span><span> </span><span>=</span><span> </span><span>_mm_andnot_si128</span><span>(</span><span>gt</span><span>,</span><span> </span><span>bit</span><span>);</span><span>
+
+            </span><span>// conditionally update reminder and quotient
+</span><span>            </span><span>reminder</span><span> </span><span>=</span><span> </span><span>_mm_sub_epi16</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>cond_divisor</span><span>);</span><span>
+            </span><span>quotient</span><span> </span><span>=</span><span> </span><span>_mm_or_si128</span><span>(</span><span>quotient</span><span>,</span><span> </span><span>cond_quotient_bit</span><span>);</span><span>
+
+            </span><span>// next bit for quotient
+</span><span>            </span><span>bit</span><span> </span><span>=</span><span> </span><span>_mm_srli_epi32</span><span>(</span><span>bit</span><span>,</span><span> </span><span>1</span><span>);</span><span>
+
+            </span><span>// put the next bit from dividend to MSB
+</span><span>            </span><span>dividend</span><span> </span><span>=</span><span> </span><span>_mm_add_epi8</span><span>(</span><span>dividend</span><span>,</span><span> </span><span>dividend</span><span>);</span><span>
+
+            </span><span>// make room for bit from dividend
+</span><span>            </span><span>reminder</span><span> </span><span>=</span><span> </span><span>_mm_add_epi32</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>reminder</span><span>);</span><span>
+        </span><span>}</span><span>
+
+        </span><span>_mm_storeu_si128</span><span>((</span><span>__m128i</span><span>*</span><span>)(</span><span>&amp;</span><span>C</span><span>[</span><span>i</span><span>]),</span><span> </span><span>quotient</span><span>);</span><span>
+    </span><span>}</span><span>
+</span><span>}</span>
+</pre>
+</div>
+</div>
+<div id="avx-512">
+<h2>AVX-512</h2>
+<div id="step-1-updating-reminder-1">
+<h3>Step 1: Updating reminder</h3>
+<p>Unlike SSE/AVX2 code it's easier to actually perform shift right
+to place i-th bit at position zero. Then isolating the least
+siginificant bit and merging it with quotient can be expressed
+as a single <a href="http://0x80.pl/notesen/2015-03-22-avx512-ternary-functions.html">ternary operation</a>.</p>
+<pre><span>reminder</span><span> </span><span>&lt;&lt;=</span><span> </span><span>1</span><span>;</span><span>
+</span><span>t0</span><span>         </span><span>=</span><span> </span><span>divisor</span><span> </span><span>&gt;&gt;</span><span> </span><span>i</span><span>;</span><span>
+</span><span>reminder</span><span>   </span><span>=</span><span> </span><span>reminder</span><span> </span><span>|</span><span> </span><span>(</span><span>t0</span><span> </span><span>&amp;</span><span> </span><span>1</span><span>);</span><span> </span><span>// ternary operation</span>
+</pre>
+</div>
+<div id="step-2-comparison-1">
+<h3>Step 2: Comparison</h3>
+<p>AVX512 supports unsigned byte comparison, and returns a mask.</p>
+</div>
+<div id="step-3-conditional-operations-1">
+<h3>Step 3: Conditional operations</h3>
+<p>This is straightforward use of masked operations.</p>
+</div>
+<div id="implementation">
+<h3>Implementation</h3>
+<p>The actual AVX512 implementation is shown below. Unlike SSE code, the inner
+loop is manually unrolled. Also, there's no explictly use of the ternary logic
+intrinsic function — but examing the assembly code revelas that a compiler
+nicely fuses binary operation.</p>
+<pre><span>void</span><span> </span><span>avx512_long_div_u8</span><span>(</span><span>const</span><span> </span><span>uint8_t</span><span>*</span><span> </span><span>A</span><span>,</span><span> </span><span>const</span><span> </span><span>uint8_t</span><span>*</span><span> </span><span>B</span><span>,</span><span> </span><span>uint8_t</span><span>*</span><span> </span><span>C</span><span>,</span><span> </span><span>size_t</span><span> </span><span>n</span><span>)</span><span> </span><span>{</span><span>
+    </span><span>const</span><span> </span><span>__m512i</span><span> </span><span>one</span><span> </span><span>=</span><span> </span><span>_mm512_set1_epi8</span><span>(</span><span>1</span><span>);</span><span>
+
+    </span><span>for</span><span> </span><span>(</span><span>size_t</span><span> </span><span>i</span><span>=</span><span>0</span><span>;</span><span> </span><span>i</span><span> </span><span>&lt;</span><span> </span><span>n</span><span>;</span><span> </span><span>i</span><span> </span><span>+=</span><span> </span><span>64</span><span>)</span><span> </span><span>{</span><span>
+        </span><span>const</span><span> </span><span>__m512i</span><span> </span><span>dividend</span><span> </span><span>=</span><span> </span><span>_mm512_loadu_si512</span><span>((</span><span>const</span><span> </span><span>__m512</span><span>*</span><span>)(</span><span>&amp;</span><span>A</span><span>[</span><span>i</span><span>]));</span><span>
+        </span><span>const</span><span> </span><span>__m512i</span><span> </span><span>divisor</span><span>  </span><span>=</span><span> </span><span>_mm512_loadu_si512</span><span>((</span><span>const</span><span> </span><span>__m512</span><span>*</span><span>)(</span><span>&amp;</span><span>B</span><span>[</span><span>i</span><span>]));</span><span>
+
+        </span><span>const</span><span> </span><span>__m512i</span><span> </span><span>dividend_bit7</span><span> </span><span>=</span><span> </span><span>_mm512_and_epi32</span><span>(</span><span>_mm512_srli_epi32</span><span>(</span><span>dividend</span><span>,</span><span> </span><span>7</span><span>),</span><span> </span><span>one</span><span>);</span><span>
+        </span><span>const</span><span> </span><span>__m512i</span><span> </span><span>dividend_bit6</span><span> </span><span>=</span><span> </span><span>_mm512_and_epi32</span><span>(</span><span>_mm512_srli_epi32</span><span>(</span><span>dividend</span><span>,</span><span> </span><span>6</span><span>),</span><span> </span><span>one</span><span>);</span><span>
+        </span><span>const</span><span> </span><span>__m512i</span><span> </span><span>dividend_bit5</span><span> </span><span>=</span><span> </span><span>_mm512_and_epi32</span><span>(</span><span>_mm512_srli_epi32</span><span>(</span><span>dividend</span><span>,</span><span> </span><span>5</span><span>),</span><span> </span><span>one</span><span>);</span><span>
+        </span><span>const</span><span> </span><span>__m512i</span><span> </span><span>dividend_bit4</span><span> </span><span>=</span><span> </span><span>_mm512_and_epi32</span><span>(</span><span>_mm512_srli_epi32</span><span>(</span><span>dividend</span><span>,</span><span> </span><span>4</span><span>),</span><span> </span><span>one</span><span>);</span><span>
+        </span><span>const</span><span> </span><span>__m512i</span><span> </span><span>dividend_bit3</span><span> </span><span>=</span><span> </span><span>_mm512_and_epi32</span><span>(</span><span>_mm512_srli_epi32</span><span>(</span><span>dividend</span><span>,</span><span> </span><span>3</span><span>),</span><span> </span><span>one</span><span>);</span><span>
+        </span><span>const</span><span> </span><span>__m512i</span><span> </span><span>dividend_bit2</span><span> </span><span>=</span><span> </span><span>_mm512_and_epi32</span><span>(</span><span>_mm512_srli_epi32</span><span>(</span><span>dividend</span><span>,</span><span> </span><span>2</span><span>),</span><span> </span><span>one</span><span>);</span><span>
+        </span><span>const</span><span> </span><span>__m512i</span><span> </span><span>dividend_bit1</span><span> </span><span>=</span><span> </span><span>_mm512_and_epi32</span><span>(</span><span>_mm512_srli_epi32</span><span>(</span><span>dividend</span><span>,</span><span> </span><span>1</span><span>),</span><span> </span><span>one</span><span>);</span><span>
+        </span><span>const</span><span> </span><span>__m512i</span><span> </span><span>dividend_bit0</span><span> </span><span>=</span><span> </span><span>_mm512_and_epi32</span><span>(</span><span>_mm512_srli_epi32</span><span>(</span><span>dividend</span><span>,</span><span> </span><span>0</span><span>),</span><span> </span><span>one</span><span>);</span><span>
+
+        </span><span>__m512i</span><span> </span><span>quotient</span><span> </span><span>=</span><span> </span><span>_mm512_set1_epi32</span><span>(</span><span>0</span><span>);</span><span>
+        </span><span>__m512i</span><span> </span><span>reminder</span><span> </span><span>=</span><span> </span><span>dividend_bit7</span><span>;</span><span>
+
+        </span><span>{</span><span>
+            </span><span>const</span><span> </span><span>__mmask64</span><span> </span><span>ge</span><span> </span><span>=</span><span> </span><span>_mm512_cmpge_epu8_mask</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>divisor</span><span>);</span><span>
+            </span><span>reminder</span><span> </span><span>=</span><span> </span><span>_mm512_mask_sub_epi8</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>ge</span><span>,</span><span> </span><span>reminder</span><span>,</span><span> </span><span>divisor</span><span>);</span><span>
+            </span><span>quotient</span><span> </span><span>=</span><span> </span><span>_mm512_mask_add_epi8</span><span>(</span><span>quotient</span><span>,</span><span> </span><span>ge</span><span>,</span><span> </span><span>quotient</span><span>,</span><span> </span><span>one</span><span>);</span><span>
+        </span><span>}</span><span>
+
+        </span><span>reminder</span><span> </span><span>=</span><span> </span><span>_mm512_add_epi32</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>reminder</span><span>);</span><span>
+        </span><span>reminder</span><span> </span><span>=</span><span> </span><span>_mm512_or_epi32</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>dividend_bit6</span><span>);</span><span>
+
+        </span><span>{</span><span>
+            </span><span>const</span><span> </span><span>__mmask64</span><span> </span><span>ge</span><span> </span><span>=</span><span> </span><span>_mm512_cmpge_epu8_mask</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>divisor</span><span>);</span><span>
+            </span><span>reminder</span><span> </span><span>=</span><span> </span><span>_mm512_mask_sub_epi8</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>ge</span><span>,</span><span> </span><span>reminder</span><span>,</span><span> </span><span>divisor</span><span>);</span><span>
+            </span><span>quotient</span><span> </span><span>=</span><span> </span><span>_mm512_add_epi32</span><span>(</span><span>quotient</span><span>,</span><span> </span><span>quotient</span><span>);</span><span>
+            </span><span>quotient</span><span> </span><span>=</span><span> </span><span>_mm512_mask_add_epi8</span><span>(</span><span>quotient</span><span>,</span><span> </span><span>ge</span><span>,</span><span> </span><span>quotient</span><span>,</span><span> </span><span>one</span><span>);</span><span>
+        </span><span>}</span><span>
+
+        </span><span>reminder</span><span> </span><span>=</span><span> </span><span>_mm512_add_epi32</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>reminder</span><span>);</span><span>
+        </span><span>reminder</span><span> </span><span>=</span><span> </span><span>_mm512_or_epi32</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>dividend_bit5</span><span>);</span><span>
+
+        </span><span>{</span><span>
+            </span><span>const</span><span> </span><span>__mmask64</span><span> </span><span>ge</span><span> </span><span>=</span><span> </span><span>_mm512_cmpge_epu8_mask</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>divisor</span><span>);</span><span>
+            </span><span>reminder</span><span> </span><span>=</span><span> </span><span>_mm512_mask_sub_epi8</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>ge</span><span>,</span><span> </span><span>reminder</span><span>,</span><span> </span><span>divisor</span><span>);</span><span>
+            </span><span>quotient</span><span> </span><span>=</span><span> </span><span>_mm512_add_epi32</span><span>(</span><span>quotient</span><span>,</span><span> </span><span>quotient</span><span>);</span><span>
+            </span><span>quotient</span><span> </span><span>=</span><span> </span><span>_mm512_mask_add_epi8</span><span>(</span><span>quotient</span><span>,</span><span> </span><span>ge</span><span>,</span><span> </span><span>quotient</span><span>,</span><span> </span><span>one</span><span>);</span><span>
+        </span><span>}</span><span>
+
+        </span><span>reminder</span><span> </span><span>=</span><span> </span><span>_mm512_add_epi32</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>reminder</span><span>);</span><span>
+        </span><span>reminder</span><span> </span><span>=</span><span> </span><span>_mm512_or_epi32</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>dividend_bit4</span><span>);</span><span>
+
+        </span><span>{</span><span>
+            </span><span>const</span><span> </span><span>__mmask64</span><span> </span><span>ge</span><span> </span><span>=</span><span> </span><span>_mm512_cmpge_epu8_mask</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>divisor</span><span>);</span><span>
+            </span><span>reminder</span><span> </span><span>=</span><span> </span><span>_mm512_mask_sub_epi8</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>ge</span><span>,</span><span> </span><span>reminder</span><span>,</span><span> </span><span>divisor</span><span>);</span><span>
+            </span><span>quotient</span><span> </span><span>=</span><span> </span><span>_mm512_add_epi32</span><span>(</span><span>quotient</span><span>,</span><span> </span><span>quotient</span><span>);</span><span>
+            </span><span>quotient</span><span> </span><span>=</span><span> </span><span>_mm512_mask_add_epi8</span><span>(</span><span>quotient</span><span>,</span><span> </span><span>ge</span><span>,</span><span> </span><span>quotient</span><span>,</span><span> </span><span>one</span><span>);</span><span>
+        </span><span>}</span><span>
+
+        </span><span>reminder</span><span> </span><span>=</span><span> </span><span>_mm512_add_epi32</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>reminder</span><span>);</span><span>
+        </span><span>reminder</span><span> </span><span>=</span><span> </span><span>_mm512_or_epi32</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>dividend_bit3</span><span>);</span><span>
+
+        </span><span>{</span><span>
+            </span><span>const</span><span> </span><span>__mmask64</span><span> </span><span>ge</span><span> </span><span>=</span><span> </span><span>_mm512_cmpge_epu8_mask</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>divisor</span><span>);</span><span>
+            </span><span>reminder</span><span> </span><span>=</span><span> </span><span>_mm512_mask_sub_epi8</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>ge</span><span>,</span><span> </span><span>reminder</span><span>,</span><span> </span><span>divisor</span><span>);</span><span>
+            </span><span>quotient</span><span> </span><span>=</span><span> </span><span>_mm512_add_epi32</span><span>(</span><span>quotient</span><span>,</span><span> </span><span>quotient</span><span>);</span><span>
+            </span><span>quotient</span><span> </span><span>=</span><span> </span><span>_mm512_mask_add_epi8</span><span>(</span><span>quotient</span><span>,</span><span> </span><span>ge</span><span>,</span><span> </span><span>quotient</span><span>,</span><span> </span><span>one</span><span>);</span><span>
+        </span><span>}</span><span>
+
+        </span><span>reminder</span><span> </span><span>=</span><span> </span><span>_mm512_add_epi32</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>reminder</span><span>);</span><span>
+        </span><span>reminder</span><span> </span><span>=</span><span> </span><span>_mm512_or_epi32</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>dividend_bit2</span><span>);</span><span>
+
+        </span><span>{</span><span>
+            </span><span>const</span><span> </span><span>__mmask64</span><span> </span><span>ge</span><span> </span><span>=</span><span> </span><span>_mm512_cmpge_epu8_mask</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>divisor</span><span>);</span><span>
+            </span><span>reminder</span><span> </span><span>=</span><span> </span><span>_mm512_mask_sub_epi8</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>ge</span><span>,</span><span> </span><span>reminder</span><span>,</span><span> </span><span>divisor</span><span>);</span><span>
+            </span><span>quotient</span><span> </span><span>=</span><span> </span><span>_mm512_add_epi32</span><span>(</span><span>quotient</span><span>,</span><span> </span><span>quotient</span><span>);</span><span>
+            </span><span>quotient</span><span> </span><span>=</span><span> </span><span>_mm512_mask_add_epi8</span><span>(</span><span>quotient</span><span>,</span><span> </span><span>ge</span><span>,</span><span> </span><span>quotient</span><span>,</span><span> </span><span>one</span><span>);</span><span>
+        </span><span>}</span><span>
+
+        </span><span>reminder</span><span> </span><span>=</span><span> </span><span>_mm512_add_epi32</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>reminder</span><span>);</span><span>
+        </span><span>reminder</span><span> </span><span>=</span><span> </span><span>_mm512_or_epi32</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>dividend_bit1</span><span>);</span><span>
+
+        </span><span>{</span><span>
+            </span><span>const</span><span> </span><span>__mmask64</span><span> </span><span>ge</span><span> </span><span>=</span><span> </span><span>_mm512_cmpge_epu8_mask</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>divisor</span><span>);</span><span>
+            </span><span>reminder</span><span> </span><span>=</span><span> </span><span>_mm512_mask_sub_epi8</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>ge</span><span>,</span><span> </span><span>reminder</span><span>,</span><span> </span><span>divisor</span><span>);</span><span>
+            </span><span>quotient</span><span> </span><span>=</span><span> </span><span>_mm512_add_epi32</span><span>(</span><span>quotient</span><span>,</span><span> </span><span>quotient</span><span>);</span><span>
+            </span><span>quotient</span><span> </span><span>=</span><span> </span><span>_mm512_mask_add_epi8</span><span>(</span><span>quotient</span><span>,</span><span> </span><span>ge</span><span>,</span><span> </span><span>quotient</span><span>,</span><span> </span><span>one</span><span>);</span><span>
+        </span><span>}</span><span>
+
+        </span><span>reminder</span><span> </span><span>=</span><span> </span><span>_mm512_add_epi32</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>reminder</span><span>);</span><span>
+        </span><span>reminder</span><span> </span><span>=</span><span> </span><span>_mm512_or_epi32</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>dividend_bit0</span><span>);</span><span>
+
+
+        </span><span>{</span><span>
+            </span><span>const</span><span> </span><span>__mmask64</span><span> </span><span>ge</span><span> </span><span>=</span><span> </span><span>_mm512_cmpge_epu8_mask</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>divisor</span><span>);</span><span>
+            </span><span>reminder</span><span> </span><span>=</span><span> </span><span>_mm512_mask_sub_epi8</span><span>(</span><span>reminder</span><span>,</span><span> </span><span>ge</span><span>,</span><span> </span><span>reminder</span><span>,</span><span> </span><span>divisor</span><span>);</span><span>
+            </span><span>quotient</span><span> </span><span>=</span><span> </span><span>_mm512_add_epi8</span><span>(</span><span>quotient</span><span>,</span><span> </span><span>quotient</span><span>);</span><span>
+            </span><span>quotient</span><span> </span><span>=</span><span> </span><span>_mm512_mask_add_epi8</span><span>(</span><span>quotient</span><span>,</span><span> </span><span>ge</span><span>,</span><span> </span><span>quotient</span><span>,</span><span> </span><span>one</span><span>);</span><span>
+        </span><span>}</span><span>
+
+        </span><span>_mm512_storeu_si512</span><span>((</span><span>__m512</span><span>*</span><span>)</span><span>&amp;</span><span>C</span><span>[</span><span>i</span><span>],</span><span> </span><span>quotient</span><span>);</span><span>
+    </span><span>}</span><span>
+</span><span>}</span>
+</pre>
+</div>
+</div>
+</div>
+<div id="experiment-results">
+
+<p>Short summary:</p>
+<ul>
+<li>AVX-512 implementation of long division is the fastests on all Intel CPUs.</li>
+<li>AVX2 using approximate reciprocal is the fastests on Ryzen.</li>
+<li>It's worth noting that GCC autovectorized <strong>better</strong> or comparable code
+to hand-written AVX2 variants.</li>
+</ul>
+<p>All benchmark programs were compiled with <tt><span>-O3</span> <span>-march=native</span></tt> options on each
+machine separately.</p>
+<table>
+<caption>Tested procedures</caption>
+<colgroup>
+<col width="50%">
+<col width="50%">
+</colgroup>
+<thead>
+<tr><th>Procedure</th>
+<th>Comments</th>
+</tr>
+</thead>
+<tbody>
+<tr><td><tt>scalar</tt></td>
+<td>plain 8-bit division</td>
+</tr>
+<tr><td><tt>scalar (unrolled x 4)</tt></td>
+<td>division unrolled manually 4 times</td>
+</tr>
+<tr><td><tt>scalar (long division)</tt></td>
+<td>scalar implementation of <a href="#long-div">long division</a>, with disabled autovectorization</td>
+</tr>
+<tr><td><tt>scalar (long div, autovect)</tt></td>
+<td>scalar implementation of long division, with autovectorization</td>
+</tr>
+<tr><td><tt>SSE</tt></td>
+<td><a href="#div-with-rounding">division with rounding</a></td>
+</tr>
+<tr><td><tt>SSE (no rounding)</tt></td>
+<td><a href="#div-no-rounding">division without rounding</a> (divident multiplied by 256)</td>
+</tr>
+<tr><td><tt>SSE (rcp)</tt></td>
+<td><a href="#rcp">multiplication by approximate reciprocal</a></td>
+</tr>
+<tr><td><tt>SSE long div</tt></td>
+<td><a href="#long-div-sse">long division implemented with SSE instructions</a></td>
+</tr>
+<tr><td><tt>AVX2</tt></td>
+<td><a href="#div-with-rounding">division with rounding</a></td>
+</tr>
+<tr><td><tt>AVX2 (rcp)</tt></td>
+<td><a href="#rcp">multiplication by approximate reciprocal</a></td>
+</tr>
+<tr><td><tt>AVX2 long div</tt></td>
+<td><a href="#long-div-avx2">long division implemented with AVX2 instructions</a></td>
+</tr>
+<tr><td><tt>AVX512 long div</tt></td>
+<td><a href="#long-div-avx512">long division implemented with AVX-512 instructions</a></td>
+</tr>
+</tbody>
+</table>
+<div id="ryzen-7">
+<h2>Ryzen 7</h2>
+<ul>
+<li>Compiler: gcc (Debian 14.1.0-5) 14.1.0</li>
+<li>CPU: AMD Ryzen 7 7730U with Radeon Graphics</li>
+</ul>
+<table>
+<colgroup>
+<col width="28%">
+<col width="13%">
+<col width="11%">
+<col width="5%">
+<col width="44%">
+</colgroup>
+<thead>
+<tr><th>procedure</th>
+<th colspan="2">time in cycles per byte</th>
+<th colspan="2">speed-up</th>
+</tr>
+<tr><th>&nbsp;</th>
+<th>average</th>
+<th>best</th>
+<th>&nbsp;</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>scalar</td>
+<td>1.777</td>
+<td>1.759</td>
+<td>1.0</td>
+<td><tt><span>████▊</span></tt></td>
+</tr>
+<tr><td>scalar (unrolled x 4)</td>
+<td>1.881</td>
+<td>1.869</td>
+<td>0.9</td>
+<td><tt><span>████▌</span></tt></td>
+</tr>
+<tr><td>scalar (long div)</td>
+<td>5.548</td>
+<td>5.523</td>
+<td>0.3</td>
+<td><tt>█▌</tt></td>
+</tr>
+<tr><td>scalar (long div, autovect)</td>
+<td>0.418</td>
+<td>0.414</td>
+<td>4.2</td>
+<td><tt><span>████████████████████▍</span></tt></td>
+</tr>
+<tr><td>SSE</td>
+<td>0.372</td>
+<td>0.367</td>
+<td>4.8</td>
+<td><tt><span>███████████████████████</span></tt></td>
+</tr>
+<tr><td>SSE (no rounding)</td>
+<td>0.334</td>
+<td>0.331</td>
+<td>5.3</td>
+<td><tt><span>█████████████████████████▌</span></tt></td>
+</tr>
+<tr><td>SSE (rcp)</td>
+<td>0.330</td>
+<td>0.327</td>
+<td>5.4</td>
+<td><tt><span>█████████████████████████▉</span></tt></td>
+</tr>
+<tr><td>SSE long div</td>
+<td>0.751</td>
+<td>0.741</td>
+<td>2.4</td>
+<td><tt><span>███████████▍</span></tt></td>
+</tr>
+<tr><td>AVX2</td>
+<td>0.220</td>
+<td>0.218</td>
+<td>8.1</td>
+<td><tt><span>██████████████████████████████████████▉</span></tt></td>
+</tr>
+<tr><td>AVX2 (rcp)</td>
+<td>0.215</td>
+<td>0.212</td>
+<td>8.3</td>
+<td><tt><span>████████████████████████████████████████</span></tt></td>
+</tr>
+<tr><td>AVX2 long div</td>
+<td>0.376</td>
+<td>0.372</td>
+<td>4.7</td>
+<td><tt><span>██████████████████████▊</span></tt></td>
+</tr>
+</tbody>
+</table>
+</div>
+<div id="skylake-x">
+<h2>Skylake-X</h2>
+<ul>
+<li>CPU: Intel(R) Xeon(R) W-2104 CPU @ 3.20GHz</li>
+<li>Compiler: gcc (GCC) 11.2.0</li>
+</ul>
+<table>
+<colgroup>
+<col width="28%">
+<col width="12%">
+<col width="10%">
+<col width="6%">
+<col width="44%">
+</colgroup>
+<thead>
+<tr><th>procedure</th>
+<th colspan="2">time in cycles per byte</th>
+<th colspan="2">speed-up</th>
+</tr>
+<tr><th>&nbsp;</th>
+<th>average</th>
+<th>best</th>
+<th>&nbsp;</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>scalar</td>
+<td>8.038</td>
+<td>8.017</td>
+<td>1.0</td>
+<td><tt><span>███▍</span></tt></td>
+</tr>
+<tr><td>scalar (unrolled x 4)</td>
+<td>7.015</td>
+<td>7.012</td>
+<td>1.1</td>
+<td><tt><span>███▉</span></tt></td>
+</tr>
+<tr><td>scalar (long div)</td>
+<td>19.024</td>
+<td>18.989</td>
+<td>0.4</td>
+<td><tt>█▍</tt></td>
+</tr>
+<tr><td>scalar (long div, autovect)</td>
+<td>0.998</td>
+<td>0.993</td>
+<td>8.1</td>
+<td><tt><span>███████████████████████████▋</span></tt></td>
+</tr>
+<tr><td>SSE</td>
+<td>1.166</td>
+<td>1.162</td>
+<td>6.9</td>
+<td><tt><span>███████████████████████▋</span></tt></td>
+</tr>
+<tr><td>SSE (no rounding)</td>
+<td>0.831</td>
+<td>0.825</td>
+<td>9.7</td>
+<td><tt><span>█████████████████████████████████▎</span></tt></td>
+</tr>
+<tr><td>SSE (rcp)</td>
+<td>0.907</td>
+<td>0.903</td>
+<td>8.9</td>
+<td><tt><span>██████████████████████████████▍</span></tt></td>
+</tr>
+<tr><td>SSE long div</td>
+<td>2.095</td>
+<td>2.089</td>
+<td>3.8</td>
+<td><tt><span>█████████████▏</span></tt></td>
+</tr>
+<tr><td>AVX2</td>
+<td>1.065</td>
+<td>1.054</td>
+<td>7.6</td>
+<td><tt><span>██████████████████████████</span></tt></td>
+</tr>
+<tr><td>AVX2 (rcp)</td>
+<td>0.975</td>
+<td>0.966</td>
+<td>8.3</td>
+<td><tt><span>████████████████████████████▍</span></tt></td>
+</tr>
+<tr><td>AVX2 long div</td>
+<td>1.075</td>
+<td>1.068</td>
+<td>7.5</td>
+<td><tt><span>█████████████████████████▋</span></tt></td>
+</tr>
+<tr><td>AVX512 long div</td>
+<td>0.692</td>
+<td>0.687</td>
+<td>11.7</td>
+<td><tt><span>████████████████████████████████████████</span></tt></td>
+</tr>
+</tbody>
+</table>
+</div>
+<div id="icelake">
+<h2>IceLake</h2>
+<ul>
+<li>Compiler: gcc (GCC) 13.3.1 20240611 (Red Hat 13.3.1-2)</li>
+<li>CPU: Intel(R) Xeon(R) Gold 6338 CPU @ 2.00GHz</li>
+</ul>
+<table>
+<colgroup>
+<col width="28%">
+<col width="12%">
+<col width="10%">
+<col width="6%">
+<col width="44%">
+</colgroup>
+<thead>
+<tr><th>procedure</th>
+<th colspan="2">time in cycles per byte</th>
+<th colspan="2">speed-up</th>
+</tr>
+<tr><th>&nbsp;</th>
+<th>average</th>
+<th>best</th>
+<th>&nbsp;</th>
+<th>&nbsp;</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>scalar</td>
+<td>6.043</td>
+<td>6.012</td>
+<td>1.0</td>
+<td><tt>██▋</tt></td>
+</tr>
+<tr><td>scalar (unrolled x 4)</td>
+<td>6.016</td>
+<td>6.010</td>
+<td>1.0</td>
+<td><tt>██▋</tt></td>
+</tr>
+<tr><td>scalar (long div)</td>
+<td>9.816</td>
+<td>8.412</td>
+<td>0.7</td>
+<td><tt>█▉</tt></td>
+</tr>
+<tr><td>scalar (long div, autovect)</td>
+<td>0.582</td>
+<td>0.578</td>
+<td>10.4</td>
+<td><tt><span>███████████████████████████▍</span></tt></td>
+</tr>
+<tr><td>SSE</td>
+<td>0.593</td>
+<td>0.586</td>
+<td>10.3</td>
+<td><tt><span>███████████████████████████</span></tt></td>
+</tr>
+<tr><td>SSE (no rounding)</td>
+<td>0.476</td>
+<td>0.473</td>
+<td>12.7</td>
+<td><tt><span>█████████████████████████████████▍</span></tt></td>
+</tr>
+<tr><td>SSE (rcp)</td>
+<td>0.504</td>
+<td>0.498</td>
+<td>12.1</td>
+<td><tt><span>███████████████████████████████▊</span></tt></td>
+</tr>
+<tr><td>SSE long div</td>
+<td>1.247</td>
+<td>1.239</td>
+<td>4.9</td>
+<td><tt><span>████████████▊</span></tt></td>
+</tr>
+<tr><td>AVX2</td>
+<td>0.547</td>
+<td>0.518</td>
+<td>11.6</td>
+<td><tt><span>██████████████████████████████▌</span></tt></td>
+</tr>
+<tr><td>AVX2 (rcp)</td>
+<td>0.447</td>
+<td>0.431</td>
+<td>13.9</td>
+<td><tt><span>████████████████████████████████████▊</span></tt></td>
+</tr>
+<tr><td>AVX2 long div</td>
+<td>0.641</td>
+<td>0.636</td>
+<td>9.5</td>
+<td><tt><span>████████████████████████▉</span></tt></td>
+</tr>
+<tr><td>AVX512 long div</td>
+<td>0.399</td>
+<td>0.396</td>
+<td>15.2</td>
+<td><tt><span>████████████████████████████████████████</span></tt></td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+<div id="source-code">
+
+<p>Sample implementation is available at <a href="https://github.com/WojciechMula/toys/tree/master/u8div">GitHub</a>.</p>
+</div>
+</div></div>]]>
+            </description>
+            <link>http://0x80.pl/notesen/2024-12-21-uint8-division.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42481612</guid>
+            <pubDate>Sat, 21 Dec 2024 19:25:13 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Gazzetta, an RSS Reader for Mastodon]]>
+            </title>
+            <description>
+<![CDATA[
+Score 15 | Comments 3 (<a href="https://news.ycombinator.com/item?id=42480885">thread link</a>) | @primatologyxyz
+<br/>
+December 21, 2024 | https://primatology.xyz/blog/introducing-gazzetta | <a href="https://web.archive.org/web/*/https://primatology.xyz/blog/introducing-gazzetta">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content">
+<!-- BEGIN PAGE CONTENT -->
+
+<div>
+  <p><img src="https://primatology.xyz/assets/blog/gazzetta-screenshot-1.png">
+  </p>
+<!-- BEGIN BLOG POST -->
+<p>While there are many great apps for Mastodon, they are built around the core experience of<br>
+Mastodon as a social network. So, it’s easy for great content to pass you by, in your timeline, as<br>
+you read posts, reply to people, favorite posts, etc.</p>
+<p>Gazzetta can be thought of as an RSS reader for Mastodon. It presents an interface, separate<br>
+from the social network, to give you the time and space to read the news and links you care<br>
+about.</p>
+<ul>
+  <li>Follow servers (e.g. flipboard.social) and see all the trending links.</li>
+  <li>Follow accounts (e.g. <a href="https://primatology.xyz/cdn-cgi/l/email-protection" data-cfemail="9ef5f1eaeaf5fbdef3ffedeaf1faf1f0b0edf1fdf7fff2">[email&nbsp;protected]</a>) and see all the links they’ve posted.</li>
+  <li>Login to your own accounts and see all the links posted by the people you follow.</li>
+  <li>Full-text search allows you to find the content you’re looking for.</li>
+  <li>Read the links in Safari View Controller, with secure, private access to your passwords, and<br>
+extensions.</li>
+  <li>Add links to bookmarks, favorites, and reading list, in-app.</li>
+  <li>Alternatively, add links to Safari Reading List.</li>
+  <li>Export your bookmarks, favorites and reading list to an HTML document.</li>
+  <li>Filter links by domain, keyword, and language.</li>
+  <li>Customize your experience:
+    <ul>
+      <li>Font styles and sizes</li>
+      <li>Hide thumbnails and icons</li>
+      <li>Hide authors, comments, dates, descriptions, publishers, sources, etc.</li>
+      <li>Limit title and description lengths</li>
+      <li>Date formats/styles</li>
+    </ul>
+  </li>
+</ul>
+
+<p><a target="_blank" rel="noopener" href="https://apps.apple.com/app/id6738706671">
+    <img alt="Download on the App Store" src="https://primatology.xyz/assets/images/app-store.svg">
+</a>
+</p>
+
+<!-- END BLOG POST -->
+</div>
+<!-- END PAGE CONTENT -->
+		</div></div>]]>
+            </description>
+            <link>https://primatology.xyz/blog/introducing-gazzetta</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42480885</guid>
+            <pubDate>Sat, 21 Dec 2024 17:20:12 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[AI 'Street Photography' Isn't Photography: What We Lose by Simulating Experience]]>
+            </title>
+            <description>
+<![CDATA[
+Score 34 | Comments 27 (<a href="https://news.ycombinator.com/item?id=42480706">thread link</a>) | @smnrg
+<br/>
+December 21, 2024 | https://simone.org/synthography/ | <a href="https://web.archive.org/web/*/https://simone.org/synthography/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+            <p>A veteran of photography recently told me she's “really been enjoying AI street photography.” She explained that she had never felt comfortable doing actual street photography. In particular: going out into the world, engaging with strangers, capturing real moments. But now she could finally enjoy the genre without that discomfort.</p><p>I had to stop her there. What she's doing isn't photography at all.</p><p>This isn't mere semantics. Photography—from photo- “light” + -graph “something written”—means drawing with light onto something¹. You cannot “photograph” something that never existed. No photons were recorded because no moment actually happened. What she's doing might be art, ML image generation, or what some call “synthography.”² Yet, it cannot, by definition, be photography.</p><p>“In the end, your view is just different from mine,” she responded. True. But this is about the collapse of meaning in our rush to simulate experience rather than live it.</p><p>Think of it like emulation versus native execution.</p><p>We pretend the simulation is equal to the real thing. But that pretense requires ignoring the physics and embodied reality of what's happening.</p><p>The tragedy isn't linguistic imprecision—it's what this collapse of meaning represents. Street photography isn't just about getting images. It's about being present in the world, engaging with fellow humans, finding the courage to put yourself in uncomfortable situations.</p><p>I experienced this truth firsthand recently in Brooklyn's Chinatown. Unsure of my bearings in an unfamiliar neighborhood, I chose to first observe from the safety of a bus. When I spotted a crowd gathered around two metal barrels, smoke and paper ash in the air, something pulled me off that bus and into the scene.</p><!--members-only--><p>I found myself the only non-Chinese person among about fifty locals, gathered in two circles around burning fires. Not a word of English spoken. With my camera, I was an outsider, met with skeptical glances. But through careful body language, respectful distance, and genuine curiosity, something remarkable happened. The elder tending the fire caught my eye and smiled. We exchanged thumbs up and a laugh. A wordless permission that transformed me from outsider to welcomed observer. For the next twenty minutes, I documented a ceremony I'd later research and discuss with Chinese friends. But at that moment, I was present, connected, learning.</p><figure><img src="https://simone.org/content/images/2024/12/DSC09490-2.jpg" alt="" loading="lazy" width="2000" height="1333" srcset="https://simone.org/content/images/size/w600/2024/12/DSC09490-2.jpg 600w, https://simone.org/content/images/size/w1000/2024/12/DSC09490-2.jpg 1000w, https://simone.org/content/images/size/w1600/2024/12/DSC09490-2.jpg 1600w, https://simone.org/content/images/size/w2400/2024/12/DSC09490-2.jpg 2400w" sizes="(min-width: 720px) 720px"></figure><figure><div><div><p><img src="https://simone.org/content/images/2024/12/DSC09443.jpg" width="2000" height="1333" loading="lazy" alt="" srcset="https://simone.org/content/images/size/w600/2024/12/DSC09443.jpg 600w, https://simone.org/content/images/size/w1000/2024/12/DSC09443.jpg 1000w, https://simone.org/content/images/size/w1600/2024/12/DSC09443.jpg 1600w, https://simone.org/content/images/size/w2400/2024/12/DSC09443.jpg 2400w" sizes="(min-width: 720px) 720px"></p><p><img src="https://simone.org/content/images/2024/12/DSC09480.jpg" width="2000" height="1333" loading="lazy" alt="" srcset="https://simone.org/content/images/size/w600/2024/12/DSC09480.jpg 600w, https://simone.org/content/images/size/w1000/2024/12/DSC09480.jpg 1000w, https://simone.org/content/images/size/w1600/2024/12/DSC09480.jpg 1600w, https://simone.org/content/images/size/w2400/2024/12/DSC09480.jpg 2400w" sizes="(min-width: 720px) 720px"></p><p><img src="https://simone.org/content/images/2024/12/DSC09428.jpg" width="2000" height="1333" loading="lazy" alt="" srcset="https://simone.org/content/images/size/w600/2024/12/DSC09428.jpg 600w, https://simone.org/content/images/size/w1000/2024/12/DSC09428.jpg 1000w, https://simone.org/content/images/size/w1600/2024/12/DSC09428.jpg 1600w, https://simone.org/content/images/size/w2400/2024/12/DSC09428.jpg 2400w" sizes="(min-width: 720px) 720px"></p></div></div></figure><p>This is what we sacrifice when we pretend AI image generation is equal to street photography.</p><p>No algorithm could have replaced that social dance, the warmth of that man's smile, or the shift from outsider to accepted observer. These are not photos but artifacts of human connection, of pushing past comfort zones, of cultural exchange.</p><p>We're not just misusing terms—we're surrendering the very concept of authentic engagement with reality. Automation of the experience.</p><p>“But 'synthography' isn't gaining much traction,” she explained, defending her terminology. Of course it isn't. We prefer comfy illusions to precise truths. It's easier to pretend we're doing the same thing as those who actually engage with the world, who actually capture real moments, who actually face the discomfort of genuine human interaction.</p><p>This is a classic case of tools displacing users: a device appears making things so easy to the point of undermining our fundamental human capacity to do it ourselves.</p><p>And the pattern extends far beyond photography. Everywhere we look, the virtual replaces the physical without acknowledging the fundamental difference. I know this has already happened, but I would like to highlight the process as it unfolds, so you can decide where the value is for you. In which order of reality are you living an embodied experience in? This reality is your anchor. Now. Not a prompt. You won't find your life in a prompt.</p><p>What happens to a culture that becomes comfortable with synthetic versions of real experiences? What dies in us when we stop distinguishing between capturing reality and generating simulacra? What changes when we choose the comfort of artificial engagement over the messy, uncomfortable reality of being present in the world? While I can't be sure that this reality isn't already a synthography itself, I am certain that your experience <em>of</em> it depends on getting involved <em>in</em> it. Perhaps Baudrillard would know more.³ I don't.</p><p>Maybe we can't escape the collapse of meaning, but we can decide how to engage with it.</p><p>By all means, generate AI content. Create synthetic images. Enjoy that process.</p><p>But don't collapse the meaning of photography—an art form about engaging with and capturing reality—into something that avoids that engagement. Some distinctions are worth preserving, even if maintaining them makes us uncomfortable.</p><p>Because that discomfort is the point.</p><hr><ol><li>Etymology Online. (2024). Photograph. Retrieved from https://web.archive.org/web/20171017074553/etymonline.com/word/photograph.</li><li>The term “synthography” appears to have been independently coined in 2022-2023 by both Reinhuber (https://web.archive.org/web/20221220183225/https://link.springer.com/chapter/10.1007/978-3-030-95531-1_22) and Ango (https://web.archive.org/web/20230906022043/https://stephango.com/synthography), demonstrating convergent thinking about AI-generated imagery. There are more people who could claim it around that time. It's a simultaneous invention.</li><li>Baudrillard would likely recognize this as the “precession of simulacra” at work: AI photography is not just a copy of reality, but a representation without original. Simulacra.</li></ol>
+        </div></div>]]>
+            </description>
+            <link>https://simone.org/synthography/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42480706</guid>
+            <pubDate>Sat, 21 Dec 2024 16:56:03 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Introducing S2]]>
+            </title>
+            <description>
+<![CDATA[
+Score 134 | Comments 70 (<a href="https://news.ycombinator.com/item?id=42480105">thread link</a>) | @brancz
+<br/>
+December 21, 2024 | https://s2.dev/blog/intro | <a href="https://web.archive.org/web/*/https://s2.dev/blog/intro">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><blockquote>
+<p>Elevate the beating heart of data systems.</p>
+</blockquote>
+<p>Our team has worked a lot on reliable real-time ingest, where <a href="https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying" target="_blank">The Log</a> is foundational. We loved the serverless experience of object storage, but it <a href="https://blog.schmizz.net/designing-serverless-stream-storage#heading-vision" target="_blank">simply did not exist</a> for streaming data.</p>
+<p>We believe the humble log – the <em><strong>stream</strong></em> – deserves to be a cloud storage primitive.</p>
+<p>With S2, we are previewing just that: S2 is the Stream Store, our interpretation of streaming for the cloud era.</p>
+<h3 id="what-if-streams-had-the-primacy-of-objects"><a aria-label="Link to section" href="#what-if-streams-had-the-primacy-of-objects">What if streams had the primacy of objects?</a></h3>
+<p>Object storage has been nothing short of revolutionary. S3 broke ground in 2006 with simple storage operations on named objects – and 18 years later, S3 Express One Zone even allows appends. But ultimately, object storage is all about blobs and byte ranges. It is best for data at rest. Our vision of stream storage is predicated on the idea that the demands of <em>data in motion</em> need a fresh perspective.</p>
+<p>With S2, you are elevated to the natural granularity of <em>records</em>. Writes to an S2 stream are appended at the tail, and even if multiple writers are acting a time, S2 will durably sequence all records. S2 takes care of serving your reads efficiently, whether you need to start streaming from seconds ago or years. Streams can also be tailed in real-time, which is not possible with a blob in S3.</p>
+<div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Object Storage</th><th>Stream Storage</th></tr></thead><tbody><tr><td>Blobs and byte ranges</td><td>Records and sequence numbers</td></tr><tr><td><code>PUT</code> / <code>GET</code> / <code>DELETE</code> value of a named <code>Object</code> in a <code>Bucket</code></td><td><code>APPEND</code> / <code>READ</code> / <code>TRIM</code> records on a named <code>Stream</code> in a <code>Basin</code></td></tr><tr><td>Cumbersome and expensive for granular appends</td><td>Easy and cheap to append records</td></tr></tbody></table>
+</div>
+<p>Just like buckets are a namespace for objects, <em>basins</em> play that role for streams in S2. Basins and streams lean into the scale of the cloud – there is no limit on how many you can have, or how long data can be retained.</p>
+<p>Want to model streams per user? Do it, this isn't Kafka. There are no cluster limitations to wrangle, and no infrastructure to tune.</p>
+<figure data-rehype-pretty-code-figure=""><pre tabindex="0" data-language="bash" data-theme="github-dark"><code data-language="bash" data-theme="github-dark"><span data-line=""><span>$</span><span> s2</span><span> ls</span><span> s2://copilot-rag-ingest</span></span>
+<span data-line=""><span>  /user-foo/cool-project</span></span>
+<span data-line=""><span>  /user-foo/another-project</span></span>
+<span data-line=""><span>  /user-bar/fork-of-cool-project</span></span>
+<span data-line=""><span>  # ... ∞</span></span></code></pre></figure>
+<p>This stream interface brought us closer to our vision, but we also wanted to liberate the superpower of <a href="https://blog.schmizz.net/disaggregated-wal" target="_blank">offloading durability</a> which databases like MemoryDB and Neon leverage. Decoupling compute and storage is safest when the storage service cooperates.</p>
+<p>So we added a verb to <a href="https://maheshba.bitbucket.io/papers/osr2024.pdf" target="_blank">check the tail</a> of the stream with strong consistency, and support for concurrency control when writing. You can be a pessimist wielding a <a href="https://brooker.co.za/blog/2024/04/25/memorydb.html" target="_blank">fencing token</a> or optimistically supply the sequence number you expect assigned – no judgment which side of the fence you find yourself on.</p>
+<h3 id="serverless--at-what-cost"><a aria-label="Link to section" href="#serverless--at-what-cost">Serverless – at what cost?</a></h3>
+<p>S2 is architected around the infinite scale and unrelenting durability of object storage. That does not necessitate a slow or expensive offering – quite the opposite! We bridge the abstraction gap with a multi-tenant service so that you can have a truly serverless API for streaming data.</p>
+<p>Durability is not negotiable for us in the undeniable <a href="https://materializedview.io/p/cloud-storage-triad-latency-cost-durability" target="_blank">cloud storage triad</a>. We allow users to navigate their latency vs cost tradeoff on a per stream basis, with <em>storage classes</em>. We are starting out with two:</p>
+<ol>
+<li>
+<p><strong><code>Standard</code></strong>, backed by S3 Standard in AWS. S3 Standard has a counterpart in all public cloud providers, so we will be able to ship it in all cloud regions as we grow.</p>
+</li>
+<li>
+<p><strong><code>Express</code></strong>, backed by a quorum of three S3 Express One Zone buckets in AWS. Azure has had a regional <a href="https://learn.microsoft.com/en-us/azure/storage/blobs/storage-blob-block-blob-premium" target="_blank">counterpart</a> for years, and it is <a href="https://www.linkedin.com/feed/update/urn:li:activity:7170847492522061825" target="_blank">in the cards</a> at GCP, so we are optimistic about wider availability.</p>
+</li>
+</ol>
+<p>Our <code>Standard</code> storage class provides end-to-end p99 latencies of <strong>under 500 milliseconds</strong>. With <code>Express</code> you can expect <strong>under 50 milliseconds</strong> – in the realm of disk-based cloud streaming systems! S2 on the other hand is completely diskless, and all writes will be safe in S3 with regional durability before being acknowledged.</p>
+<p>These latencies are supported at throughputs of <strong>hundreds of megabytes per second, per stream</strong>. The overhead of reading recently written data is negligible in S2 because of in-memory caching. Lagging readers can be particularly thirsty for throughput, and S2 serves them directly from object storage without a cap. We are initially throttling writes at 125 MiBps and reads against recent writes at 500 MiBps, per stream.</p>
+<p><img src="https://s2.dev/blog/20241219-latencies.svg" alt="Consistent low latency for S2 storage classes" title="Latencies at over 1 GiBps aggregate throughput"></p>
+<p>The service is free during our preview period to optimize for feedback. We want to be transparent about our <a href="https://s2.dev/pricing" target="_blank">intended pricing</a>, and you will find that S2 comes in meaningfully cheaper than the norms of cloud streaming systems. This will be particularly stark in comparison to "serverless" offerings, which attract tiny ceilings on the number of streams and the throughputs you can push through them – at a very high premium.</p>
+<p>There are no fixed costs in S2 like instances or cluster units. When we say serverless, we mean it!</p>
+<h3 id="whats-next-for-s2"><a aria-label="Link to section" href="#whats-next-for-s2">What's next for S2</a></h3>
+<p>S2 stands on a foundation of battle-tested cloud infrastructure, and our own Rust codebase gets put through the wringer with deterministic simulation testing. That said, the system is young, and there will be kinks. We are working hard to mature towards general availability and an SLA you can count on in production.</p>
+<p>We are now shipping a <a href="https://s2.dev/docs/interface/grpc" target="_blank">gRPC API</a>, <a href="https://github.com/s2-streamstore/s2-sdk-rust" target="_blank">Rust SDK</a>, and a <a href="https://s2.dev/docs/quickstart#get-started-with-the-cli" target="_blank">shiny CLI</a> – and we are going to get cracking on a REST API. Do <a href="https://discord.gg/vTCs7kMkAf" target="_blank">tell us</a> which language SDKs you would be most interested in.</p>
+<p>To give you a bigger picture sense of our direction:</p>
+<ul>
+<li>
+<p><strong>Kafka protocol compatibility</strong>. This will be an open source layer, and we will integrate certain features like key-based compaction directly in S2.</p>
+</li>
+<li>
+<p><strong>Multi-region basins</strong>. Once we expand into more cloud regions, we see a path towards basins that can span regions and even clouds, for the highest standard of availability.</p>
+</li>
+<li>
+<p><strong>Under 5 millisecond latencies</strong>. We are just getting started with the architectural flexibility of storage classes, and another 10x improvement over <code>Express</code> is achievable.</p>
+</li>
+</ul>
+<p>Can you replace Kafka or Kinesis with S2 today? If you find yourself reaching for their “low-level” APIs, S2 is likely to be a fit, and even address your requirements more directly.</p>
+<p>If you expect a lot more from the cloud than current norms for streaming data – like not being limited on how many streams you can have, 10-100x higher ordered throughput, and concurrency control – S2 is the missing piece.</p>
+<p>We are beyond excited for all the innovative data systems S2 enables, and invite you to <a href="https://s2.dev/docs">build with us</a>!</p></div></div>]]>
+            </description>
+            <link>https://s2.dev/blog/intro</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42480105</guid>
+            <pubDate>Sat, 21 Dec 2024 15:11:19 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[An academic Great Gatsby Curve – How much academic success is inherited?]]>
+            </title>
+            <description>
+<![CDATA[
+Score 30 | Comments 36 (<a href="https://news.ycombinator.com/item?id=42479958">thread link</a>) | @nabla9
+<br/>
+December 21, 2024 | https://blogs.lse.ac.uk/impactofsocialsciences/2024/10/21/an-academic-great-gatsby-curve-how-much-academic-success-inherited/ | <a href="https://web.archive.org/web/*/https://blogs.lse.ac.uk/impactofsocialsciences/2024/10/21/an-academic-great-gatsby-curve-how-much-academic-success-inherited/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+      <div><p><em>To what extent does academic success follow success? Drawing on a dataset of mentor-mentee relations and their citations, </em><strong>Ye Sun, Fabio Caccioli, Xiancheng Li&nbsp;</strong><em>and</em><strong> Giacomo Livan </strong><em>suggest the dynamics of citation and wealth inequality are surprisingly similar.</em></p>
+<hr>
+<p>Rankings are ubiquitous: every week, lists of best-selling records, movies, and books are released, and in sports like tennis, athletes are ranked based on their performance in major tournaments. While we know there is more to a song, book, or movie than its sales figures, we are drawn to rankings because they simplify complexity. They reduce a multidimensional concept like success into simple ordered lists.</p>
+<p>In academia, citation-based metrics have come to serve a similar function. With platforms like Clarivate and Google Scholar, measuring an author’s performance through citations has become a common practice, whether we like it or not. In some countries, these bibliometric indicators have even started to dictate career progression, making citations an informal currency of success.</p>
+<p>In this context, it is useful to consider what determines academic success. Natural abilities certainly matter. Personal attributes such as intelligence, diligence, and a strong work ethic are crucial. But does nurture play a role as well? Research suggests it does. Recent studies have shown that <a href="https://www.nature.com/articles/s41467-019-13130-4" target="_blank" rel="noopener">early-career collaborations with highly-cited scientists</a> increase the likelihood of becoming a highly-cited author, even two decades later. These studies have also documented the “<a href="https://www.pnas.org/doi/abs/10.1073/pnas.1800471115" target="_blank" rel="noopener">chaperone effect</a>,” where publishing in high-impact journals is facilitated by co-authors who have already established themselves in those venues.</p>
+<blockquote><p>Natural abilities certainly matter. Personal attributes such as intelligence, diligence, and a strong work ethic are crucial. But does nurture play a role as well?</p></blockquote>
+<p>This brings us to a critical question: Can academic success be inherited in a way similar to wealth and social status? In a <a href="https://doi.org/10.1098/rsif.2024.0173" target="_blank" rel="noopener">recent paper</a>, we sought to address this question by analysing the transfer of success from mentors to mentees in academia. In economics, the <em>Great Gatsby Curve</em> describes a negative correlation between income inequality (measured, for example, by the Gini coefficient) and intergenerational social mobility. In other words, the more unequal a society’s income distribution, the harder it is for individuals to move up the social ladder compared to their parents’ social class.</p>
+<p>Drawing on this concept, we analysed genealogical data from over 245,000 mentor-mentee pairs across 22 different disciplines. Our findings reveal a similar pattern in academia: the more unequal the distribution of citations within a discipline, the more likely a mentee’s citation ranking is to mirror their mentor’s. This suggests that academic success is shaped by structural forces similar to those that govern social mobility, where the advantage of having a top mentor can lead to a self-reinforcing cycle of success.</p>
+<p>This relationship is illustrated in the figure one below. The horizontal axis represents citation inequality across various disciplines. We observe that fields such as experimental psychology, microbiology, and evolutionary biology exhibit the most egalitarian citation distribution, while philosophy, education, and anthropology display the highest levels of inequality. The vertical axis captures intergenerational ranking persistence, where disciplines like microbiology, cell biology, and bioengineering show the weakest correlation between the citation ranking of mentors and mentees. In contrast, in some liberal arts and medical fields, such as philosophy, linguistics, and epidemiology, ranking persistence across academic generations is notably strong.</p>
+<p><img data-attachment-id="51075" data-permalink="https://blogs.lse.ac.uk/impactofsocialsciences/2024/10/21/an-academic-great-gatsby-curve-how-much-academic-success-inherited/academic-inequality-lse-impact/" data-orig-file="https://i0.wp.com/blogsmedia.lse.ac.uk/blogs.dir/9/files/2024/10/Academic-Inequality-LSE-Impact.jpg?fit=1421%2C1041&amp;ssl=1" data-orig-size="1421,1041" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="Academic-Inequality-LSE-Impact" data-image-description="" data-medium-file="https://i0.wp.com/blogsmedia.lse.ac.uk/blogs.dir/9/files/2024/10/Academic-Inequality-LSE-Impact.jpg?fit=300%2C220&amp;ssl=1" data-large-file="https://i0.wp.com/blogsmedia.lse.ac.uk/blogs.dir/9/files/2024/10/Academic-Inequality-LSE-Impact.jpg?fit=1024%2C750&amp;ssl=1" title="Fig.1: The academic Great Gatsby curve showing varying inherited citation inequality across different disciplines." src="https://i0.wp.com/blogsmedia.lse.ac.uk/blogs.dir/9/files/2024/10/Academic-Inequality-LSE-Impact.jpg?resize=1421%2C1041&amp;ssl=1" alt="Fig.1: The academic Great Gatsby curve showing varying inherited citation inequality across different disciplines." width="1421" height="1041" srcset="https://i0.wp.com/blogsmedia.lse.ac.uk/blogs.dir/9/files/2024/10/Academic-Inequality-LSE-Impact.jpg?w=1421&amp;ssl=1 1421w, https://i0.wp.com/blogsmedia.lse.ac.uk/blogs.dir/9/files/2024/10/Academic-Inequality-LSE-Impact.jpg?resize=300%2C220&amp;ssl=1 300w, https://i0.wp.com/blogsmedia.lse.ac.uk/blogs.dir/9/files/2024/10/Academic-Inequality-LSE-Impact.jpg?resize=768%2C563&amp;ssl=1 768w, https://i0.wp.com/blogsmedia.lse.ac.uk/blogs.dir/9/files/2024/10/Academic-Inequality-LSE-Impact.jpg?resize=1024%2C750&amp;ssl=1 1024w, https://i0.wp.com/blogsmedia.lse.ac.uk/blogs.dir/9/files/2024/10/Academic-Inequality-LSE-Impact.jpg?resize=137%2C100&amp;ssl=1 137w" sizes="(max-width: 1000px) 100vw, 1000px" data-recalc-dims="1"></p>
+<p><em>Fig.1: The academic Great Gatsby curve showing varying inherited citation inequality across different disciplines.</em></p>
+<p>In everyday life, parents and children do not choose each other, whereas in academia, mentors and mentees actively select one another. This mutual selection means that top mentors often attract top mentees, and vice versa, leading naturally to lower mobility across generations within the citation distribution. While this makes some degree of inheritance and persistence expected, our findings go beyond merely showing that mentors matter. We document not only a decrease in mobility across generations over time, but also a clear negative correlation between mobility and citation inequality—an exact mirror of patterns observed in wealth inequality in wider society.</p>
+<blockquote><p>our findings go beyond merely showing that mentors matter</p></blockquote>
+<p>These findings do not imply that mentees who inherit top-ranking positions are undeserving of their status. On the contrary, they likely had an initial advantage over their peers, which allowed them to gain access to top mentors in the first place. From these mentors, they acquired valuable skills that further widened the gap between them and others. This is similar to the much debated example of hockey players popularised by Malcolm Gladwell in <em>Outliers</em>. There is an overrepresentation of Canadian professional hockey players born in January and February because youth leagues group players by birth year. Being born early in the year gives these children a physical development edge, which leads to their selection for better teams and training. Over time, this initial advantage compounds, and they ultimately become much stronger players than their peers.</p>
+<p>If anything, our results suggest that citation-based metrics should be handled with caution, as the story behind these numbers is more nuanced than it appears at first glance. Additionally, promoting geographical and institutional mobility could help unlock untapped potential by providing broader access to top-cited mentors. Concrete measures such as cross-institution mentorship programs or incentives for top scholars to engage with early-career researchers outside their immediate networks could foster greater academic equity and help reduce the persistent disparities highlighted by our study.</p>
+
+<hr>
+<p><em>This post draws on the authors’ article, <a href="https://doi.org/10.1098/rsif.2024.0173">The academic Great Gatsby Curve</a> published in Journal of the Royal Society Interface</em></p>
+<p><i>The content generated on this blog is for information purposes only. This Article gives the views and opinions of the authors and does not reflect the views and opinions of the Impact of Social Science blog (the blog), nor of the London School of Economics and Political Science.&nbsp;<em>Please review our&nbsp;</em><a href="https://blogs.lse.ac.uk/impactofsocialsciences/about-the-blog/comments-policy/" target="_blank" rel="noopener"><em>comments policy</em></a><em>&nbsp;if you have any concerns on posting a comment below.</em></i></p>
+<p><em>Image Credit:&nbsp;<a title="Rawpixel.com" href="https://www.shutterstock.com/g/Rawpixel"><span><span>Rawpixel.com</span></span></a>&nbsp;on <a href="https://www.shutterstock.com/image-illustration/woman-holding-horse-racing-ticket-1895-2522721131" target="_blank" rel="noopener">Shutterstock</a>.&nbsp;</em></p>
+<hr>
+<p><a href="#" rel="nofollow" onclick="window.print(); return false;" title="Printer Friendly, PDF &amp; Email"><img src="https://i2.wp.com/cdn.printfriendly.com/buttons/printfriendly-button.png?ssl=1" alt="Print Friendly, PDF &amp; Email" data-recalc-dims="1"></a></p></div>
+    </div></div>]]>
+            </description>
+            <link>https://blogs.lse.ac.uk/impactofsocialsciences/2024/10/21/an-academic-great-gatsby-curve-how-much-academic-success-inherited/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42479958</guid>
+            <pubDate>Sat, 21 Dec 2024 14:42:56 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Escaping Google's Manual Reputation Penalty and Resuming Business as Usual]]>
             </title>
             <description>
 <![CDATA[
-Score 18 | Comments 3 (<a href="https://news.ycombinator.com/item?id=42479866">thread link</a>) | @fueloil
+Score 116 | Comments 25 (<a href="https://news.ycombinator.com/item?id=42479866">thread link</a>) | @fueloil
 <br/>
 December 21, 2024 | https://recleudo.com/under-googles-watchfull-eye-getting-out-of-a-manual-site-reputation-abuse-penalty-and-continuing-business-as-usual/ | <a href="https://web.archive.org/web/*/https://recleudo.com/under-googles-watchfull-eye-getting-out-of-a-manual-site-reputation-abuse-penalty-and-continuing-business-as-usual/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="content">
@@ -324,7 +1633,7 @@ Here’s the sitemap for their /se/ subdirectory:</p>
             </title>
             <description>
 <![CDATA[
-Score 21 | Comments 18 (<a href="https://news.ycombinator.com/item?id=42478654">thread link</a>) | @Raed667
+Score 23 | Comments 20 (<a href="https://news.ycombinator.com/item?id=42478654">thread link</a>) | @Raed667
 <br/>
 December 21, 2024 | https://blog.raed.dev/posts/goodbye_spotify?source=hn-dec-24 | <a href="https://web.archive.org/web/*/https://blog.raed.dev/posts/goodbye_spotify?source=hn-dec-24">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article id="article" role="article">
@@ -374,7 +1683,7 @@ Today I exported my data, I canceled my subscription, and I mourn the app that S
             </title>
             <description>
 <![CDATA[
-Score 179 | Comments 311 (<a href="https://news.ycombinator.com/item?id=42472247">thread link</a>) | @chmaynard
+Score 181 | Comments 319 (<a href="https://news.ycombinator.com/item?id=42472247">thread link</a>) | @chmaynard
 <br/>
 December 20, 2024 | https://climate.benjames.io/uk-electricity-bills/ | <a href="https://web.archive.org/web/*/https://climate.benjames.io/uk-electricity-bills/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -1968,7 +3277,7 @@ December 20, 2024 | http://red-green-blue.com/kid-pix-the-early-years | <a href=
             </title>
             <description>
 <![CDATA[
-Score 154 | Comments 159 (<a href="https://news.ycombinator.com/item?id=42464966">thread link</a>) | @tlf
+Score 154 | Comments 160 (<a href="https://news.ycombinator.com/item?id=42464966">thread link</a>) | @tlf
 <br/>
 December 19, 2024 | https://mayhul.com/posts/type-driven-design/ | <a href="https://web.archive.org/web/*/https://mayhul.com/posts/type-driven-design/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>  <p>Over the last couple years, my programming brain has become increasingly warped around types, functional programming principles &amp; Typescript. Most of it is influenced by the inordinate amount of time I’ve spent working on the Heartbeat codebase, a 300k+ line Typescript full-stack application that includes a React web app, a React Native mobile app and a Node.js server. My experience in this codebase has shown me that the more I lean into relying on the type system, the more I benefit.</p>
@@ -2453,7 +3762,7 @@ December 19, 2024 | https://mayhul.com/posts/type-driven-design/ | <a href="http
             </title>
             <description>
 <![CDATA[
-Score 190 | Comments 56 (<a href="https://news.ycombinator.com/item?id=42464557">thread link</a>) | @coloneltcb
+Score 194 | Comments 57 (<a href="https://news.ycombinator.com/item?id=42464557">thread link</a>) | @coloneltcb
 <br/>
 December 19, 2024 | https://roelsworld.eu/blog-music/music-geometry-intervals-scales/ | <a href="https://web.archive.org/web/*/https://roelsworld.eu/blog-music/music-geometry-intervals-scales/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
@@ -2468,7 +3777,7 @@ December 19, 2024 | https://roelsworld.eu/blog-music/music-geometry-intervals-sc
             </title>
             <description>
 <![CDATA[
-Score 418 | Comments 78 (<a href="https://news.ycombinator.com/item?id=42463123">thread link</a>) | @ivmoreau
+Score 421 | Comments 82 (<a href="https://news.ycombinator.com/item?id=42463123">thread link</a>) | @ivmoreau
 <br/>
 December 19, 2024 | https://www.nicbarker.com/clay | <a href="https://web.archive.org/web/*/https://www.nicbarker.com/clay">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -2498,7 +3807,7 @@ December 19, 2024 | https://www.writingruxandrabio.com/p/on-clinical-trial-abund
             </title>
             <description>
 <![CDATA[
-Score 197 | Comments 180 (<a href="https://news.ycombinator.com/item?id=42461264">thread link</a>) | @todsacerdoti
+Score 198 | Comments 184 (<a href="https://news.ycombinator.com/item?id=42461264">thread link</a>) | @todsacerdoti
 <br/>
 December 19, 2024 | https://rakhim.exotext.com/web-developers-a-growing-disconnect | <a href="https://web.archive.org/web/*/https://rakhim.exotext.com/web-developers-a-growing-disconnect">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2554,11 +3863,11 @@ p.<span>then</span>(<span>console</span>.<span>log</span>).<span>catch</span>(<s
         </item>
         <item>
             <title>
-<![CDATA[Your Voting System Doesn't Work]]>
+<![CDATA[My vote on voting systems]]>
             </title>
             <description>
 <![CDATA[
-Score 30 | Comments 10 (<a href="https://news.ycombinator.com/item?id=42458429">thread link</a>) | @max__dev
+Score 36 | Comments 16 (<a href="https://news.ycombinator.com/item?id=42458429">thread link</a>) | @max__dev
 <br/>
 December 18, 2024 | https://blog.danielh.cc/blog/voting | <a href="https://web.archive.org/web/*/https://blog.danielh.cc/blog/voting">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-v-39a288b8=""><div data-v-39a288b8=""><!--[--><!--]--><main data-v-39a288b8=""><div data-v-39a288b8=""><div><p>You and your friends are about to log into a brand new Minecraft server. But just before you start, you're about to decide where to build the first house. Your options are:</p><ul><li><p>Desert: Warm, sunny weather all year round! Perfect for builders — endless sandstone supplies and no rain to worry about. Plus you might find some ancient treasures nearby!</p></li><li><p>Savanna: A warm, welcoming paradise with wide open spaces and beautiful acacia trees. Great visibility and plenty of room to expand your base as needed.</p></li><li><p>Snowy Slopes: Bundle up for this winter wonderland! Stunning mountain views and natural ice production. Makes for some seriously impressive cliffside builds!</p></li></ul><p>Voting has begun, and the results are in:</p><table tabindex="0"><thead><tr><th>Biome</th><th>Votes</th></tr></thead><tbody><tr><td>Desert</td><td>3</td></tr><tr><td>Savanna</td><td>3</td></tr><tr><td>Snowy Slopes</td><td>4</td></tr></tbody></table><p>Snowy Slopes is the winner! You've now logged into the server and building has begun.</p><h2 id="not-so-fast" tabindex="-1">Not so fast <a href="#not-so-fast" aria-label="Permalink to &quot;Not so fast&quot;">​</a></h2><p>Turns out, most people actually don't like the Snowy Slopes — 60% of the players voted against it. But why did it win? Imagine that Desert was removed from the race. Desert and Savanna are both warm biomes — in fact, they were right next to each other on the map. All of the players that originally picked Desert would pick Savanna instead, making it win with a 60% majority.</p><p>What happened? The voting system used here was <strong>plurality voting</strong> (also known as <strong>first-past-the-post</strong>), where each voter can vote for a single option, and the option with the most votes wins. However, this is vulnerable to the <strong>spoiler effect</strong>, where having additional choices would cause the most similar choices to lose, leaving the less popular choice to win.</p><p>Plurality voting is used in elections in the United States, which is one of the reasons there are only 2 major political parties — any third party that gains traction would end up taking votes from the most similar major party, causing them both to lose.</p><h2 id="instant-runoff" tabindex="-1">Instant runoff <a href="#instant-runoff" aria-label="Permalink to &quot;Instant runoff&quot;">​</a></h2><p>Let's try something new instead. Instead of leaving each player to only vote for their favorite, they would instead rank all choices from most favorite to least favorite, and leave blank any choices that they don't like at all. To find the winner:</p><ul><li>Look for the candidate that has the most voters that put it as their first choice.</li><li>The candidate with the most first-choice voters will win if they have the majority.</li><li>Otherwise, eliminate the candidate with the least votes as the first choice, and try again.</li></ul><p>The results are in:</p><table tabindex="0"><thead><tr><th>First choice</th><th>Second choice</th><th>Third choice</th><th>Votes</th></tr></thead><tbody><tr><td>Desert</td><td>Savanna</td><td>Snowy Slopes</td><td>4</td></tr><tr><td>Savanna</td><td>Desert</td><td></td><td>3</td></tr><tr><td>Snowy Slopes</td><td>Desert</td><td></td><td>2</td></tr><tr><td>Snowy Slopes</td><td>Savanna</td><td></td><td>3</td></tr></tbody></table><p>None of the options have the majority — Savanna only has 3 votes as the first choice, and is eliminated:</p><table tabindex="0"><thead><tr><th>First choice</th><th>Second choice</th><th>Votes</th></tr></thead><tbody><tr><td>Desert</td><td>Snowy Slopes</td><td>4</td></tr><tr><td>Desert</td><td></td><td>3</td></tr><tr><td>Snowy Slopes</td><td>Desert</td><td>2</td></tr><tr><td>Snowy Slopes</td><td></td><td>3</td></tr></tbody></table><p>Desert now has 7 votes as first choice, and Snowy Slopes only has 5. Desert now has the majority, and is the winner. Seems like it worked!</p><p>Now, after the server having lot more players, a new contender wants to join the race:</p><ul><li>Frozen Peaks: Like Snowy Slopes, but higher and more extreme! Jagged mountaintops pierce the clouds, offering the most dramatic views. Perfect for those who want their builds to truly stand out.</li></ul><p>It's time to vote again to decide where to build the next house. After some discussion, the results are in:</p><table tabindex="0"><thead><tr><th>First choice</th><th>Second choice</th><th>Third choice</th><th>Fourth choice</th><th>Votes</th></tr></thead><tbody><tr><td>Desert</td><td>Savanna</td><td>Snowy Slopes</td><td>Frozen Peaks</td><td>35</td></tr><tr><td>Savanna</td><td>Snowy Slopes</td><td>Frozen Peaks</td><td>Desert</td><td>33</td></tr><tr><td>Snowy Slopes</td><td>Frozen Peaks</td><td>Savanna</td><td>Desert</td><td>15</td></tr><tr><td>Frozen Peaks</td><td>Snowy Slopes</td><td>Savanna</td><td>Desert</td><td>17</td></tr></tbody></table><p>None of the options have a majority, so Snowy Slopes gets eliminated:</p><table tabindex="0"><thead><tr><th>First choice</th><th>Second choice</th><th>Third choice</th><th>Votes</th></tr></thead><tbody><tr><td>Desert</td><td>Savanna</td><td>Frozen Peaks</td><td>35</td></tr><tr><td>Savanna</td><td>Frozen Peaks</td><td>Desert</td><td>33</td></tr><tr><td>Frozen Peaks</td><td>Savanna</td><td>Desert</td><td>15</td></tr><tr><td>Frozen Peaks</td><td>Savanna</td><td>Desert</td><td>17</td></tr></tbody></table><p>Again, none of the options have a majority, so Frozen Peaks (with only 32 votes as first choice) gets eliminated:</p><table tabindex="0"><thead><tr><th>First choice</th><th>Second choice</th><th>Votes</th></tr></thead><tbody><tr><td>Desert</td><td>Savanna</td><td>35</td></tr><tr><td>Savanna</td><td>Desert</td><td>33</td></tr><tr><td>Savanna</td><td>Desert</td><td>15</td></tr><tr><td>Savanna</td><td>Desert</td><td>17</td></tr></tbody></table><p>Savanna has 65 votes in total, which is a majority out of the 100 total votes, and is the winner.</p><p>But after a while, some players want to switch things up — 3 players that originally voted for Savanna as first choice change their vote to Desert as first choice (since they want their home to be a bit warmer):</p><table tabindex="0"><thead><tr><th>First choice</th><th>Second choice</th><th>Third choice</th><th>Fourth choice</th><th>Votes</th></tr></thead><tbody><tr><td>Desert</td><td>Savanna</td><td>Snowy Slopes</td><td>Frozen Peaks</td><td><strong>38</strong> (+3)</td></tr><tr><td>Savanna</td><td>Snowy Slopes</td><td>Frozen Peaks</td><td>Desert</td><td><strong>30</strong> (-3)</td></tr><tr><td>Snowy Slopes</td><td>Frozen Peaks</td><td>Savanna</td><td>Desert</td><td>15</td></tr><tr><td>Frozen Peaks</td><td>Snowy Slopes</td><td>Savanna</td><td>Desert</td><td>17</td></tr></tbody></table><p>None of the options have a majority, so Snowy Slopes gets eliminated:</p><table tabindex="0"><thead><tr><th>First choice</th><th>Second choice</th><th>Third choice</th><th>Votes</th></tr></thead><tbody><tr><td>Desert</td><td>Savanna</td><td>Frozen Peaks</td><td>38</td></tr><tr><td>Savanna</td><td>Frozen Peaks</td><td>Desert</td><td>30</td></tr><tr><td>Frozen Peaks</td><td>Savanna</td><td>Desert</td><td>15</td></tr><tr><td>Frozen Peaks</td><td>Savanna</td><td>Desert</td><td>17</td></tr></tbody></table><p>This time, now that Savanna only has 30 votes (less than the 32 votes for Frozen Peaks), Savanna gets eliminated:</p><table tabindex="0"><thead><tr><th>First choice</th><th>Second choice</th><th>Votes</th></tr></thead><tbody><tr><td>Desert</td><td>Frozen Peaks</td><td>38</td></tr><tr><td>Frozen Peaks</td><td>Desert</td><td>30</td></tr><tr><td>Frozen Peaks</td><td>Desert</td><td>15</td></tr><tr><td>Frozen Peaks</td><td>Desert</td><td>17</td></tr></tbody></table><p>Frozen Peaks, with 62 votes out of the 100 total, is the winner.</p><p>What just happened? Let's look at the ballots of the 3 voters that changed their decision:</p><table tabindex="0"><thead><tr><th>Old preferences</th><th>New preferences</th></tr></thead><tbody><tr><td>Savanna</td><td><strong>Desert</strong></td></tr><tr><td>Snowy Slopes</td><td>Savanna</td></tr><tr><td>Frozen Peaks</td><td>Snowy Slopes</td></tr><tr><td><strong>Desert</strong></td><td>Frozen Peaks</td></tr></tbody></table><p>Their new preferences leave everything the same as before, with the only difference being that Desert is moved to the top, wanting a warmer biome. However, the winner is now Frozen Peaks, which is not only colder than before, but also their last choice. This breaks the expectation of <strong>monotonicity</strong>, since a choice gaining votes can have the opposite effect that the voters intended.</p><h2 id="arrow-s-theorem" tabindex="-1">Arrow's theorem <a href="#arrow-s-theorem" aria-label="Permalink to &quot;Arrow's theorem&quot;">​</a></h2><p>Instant runoff, the voting system that was just used, is a form of <strong>ranked-choice voting</strong>, where each voter lists their preferences from most to least favorite. However, instant runoff isn't the only form of ranked-choice voting. Another system is the Borda method: in an election with <mjx-container jax="SVG"><mjx-assistive-mml unselectable="on" display="inline"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>n</mi></math></mjx-assistive-mml></mjx-container> candidates, each voter will award their first choice <mjx-container jax="SVG"><mjx-assistive-mml unselectable="on" display="inline"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>n</mi></math></mjx-assistive-mml></mjx-container> points, their second choice <mjx-container jax="SVG"><mjx-assistive-mml unselectable="on" display="inline"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>n</mi><mo>−</mo><mn>1</mn></math></mjx-assistive-mml></mjx-container> points, up until their last choice who gets a single point. Then, the candidate with the highest amount of points wins.</p><p>However, Arrow's theorem, proved in 1950, showed that with 3 or more choices, any form of ranked-choice voting must violate at least one of these conditions:</p><ul><li>Unanimity: If every voter chooses the same candidate as their favorite, then that candidate wins.</li><li>Non-dictatorship: No voter should have the sole power to decide the entire election — if any 2 voters switch their ballots, the election outcome should remain the same.</li><li>Independence of irrelevant alternatives: A candidate leaving or joining the race does not affect the relative performance of any of the other candidates.</li></ul><p>The theorem is quite complicated to prove, so I'll leave some links here: <a href="https://en.wikipedia.org/wiki/Arrow%27s_impossibility_theorem" target="_blank" rel="noreferrer">Wikipedia</a>, <a href="https://www.youtube.com/watch?v=C57eSIn9c5M" target="_blank" rel="noreferrer">Eric Pacuit</a></p><details><summary>Advent of Code</summary><p>Advent of Code's leaderboard uses the Borda method, which means that a participant's performance can affect the relative rankings of other participants. Each star is equivalent to a voter, and the time to finish represents the star's "voting preference". You can see this happening in a private leaderboard — sometimes, when participants leave or join a private leaderboard, the placements of other players can switch around.</p><p>Eric Wastl left a note in the description that mentions this:</p><blockquote><p>[Local Score], which awards users on this leaderboard points much like the global leaderboard. If you add or remove users, the points will be recalculated, and the order can change. For N users, the first user to get each star gets N points, the second gets N-1, and the last gets 1. This is the default.</p></blockquote></details><h2 id="what-to-do" tabindex="-1">What to do? <a href="#what-to-do" aria-label="Permalink to &quot;What to do?&quot;">​</a></h2><p>There's an important piece of information missing from ranked-choice voting. Although each voter can specify that they prefer a candidate over another, it's not possible to specify <em>how much</em> they prefer that candidate. A voter might slightly prefer a candidate over another, but might also believe that a candidate is much better than another — picking the first candidate would be a no-brainer.</p><p>Instead of using ranked-choice voting, <strong>score voting</strong> can be used instead. On each ballot, the voter gives each candidate a score (say, 1 to 10), and the candidate with the highest average wins. This satisfies all 3 conditions referenced in Arrow's theorem:</p><ul><li>Unanimity: If every voter chooses the same candidate as their favorite, then that candidate will receive the highest score and become the winner.</li><li>Non-dictatorship: Calculating the average takes every voter into account, so there isn't a single dictator.</li><li>Independence of irrelevant alternatives: Adding or removing a candidate leaves the average scores of the other candidates exactly the same.</li></ul><p>Still, this system is still susceptible to <strong>strategic voting</strong>, where a voter might want to fill a ballot that doesn't exactly match their true preferences. For example, a player could be okay with all four biomes: Desert, Savanna, Snowy Slopes, and Frozen Peaks would all work fine. However, if that player has a slight preference for Desert over the other 3 options, their true preference could be assigning a score of 9 points to Desert, and a score of 8 to the other 3 options. However, they might decide to vote strategically to amplify their vote — giving Desert a score of 10 while giving everything else a score of 1 would effectively make their vote stronger.</p><p>If every voter did this, the voting system would be <strong>approval voting</strong>. This is similar to plurality voting, with the difference being that each voter can now vote for as many candidates as they like, instead of just one — each voter gives each candidate a yes or no on the ballot, and the candidate with the most votes wins. Approval voting also passes the 3 conditions, since it isn't ranked-choice voting.</p><h2 id="conclusion" tabindex="-1">Conclusion <a href="#conclusion" aria-label="Permalink to &quot;Conclusion&quot;">​</a></h2><p>With this information, here is my final vote on and in voting systems:</p><table tabindex="0"><thead><tr><th>If the voting system was</th><th>then I would vote</th></tr></thead><tbody><tr><td>Plurality voting</td><td>Score voting</td></tr><tr><td>Ranked-choice voting</td><td>Score voting, approval voting, ranked-choice voting, plurality voting</td></tr><tr><td>Score voting</td><td>Score voting (10/10), approval voting (9/10), ranked-choice voting (6/10), plurality voting (3/10)</td></tr><tr><td>Approval voting</td><td>Score voting (Yes), approval voting (Yes), ranked-choice voting (Yes), plurality voting (No)</td></tr></tbody></table></div></div></main><!--[--><!--]--></div></div></div>]]>
@@ -2667,7 +3976,7 @@ innovation, and equality that the internet was meant to protect.
             </title>
             <description>
 <![CDATA[
-Score 131 | Comments 101 (<a href="https://news.ycombinator.com/item?id=42457515">thread link</a>) | @samanthasu
+Score 133 | Comments 101 (<a href="https://news.ycombinator.com/item?id=42457515">thread link</a>) | @samanthasu
 <br/>
 December 18, 2024 | https://greptime.com/blogs/2024-05-07-error-rust | <a href="https://web.archive.org/web/*/https://greptime.com/blogs/2024-05-07-error-rust">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-v-0de291f9=""><div data-v-0de291f9=""><div><div><p>TL;DR:</p><p>In this article, we discuss the practice of Rust error handling topic in <a href="https://github.com/GreptimeTeam/greptimedb" target="_blank" rel="noreferrer">GreptimeDB</a> and shares possibly future work in the end.</p><p>Topics including: (1) How to build a cheaper yet more accurate error stack to replace system backtrace; (2) How to organize errors in large projects; (3) How to print errors in different schemes to log and end users.</p><p>An error in GreptimeDB might look like this:</p><div><pre><code><span><span>0: Foo error, at src/common/catalog/src/error.rs:80:10</span></span>
@@ -3576,7 +4885,7 @@ December 18, 2024 | https://app.yeshid.com/lab/google-workspace-scope-inspector/
             </title>
             <description>
 <![CDATA[
-Score 95 | Comments 18 (<a href="https://news.ycombinator.com/item?id=42453431">thread link</a>) | @aboodman
+Score 96 | Comments 18 (<a href="https://news.ycombinator.com/item?id=42453431">thread link</a>) | @aboodman
 <br/>
 December 18, 2024 | https://bugs.rocicorp.dev/issue/0 | <a href="https://web.archive.org/web/*/https://bugs.rocicorp.dev/issue/0">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
@@ -3584,6 +4893,71 @@ December 18, 2024 | https://bugs.rocicorp.dev/issue/0 | <a href="https://web.arc
             <link>https://bugs.rocicorp.dev/issue/0</link>
             <guid isPermaLink="false">hacker-news-small-sites-42453431</guid>
             <pubDate>Wed, 18 Dec 2024 18:38:31 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Efficient German Language Learning: Is Anki the Answer?]]>
+            </title>
+            <description>
+<![CDATA[
+Score 11 | Comments 7 (<a href="https://news.ycombinator.com/item?id=42452527">thread link</a>) | @shinryuu
+<br/>
+December 18, 2024 | https://www.argpar.se/posts/misc/efficient-german-language-learning-is-anki-the-answer | <a href="https://web.archive.org/web/*/https://www.argpar.se/posts/misc/efficient-german-language-learning-is-anki-the-answer">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+        <div>
+          <div>
+<section id="content">
+    <article>
+      <img src="https://www.argpar.se/images/learning-german-flying-books.webp">
+      
+      
+      <div>
+          <p>It's confession time: after nearly eight years living in Germany, I still haven't learned the language. At this point it feels somewhat embarrassing and it's something I'd like to change.</p>
+<p>Learning a new language as an adult is not easy. On top of that, when you don't come into contact with German naturally in your work environment, at home, or through friends it becomes even more difficult to learn the language. Not to mention, in a situation like that I find myself often lacking the motivation to do the work.</p>
+<p>Picking up vocabulary can easily be quite time-consuming, and really, in some ways I don't want to spend too much time on this. <a href="https://www.eetimes.com/most-engineers-are-lazyand-thats-often-a-good-thing/">Most engineers are lazy</a>, me included, therefore I try to find efficient ways of accomplishing my goals which can sometimes be to my detriment. <a href="https://en.wikipedia.org/wiki/Spaced_repetition">Spaced repetition</a> is a technique that maximize retention while minimizing the effort; as such it's a method that aligns well with this lazy mindset.</p>
+<p>As <a href="https://ankiweb.net/">Anki</a> is using spaced repetition I'm now committing to try it once again. In the past, I've found it pretty crushing, and from what I've read, I'm not alone. Lately I've been learning kanji through the app Kanji Study. The experience has been pretty delightful. I figured that is a good reason to give Anki one more try.</p>
+<p>I think it's easy to overcommit. To try to learn to many words each day. This time around I'm only going to try 10 new words every day. That's still a respectable 3600 words in a year, which should roughly be equal to the vocabulary of C1 which is rather impressive! After all, almost 8 years have gone by, what is yet another year. Being able to stick to a routine is far more important.</p>
+<p>So what Anki deck to choose...? Why, of course a deck that contains words ordered by frequency! This <a href="https://drive.proton.me/urls/E33PMGWMMG#v3V4Rfg9qX3o">Anki deck</a>, which is a shared deck on AnkiWeb. It contains 5000 entries ordered by frequency. Most importantly, each entry has example sentences and audio.</p>
+<p>I added the audio myself using text-to-speech. After all, engineers love to build the tools rather than using them, don't they? Even this blog falls somewhat into that category. I've certainly spent more time coding it than writing blog posts.</p>
+<p>I'm sure you are curious how the audio was generated, if you are, you can have a peek in the following <a href="https://github.com/jonathan-s/anki-audio">repo</a>. There are also some useful bits on how to edit an Anki collection programmatically in there.</p>
+<p>If you've read this far, I would love to hear from you if you've used Anki to learn German, or perhaps if you've failed learning German using Anki.</p>
+<p>Perhaps you have any other tips or suggestions or things you'd want to share. I'd love to hear about it.</p>
+      </div>
+<div>
+<p>Did you find this article helpful?</p>
+
+</div><div>
+  <p>
+    Thanks for reading! If you need anyone to solve technical problems or build
+    web applications in Django,
+    <a href="mailto:jonathan@argpar.se?subject=Solving%20my%20technical%20problems">send me an email</a> and let's talk.
+  </p>
+
+  <p>
+    If you're interested in getting the latest blog posts directly to your inbox
+    you can subscribe below.
+  </p>
+
+  <!-- Begin Mailchimp Signup Form -->
+  
+  
+  
+  <!--End mc_embed_signup-->
+</div>
+      <hr>
+
+      
+    </article>
+
+</section>
+          </div>
+          
+        </div>
+      </div></div>]]>
+            </description>
+            <link>https://www.argpar.se/posts/misc/efficient-german-language-learning-is-anki-the-answer</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42452527</guid>
+            <pubDate>Wed, 18 Dec 2024 17:20:12 GMT</pubDate>
         </item>
         <item>
             <title>
@@ -4202,7 +5576,7 @@ interested in implementing MCP and need help, please reach out.</p></div></div>]
             </title>
             <description>
 <![CDATA[
-Score 33 | Comments 25 (<a href="https://news.ycombinator.com/item?id=42450389">thread link</a>) | @mbastos
+Score 38 | Comments 29 (<a href="https://news.ycombinator.com/item?id=42450389">thread link</a>) | @mbastos
 <br/>
 December 18, 2024 | https://liblab.com/blog/accruing-technical-assets-vs-paying-off-technical-debt | <a href="https://web.archive.org/web/*/https://liblab.com/blog/accruing-technical-assets-vs-paying-off-technical-debt">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="__blog-post-container"><h2 id="what-is-technical-debt">What is Technical Debt?<a href="#what-is-technical-debt" aria-label="Direct link to What is Technical Debt?" title="Direct link to What is Technical Debt?">​</a></h2>
@@ -4258,7 +5632,7 @@ December 18, 2024 | https://liblab.com/blog/accruing-technical-assets-vs-paying-
             </title>
             <description>
 <![CDATA[
-Score 20 | Comments 9 (<a href="https://news.ycombinator.com/item?id=42450274">thread link</a>) | @frou_dh
+Score 32 | Comments 17 (<a href="https://news.ycombinator.com/item?id=42450274">thread link</a>) | @frou_dh
 <br/>
 December 18, 2024 | https://www.moonbitlang.com/blog/compiler-opensource | <a href="https://web.archive.org/web/*/https://www.moonbitlang.com/blog/compiler-opensource">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="__blog-post-container"><p><img decoding="async" loading="lazy" alt="cover" src="https://www.moonbitlang.com/assets/images/cover-aeaaf769be3931ae071e312a52e1e720.jpg" width="3840" height="2160"></p>
@@ -4308,7 +5682,7 @@ December 18, 2024 | https://www.moonbitlang.com/blog/compiler-opensource | <a hr
             </title>
             <description>
 <![CDATA[
-Score 82 | Comments 4 (<a href="https://news.ycombinator.com/item?id=42450232">thread link</a>) | @mbo
+Score 93 | Comments 6 (<a href="https://news.ycombinator.com/item?id=42450232">thread link</a>) | @mbo
 <br/>
 December 18, 2024 | https://maxbo.me/celine/bibhtml/ | <a href="https://web.archive.org/web/*/https://maxbo.me/celine/bibhtml/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4678,7 +6052,7 @@ December 18, 2024 | https://maxbo.me/celine/bibhtml/ | <a href="https://web.arch
             </title>
             <description>
 <![CDATA[
-Score 29 | Comments 1 (<a href="https://news.ycombinator.com/item?id=42450223">thread link</a>) | @medo-bear
+Score 53 | Comments 2 (<a href="https://news.ycombinator.com/item?id=42450223">thread link</a>) | @medo-bear
 <br/>
 December 18, 2024 | https://www.ap5.com/ap5-man.html | <a href="https://web.archive.org/web/*/https://www.ap5.com/ap5-man.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -5889,7 +7263,7 @@ project at all, there is simply no tuple for that person …</td></div></div>
             </title>
             <description>
 <![CDATA[
-Score 30 | Comments 38 (<a href="https://news.ycombinator.com/item?id=42449915">thread link</a>) | @kqr
+Score 30 | Comments 43 (<a href="https://news.ycombinator.com/item?id=42449915">thread link</a>) | @kqr
 <br/>
 December 18, 2024 | https://entropicthoughts.com/when-is-insurance-worth-it | <a href="https://web.archive.org/web/*/https://entropicthoughts.com/when-is-insurance-worth-it">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -6304,7 +7678,7 @@ December 18, 2024 | https://news.alvaroduran.com/p/nodb-processing-payments-with
             </title>
             <description>
 <![CDATA[
-Score 166 | Comments 251 (<a href="https://news.ycombinator.com/item?id=42447762">thread link</a>) | @thunderbong
+Score 166 | Comments 253 (<a href="https://news.ycombinator.com/item?id=42447762">thread link</a>) | @thunderbong
 <br/>
 December 17, 2024 | https://olivernguyen.io/w/namespace.error/ | <a href="https://web.archive.org/web/*/https://olivernguyen.io/w/namespace.error/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div itemprop="articleBody"><p><em>Handling errors in Go is simple and flexible – yet no structure!</em></p><p><em>It’s supposed to be simple, right? Just return an <code>error</code> , wrapped with a message, and move on. Well, that simplicity quickly turns into chaotic as our codebase grows with more packages, more developers, and more “quick fixes” that stay there forever. Over time, the logs are full of “failed to do this” and “unexpected that”, and nobody knows if it’s the user’s fault, the server’s fault, buggy code, or it’s just a misalignment of the stars!</em></p><p><em>Errors are created with inconsistent messages. Each package has it own set of styles, constants, or custom error types. Error codes are added arbitrarily. No easy way to tell which errors may be returned from which function without digging into its implementation!</em></p><p><em>So, I took the challenge of creating a new error framework. We decided to go with a structured, centralized system using namespace codes to make errors meaningful, traceable, and – most importantly – give us peace of mind!</em></p><p><em>This is the story of how we started with a simple error handling approach, got thoroughly frustrated as the problems grew, and eventually built our own error framework. The design decisions, how it’s implemented, the lessons learned, and why it transformed our approach to managing errors. I hope that it will bring some ideas for you too!</em></p><hr><h2 id="go-errors-are-just-values">Go errors are just values</h2><p>Go has a straightforward way to handle errors: errors are just values. An error is just a value that implements the <code>error</code> interface with a single method <code>Error() string</code>. Instead of throwing an exception and disrupting the current execution flow, Go functions return an <code>error</code> value alongside other results. The caller can then decide how to handle it: check its value to make decision, wrap with new messages and context, or simply return the error, leaving the handling logic for parent callers.</p><p>We can make any type an <code>error</code> by adding the <code>Error() string</code> method on it. This flexibility allows each package to define its own error-handling strategy, and choose whatever works best for them. This also integrates well with Go’s philosophy of composability, making it easy to wrap, extend, or customize errors as required.</p><h2 id="every-package-needs-to-deal-with-errors">Every package needs to deal with errors</h2><p>The common practice is to return an error value that implements the <code>error</code> interface and lets the caller decide what to do next. Here’s a typical example:</p><div><pre tabindex="0"><code data-lang="go"><span>func</span> <span>loadCredentials</span><span>()</span> <span>(</span><span>Credentials</span><span>,</span> <span>error</span><span>)</span> <span>{</span>
@@ -6923,7 +8297,7 @@ December 17, 2024 | https://olivernguyen.io/w/namespace.error/ | <a href="https:
             </title>
             <description>
 <![CDATA[
-Score 75 | Comments 8 (<a href="https://news.ycombinator.com/item?id=42447580">thread link</a>) | @zdw
+Score 82 | Comments 8 (<a href="https://news.ycombinator.com/item?id=42447580">thread link</a>) | @zdw
 <br/>
 December 17, 2024 | https://www.leadedsolder.com/2024/12/17/coco-fujinet.html | <a href="https://web.archive.org/web/*/https://www.leadedsolder.com/2024/12/17/coco-fujinet.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
