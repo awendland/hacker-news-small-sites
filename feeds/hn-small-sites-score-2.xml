@@ -8,9 +8,9 @@
         </description>
         <link>https://news.ycombinator.com</link>
         <generator>RSS for Node</generator>
-        <lastBuildDate>Mon, 24 Feb 2025 20:22:56 GMT</lastBuildDate>
+        <lastBuildDate>Tue, 25 Feb 2025 00:34:21 GMT</lastBuildDate>
         <atom:link href="https://raw.githubusercontent.com/awendland/hacker-news-small-sites/generated/feeds/hn-small-sites-score-2.xml" rel="self" type="application/rss+xml"></atom:link>
-        <pubDate>Mon, 24 Feb 2025 20:22:56 GMT</pubDate>
+        <pubDate>Tue, 25 Feb 2025 00:34:21 GMT</pubDate>
         <language>
 <![CDATA[en-US]]>
         </language>
@@ -18,6 +18,542 @@
 <![CDATA[me@alexwendland.com (Alex Wendland)]]>
         </managingEditor>
         <ttl>240</ttl>
+        <item>
+            <title>
+<![CDATA[Why do frame pointers matter for OCaml?]]>
+            </title>
+            <description>
+<![CDATA[
+Score 3 | Comments 0 (<a href="https://news.ycombinator.com/item?id=43165937">thread link</a>) | @lambda_foo
+<br/>
+February 24, 2025 | https://lambdafoo.com/posts/2025-02-24-ocaml-frame-pointers.html | <a href="https://web.archive.org/web/*/https://lambdafoo.com/posts/2025-02-24-ocaml-frame-pointers.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
+  
+  <p><span>February 24, 2025</span></p><p>At the end of last year at Tarides, my colleagues and I worked on improving the support for Frame Pointers in OCaml. While pitching the work internally, we were asked the question: <strong>Why do frame pointers matter for OCaml?</strong> In this post, I will share the response I gave.</p>
+<p>We want to support frame pointers in the OCaml compiler because it gives us a reliable way to profile OCaml programs across different hardware using standard tooling like perf or eBFPF that people are already familiar with. Targeting all Tier-1 supported platforms (AMD64, ARM64, RISC-V, s390x and Power) would give a consistent experience across them all. By focusing on reusing standard tooling we can leverage the solutions built for other languages and get better impact for the smaller OCaml community, think reusing Instruments on macOS or the ecosystem of eBPF tools on Linux. An additional benefit is that frame pointers can be useful for source-level debuggers, as a last resort when debugging information and when symbols are absent.</p>
+
+<p>The Frame Pointer (also known as the base pointer) is a register that points to the base of the current stack frame (e.g., <code>%rbp</code> on AMD64 or <code>x29</code> on ARM64). The stack frame (also known as the activation frame or the activation record) refers to the portion of the stack allocated to a single function call. This is where a function will save registers to or use for storage while performing work. By saving the frame pointer along with the return address, the call stack for OCaml can be calculated in a process called unwinding. As an example ARM64 call stack looks like this (note that the stack grows downwards to lower addresses):</p>
+<pre><code>          Stack                        Instruction Text     
+   ┌────────────────────┐            ┌────────────────────┐ 
+   │Return Address (x30)┼───────────►│ ancestor function  │ 
+┌─►│Saved Frame Pointer │            │                    │ 
+│  ┼────────────────────┼            │                    │ 
+│  │Local allocations   │     ┌─────►│ parent function    │ 
+│  │                    │     │      │                    │ 
+│  ├────────────────────┤     │      │                    │ 
+│  │Return Address (x30)├─────┼─────►│ grand-parent func  │ 
+└──┤Saved Frame Pointer │     │      │                    │ 
+┌─►┼────────────────────┼     │      │                    │ 
+│  │Local allocations   │     │   ┌─►│ current function   │ 
+│  │                    │     │   │  │                    │ 
+│  ├────────────────────┤     │   │  └────────────────────┘ 
+│  │Return Address (x30)├─────┘   │                         
+└──┤Saved Frame Pointer │         │                         
+   ┼────────────────────┼◄──┐     │      Registers          
+   │Local allocations   │   │     │ ┌──────────────────────┐
+   │                    │   └─────┼─┤ x29 - frame pointer  │
+   └────────────────────┘◄──┐     │ │ x30 - link register  │
+                            └─────┼─┤ sp  - stack pointer  │
+                                  └─┼ pc  - program counter│
+                                    └──────────────────────┘</code></pre>
+<p>More specifically, frame pointers can be used by profilers to unwind the stack in a language agnostic way. Many languages like C/C++, Rust, and Erlang support maintaining frame pointers.</p>
+
+<p>We started with the ambitious goal of adding frame pointer support to all the Tier-1 platforms supported by OCaml. That included the popular AMD64 and ARM64 platforms that cover most users, and less common platforms like RISC-V, Power and s390x.</p>
+<p>The specific focus was to address the recognised limitations of perf when used with OCaml 5 programs (<a href="https://github.com/ocaml/ocaml/issues/12563">#12563</a>. OCaml 5 (aka multicore) introduced non-contiguous stacks as part of the implementation of effects. Mentioned in the PLDI 2021 paper on <a href="https://kcsrk.info/papers/retro-concurrency_pldi_21.pdf">retrofitting effect handlers – Section 5.5</a>. At a high level, these stacks are stored in memory allocated by the runtime and not on the stack as would happen with C/C++. These non-contiguous stacks are essentially unknown to perf and will not work correctly with the copying nature of perf, it will copy the wrong things. So traces produced for OCaml 5 will appear truncated or contain incorrect values. This same problem occurs if you use DWARF call graphs, in particular perf will copy a chunk of the stack without decoding it via DWARF and for OCaml 5 onwards what it copies might not be stack. So the best solution is frame pointers.</p>
+<p>We started by looking at <a href="https://lambdafoo.com/posts/://github.com/ocaml/ocaml/pull/11144">#11144</a> which restored frame-pointers support for AMD64 after the initial OCaml 5.0 multicore release. It was clear that adding frame pointers required changes to both the backend assembly code generation and the OCaml runtime, and that the general design should follow the existing AMD64 approach. With that understanding the first step was to extend the <code>--enable-frame-pointers</code> autoconf file to allow configuring the compiler on macOS which only required a one line change of <code>[x86_64-*-linux*|x86_64-*-darwin*],</code> to recognise the new platform (more <a href="https://github.com/tmcgilchrist/ocaml/blob/c1eec79948f699f2c9d8425c61bcc29553243bf1/configure.ac#L2458-L2472">context</a>).</p>
+<p>Now, that allowed configuring the compiler with <code>./configure --enable-frame-pointers</code> and since the work had already been done to codegen and runtime, we only needed to test the changes on AMD64 macOS.</p>
+<p>The next platform we chose was ARM64, for the dual reasons that it is a common platform for cloud vendors with most offering a Linux ARM64 option and that all new Apple laptops come with an ARM64 CPU (aka Apple Silicon). Getting ARM64 working seemed like it would have the most impact,, both for OCaml deployments and for local development where Apple laptops are quite common. Implementing again starting with a simple change to add new Linux and macOS cases to autoconf <code>[x86_64-*-linux*|x86_64-*-darwin*|aarch64-*-linux*|aarch64-*-darwin*],</code>. This exposes a configuration flag <code>Config.with_frame_pointers</code> that we can query when implementing the assembly code generation.</p>
+<p>The assembly generation code is in the <code>asmcomp</code> directory of the <a href="https://github.com/ocaml/ocaml">OCaml sources</a>, the common code is in that directory and each platform supported has a sub-directory for it e.g.&nbsp;<code>asmcomp/arm64</code> for ARM64. Conceptually the changes required a modification to the calling convention for OCaml code to only use <code>x29</code> as a frame pointer (previously it was considered as a general purpose register), a second change to the calculation of stack frame sizes to allow for an extra register save, and finally emitting the correct assembly to save/restore <code>x29</code>.</p>
+<p>The end result is that frame pointer save and restore is implemented using <code>stp</code> and <code>ldp</code> instructions plus an extra <code>add</code> instruction for updating <code>x29</code>. This results in an extra <code>add</code> plus saving an extra register for functions allocating a stack frame. In assembly this looks like:</p>
+<div id="cb2"><pre><code><span id="cb2-1"><span>;; function prologue</span></span>
+<span id="cb2-2">	stp	x29<span>,</span> x30<span>,</span> <span>[</span><span>sp</span><span>,</span> <span>#-</span><span>16</span><span>]</span></span>
+<span id="cb2-3">	<span>sub</span>	<span>sp</span><span>,</span> <span>sp</span><span>,</span> <span>#</span><span>16</span></span>
+<span id="cb2-4">	<span>add</span>	x29<span>,</span>  <span>sp</span><span>,</span> <span>#</span><span>0</span></span>
+<span id="cb2-5"></span>
+<span id="cb2-6"><span>;; function epilogue</span></span>
+<span id="cb2-7">	<span>add</span>	<span>sp</span><span>,</span> <span>sp</span><span>,</span> <span>#</span><span>16</span></span>
+<span id="cb2-8">	ldp	x29<span>,</span> x30<span>,</span> <span>[</span><span>sp</span><span>,</span> <span>#-</span><span>16</span><span>]</span></span></code></pre></div>
+<p>Whereas previously the store and load would just operate on the <code>x30</code> the link register. The overhead is quite minimal. The compiler already maintained the <code>x29</code> register when calling into C and when using TSan. Plus there is minimal extra stack space usage, as we needed to be quad word aligned anyway, so the <code>x29</code> register is going into an already allocated space on the stack. The end result is quite pleasing.</p>
+<p>It’s interesting to note that the <a href="https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms">ABI on macOS</a> requires maintaining frame pointers, and certain popular Linux distributions like <a href="https://ubuntu.com/blog/ubuntu-performance-engineering-with-frame-pointers-by-default">Ubuntu</a>, <a href="https://pagure.io/fesco/issue/2923">Fedora</a> and <a href="https://gitlab.archlinux.org/archlinux/rfcs/-/merge_requests/26">Arch</a> are reenabling frame pointers in recent distributions. So I feel the impact on usability will be high and the runtime overhead quite low.</p>
+
+<p>The short version is that frame pointers are now available for the two most popular Unix platforms (AMD64 and ARM64), that covers most deployments of OCaml and many OCaml developers. The work is split across these PRs:</p>
+<ul>
+<li><p><a href="https://github.com/ocaml/ocaml/pull/13163">#13163</a>: Enabled frame pointers on macOS x86_64 worked with some minor autoconf changes to correctly detect macOS and updating the tests to remove Linux specific backtrace formatting. Available in OCmal 5.3.</p></li>
+<li><p><a href="https://github.com/ocaml/ocaml/pull/13500">#13500</a>: Added frame pointers support for ARM64 on Linux and macOS. This will be released in OCaml 5.4.</p></li>
+<li><p><a href="https://github.com/ocaml/ocaml/pull/13595">#13595</a>: Fixed a bug introduced in #13050 where the wrong Canonical Frame Address (CFA) register was used for calls from OCaml into non-allocating C code. This appeared as incorrect backtraces in debuggers like GDB when setting a breakpoint inside the C code.</p></li>
+<li><p><a href="https://github.com/ocaml/ocaml/issues/13575">#13575</a>, <a href="https://github.com/ocaml/ocaml/pull/13635">#13635</a>: Maintain OCaml frame pointers correctly even when using C libraries that do not support them, allowing mixing OCaml code with frame pointers with an operating system environment that might not have them.</p></li>
+<li><p><a href="https://github.com/ocaml/ocaml/pull/13751/">#13751</a>: proposes a new section for the OCaml manual detailing how to use frame pointers with Linux perf highlighting what works and what does not work (DWARF stack unwinding). Hopefully this will get merged soon and close the documentation gap for using perf reliably with OCaml programs. Should be available in OCaml 5.4.</p></li>
+</ul>
+<p>The original target of all Tier-1 platforms was an ambitious one, unfortunately we didn’t manage to finish everything. The work for adding RISC-V frame pointer support was started but needs further work. The work in progress available at <a href="https://github.com/tmcgilchrist/ocaml/pull/22">tmcgilchrist/ocaml#22</a>. The work on <a href="https://github.com/tmcgilchrist/ocaml/pull/24">s390x</a> and Power didn’t get much further than diagramming stack frames and reading ABI documents. In particular the Power backend is also missing CFI support which makes debugging very difficult and really needs to be added first before tackling frame pointer support. Essentially you don’t even have a working debugger while debugging any problems with your frame pointer changes.</p>
+<p>Next steps are finding time or help with finishing off the remaining platforms, starting with Risc-V. If you’d like to help please get in touch. Then doing some comprehensive benchmarking for the ARM64 platform, my intuition is there is negligible overhead when adding frame pointers since it uses a load/store pair instruction, but firm results would be better.</p>
+<p>If you’ve made it this far thanks for reading.</p>
+</div></div>]]>
+            </description>
+            <link>https://lambdafoo.com/posts/2025-02-24-ocaml-frame-pointers.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-43165937</guid>
+            <pubDate>Mon, 24 Feb 2025 22:56:55 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Bees in My Computer]]>
+            </title>
+            <description>
+<![CDATA[
+Score 3 | Comments 0 (<a href="https://news.ycombinator.com/item?id=43165770">thread link</a>) | @luu
+<br/>
+February 24, 2025 | https://transmom.love/@elilla/114058257999223890 | <a href="https://web.archive.org/web/*/https://transmom.love/@elilla/114058257999223890">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/>Unable to extract article]]>
+            </description>
+            <link>https://transmom.love/@elilla/114058257999223890</link>
+            <guid isPermaLink="false">hacker-news-small-sites-43165770</guid>
+            <pubDate>Mon, 24 Feb 2025 22:36:45 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Carlos Slim breaks deals with Starlink after Musk links Slim to drug trafficking]]>
+            </title>
+            <description>
+<![CDATA[
+Score 11 | Comments 0 (<a href="https://news.ycombinator.com/item?id=43165192">thread link</a>) | @CharlesW
+<br/>
+February 24, 2025 | https://macronews.mx/informacion/nacional/carlos-slim-rompe-acuerdos-con-starlink-y-musk-pierde-mas-de-7-mil-millones-de-dolares/ | <a href="https://web.archive.org/web/*/https://macronews.mx/informacion/nacional/carlos-slim-rompe-acuerdos-con-starlink-y-musk-pierde-mas-de-7-mil-millones-de-dolares/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><div><div><div><h3 data-pm-slice="1 1 []">CARLOS SLIM ROMPE ACUERDOS CON STARLINK Y MUSK PIERDE MÃ�S DE 7 MIL MILLONES DE DÃ“LARES</h3><p><img decoding="async" src="https://elceo.com/wp-content/uploads/2024/10/carlos_slim_elon_musk_starlink-1.jpg" alt="Carlos Slim logra alianza con Elon Musk para ofrecer internet con Starlink" data-old-src="data:image/gif;base64,R0lGODdhAQABAPAAAMPDwwAAACwAAAAAAQABAAACAkQBADs=" data-src="https://elceo.com/wp-content/uploads/2024/10/carlos_slim_elon_musk_starlink-1.jpg"></p><p><strong>AmÃ©rica MÃ³vil invertirÃ¡ en su propia infraestructura y descarta colaboraciÃ³n con SpaceX</strong></p><p>Un simple tuit desatÃ³ la tensiÃ³n entre dos de los hombres mÃ¡s ricos del mundo: Carlos Slim y Elon Musk. El pasado 22 de enero, el dueÃ±o de Tesla y SpaceX reaccionÃ³ con un emoji en X (antes Twitter) a una publicaciÃ³n que, sin pruebas, vinculaba a Slim con el narcotrÃ¡fico. La respuesta del magnate mexicano no fue pÃºblica, pero en el Ã¡mbito empresarial se ha hecho notar con una decisiÃ³n que podrÃ­a costarle caro a Musk.</p><p>AmÃ©rica MÃ³vil, la gigante de telecomunicaciones controlada por Slim, anunciÃ³ que invertirÃ¡ 22 mil millones de dÃ³lares en los prÃ³ximos tres aÃ±os para fortalecer su propia infraestructura de telecomunicaciones, descartando asÃ­ cualquier acuerdo con Starlink, la filial de SpaceX que ofrece internet satelital. La noticia ha golpeado a Musk, quien ya enfrenta una pÃ©rdida de mÃ¡s de 7 mil millones de dÃ³lares en la valoraciÃ³n de su empresa, en medio de una fuerte competencia en el mercado de telecomunicaciones global.</p><p>La relaciÃ³n entre AmÃ©rica MÃ³vil y Starlink apuntaba a una posible colaboraciÃ³n en AmÃ©rica Latina, una regiÃ³n con alto potencial para la conectividad satelital. Sin embargo, la reciente postura de Slim deja claro que el empresario mexicano apostarÃ¡ por su red propia en lugar de depender de la tecnologÃ­a de Musk. Esto marca un nuevo capÃ­tulo en la disputa entre ambos magnates, donde los negocios y la polÃ­tica parecen entrelazarse.</p><p><img decoding="async" src="https://macronews.mx/wp-content/uploads/2024/12/MACROTOLOK-2024-DICIEMBRE.jpeg" data-old-src="data:image/gif;base64,R0lGODdhAQABAPAAAMPDwwAAACwAAAAAAQABAAACAkQBADs=" data-src="https://macronews.mx/wp-content/uploads/2024/12/MACROTOLOK-2024-DICIEMBRE.jpeg"></p><p>Aunque Slim ha evitado pronunciarse pÃºblicamente sobre la controversia en X, su movimiento empresarial sugiere que el distanciamiento con Musk no solo es comercial, sino tambiÃ©n estratÃ©gico. La inversiÃ³n de AmÃ©rica MÃ³vil en infraestructura propia refuerza su dominio en la regiÃ³n, dejando a Starlink con un panorama mÃ¡s complicado para expandirse en mercados clave de LatinoamÃ©rica.</p><p>La decisiÃ³n tambiÃ©n ocurre en un contexto polÃ­tico complejo. Con el posible regreso de Donald Trump a la presidencia de Estados Unidos, el nacionalismo econÃ³mico ha tomado fuerza en NorteamÃ©rica, y los conflictos entre empresarios de ambos paÃ­ses podrÃ­an intensificarse. Para Musk, perder un socio estratÃ©gico como Slim podrÃ­a significar un freno en su ambiciÃ³n de convertir a Starlink en el lÃ­der global de conectividad satelital.</p><p>Por ahora, AmÃ©rica MÃ³vil sigue consolidÃ¡ndose como la empresa de telecomunicaciones mÃ¡s poderosa de AmÃ©rica Latina, mientras que Musk enfrenta un revÃ©s significativo en sus apuestas por el futuro de la conectividad global.</p></div></div><div><p><a href="#" target="_blank" rel="nofollow noopener">
+<img src="https://macronews.mx/estado/wp-content/uploads/2019/01/ad_728x90.png" data-src="https://macronews.mx/estado/wp-content/uploads/2019/01/ad_728x90.png" alt="" data-pin-no-hover="true">
+</a></p></div></div></div></div></div>]]>
+            </description>
+            <link>https://macronews.mx/informacion/nacional/carlos-slim-rompe-acuerdos-con-starlink-y-musk-pierde-mas-de-7-mil-millones-de-dolares/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-43165192</guid>
+            <pubDate>Mon, 24 Feb 2025 21:33:47 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA["The closer to the train station, the worse the kebab" – a "study"]]>
+            </title>
+            <description>
+<![CDATA[
+Score 137 | Comments 136 (<a href="https://news.ycombinator.com/item?id=43165112">thread link</a>) | @TeMPOraL
+<br/>
+February 24, 2025 | https://www.jmspae.se/write-ups/kebabs-train-stations/ | <a href="https://web.archive.org/web/*/https://www.jmspae.se/write-ups/kebabs-train-stations/">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section>
+			<div>
+				
+
+<p><strong>2025-02-14</strong></p>
+
+    <ul>
+    
+        <li>
+            <a href="https://jmspae.se/write-ups/kebabs-train-stations/#introduction">Introduction</a>
+            
+        </li>
+    
+        <li>
+            <a href="https://jmspae.se/write-ups/kebabs-train-stations/#method">Method</a>
+            
+                <ul>
+                    
+                        <li>
+                            <a href="https://jmspae.se/write-ups/kebabs-train-stations/#network-data">Network Data</a>
+                        </li>
+                    
+                        <li>
+                            <a href="https://jmspae.se/write-ups/kebabs-train-stations/#restaurant-data">Restaurant Data</a>
+                        </li>
+                    
+                        <li>
+                            <a href="https://jmspae.se/write-ups/kebabs-train-stations/#routing-and-distance">Routing and Distance</a>
+                        </li>
+                    
+                </ul>
+            
+        </li>
+    
+        <li>
+            <a href="https://jmspae.se/write-ups/kebabs-train-stations/#results">Results</a>
+            
+        </li>
+    
+        <li>
+            <a href="https://jmspae.se/write-ups/kebabs-train-stations/#discussion">Discussion</a>
+            
+        </li>
+    
+    </ul>
+
+<p><em>This write-up was originally posted <a href="https://www.reddit.com/r/gis/comments/1iph0yy/the_closer_to_the_railway_station_the_less_tasty/">on reddit</a>, though I've cleaned things up specifically for this post. Due to reasons discussed towards the end of this post, I'm not entirely happy with the results and intend to take another shot at it in the near future.</em></p>
+
+<p>I came across <a href="https://www.reddit.com/r/gis/comments/1iopp56/anyone_motivated_to_prove_that_the_closer_from/">this post</a> sharing a hypothesis from a French subreddit;</p>
+<blockquote>
+<p>The closer to the train station, the worse the kebab.</p>
+</blockquote>
+<p>The original French post gained a decent amount of traction compared to the subreddit's relatively small size, indicating a certain amount of agreement among its members. There were some detractors in the comments, however, sharing experiences which ran contrary to the stated hypothesis.</p>
+<p>Thus, I figured I had nothing better to do, being a burned-out, unemployed drop-out with a newly-obtained autism diagnosis, so I figured I'd sacrifice my time for a worthy cause and perform this informal <em>"study"</em>. I'll be expecting my Nobel peace prize in the postbox and several job offers in my DMs within the next 3 working days.</p>
+
+<p>I assumed the best study area to be Paris, France since;</p>
+<ol>
+<li>The original post was French</li>
+</ol>
+<p>I haven't personally heard of this hypothesis in my home country (Sweden, also home to many a kebab-serving restaurant) so I figured I'd assume this to be a French phenomenon for the purpose of this informal "Study".</p>
+<ol start="2">
+<li>Density</li>
+</ol>
+<p>The inner city is <em><strong>dense</strong></em> with dozens of train/metro stations and god knows how many kebab shops. I knew early on that this would make my life pretty miserable, but at least it'd provide plenty of sample data.</p>
+<h2 id="network-data">Network Data<a href="#network-data" aria-label="Anchor link for: network-data">🔗</a></h2>
+<p>I used OSMnx to download and save a navigation network. Given the public transit-centric nature of the French subreddit, I though it'd make sense to stick to walking distance (eg. footpaths, side-walks) thus i set the OSMnx <code>network_type</code> to <code>"walk"</code>. Given the location (and that OSMnx used this CRS automatically when none was provided), all data was projected to EPSG:32631 (UTM zone 31N).</p>
+<pre data-lang="py"><code data-lang="py"><span>import </span><span>osmnx </span><span>as </span><span>ox
+</span><span>from </span><span>geopandas </span><span>import </span><span>GeoDataFrame
+</span><span>
+</span><span>#EPSG
+</span><span>PROJECTION </span><span>= </span><span>32631
+</span><span>
+</span><span>graph </span><span>= </span><span>ox.</span><span>graph_from_place</span><span>(</span><span>'Paris, FR'</span><span>, </span><span>network_type</span><span>=</span><span>"walk"</span><span>)
+</span><span>graph </span><span>= </span><span>ox.</span><span>project_graph</span><span>(graph, </span><span>to_crs</span><span>=</span><span>PROJECTION</span><span>)
+</span><span>
+</span><span>ox.</span><span>save_graphml</span><span>(graph, </span><span>filepath</span><span>=</span><span>"network.graphml"</span><span>)
+</span></code></pre>
+<p>
+<a href="https://jmspae.se/write-ups/kebabs-train-stations/fig-1.webp" target="_blank"><img src="https://jmspae.se/processed_images/fig-1.c53f23b9b1fd351c.jpg"></a>
+
+<em>Figure 1: The study area and network</em></p>
+<p>Next up is the various train/metro stations. Given the nature of the original French sub, I figured it'd make sense to include both the long-distance central stations along with the countless metro stations. This was also rather trivial with OSMnx, filtering by <code>railway=subway_entrance</code> or <code>railway=train_station_entrance.</code></p>
+<pre data-lang="py"><code data-lang="py"><span>stations: GeoDataFrame </span><span>= </span><span>ox.</span><span>features_from_place</span><span>(</span><span>'Paris, FR'</span><span>, </span><span>tags </span><span>= </span><span>{
+</span><span>    </span><span>"railway"</span><span>: [</span><span>"subway_entrance"</span><span>, </span><span>"train_station_entrance"</span><span>]
+</span><span>})
+</span><span>
+</span><span># Filter results to points
+</span><span>station_nodes: GeoDataFrame </span><span>= </span><span>stations.loc[stations.geom_type</span><span>==</span><span>"Point"</span><span>]
+</span><span>station_nodes </span><span>= </span><span>station_nodes.</span><span>to_crs</span><span>(</span><span>epsg</span><span>=</span><span>PROJECTION</span><span>)
+</span><span>
+</span><span>station_nodes.</span><span>to_file</span><span>(</span><span>"train_station_entrances.gpkg"</span><span>)
+</span></code></pre>
+<p>I saved outputs religiously so I could easily inspect them in QGIS. I did attempt to get python notebooks working with my NeoVIM setup, but it was all for naught.</p>
+<p>
+<a href="https://jmspae.se/write-ups/kebabs-train-stations/fig-2.webp" target="_blank"><img src="https://jmspae.se/processed_images/fig-2.51f0e47dcd63c0a8.jpg"></a>
+
+<em>Figure 2: Rail/metro entrances... Please ignore the airport iconography.</em></p>
+<p>... And there we have the first half of the data, now for the restaurants.</p>
+<h2 id="restaurant-data">Restaurant Data<a href="#restaurant-data" aria-label="Anchor link for: restaurant-data">🔗</a></h2>
+<p>The Google Places API (and their respective reviews) seemed like a reasonable choice. Google reviews are naturally far from perfect and subject to their fair share of botting and the like, but it's the best I could think of at the time. There are alternatives such as Yelp, but their API is horrifically expensive for poor old me, and I was not in the mood to build a web scraper (it has the same soul-sucking effect on me as prompting an LLM). The $200 of free credit was also enticing.</p>
+<p>However, as I started exploring the API... I realised that the Places API doesn't seem to have any way to search within a polygon, only within a point radius. Thank you, Mr. publicly owned mega-corporation. How Fun.</p>
+<p>It also didn't help that autocomplete for the <code>googlemaps</code> library wasn't working. Python's a fine language, but its tooling does like to test my patience a little too often. And whilst I'm still complaining... The Google Cloud dashboard is likely the slowest "website" I've ever had the displeasure of interacting with.</p>
+<p>So... This meant I'd have to perform some sort of grid search of the whole of Paris, crossing my fingers that I wouldn't bust my free usage. This, along with a couple interesting questions;</p>
+<ol>
+<li>What is... <em>A kebab?</em></li>
+</ol>
+<p>When I search for "kebab" (no further context necessary)... How does Google decide what restaurant serves kebab?</p>
+<p>After some perusing, it didn't seem to be as deep as I thought. Plenty of restaurants simply had "kebab" in the name, some were designated as "Mediterranean" (Kebab has its origins in Turkey, Persia, middle east in general) and others had a fair few reviews simply mentioning "kebab." Good enough for me.</p>
+<ol start="2">
+<li>Trouble in query-land</li>
+</ol>
+<p>It turns out that when you query for places within a given radius, it's only a "bias." It's not a hard cut-off that'll help narrow-down our data harvesting and reduce unnecessary requests. It was becoming increasingly clear that google isn't really a fan of people doing this.</p>
+<p>Now with all of that preamble out of the way, I needed to prepare my search.</p>
+<p>
+<a href="https://jmspae.se/write-ups/kebabs-train-stations/fig-3.webp" target="_blank"><img src="https://jmspae.se/processed_images/fig-3.605c84ffddad8323.jpg"></a>
+
+<em>Figure 3. Original admin boundaries</em></p>
+<p>Paris' administrative boundary contains a couple of large green spaces. To the west, a park and to the east, some sort of sports institute.</p>
+<p>After perusing these rather large spaces in Google maps, they seemed to contain a distinct lack of kebab-serving establishments. Thus, they were a burden on our API budget and needed to go.</p>
+<p>
+<a href="https://jmspae.se/write-ups/kebabs-train-stations/fig-4.webp" target="_blank"><img src="https://jmspae.se/processed_images/fig-4.b360881962350eea.jpg"></a>
+
+<em>Figure 4. Adjusted admin boundaries w/ network</em></p>
+<p>I figured keeping the network and stations wouldn't do any harm, so they went unmodified.</p>
+<p>
+<a href="https://jmspae.se/write-ups/kebabs-train-stations/fig-5.webp" target="_blank"><img src="https://jmspae.se/processed_images/fig-5.eedb86cb4c85e12c.jpg"></a>
+
+<em>Figure 5. Sampling points, later projected to WGS84 for harvesting purposes</em></p>
+<p>To maximise data-harvesting, I decided to go with a hex layout with a vertical spacing of 1 km. This should give us a search radius of 500m * √3 ~= 866 meters. Plenty of overlap, sure, but we shouldn't be getting any holes anywhere. I'm not sure why I was spending this much time ensuring "data integrity" when that might just have flown the window courtesy of Google, but it's the illusion of control that counts.</p>
+<p>This give us 99 sample points which... Should be enough?</p>
+<p>Regardless, here's how my 3AM python turned out:</p>
+<pre data-lang="py"><code data-lang="py"><span># Already projected to WGS84
+</span><span>sample_points: GeoDataFrame </span><span>= </span><span>GeoDataFrame.</span><span>from_file</span><span>(</span><span>"samples.gpkg"</span><span>)
+</span><span>gmaps: googlemaps.Client </span><span>= </span><span>googlemaps.</span><span>Client</span><span>(</span><span>key</span><span>=</span><span>'get-your-own'</span><span>)
+</span><span>
+</span><span>output </span><span>= </span><span>{}
+</span><span>
+</span><span>for </span><span>point </span><span>in </span><span>sample_points.geometry:
+</span><span>    lat, lon </span><span>= </span><span>point.y, point.x
+</span><span>
+</span><span>    next_page_token </span><span>= </span><span>None
+</span><span>    num_fetches </span><span>= </span><span>3
+</span><span>
+</span><span>    </span><span>while </span><span>num_fetches </span><span>&gt; </span><span>0</span><span>:
+</span><span>        result </span><span>= </span><span>{}
+</span><span>
+</span><span>        </span><span>if </span><span>next_page_token </span><span>== </span><span>None</span><span>:
+</span><span>            result </span><span>= </span><span>gmaps.</span><span>places</span><span>(
+</span><span>                </span><span>"kebab"</span><span>,
+</span><span>                </span><span>location</span><span>=</span><span>(lat, lon),
+</span><span>                </span><span>radius</span><span>=</span><span>866</span><span>,
+</span><span>            )
+</span><span>        </span><span>else</span><span>:
+</span><span>            result </span><span>= </span><span>gmaps.</span><span>places</span><span>(
+</span><span>                </span><span>page_token</span><span>=</span><span>next_page_token
+</span><span>            )
+</span><span>
+</span><span>        next_page_token </span><span>= </span><span>result.</span><span>get</span><span>(</span><span>"next_page_token"</span><span>)
+</span><span>        </span><span>print</span><span>(result[</span><span>"status"</span><span>], next_page_token)
+</span><span>
+</span><span>        </span><span>for </span><span>p </span><span>in </span><span>result[</span><span>"results"</span><span>]:
+</span><span>            output[p[</span><span>"place_id"</span><span>]] </span><span>= </span><span>p
+</span><span>
+</span><span>        </span><span>if </span><span>next_page_token </span><span>== </span><span>None</span><span>:
+</span><span>            </span><span>break
+</span><span>
+</span><span>        num_fetches </span><span>-= </span><span>1
+</span><span>
+</span><span>        </span><span>sleep</span><span>(</span><span>2</span><span>)
+</span><span>
+</span><span>json_out </span><span>= </span><span>json.</span><span>dumps</span><span>(output)
+</span><span>
+</span><span>with </span><span>open</span><span>(</span><span>"output.json"</span><span>, </span><span>"w"</span><span>) </span><span>as </span><span>file:
+</span><span>    file.</span><span>write</span><span>(json_out)
+</span></code></pre>
+<p>This worked quite well. Initially I skipped paging, resulting in 322 results. However, I noticed that a few establishments were missing in the results compared to my explorations in Google Maps.</p>
+<p>After implementing paging and re-running, this gave us a grand total of 400 kebab-serving establishments. I was likely over-zealous with the paging considering how few additional results were retrieved. That, and that the API doesn't cap the search radius (again, it's only a bias) likely led to a fair few redundant API calls.</p>
+<p>The raw Google Places API-output also needed to be clipped to the study area, projected to the local UTM zone as well as converted to a geospatial format;</p>
+<pre data-lang="py"><code data-lang="py"><span>import </span><span>pandas </span><span>as </span><span>pd
+</span><span>
+</span><span>with </span><span>open</span><span>(</span><span>"output.json"</span><span>, </span><span>"r"</span><span>) </span><span>as </span><span>file:
+</span><span>    data </span><span>= </span><span>json.</span><span>load</span><span>(file)
+</span><span>    file.</span><span>close</span><span>()
+</span><span>    
+</span><span>    </span><span>for </span><span>id </span><span>in </span><span>data:
+</span><span>        place </span><span>= </span><span>data[</span><span>id</span><span>]
+</span><span>        point </span><span>= </span><span>place[</span><span>"geometry"</span><span>][</span><span>"location"</span><span>]
+</span><span>        data[</span><span>id</span><span>][</span><span>"lng"</span><span>] </span><span>= </span><span>point[</span><span>"lng"</span><span>]
+</span><span>        data[</span><span>id</span><span>][</span><span>"lat"</span><span>] </span><span>= </span><span>point[</span><span>"lat"</span><span>]
+</span><span>        </span><span>del </span><span>data[</span><span>id</span><span>][</span><span>"geometry"</span><span>]
+</span><span>
+</span><span>    data </span><span>= </span><span>pd.DataFrame.</span><span>from_dict</span><span>(data).T
+</span><span>    data.rating </span><span>= </span><span>pd.</span><span>to_numeric</span><span>(data.rating)
+</span><span>    data.user_ratings_total </span><span>= </span><span>pd.</span><span>to_numeric</span><span>(data.user_ratings_total)
+</span><span>    data </span><span>= </span><span>data[data[</span><span>"user_ratings_total"</span><span>] </span><span>&gt; </span><span>0</span><span>]
+</span><span>
+</span><span>    </span><span># Cleanup was added after the screenshot below was taken
+</span><span>    data </span><span>= </span><span>data.</span><span>drop</span><span>(</span><span>columns</span><span>=</span><span>[
+</span><span>        </span><span>"icon"</span><span>,
+</span><span>        </span><span>"icon_background_color"</span><span>,
+</span><span>        </span><span>"icon_mask_base_uri"</span><span>,
+</span><span>        </span><span>"plus_code"</span><span>,
+</span><span>        </span><span>"reference"</span><span>,
+</span><span>        </span><span>"photos"</span><span>,
+</span><span>        </span><span>"opening_hours"
+</span><span>    ])
+</span><span>
+</span><span>    gdata </span><span>= </span><span>GeoDataFrame</span><span>(
+</span><span>        data, </span><span>geometry</span><span>=</span><span>geopandas.</span><span>points_from_xy</span><span>(data.lng, data.lat),
+</span><span>        </span><span>crs</span><span>=</span><span>4326
+</span><span>    )
+</span><span>
+</span><span>    gdata: GeoDataFrame </span><span>= </span><span>gdata.</span><span>to_crs</span><span>(</span><span>PROJECTION</span><span>)
+</span><span>
+</span><span>    </span><span># Modified boundaries from Figure 4.
+</span><span>    paris </span><span>= </span><span>GeoDataFrame.</span><span>from_file</span><span>(</span><span>"mod_bounary.gpkg"</span><span>);
+</span><span>
+</span><span>    gdata: GeoDataFrame </span><span>= </span><span>gdata.</span><span>clip</span><span>(paris)
+</span><span>
+</span><span>    gdata.</span><span>to_file</span><span>(</span><span>"establishments.gpkg"</span><span>)
+</span></code></pre>
+<p>
+<a href="https://jmspae.se/write-ups/kebabs-train-stations/fig-6.webp" target="_blank"><img src="https://jmspae.se/processed_images/fig-6.1eab106a30493ee2.jpg"></a>
+
+<em>Figure 6. We're in f###ing business</em></p>
+<h2 id="routing-and-distance">Routing and Distance<a href="#routing-and-distance" aria-label="Anchor link for: routing-and-distance">🔗</a></h2>
+<p>Finally, the fun part. I need to get the distance to the nearest station entrance for each establishment.</p>
+<p>I could've absolutely just routed to every single entrance for every single restaurant to get the nearest... But that would've taken several decades. I needed to build some sort of spatial index and route to the nearest ~3 or something along those lines. Since Paris is so dense with plenty of routing options, I figured I wouldn't need to perform too many routing operations.</p>
+<p>After some googling and dredging through API docs, however, it seemed GeoPandas was nice enough to do that for us with <code>sindex</code>. Although it didn't have the same "return nearest N" like my beloved r-tree rust library I was all too used to, it did allow me to search within a certain radius (1 km was large enough) and go from there. The query results weren't sorted, so I had to sort the indexes by distance and cut it down to size.</p>
+<p>The network analysis was relatively straight-forward thanks to NetworkX, and after a couple of hours I managed to cobble together the following;</p>
+<pre data-lang="py"><code data-lang="py"><span>import </span><span>networkx </span><span>as </span><span>nx
+</span><span>import </span><span>shapely </span><span>as </span><span>shp
+</span><span>
+</span><span>establishments: GeoDataFrame </span><span>= </span><span>GeoDataFrame.</span><span>from_file</span><span>(</span><span>"establishments.gpkg"</span><span>)
+</span><span>entrances: GeoDataFrame </span><span>= </span><span>GeoDataFrame.</span><span>from_file</span><span>(</span><span>"entrances.gpkg"</span><span>)
+</span><span>graph </span><span>= </span><span>ox.</span><span>load_graphml</span><span>(</span><span>"network.graphml"</span><span>)
+</span><span>graph </span><span>= </span><span>ox.</span><span>project_graph</span><span>(graph, </span><span>to_crs </span><span>= </span><span>PROJECTION</span><span>)
+</span><span>
+</span><span># Ensure the same CRS
+</span><span>if </span><span>(establishments.crs </span><span>!= </span><span>entrances.crs </span><span>!= </span><span>PROJECTION</span><span>):
+</span><span>    </span><span>exit</span><span>(</span><span>100</span><span>)
+</span><span>
+</span><span># Helper function to get the distance between a graph node and establishment geometry
+</span><span>def </span><span>node_geom_dist</span><span>(</span><span>node_id</span><span>: int, </span><span>geom</span><span>: shp.Point):
+</span><span>    node </span><span>= </span><span>graph.nodes[node_id]
+</span><span>    </span><span>return </span><span>math.</span><span>sqrt</span><span>((geom.x </span><span>- </span><span>node[</span><span>'x'</span><span>]) </span><span>** </span><span>2 </span><span>+ </span><span>(geom.y </span><span>- </span><span>node[</span><span>'y'</span><span>]) </span><span>** </span><span>2</span><span>)
+</span><span>
+</span><span>distances: list[float] </span><span>= </span><span>[]
+</span><span>
+</span><span>for </span><span>(</span><span>id</span><span>, establishment) </span><span>in </span><span>establishments.</span><span>iterrows</span><span>():
+</span><span>    establishment_geom: shp.Point </span><span>= </span><span>establishment.geometry
+</span><span>    establishment_node: int </span><span>= </span><span>ox.</span><span>nearest_nodes</span><span>(graph, establishment_geom.x, establishment_geom.y)
+</span><span>    establishment_dist_to_node: float </span><span>= </span><span>node_geom_dist</span><span>(establishment_node, establishment_geom)
+</span><span>    
+</span><span>    </span><span># Spatial index for rail entrances
+</span><span>    index: shp.STRtree </span><span>= </span><span>entrances.sindex
+</span><span>    nearest_q </span><span>= </span><span>index.</span><span>query</span><span>(establishment_geom, </span><span>predicate</span><span>=</span><span>"dwithin"</span><span>, </span><span>distance </span><span>= </span><span>1000</span><span>)
+</span><span>    nearest_entrances: list[tuple[int, float]] </span><span>= </span><span>[]
+</span><span>
+</span><span>    </span><span>for </span><span>i </span><span>in </span><span>nearest_q:
+</span><span>        ent </span><span>= </span><span>entrances.iloc[i]
+</span><span>        ent_geom: shp.Point </span><span>= </span><span>ent.geometry
+</span><span>
+</span><span>        dist </span><span>= </span><span>ent_geom.</span><span>distance</span><span>(establishment.geometry)
+</span><span>        
+</span><span>        nearest_entrances.</span><span>append</span><span>((i, dist))
+</span><span>     
+</span><span>    nearest_entrances </span><span>= </span><span>sorted</span><span>(nearest_entrances, </span><span>key </span><span>= lambda </span><span>e</span><span>: e[</span><span>1</span><span>])[:</span><span>3</span><span>]
+</span><span>    entrance_geom: list[shp.Point] </span><span>= </span><span>[entrances.iloc[i].geometry </span><span>for </span><span>(i, </span><span>_</span><span>) </span><span>in </span><span>nearest_entrances]
+</span><span>    entrance_nodes: list[int] </span><span>= </span><span>[ox.</span><span>nearest_nodes</span><span>(graph, point.x, point.y) </span><span>for </span><span>point </span><span>in </span><span>entrance_geom]
+</span><span>    entrance_geom_dist_to_node: list[float] </span><span>= </span><span>[</span><span>node_geom_dist</span><span>(entrance_nodes[i], entrance_geom[i]) </span><span>for </span><span>i </span><span>in </span><span>range</span><span>(</span><span>len</span><span>(nearest_entrances))]
+</span><span>
+</span><span>    result_paths </span><span>= </span><span>[nx.</span><span>shortest_path</span><span>(graph, establishment_node, dest_node, </span><span>weight</span><span>=</span><span>"length"</span><span>) </span><span>for </span><span>dest_node </span><span>in </span><span>entrance_nodes]
+</span><span>    result_lengths: list[float] </span><span>= </span><span>[nx.</span><span>path_weight</span><span>(graph, path, </span><span>"length"</span><span>) </span><span>+ </span><span>entrance_geom_dist_to_node[i] </span><span>+ </span><span>establishment_dist_to_node </span><span>for </span><span>(i, path) </span><span>in </span><span>enumerate</span><span>(result_paths)]
+</span><span>
+</span><span>    distances.</span><span>append</span><span>(</span><span>min</span><span>(result_lengths))
+</span><span>
+</span><span>establishments[</span><span>"distance"</span><span>] </span><span>= </span><span>distances 
+</span><span>establishments.</span><span>to_file</span><span>(</span><span>"establishment_results.gpkg"</span><span>)
+</span></code></pre>
+<p>Not exactly my finest work. The sheer amount of list comprehension is perhaps a little terrifying, but it works.</p>
+<p>After some prodding around in QGIS with the resulting data and networks (and many print() statements), I was confident in the accuracy of the results.</p>
+
+<p>Now with all of this data, it is time to settle the question of whether or not the kebabs are less tasty the closer they are to a train/metro station...</p>
+<p>
+<a href="https://jmspae.se/write-ups/kebabs-train-stations/fig-7.webp" target="_blank"><img src="https://jmspae.se/processed_images/fig-7.1ff7f2b316a90f62.jpg"></a>
+
+<em>Figure 7. Hmmmmm....</em></p>
+<p>With a mighty Pearson's correlation of 0.091, the data indicates that this could be true! If you ignore the fact that the correlation is so weak that calling it 'statistically insignificant' would be quite generous.</p>
+<p>Outliers can have an outsized impact on a Pearson's correlation, so after ridding the dataset of some outliers via IQR fencing...</p>
+<p>
+<a href="https://jmspae.se/write-ups/kebabs-train-stations/fig-8.webp" target="_blank"><img src="https://jmspae.se/processed_images/fig-8.af2b5c5cacb7b32d.jpg"></a>
+
+<em>Figure 8. Removed outliers</em></p>
+<p>... This increased the coefficient to a whopping 0.098.</p>
+<p>This was a bit of a bummer (though hardly surprising) and figuring I had nothing to lose from messing around a little, I tried filtering out metro stations in case my original assumption of the metro being included in the original hypothesis was incorrect.</p>
+<p>
+<a href="https://jmspae.se/write-ups/kebabs-train-stations/fig-9.webp" target="_blank"><img src="https://jmspae.se/processed_images/fig-9.3427bdea5242e0b1.jpg"></a>
+
+*Figure 9. Not much better, eh? Correction: "... Nearest train station entrance."</p>
+<p>With an even worse coefficient of 0.001, I think It's time to hang up the towel.</p>
+<p>Whilst there are some minor indications that the hypothesis <em>could</em> be correct (eg. Many of the absolute worst restaurants being some of the closest) the correlation is simply too weak.</p>
+
+<p><em><strong>- Are Google reviews an objective measurement of how tasty the kebabs are?</strong></em></p>
+<p>Absolutely the f### not. This was a rather subjective observation from the very beginning and Google reviews aren't exactly a good measure of "is the food good?" There are many aspects of the dining experience that could hypothetically impact a review score. The staff, cleanliness, the surrounding environment, etc. Not to mention online skulduggery and review manipulation.</p>
+<p><em><strong>- Can tourism have an impact?</strong></em></p>
+<p>It absolutely could. I don't want to make any definitive assumptions, but I can absolutely imagine the local regulars being harsher than the massive tourist population, or even vice-versa.</p>
+<p><em><strong>- Were the Google results accurate?</strong></em></p>
+<p>To an extent, yes. From what I could gather, every location from the query seemed to serve kebab in some form. There were a few weird outliers and nuances, such as Pizza Hut which likely only serves kebab pizza rather than the multitude of different forms in which kebab could possibly be consumed.</p>
+<p><em><strong>- Why not restaurants in general?</strong></em></p>
+<p>Because the initial hypothesis was too comically hyper-specific for me to give up on.</p>
+<p><em><strong>- What about review count?</strong></em></p>
+<p>This could very well have an effect, though I was not entirely certain how to properly implement this metric into the analysis at the time.</p>
+<p><em><strong>- Gib Data</strong></em></p>
+<p>I'm not quite comfortable in doing so, mostly due to potential breaches of Google's TOS. I don't think they would care about me harvesting some 400 POIs for this little experiment, I'm not quite willing to gamble sharing the data with others.</p>
+<p>Besides, I gave you the code. Go burn some of your own credits.</p>
+<p><em><strong>- Are you Ok?</strong></em></p>
+<p>... I guess? Are you?</p>
+<p>In conclusion, this was actually quite fun. I wrote this as the project went on (otherwise I would likely never have found the motivation) and I would encourage others to do other silly explorations like this, even if the results end up slightly depressing.</p>
+<p>... <em>However</em>, after some additional discussion, I decided I wasn't quite done.</p>
+<p>As stated earlier, there were a few detracting comments on the original French post. Interestingly, many of the provided examples of good kebab restaurants next to train stations just so happened to be in Paris.</p>
+<p>The user who originally posted the French post for the sub in English provided some <a href="https://imgur.com/gallery/kebab-railway-stations-wuYG9D2">examples</a> which seem to strengthen the hypothesis. It could very well be that whatever conditions affect Paris restaurants (whether it be higher rent, wages, tourism, population density...) had a larger impact than I initially suspected.</p>
+<p><em><strong>Stay tuned for part 2... Whenever I get around to doing it!</strong></em></p>
+
+
+			</div>
+		</section></div>]]>
+            </description>
+            <link>https://www.jmspae.se/write-ups/kebabs-train-stations/</link>
+            <guid isPermaLink="false">hacker-news-small-sites-43165112</guid>
+            <pubDate>Mon, 24 Feb 2025 21:25:15 GMT</pubDate>
+        </item>
+        <item>
+            <title>
+<![CDATA[Controlling FFmpeg with natural language from the command line]]>
+            </title>
+            <description>
+<![CDATA[
+Score 3 | Comments 0 (<a href="https://news.ycombinator.com/item?id=43164544">thread link</a>) | @dbreunig
+<br/>
+February 24, 2025 | https://www.dbreunig.com/2025/02/24/building-an-easier-to-use-ffmpeg-with-llm.html | <a href="https://web.archive.org/web/*/https://www.dbreunig.com/2025/02/24/building-an-easier-to-use-ffmpeg-with-llm.html">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div itemprop="articleBody">
+    <p>Chatbots are great for navigating complex domain-specific languages and APIs, especially if you rarely interact with these interfaces. This use case surfaced quickly with ChatGPT, which proved to be <a href="https://www.reddit.com/r/webdev/comments/11pqq82/chatgpt_is_a_regex_god/"><em>excellent</em></a> at writing and explaining <a href="https://en.wikipedia.org/wiki/Regular_expression">regular expressions</a>.</p>
+
+<p>But my favorite example of this use case is writing <a href="https://www.ffmpeg.org/">FFmpeg</a> incantations.</p>
+
+<p>For the unfamiliar, FFmpeg is a command-line tool for converting video and audio files. It is <em>ridiculously</em> powerful and <em>ridiculously</em> complex. Most people I know use Google as the primary interface for FFmpeg: search for the job to be done, copy-and-paste the command. This pattern quickly migrated to ChatGPT and Claude, which proved excellent at FFmpeg incantations.</p>
+
+<p>But it can get even easier…</p>
+
+<p>Recently, Simon Willison added an “<a href="https://llm.datasette.io/en/stable/usage.html#extracting-fenced-code-blocks">extraction</a>” feature to his <a href="https://llm.datasette.io/en/stable/index.html">llm</a> utility, enabling us to return only the code from our LLM response, with none of the preamble. The tool looks for the first instance of Markdown-fenced code and returns only that block.</p>
+
+<p>Armed with this feature, we can write <a href="https://gist.github.com/dbreunig/834c625a1aaac6b3c4cf2bb388dae542">a simple shell script to streamline this workflow</a>:</p>
+
+<div><div><pre><code><span>#!/usr/bin/env zsh</span>
+
+<span># Check for if the user wants to execute the command</span>
+<span>flag_x</span><span>=</span><span>false
+</span><span>for </span>arg <span>in</span> <span>"</span><span>$@</span><span>"</span><span>;</span> <span>do
+    if</span> <span>[[</span> <span>"</span><span>$arg</span><span>"</span> <span>==</span> <span>"-x"</span> <span>]]</span><span>;</span> <span>then
+        </span><span>flag_x</span><span>=</span><span>true
+        break
+    </span><span>fi
+done</span>
+
+<span># Hit the model and get the ffmpeg command</span>
+<span>output</span><span>=</span><span>$(</span>llm <span>"</span><span>$1</span><span>"</span> <span>\</span>
+    <span>--system</span> <span>"You are an expert at writing commands for ffmpeg. You will be given prompts describing what the user wants to do with ffmpeg. to the best of your abilities, translate these plain language descriptions into a single one-liner that calls ffmpeg, with all the appropriate flags and input/output specifications. Do not use the variable 'total_frames' in any select statement. Ensure the command is wrapped as a code block."</span> <span>\</span>
+    <span>--extract</span><span>)</span>
+
+<span># Print or execute the command</span>
+<span>if</span> <span>[[</span> <span>"</span><span>$flag_x</span><span>"</span> <span>==</span> <span>true</span> <span>]]</span><span>;</span> <span>then
+    </span><span>echo</span> <span>"</span><span>$output</span><span>"</span>
+    <span>eval</span> <span>"</span><span>$output</span><span>"</span>
+<span>else
+    </span><span>echo</span> <span>"</span><span>$output</span><span>"</span>
+<span>fi</span>
+</code></pre></div></div>
+
+<p>Stashing this script in my path as <code>ffmsay</code>, I can now run <code>ffmsay -x 'Do things to video example.mp4'</code>. The <code>-x</code> flag tells the script to not only print, but execute the command.</p>
+
+<p>And it works great! Testing it on <a href="https://www.youtube.com/watch?v=auFlBlS-2hk">a random YouTube video</a> I downloaded, here’s some tasks I ran:</p>
+
+<p><strong>“Extract the audio from the sample.mp4 video and save it as a stereo mp3 with lossless compression.”</strong></p>
+
+<p>This yielded: <code>ffmpeg -i sample.mp4 -vn -acodec libmp3lame -b:a 320k -ac 2 sample.mp3</code></p>
+
+<p><strong>“Convert the video sample.mp4 into a video the size of a postage stamp in black and white color.”</strong></p>
+
+<p>Yielding: <code>ffmpeg -i sample.mp4 -vf "scale=50:50,format=gray" -sws_flags lanczos output.mp4</code></p>
+
+<p><strong>“Extract 9 random keyframes, as a grid in a single image named grid.png, from the video sample.mp4.”</strong></p>
+
+<p>Yielding: <code>ffmpeg -i sample.mp4 -vf "select='eq(pict_type,I)',scale=320:180,tile=3x3" -frames:v 9 grid.png</code></p>
+
+<p>This threw a complaint about the output filename not having a numeric variable, but did the job perfectly:</p>
+
+<p><img src="https://www.dbreunig.com/img/ffmsay_grid.png" alt=""></p>
+
+<p><strong>“Render a random snippet 2 seconds long from sample.mp4 as an animated GIF. Adjust the settings for a lightweight website GIF.”</strong></p>
+
+<p>This yielded the most complex call yet: <code>ffmpeg -i sample.mp4 -t 2 -ss $(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 sample.mp4 | awk -v seed=$RANDOM 'BEGIN{srand(seed)} {print rand()*($1-2)}') -vf "fps=10,scale=320:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse" -f gif output.gif</code></p>
+
+<p>And worked perfectly!</p>
+
+<p><img src="https://www.dbreunig.com/img/ffmsay_gif.gif" alt=""></p>
+
+<p>Interfacing with rarely used, complex interfaces is a <em>perfect</em> LLM use case. Previously, API and UX designers have had to simplify interfaces for powerful tools to produce reasonable surface areas for casual users. But with LLMs we can expose all the complexity with few of the downsides.</p>
+
+<p>This FFmpeg example, is one we can handle out-of-the-box with little precision prompting. For newer, or less commonly used interfaces, simple system prompting and/or a bit of fine-tuning can yield similar results.</p>
+
+
+
+
+  </div></div>]]>
+            </description>
+            <link>https://www.dbreunig.com/2025/02/24/building-an-easier-to-use-ffmpeg-with-llm.html</link>
+            <guid isPermaLink="false">hacker-news-small-sites-43164544</guid>
+            <pubDate>Mon, 24 Feb 2025 20:26:38 GMT</pubDate>
+        </item>
         <item>
             <title>
 <![CDATA[Fine Tuning a Python Code Completion Model]]>
@@ -206,7 +742,7 @@ February 24, 2025 | https://transformerlab.ai/blog/python-fine-tune/ | <a href="
             </title>
             <description>
 <![CDATA[
-Score 31 | Comments 0 (<a href="https://news.ycombinator.com/item?id=43163307">thread link</a>) | @cgwu
+Score 36 | Comments 1 (<a href="https://news.ycombinator.com/item?id=43163307">thread link</a>) | @cgwu
 <br/>
 February 24, 2025 | https://www.runllm.com/blog/introducing-runllm-the-ai-support-engineer | <a href="https://web.archive.org/web/*/https://www.runllm.com/blog/introducing-runllm-the-ai-support-engineer">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><section><section><div><div><div><div><p>Today, we're excited to share the <a href="http://app.runllm.com/">public beta of RunLLM</a>, the first <em>AI Support Engineer.</em> RunLLM is a new kind of AI product explicitly built for <em>advanced technical support</em> and complex problem-solving.</p><p>Technical support is one of the most valuable customer interactions a company has. Done right, it does more than help customers with technical questions — it drives adoption, retention, and long-term revenue. This is why innovative tech companies like <a href="https://www.databricks.com/">Databricks</a>, <a href="https://www.llamaindex.ai/">LlamaIndex</a>, <a href="https://motherduck.com/">MotherDuck</a>, <a href="https://livekit.io/">Livekit</a>, and <a href="https://arize.com/">Arize </a>already use RunLLM.</p><p>But unlocking that value is extremely hard. Today’s technical support teams juggle a lot of responsibilities: handling detailed technical questions, keeping up with product changes, and helping internal teams understand customer needs. On top of that, they must document every interaction, keep colleagues informed of ongoing issues, and maintain knowledge consistently across multiple systems. Support engineers who excel at all of this are incredibly rare.</p><p>That’s why we built RunLLM — to seamlessly integrate into technical support teams as a trusted teammate, lightening the load, accelerating customer adoption, and surfacing valuable insights. RunLLM doesn’t just answer questions: It works alongside your team, managing documentation, identifying patterns, and ensuring knowledge flows effortlessly across systems.</p><p>‍</p><figure><p><img src="https://cdn.prod.website-files.com/67ace557c186b0fcca333a7f/67bc09d36cbbed2183fb6536_RunLLM_The-AI-Support-Engineer_blogImage-wide.png" loading="lazy" alt=""></p></figure><p>‍</p><h3><strong>Scaling Technical Support Is Hard</strong></h3><p>From hundreds of customer conversations, we’ve identified the three biggest obstacles that prevent teams from scaling advanced technical support:</p><ul role="list"><li><strong>Technical Products Are Complex:</strong> They generate a high volume of intricate questions, in addition to many more which go unasked because users know detailed questions take time to answer. Support teams work hard to keep up, but high demand and repetitive “Hello, world” inquiries make scaling difficult.</li><li><strong>Support Engineering Talent Is Scarce:</strong> Support engineers are rare—technically skilled and customer-facing. Hiring and training take time, and customer demand often outpaces team capacity.</li><li><strong>AI That Only Retrieves Docs Falls Short:</strong> “Chat-with-your-docs” apps can answer basic questions, but they hallucinate, provide shallow responses, and fail to detect recurring issues across tickets.</li></ul><p>‍</p><h3><strong>RunLLM Helps Support Teams Scale</strong></h3><p>Like a real support engineer, RunLLM starts by learning your product inside and out. It uses that expertise to triage tickets, deliver precise answers, and surface insights from support conversations.</p><p>The result? RunLLM flexes your support capacity—freeing your team to focus on the high-value, complex issues that require human expertise.</p><p>Here’s how RunLLM delivers value:</p><ul role="list"><li><strong>Provides Unmatched Answer Quality:</strong> Trusting AI to interact with customers is a big deal. That’s why we’ve spent 18 months refining RunLLM’s accuracy and reliability, based on the feedback we’ve gotten over 50 production deployments.</li><li><strong>Behaves Like a Real Support Engineer:</strong> Great support doesn’t stop at answering questions. RunLLM follows up with users, validates code snippets, and offers proactive suggestions — mirroring how your best support engineers help customers.</li><li><strong>Surfaces Insights:</strong> RunLLM doesn’t just answer questions, it learns. By analyzing customer interactions at scale, it identifies pain points, improves documentation, and recommends product improvements.</li></ul><p>‍</p><h3><strong>Your Customers Are What Matter Most</strong></h3><p>At the end of the day, the success of any support solution isn’t measured by how many tickets it deflects—it’s measured by how much customers actually use and benefit from it.</p><p>From what we’re seeing, RunLLM is delivering real impact. Each time it’s deployed, users engage up to <em>10X more</em> than before—not because new issues suddenly appear, but because users have an immediate, trusted way to get the answers they need, whenever they need them. That level of engagement tells us something important: when high-quality technical support is truly accessible, users rely on it—and engagement skyrockets.</p><p>Yet too often, users won’t ask for help. Some avoid it simply because they don’t want to wait hours or days for a response. Others hold back because their question feels too basic or obvious—something they don’t want to “bother” support with. And then there are those who assume complex questions will take too much effort to resolve, leading to a long back-and-forth or unclear next steps. Instead of asking, they give up—or turn to a competitor for answers.</p><p>By eliminating this friction, RunLLM changes the dynamic. Users ask more, learn more, and get more out of your products. And because we unlock so much more interaction data, your company gains much better insights about how to improve support documentation and your products.</p><p>‍</p><h3><strong>Better Support Equals Business Growth</strong></h3><p>Advances in AI now make it possible to graduate technical support from a cost center to a revenue driver. RunLLM’s AI-powered technical support solution does more than just help teams deflect tickets with high quality answers. It increases positive interactions between companies and customers, and transforms support into a business growth driver.</p><p>Support is a business conversation. Every question asked is a moment of engagement—an opportunity to strengthen adoption, trust, and customer loyalty. Companies that leverage AI in the right way won’t just reduce support workload—they‘ll drive growth.</p><p>‍</p><h3><strong>Try the RunLLM Beta for Free</strong></h3><p>Starting today, you can set up RunLLM’s AI Support Engineer for your own product, and ask it questions about your own documentation. Onboarding takes a few minutes, and it’s free to try. You can see RunLLM&nbsp;in action here in a demo walk through from our CEO, Vikram:&nbsp;</p><div><p>
@@ -281,7 +817,7 @@ February 24, 2025 | https://blog.superb-owl.link/p/gentle-math-for-meditators-vi
             </title>
             <description>
 <![CDATA[
-Score 3 | Comments 0 (<a href="https://news.ycombinator.com/item?id=43162017">thread link</a>) | @elvis70
+Score 8 | Comments 0 (<a href="https://news.ycombinator.com/item?id=43162017">thread link</a>) | @elvis70
 <br/>
 February 24, 2025 | https://apicko.cz/posts/indy-4-localization/ | <a href="https://web.archive.org/web/*/https://apicko.cz/posts/indy-4-localization/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><article><header><h2>Localizing 'Indiana Jones and the Fate of Atlantis' 30 years after release</h2></header><figure><img src="https://apicko.cz/posts/indy-4-localization/00-intro.jpg" alt="To get in mood, I do recommend to listen to official soundtract while reading."><figcaption>To get in mood, <a href="https://www.youtube.com/watch?v=mwQiHqAuBEY" target="_blank">official soundtrack</a> is recommended to be played while reading.</figcaption></figure><h2 id="prologue">Prologue</h2><p>I hate autumn! All the free time you can spend in summer chatting pointlessly over beer and liquor, in the pub, in the garden, with family and friends, suddenly has nothing to fill it. And so I start looking for other forms of entertainment - digital ones. I don’t even know why, but in the autumn of 2022 I had the idea of translating the game <a href="https://gedig.itch.io/peglin" target="_blank">Peglin</a> into English. I started researching how such community translations are made. I discovered <a href="https://hernipreklady.cz/" target="_blank">prekladyher.eu (now moved to hernipreklady.cz)</a> and you can guess what happened next by reading the title. Right, I never translated Peglin. However, I did come across <a href="https://prekladyher.eu/vlakno/indiana-jones-and-the-fate-of-atlantis.4333/#post-54513" target="_blank">request for help</a> with <a href="https://en.wikipedia.org/wiki/Language_localisation" target="_blank">localising</a> a 30 years old game.</p><p><em>Author’s note: Yes, the date of the request (and my reply) doesn’t really fit with autumn. But that doesn’t negate the fact that I hate autumn.</em></p><h2 id="getting-the-game">Getting the game</h2><p>I played the game <a href="https://en.wikipedia.org/wiki/Indiana_Jones_and_the_Fate_of_Atlantis" target="_blank">Indiana Jones and the Fate of Atlantis</a> (aka Indy4) for a while when I was a kid, but since it was in English, I didn’t really know what was going on. However, I got the Czech version of the previous game in the series - <a href="https://en.wikipedia.org/wiki/Indiana_Jones_and_the_Last_Crusade" target="_blank">Indiana Jones and the Last Crusade</a> (aka Indy3) - and it made me pass out for a really long time. I knew what to expect. Classic <a href="https://www.lucasfilm.com/what-we-do/games/" target="_blank">Lucasfilm Games</a> adventure game based on the <a href="https://en.wikipedia.org/wiki/SCUMM" target="_blank">SCUMM</a> engine.</p><p>I bought the game (<em>at <a href="https://www.gog.com/game/indiana_jones_and_the_fate_of_atlantis" target="_blank">GOG</a> and just to be on the safe side, I bought <a href="https://www.gog.com/en/game/indiana_jones_and_the_last_crusade" target="_blank">Indy3</a> to settle some old debts</em>). Here was the first challenge for me. Indy4 has been released in several versions. GOG sells a so-called “talkie” version, which includes a full English voice-over. Just to be sure, I found the original DOS version on archive.org and compared them. The files are the same and this is the version I was looking for. I successfully installed and ran the game (via <a href="https://www.scummvm.org/" target="_blank">ScummVM</a> on Linux).</p><p>According to the <a href="https://wiki.scummvm.org/index.php/Indiana_Jones_and_the_Fate_of_Atlantis" target="_blank">ScummVM wiki</a> Indy4 contains 3 main data files. I found them in the game directory (in my case <code>/opt/Games/Indiana Jones and the Fate of Atlantis</code>) in the <code>data</code> folder.</p><pre tabindex="0"><code>[retro@retro  Indiana Jones and the Fate of Atlantis]❤ ls -lh data
@@ -405,6 +941,22 @@ February 24, 2025 | https://semking.com/seo-dead-technical-seo-useless/ | <a hre
         </item>
         <item>
             <title>
+<![CDATA[I solo-built a coding tutorials platform to compete with YouTube and Thinkific]]>
+            </title>
+            <description>
+<![CDATA[
+Score 4 | Comments 2 (<a href="https://news.ycombinator.com/item?id=43161733">thread link</a>) | @hainghiem375
+<br/>
+February 24, 2025 | https://app.catswithbats.com/lesson/4a0376c0 | <a href="https://web.archive.org/web/*/https://app.catswithbats.com/lesson/4a0376c0">archive.org</a>
+<br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>Master web data extraction with Firecrawl's powerful `/extract` feature, leveraging AI to transform websites into structured JSON data using simple prompts and schemas.  Explore the user-friendly playground API, compare different extraction methods, and efficiently validate your data using Pydantic for streamlined workflows.
+</p><p><span>... Show more</span></p></div></div>]]>
+            </description>
+            <link>https://app.catswithbats.com/lesson/4a0376c0</link>
+            <guid isPermaLink="false">hacker-news-small-sites-43161733</guid>
+            <pubDate>Mon, 24 Feb 2025 16:51:56 GMT</pubDate>
+        </item>
+        <item>
+            <title>
 <![CDATA[Show HN: Botnet of Ares, an incremental hacking game]]>
             </title>
             <description>
@@ -480,7 +1032,7 @@ February 24, 2025 | https://tiniuc.com/botnet-of-ares/ | <a href="https://web.ar
             </title>
             <description>
 <![CDATA[
-Score 138 | Comments 85 (<a href="https://news.ycombinator.com/item?id=43160884">thread link</a>) | @ChrisArchitect
+Score 262 | Comments 162 (<a href="https://news.ycombinator.com/item?id=43160884">thread link</a>) | @ChrisArchitect
 <br/>
 February 24, 2025 | https://www.ericdaigle.ca/posts/breaking-into-dozens-of-apartments-in-five-minutes/ | <a href="https://web.archive.org/web/*/https://www.ericdaigle.ca/posts/breaking-into-dozens-of-apartments-in-five-minutes/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div id="quarto-content">
@@ -1139,7 +1691,7 @@ Works nicely with todo.txt and calendar.txt.
             </title>
             <description>
 <![CDATA[
-Score 29 | Comments 8 (<a href="https://news.ycombinator.com/item?id=43159691">thread link</a>) | @meysamazad
+Score 32 | Comments 11 (<a href="https://news.ycombinator.com/item?id=43159691">thread link</a>) | @meysamazad
 <br/>
 February 24, 2025 | https://developer-friendly.blog/blog/2025/02/24/ente-self-host-the-google-photos-alternative-and-own-your-privacy/ | <a href="https://web.archive.org/web/*/https://developer-friendly.blog/blog/2025/02/24/ente-self-host-the-google-photos-alternative-and-own-your-privacy/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-md-component="main"> <div>   <div data-md-component="content">  <article> <a href="https://github.com/developer-friendly/blog/blob/main/docs/blog/posts/2025/006-ente/README.md" title="Edit this page"> <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M10 20H6V4h7v5h5v3.1l2-2V8l-6-6H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h4zm10.2-7c.1 0 .3.1.4.2l1.3 1.3c.2.2.2.6 0 .8l-1 1-2.1-2.1 1-1c.1-.1.2-.2.4-.2m0 3.9L14.1 23H12v-2.1l6.1-6.1z"></path></svg> </a> <a href="https://github.com/developer-friendly/blog/raw/main/docs/blog/posts/2025/006-ente/README.md" title="View source of this page"> <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M17 18c.56 0 1 .44 1 1s-.44 1-1 1-1-.44-1-1 .44-1 1-1m0-3c-2.73 0-5.06 1.66-6 4 .94 2.34 3.27 4 6 4s5.06-1.66 6-4c-.94-2.34-3.27-4-6-4m0 6.5a2.5 2.5 0 0 1-2.5-2.5 2.5 2.5 0 0 1 2.5-2.5 2.5 2.5 0 0 1 2.5 2.5 2.5 2.5 0 0 1-2.5 2.5M9.27 20H6V4h7v5h5v4.07c.7.08 1.36.25 2 .49V8l-6-6H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h4.5a8.2 8.2 0 0 1-1.23-2"></path></svg> </a>  <p>In the recent few years, I keep seeing people being more aware of their privacy and taking it into their own hands.</p> <p>More and more solutions are emerging through the community that address the critical part of our society and personal life; privacy!</p> <p>In this blog post, I will introduce you to Ente, the Google Photos alternative.</p> <p>You will see the codes required to deploy the server into a Kubernetes setup and host the frontend using GitHub Pages.</p> <p>Stick around till the end if that's your cup of tea.</p> <h2 id="introduction">Introduction<a href="#introduction" title="Permanent link">¶</a></h2> <p>It delights me to see more and more people raising concerns on the matter of <a href="https://developer-friendly.blog/blog/category/privacy/">privacy</a>.</p> <p>It's a crucial aspect, one that is regularly overlooked due to the enormous amount of tracking (by big conglamorate) that is concerningly becoming a habit and we're becoming numb to the idea!</p> <p>This shouldn't be the norm. It's not right!</p> <p>And hopefully, reading this post and similar ones like this throughout the internet, you will take your privacy more seriously and start taking it under your control.</p> <p>To a tracking-less and cookie-less internet <img alt="🥂" src="https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/svg/1f942.svg" title=":champagne_glass:"> . Let's begin!</p> <h2 id="preface">Preface<a href="#preface" title="Permanent link">¶</a></h2> <p>Before we dive in, it's important to mention that this blog post, as well as the rest of the articles in <a href="https://developer-friendly.blog/">this website</a> are all technical-heavy. More importantly, we focus on <a href="https://developer-friendly.blog/blog/category/kubernetes/">Kubernetes</a> here, cause that's what we do in our day to day life, and that's what you'd hear us talking about non-stop if you were to sit and chat with us. <img alt="🤓" src="https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/svg/1f913.svg" title=":nerd:"></p> <p>If you're not technical, or do not enjoy the ecosystem of <a href="https://developer-friendly.blog/blog/category/kubernetes/">Kubernetes</a>, then probably this blog post is not for you. The official Ente documentation has a proper guide<sup id="fnref:ente-selfhosting"><a href="#fn:ente-selfhosting">1</a></sup> on docker compose deployment which tends to be a lot easier for non-technical people.</p> <p>With that out of the way, let us not waste any more time.</p> <h2 id="prerequisites">Prerequisites<a href="#prerequisites" title="Permanent link">¶</a></h2> <ol> <li>You will need a <a href="https://developer-friendly.blog/blog/category/kubernetes/">Kubernetes</a> cluster. I have countless guides in this website explaining different forms of provisioning one, whether managed, or self-managed.</li> <li>You will need a <a href="https://developer-friendly.blog/blog/category/github/">GitHub</a> account<sup id="fnref:github"><a href="#fn:github">2</a></sup>.</li> <li>Understanding and the installation of <a href="https://developer-friendly.blog/blog/category/opentofu/">OpenTofu</a> (or <a href="https://developer-friendly.blog/blog/category/terraform/">Terraform</a>)<sup id="fnref:opentofu"><a href="#fn:opentofu">3</a></sup>.</li> </ol> <h2 id="ente-server-kubernetes-deployment">Ente Server Kubernetes Deployment<a href="#ente-server-kubernetes-deployment" title="Permanent link">¶</a></h2> <p>When you have your basic tools setup, it's time to provide you with the codes necessary to deploy the Ente server in a <a href="https://developer-friendly.blog/blog/category/kubernetes/">Kubernetes</a> deployment.</p> <div><p><span>ente-server/deployment.yml</span></p><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1"></a><a href="#__codelineno-0-1"><span data-linenos=" 1 "></span></a><span>---</span>
@@ -1836,7 +2388,7 @@ February 24, 2025 | https://wotschofsky.com/blog/telekom-cloudflare-routing | <a
             </title>
             <description>
 <![CDATA[
-Score 155 | Comments 180 (<a href="https://news.ycombinator.com/item?id=43158292">thread link</a>) | @amadeuspagel
+Score 158 | Comments 183 (<a href="https://news.ycombinator.com/item?id=43158292">thread link</a>) | @amadeuspagel
 <br/>
 February 24, 2025 | https://desmolysium.com/ketamineneurotoxic/ | <a href="https://web.archive.org/web/*/https://desmolysium.com/ketamineneurotoxic/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div data-id="1109504" data-element_type="widget" data-widget_type="theme-post-content.default">
@@ -2283,7 +2835,7 @@ February 24, 2025 | https://www.evalapply.org/posts/why-and-how-i-use-org-mode/i
             </title>
             <description>
 <![CDATA[
-Score 15 | Comments 4 (<a href="https://news.ycombinator.com/item?id=43157133">thread link</a>) | @desunit
+Score 16 | Comments 4 (<a href="https://news.ycombinator.com/item?id=43157133">thread link</a>) | @desunit
 <br/>
 February 24, 2025 | https://desunit.com/blog/they-hijacked-our-flow-state/ | <a href="https://web.archive.org/web/*/https://desunit.com/blog/they-hijacked-our-flow-state/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -2356,7 +2908,7 @@ February 24, 2025 | https://thebrooksinstitute.org/resources/living-bibliography
             </title>
             <description>
 <![CDATA[
-Score 128 | Comments 223 (<a href="https://news.ycombinator.com/item?id=43156785">thread link</a>) | @mertbio
+Score 133 | Comments 225 (<a href="https://news.ycombinator.com/item?id=43156785">thread link</a>) | @mertbio
 <br/>
 February 23, 2025 | https://mertbulan.com/2025/02/24/we-dont-need-startups-we-need-digital-mittelstand/ | <a href="https://web.archive.org/web/*/https://mertbulan.com/2025/02/24/we-dont-need-startups-we-need-digital-mittelstand/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -3374,7 +3926,7 @@ February 23, 2025 | https://digitalseams.com/blog/microwave-ovens-wi-fi-and-http
             </title>
             <description>
 <![CDATA[
-Score 14 | Comments 5 (<a href="https://news.ycombinator.com/item?id=43154711">thread link</a>) | @azhenley
+Score 18 | Comments 8 (<a href="https://news.ycombinator.com/item?id=43154711">thread link</a>) | @azhenley
 <br/>
 February 23, 2025 | https://drewknight.com/bybe.html | <a href="https://web.archive.org/web/*/https://drewknight.com/bybe.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -3562,7 +4114,7 @@ February 23, 2025 | https://drewknight.com/bybe.html | <a href="https://web.arch
             </title>
             <description>
 <![CDATA[
-Score 290 | Comments 88 (<a href="https://news.ycombinator.com/item?id=43154666">thread link</a>) | @gpjt
+Score 297 | Comments 89 (<a href="https://news.ycombinator.com/item?id=43154666">thread link</a>) | @gpjt
 <br/>
 February 23, 2025 | https://www.gilesthomas.com/2025/02/20250223-til-deep-dive-posts | <a href="https://web.archive.org/web/*/https://www.gilesthomas.com/2025/02/20250223-til-deep-dive-posts">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -4304,7 +4856,7 @@ February 23, 2025 | https://jnnnthnn.com/how-to-build-your-own-perplexity-for-an
           Hacker Search</a> multiple times a week. Although I think it could be improved further, I'm likely going
         to wind down my efforts to maintenance levels, as it was merely a side project. I am however working on
         something much bigger, and somewhat related to Hacker Search. <a href="https://x.com/jnnnthnn">Follow me on X</a> to hear more about it when it goes live!</p>
-      <p>Lastly, if you build something using this blueprint, please <a href="https://jnnnthnn.com/cdn-cgi/l/email-protection#a9c3c6c7c8ddc1c8c7e9dcc7c087c2c6de87dac2c0">reach out</a>! I'd love to see what you come up with. </p>
+      <p>Lastly, if you build something using this blueprint, please <a href="https://jnnnthnn.com/cdn-cgi/l/email-protection#3a5055545b4e525b547a4f54531451554d14495153">reach out</a>! I'd love to see what you come up with. </p>
       <p id="ft">[1] What I've outlined here is my experience building this side
         project on a strict time budget. I have no insider information regarding how Perplexity actually works, and some
         of my assessment might be incorrect. Additionally, this outline does not cover the substantial gap between a
@@ -4930,7 +5482,7 @@ February 23, 2025 | https://ryanbrewer.dev/posts/linear-logic/ | <a href="https:
             </title>
             <description>
 <![CDATA[
-Score 17 | Comments 7 (<a href="https://news.ycombinator.com/item?id=43149899">thread link</a>) | @inoshy
+Score 18 | Comments 7 (<a href="https://news.ycombinator.com/item?id=43149899">thread link</a>) | @inoshy
 <br/>
 February 23, 2025 | https://dropbud.co/space | <a href="https://web.archive.org/web/*/https://dropbud.co/space">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/>Unable to retrieve article]]>
@@ -4960,7 +5512,7 @@ February 23, 2025 | https://newsletter.rafapaez.com/p/hero-culture-is-hurting-yo
             </title>
             <description>
 <![CDATA[
-Score 182 | Comments 67 (<a href="https://news.ycombinator.com/item?id=43149648">thread link</a>) | @mooreds
+Score 182 | Comments 68 (<a href="https://news.ycombinator.com/item?id=43149648">thread link</a>) | @mooreds
 <br/>
 February 23, 2025 | https://peeifyouwanttogofaster.com/2021/05/24/pee-if-you-want-to-go-deeper/ | <a href="https://web.archive.org/web/*/https://peeifyouwanttogofaster.com/2021/05/24/pee-if-you-want-to-go-deeper/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -7585,7 +8137,7 @@ February 22, 2025 | https://www.thecaringtechie.com/p/8-guaranteed-ways-to-annoy
             </title>
             <description>
 <![CDATA[
-Score 30 | Comments 30 (<a href="https://news.ycombinator.com/item?id=43146357">thread link</a>) | @domofutu
+Score 30 | Comments 31 (<a href="https://news.ycombinator.com/item?id=43146357">thread link</a>) | @domofutu
 <br/>
 February 22, 2025 | https://www.bps.org.uk/research-digest/men-overestimate-womens-preference-masculinity | <a href="https://web.archive.org/web/*/https://www.bps.org.uk/research-digest/men-overestimate-womens-preference-masculinity">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><div><p>We are constantly bombarded with the message that certain body types are particularly sexually desirable. Previous research, however, has consistently found that we're <a href="https://www.sciencedirect.com/science/article/pii/S1740144503000251?via%3Dihub">not really that good</a> at knowing what physical features are actually appealing to our preferred gender. Straight women, for example, tend to overestimate how much men desire thinness, whereas straight men exaggerate how muscular women want them to be.</p><p>In<em> PLOS One</em>, David I. Perrett and colleagues at the University of St. Andrews <a href="https://doi.org/10.1371/journal.pone.0310835">take a look</a> at how this dynamic plays out for facial features. When asking straight men and women to digitally create a face that they thought the opposite gender would prefer, the team found that both men and women overestimate how much potential partners prefer exaggerated femininity or masculinity — misjudgements that may contribute to body dissatisfaction.</p><p>Before recruiting participants, the researchers created a set of "base" 3D images of male and female faces — composites of multiple faces. They then altered these faces, making them look more or less stereotypically masculine or feminine. Participants could adjust the faces using a slider, shifting features between these extremes in 10% increments.</p><p>The participants (144 White, straight men and women aged between 18 and 27) were then asked to adjust a face's masculinity or femininity in response to three different prompts: firstly, to create a face that resembled themselves; secondly, to create their own 'ideal' face; and finally, to create a face they believed the opposite sex would find attractive for both short- and long-term relationships. The slider's starting position was randomised each time.</p><p>On average, women adjusted male faces to be 32.7% more masculine than the least masculine version available — suggesting just a moderate preference for masculinity. In contrast, men predicted that women would prefer male faces to be 76.5% more masculine, greatly overestimating women's actual preference.</p><p>When it came to female faces, high femininity was generally preferred across the board. However, men chose slightly less feminine faces (124.8% more feminine than the least feminine face) than what women expected them to prefer (172% more feminine).</p><p>These figures varied when participants were asked to create faces of those they felt would be most attractive for short- and long-term relationships. Men assumed that women would prefer male faces to be 90% more masculine for short-term relationships, compared to 62.4% more masculine for long-term ones. In reality, though, women's preferences remained relatively stable regardless of relationship type.</p><p>The results also revealed a gap between how participants saw themselves and their 'ideal' face. Both men and women saw their own faces as less masculine or feminine than they wanted to be, respectively — and the stronger this misperception, the more dissatisfied they felt about their appearance. Women who thought men preferred highly feminine faces were more dissatisfied with their own femininity, and men who thought women wanted hyper-masculine features were less happy with their own masculinity.</p><p>Given the narrow demographic of the study, however, it's not possible to say whether these results would vary in non-White, non-American, LGBT+, and other populations.</p><p>This all suggests that misjudging what others find attractive doesn't just skew our view of potential partners, but also distorts our own self-image. Just as concerns about muscularity, body type, or weight can lead to insecurity and unhappiness, so too can worries about the masculinity or femininity of our facial features.</p><p>Though the study doesn't explore the potential implications of such unhappiness, we do know from other research that the consequences can be serious. Men, for example, can use anabolic steroids to develop muscles, while women are more susceptible to developing eating disorders. This could be a useful focus for future research, as well as forming the basis to develop strategies to address gender-specific problems of self-image.</p><p><em>Read the paper in full:</em><br>Perrett, D. I., Holzleitner, I. J., &amp; Lei, X. (2024). Misperception of the facial appearance that the opposite-sex desires. <em>PLOS ONE</em>, <em>19</em>(11), e0310835. <a href="https://doi.org/10.1371/journal.pone.0310835">https://doi.org/10.1371/journal.pone.0310835</a></p><p><span>Want the latest in psychological research, straight to your inbox?</span><br><a href="https://bps.us11.list-manage.com/subscribe?u=ef6b58887f03b7e6e6ae5b2b9&amp;id=b626c035bb">Sign up to Research Digest's free weekly newsletter.</a></p></div></div></div></div>]]>
@@ -7615,7 +8167,7 @@ February 22, 2025 | https://www.theseedsofscience.pub/p/your-iq-isnt-160-no-ones
             </title>
             <description>
 <![CDATA[
-Score 260 | Comments 105 (<a href="https://news.ycombinator.com/item?id=43146155">thread link</a>) | @walterbell
+Score 262 | Comments 105 (<a href="https://news.ycombinator.com/item?id=43146155">thread link</a>) | @walterbell
 <br/>
 February 22, 2025 | https://bangkoklocal.info/2025/02/05/thailand-to-cut-power-to-myanmar-scam-hubs/ | <a href="https://web.archive.org/web/*/https://bangkoklocal.info/2025/02/05/thailand-to-cut-power-to-myanmar-scam-hubs/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -9026,7 +9578,7 @@ SQL’s abstraction can lead to inefficient query plans—great for ease, less s
             </title>
             <description>
 <![CDATA[
-Score 4 | Comments 0 (<a href="https://news.ycombinator.com/item?id=43142923">thread link</a>) | @m_walden
+Score 5 | Comments 0 (<a href="https://news.ycombinator.com/item?id=43142923">thread link</a>) | @m_walden
 <br/>
 February 22, 2025 | https://mw.rat.bz/pointers/ | <a href="https://web.archive.org/web/*/https://mw.rat.bz/pointers/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page">
@@ -9328,7 +9880,7 @@ By Michael Walden - Created: 2025-02-22 - Updated: 2025-02-22<br>
 <a name="L3b">[3b] Greenfish Icon Editor Pro Portable</a><br>
  <a href="https://portableapps.com/apps/graphics_pictures/greenfish-icon-editor-pro-portable">https://PortableApps.com/apps/graphics_pictures/greenfish-icon-editor-pro-portable</a></p><pre>                             © 2025 Michael Walden
   (This document was originally published here: <a href="https://mw.rat.bz/pointers">https://MW.Rat.bz/pointers</a>)
-                         Counter: <span>&nbsp;647&nbsp;</span> (Since 2025-02-22)
+                         Counter: <span>&nbsp;689&nbsp;</span> (Since 2025-02-22)
 -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-==-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
                               [Back]&nbsp;<a href="#TOP">[Top]</a>&nbsp;<a href="https://mw.rat.bz/index.html">[Index]</a>
                             <a href="http://mw.rat.bz/contact.htm">[Contact Michael Walden]</a>
@@ -12012,7 +12564,7 @@ February 22, 2025 | https://blog.alaindichiappari.dev/p/sabotage-101-company-cul
             </title>
             <description>
 <![CDATA[
-Score 89 | Comments 34 (<a href="https://news.ycombinator.com/item?id=43137694">thread link</a>) | @marksully
+Score 100 | Comments 36 (<a href="https://news.ycombinator.com/item?id=43137694">thread link</a>) | @marksully
 <br/>
 February 22, 2025 | https://blog.chasingbrains.co/p/just-write-stuff | <a href="https://web.archive.org/web/*/https://blog.chasingbrains.co/p/just-write-stuff">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><div><div><article><div><div><div dir="auto"><p>I encourage you to start publishing your thoughts on a regular basis. Don’t overthink it. Start small. Just pick an existing platform and start writing short posts. If it helps, get drunk, choose a pseudonym, and post anonymously.</p><p>That’s what I’m trying to do with this short piece. I wasted so much time on overthinking and procrastinating that you could say this post was 10 years in the making.</p><p>Don’t over-engineer your site. Don’t even check the grammar. Just write 100 words and hit publish.</p></div></div></div></article></div></div></div><div><div id="discussion"><div><h4>Discussion about this post</h4></div></div></div></div>]]>
@@ -12027,7 +12579,7 @@ February 22, 2025 | https://blog.chasingbrains.co/p/just-write-stuff | <a href="
             </title>
             <description>
 <![CDATA[
-Score 290 | Comments 252 (<a href="https://news.ycombinator.com/item?id=43137586">thread link</a>) | @jgrodziski
+Score 295 | Comments 265 (<a href="https://news.ycombinator.com/item?id=43137586">thread link</a>) | @jgrodziski
 <br/>
 February 22, 2025 | https://gaiwan.co/blog/why-clojure/ | <a href="https://web.archive.org/web/*/https://gaiwan.co/blog/why-clojure/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -12681,7 +13233,7 @@ February 21, 2025 | https://www.dishytech.com/starlink-mini-review/ | <a href="h
             </title>
             <description>
 <![CDATA[
-Score 38 | Comments 22 (<a href="https://news.ycombinator.com/item?id=43132855">thread link</a>) | @ocean_moist
+Score 38 | Comments 25 (<a href="https://news.ycombinator.com/item?id=43132855">thread link</a>) | @ocean_moist
 <br/>
 February 21, 2025 | https://rohan.ga/blog/zero_game/ | <a href="https://web.archive.org/web/*/https://rohan.ga/blog/zero_game/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -13461,7 +14013,7 @@ February 21, 2025 | https://financialdata.net/documentation | <a href="https://w
             </title>
             <description>
 <![CDATA[
-Score 512 | Comments 452 (<a href="https://news.ycombinator.com/item?id=43130546">thread link</a>) | @philip1209
+Score 514 | Comments 453 (<a href="https://news.ycombinator.com/item?id=43130546">thread link</a>) | @philip1209
 <br/>
 February 21, 2025 | https://www.contraption.co/rails-versus-nextjs/ | <a href="https://web.archive.org/web/*/https://www.contraption.co/rails-versus-nextjs/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -14711,7 +15263,7 @@ Jonasstraße 22
             </title>
             <description>
 <![CDATA[
-Score 30 | Comments 21 (<a href="https://news.ycombinator.com/item?id=43127825">thread link</a>) | @emsi
+Score 32 | Comments 23 (<a href="https://news.ycombinator.com/item?id=43127825">thread link</a>) | @emsi
 <br/>
 February 21, 2025 | https://www.emsi.me/emsi/llm-chats/o3-mini-is-insane-at-simulating-computations/2025-02-21/143a52 | <a href="https://web.archive.org/web/*/https://www.emsi.me/emsi/llm-chats/o3-mini-is-insane-at-simulating-computations/2025-02-21/143a52">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
@@ -14821,7 +15373,7 @@ TF matrix (with binary counts):
             </title>
             <description>
 <![CDATA[
-Score 206 | Comments 146 (<a href="https://news.ycombinator.com/item?id=43127577">thread link</a>) | @OuterVale
+Score 240 | Comments 175 (<a href="https://news.ycombinator.com/item?id=43127577">thread link</a>) | @OuterVale
 <br/>
 February 21, 2025 | https://kyrylo.org/html/2024/10/25/why-does-target-blank-have-an-underscore-in-front.html | <a href="https://web.archive.org/web/*/https://kyrylo.org/html/2024/10/25/why-does-target-blank-have-an-underscore-in-front.html">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div itemprop="articleBody">
@@ -15307,7 +15859,7 @@ February 21, 2025 | https://belev.me/2025/02/20/Introducing-BeBlob-A-GitLab-Powe
             </title>
             <description>
 <![CDATA[
-Score 220 | Comments 261 (<a href="https://news.ycombinator.com/item?id=43125981">thread link</a>) | @merkmoi
+Score 221 | Comments 261 (<a href="https://news.ycombinator.com/item?id=43125981">thread link</a>) | @merkmoi
 <br/>
 February 21, 2025 | https://www.empathetic.dev/users-dont-care-about-your-tech-stack | <a href="https://web.archive.org/web/*/https://www.empathetic.dev/users-dont-care-about-your-tech-stack">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div><p>I still often find myself in discussions where the main focus is the choice of technologies. Questions like <em>“Is this language better than that one?”</em> or <em>“Is this framework more performant than the other?”</em> keep coming up. But the truth is: <strong>users don’t care about any of that</strong>. They won’t notice those extra 10 milliseconds you saved, nor will their experience magically improve just because you’re using the latest JavaScript framework.</p>
@@ -15464,7 +16016,7 @@ IO.inspect(desc2)</code></pre><hr><p>Almost any model coming out can be run usin
             </title>
             <description>
 <![CDATA[
-Score 114 | Comments 58 (<a href="https://news.ycombinator.com/item?id=43125176">thread link</a>) | @cautious-fly
+Score 115 | Comments 58 (<a href="https://news.ycombinator.com/item?id=43125176">thread link</a>) | @cautious-fly
 <br/>
 February 21, 2025 | https://benjamintoll.com/2022/02/04/on-running-systemd-nspawn-containers/ | <a href="https://web.archive.org/web/*/https://benjamintoll.com/2022/02/04/on-running-systemd-nspawn-containers/">archive.org</a>
 <br/><!-- hnss:readable-content --><hr/><div id="readability-page-1" class="page"><div>
